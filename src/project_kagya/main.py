@@ -78,8 +78,29 @@ def _build_pipeline(model: Any, tokenizer: Any):
             f"{payload['system_prompt']}\n\nUser: {payload['user_prompt']}\nAssistant:"
         )
         inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = _move_inputs_to_model_device(inputs, model)
         generated = model.generate(**inputs, max_new_tokens=256)
         text = tokenizer.decode(generated[0], skip_special_tokens=True)
         return {"text": text}
 
     return pipeline
+
+
+def _move_inputs_to_model_device(inputs: Any, model: Any) -> Any:
+    device = getattr(model, "device", None)
+    if device is None:
+        try:
+            first_parameter = next(model.parameters())
+        except (AttributeError, StopIteration, TypeError):
+            return inputs
+        device = first_parameter.device
+
+    mover = getattr(inputs, "to", None)
+    if callable(mover):
+        return mover(device)
+    if isinstance(inputs, dict):
+        return {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+    return inputs

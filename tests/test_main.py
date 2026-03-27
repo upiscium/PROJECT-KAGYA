@@ -75,3 +75,28 @@ def test_load_runtime_defaults_to_qwen35_9b(monkeypatch) -> None:
 
     assert runtime.model.__class__.__name__ == "FakeModel"
     assert calls == [("base_model", "Qwen/Qwen3.5-9B-Instruct")]
+
+
+def test_move_inputs_to_model_device_uses_tensor_to_method() -> None:
+    from project_kagya.main import _move_inputs_to_model_device
+
+    class FakeTensor:
+        def __init__(self):
+            self.devices: list[str] = []
+
+        def to(self, device):
+            self.devices.append(str(device))
+            return self
+
+    class FakeInputs(dict):
+        pass
+
+    class FakeModel:
+        device = "cuda:0"
+
+    inputs = FakeInputs({"input_ids": FakeTensor(), "attention_mask": FakeTensor()})
+
+    moved = _move_inputs_to_model_device(inputs, FakeModel())
+
+    assert moved["input_ids"].devices == ["cuda:0"]
+    assert moved["attention_mask"].devices == ["cuda:0"]
