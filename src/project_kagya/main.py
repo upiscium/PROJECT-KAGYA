@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .conscious_agent import ConsciousAgent
+from .dual_memory_system import DualMemorySystem
+
+
+@dataclass(slots=True)
+class ChatRuntime:
+    model: Any
+    tokenizer: Any
+    memory_system: DualMemorySystem
+    agent: ConsciousAgent
+
+
+def load_runtime(
+    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    adapter_path: str = "./kagya_subjective_adapter",
+) -> ChatRuntime:
+    tokenizer, model = _load_base_model(model_name)
+    model = _attach_adapter_if_present(model, adapter_path)
+    memory_system = DualMemorySystem()
+    agent = ConsciousAgent(
+        memory_system=memory_system, llm_pipeline=_build_pipeline(model, tokenizer)
+    )
+    return ChatRuntime(
+        model=model,
+        tokenizer=tokenizer,
+        memory_system=memory_system,
+        agent=agent,
+    )
+
+
+def chat_once(
+    runtime: ChatRuntime, user_input: str, valence: float, arousal: float
+) -> str:
+    return runtime.agent.generate(user_input, valence, arousal)
+
+
+def _load_base_model(model_name: str) -> tuple[Any, Any]:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        load_in_4bit=True,
+    )
+    return tokenizer, model
+
+
+def _attach_adapter_if_present(model: Any, adapter_path: str) -> Any:
+    path = Path(adapter_path)
+    if not path.exists():
+        return model
+
+    from peft import PeftModel
+
+    return PeftModel.from_pretrained(model, str(path))
+
+
+def _build_pipeline(model: Any, tokenizer: Any):
+    def pipeline(payload: dict[str, str]) -> dict[str, str]:
+        prompt = (
+            f"{payload['system_prompt']}\n\nUser: {payload['user_prompt']}\nAssistant:"
+        )
+        inputs = tokenizer(prompt, return_tensors="pt")
+        generated = model.generate(**inputs, max_new_tokens=256)
+        text = tokenizer.decode(generated[0], skip_special_tokens=True)
+        return {"text": text}
+
+    return pipeline
