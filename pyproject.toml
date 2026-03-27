@@ -16,6 +16,9 @@ dependencies = [
 [project.scripts]
 project-kagya = "project_kagya.cli:main"
 
+[tool.uv]
+package = true
+
 [dependency-groups]
 dev = [
     "mypy>=1.9.0",
