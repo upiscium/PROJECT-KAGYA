@@ -7,7 +7,7 @@ def test_build_parser_has_expected_defaults() -> None:
     parser = cli.build_parser()
     args = parser.parse_args(["--input", "hello"])
 
-    assert args.model_name == "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    assert args.model_name == "Qwen/Qwen3.5-9B-Instruct"
     assert args.adapter_path == "./kagya_subjective_adapter"
     assert args.user_input == "hello"
     assert args.valence == 0.0
@@ -35,7 +35,7 @@ def test_run_invokes_runtime(monkeypatch, capsys) -> None:
     assert out.strip() == "reply"
     assert calls == [
         (
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+            "Qwen/Qwen3.5-9B-Instruct",
             "./kagya_subjective_adapter",
             "load",
         ),

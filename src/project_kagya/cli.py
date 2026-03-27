@@ -9,9 +9,7 @@ from .main import chat_once, load_runtime
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="project-kagya")
-    parser.add_argument(
-        "--model-name", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    )
+    parser.add_argument("--model-name", default="Qwen/Qwen3.5-9B-Instruct")
     parser.add_argument("--adapter-path", default="./kagya_subjective_adapter")
     parser.add_argument("--input", dest="user_input", help="User message to process")
     parser.add_argument("--valence", type=float, default=0.0)

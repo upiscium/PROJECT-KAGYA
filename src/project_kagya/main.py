@@ -19,7 +19,7 @@ class ChatRuntime:
 
 
 def load_runtime(
-    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    model_name: str = "Qwen/Qwen3.5-9B-Instruct",
     adapter_path: str = "./kagya_subjective_adapter",
 ) -> ChatRuntime:
     tokenizer, model = _load_base_model(model_name)
@@ -46,12 +46,18 @@ def chat_once(
 
 def _load_base_model(model_name: str) -> tuple[Any, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import BitsAndBytesConfig
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype="bfloat16",
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
-        load_in_4bit=True,
+        quantization_config=quantization_config,
     )
     return tokenizer, model
 
