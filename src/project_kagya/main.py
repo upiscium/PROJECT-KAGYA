@@ -6,6 +6,7 @@ from typing import Any
 
 from .conscious_agent import ConsciousAgent
 from .dual_memory_system import DualMemorySystem
+from .sleep_consolidation import SleepCycleManager
 
 
 @dataclass(slots=True)
@@ -14,6 +15,7 @@ class ChatRuntime:
     tokenizer: Any
     memory_system: DualMemorySystem
     agent: ConsciousAgent
+    sleep_manager: SleepCycleManager
 
 
 def load_runtime(
@@ -26,11 +28,13 @@ def load_runtime(
     agent = ConsciousAgent(
         memory_system=memory_system, llm_pipeline=_build_pipeline(model, tokenizer)
     )
+    sleep_manager = SleepCycleManager(memory_system=memory_system)
     return ChatRuntime(
         model=model,
         tokenizer=tokenizer,
         memory_system=memory_system,
         agent=agent,
+        sleep_manager=sleep_manager,
     )
 
 

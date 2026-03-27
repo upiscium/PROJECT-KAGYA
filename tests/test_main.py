@@ -14,14 +14,15 @@ class AgentStub:
         return "reply"
 
 
-@dataclass
-class RuntimeStub:
-    agent: AgentStub
-
-
 def test_chat_once_delegates_to_agent() -> None:
     agent = AgentStub(calls=[])
-    runtime = ChatRuntime(model=None, tokenizer=None, memory_system=None, agent=agent)
+    runtime = ChatRuntime(
+        model=None,
+        tokenizer=None,
+        memory_system=None,
+        agent=agent,
+        sleep_manager=None,
+    )
 
     result = chat_once(runtime, "hello", 0.1, 0.2)
 
