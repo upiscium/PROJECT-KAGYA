@@ -31,8 +31,14 @@ The CLI is exposed as `project-kagya`:
 uv run project-kagya --input "hello"
 ```
 
+Presets:
+
+- `--preset lightweight` (default): `Qwen/Qwen2.5-1.5B-Instruct`
+- `--preset qwen3.5-9b`: `Qwen/Qwen3.5-9B-Instruct`
+
 Useful options:
 
+- `--preset`: model preset to load
 - `--model-name`: base model name or path
 - `--adapter-path`: optional LoRA adapter directory
 - `--input`: user message to process
