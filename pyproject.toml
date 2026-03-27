@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "A standard Python project managed by uv and Nix"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "chromadb>=1.5.5",
+    "sentence-transformers>=5.3.0",
+]
 
 [dependency-groups]
 dev = [
