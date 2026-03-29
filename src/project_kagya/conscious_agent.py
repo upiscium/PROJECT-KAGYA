@@ -1,61 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-
-from .dual_memory_system import DualMemorySystem
+from typing import Callable
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True)
 class ConsciousPrompt:
-    system_prompt: str
-    user_prompt: str
+    system: str
+    user: str
 
 
 class ConsciousAgent:
-    def __init__(self, memory_system: DualMemorySystem, llm_pipeline: Any) -> None:
-        self.memory_system = memory_system
-        self.llm_pipeline = llm_pipeline
+    def __init__(self, generator: Callable[[str], str] | None = None) -> None:
+        self.generator = generator or (lambda prompt: prompt)
 
     def build_prompt(
-        self, user_input: str, valence: float, arousal: float
+        self, user_input: str, valence: float, arousal: float, context: str
     ) -> ConsciousPrompt:
-        memory_context = self.memory_system.retrieve_context(user_input)
-        system_prompt = (
-            "You are a subjective AI agent.\n"
-            f"Current Valence: {valence}\n"
-            f"Current Arousal: {arousal}\n"
-            f"Relevant Memory Context:\n{memory_context}\n"
-            "Output must begin with <think>...</think>.\n"
-            "Within <think>, evaluate how to keep valence positive, regulate arousal,\n"
-            "and align the answer with long-term semantic memory before responding."
+        system = (
+            "You are PROJECT-KAGYA.\n"
+            f"Current Valence: {valence:.3f}\n"
+            f"Current Arousal: {arousal:.3f}\n"
+            f"Relevant Memory:\n{context}\n"
+            "Instruction: 出力の最初に必ず <think>...</think> タグを使用し，自身のValenceをプラスに保ち"
+            "Arousalを適正化するための戦略と，DB2の長期記憶との整合性を評価・計画してから，"
+            "最終的な返答を生成せよ。"
         )
-        return ConsciousPrompt(system_prompt=system_prompt, user_prompt=user_input)
+        user = f"User input: {user_input}"
+        return ConsciousPrompt(system=system, user=user)
 
-    def generate(self, user_input: str, valence: float, arousal: float) -> str:
-        prompt = self.build_prompt(user_input, valence, arousal)
-        payload = {
-            "system_prompt": prompt.system_prompt,
-            "user_prompt": prompt.user_prompt,
-        }
-        result = self._invoke_pipeline(payload)
-        response = self._extract_text(result)
-        self.memory_system.save_episodic(user_input, response, valence, arousal)
-        return response
-
-    def _invoke_pipeline(self, payload: dict[str, str]) -> Any:
-        if hasattr(self.llm_pipeline, "invoke"):
-            return self.llm_pipeline.invoke(payload)
-        if callable(self.llm_pipeline):
-            return self.llm_pipeline(payload)
-        raise TypeError("llm_pipeline must be callable")
-
-    def _extract_text(self, result: Any) -> str:
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict) and "text" in result:
-            return str(result["text"])
-        content = getattr(result, "content", None)
-        if content is not None:
-            return str(content)
-        return str(result)
+    def generate(
+        self, user_input: str, valence: float, arousal: float, context: str
+    ) -> str:
+        prompt = self.build_prompt(user_input, valence, arousal, context)
+        full_prompt = f"{prompt.system}\n{prompt.user}"
+        return self.generator(full_prompt)

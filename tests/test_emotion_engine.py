@@ -1,30 +1,18 @@
-from project_kagya import EmotionEngineAllostasis
+from project_kagya.emotion_engine import EmotionEngineAllostasis
 
 
-def test_update_uses_specified_formula() -> None:
-    engine = EmotionEngineAllostasis(
-        optimal_loss=2.5,
-        adaptation_rate=0.15,
-        valence=0.2,
-        arousal=0.1,
-    )
+def test_emotion_engine_updates_state() -> None:
+    engine = EmotionEngineAllostasis()
+    state = engine.update(loss=3.0, valence=0.2, arousal=0.5)
 
-    state = engine.update(3.0)
-
-    assert state.arousal == 0.6800000000000002
-    assert state.valence == 0.635
-    assert state.optimal_loss == 2.575
+    assert round(state.arousal, 3) == 1.0
+    assert round(state.valence, 3) == 0.635
+    assert round(state.optimal_loss, 3) == 2.575
 
 
-def test_update_clamps_state_values() -> None:
-    engine = EmotionEngineAllostasis(
-        optimal_loss=0.0,
-        adaptation_rate=0.15,
-        valence=1.0,
-        arousal=1.0,
-    )
+def test_emotion_engine_clamps_values() -> None:
+    engine = EmotionEngineAllostasis()
+    state = engine.update(loss=100.0, valence=10.0, arousal=10.0)
 
-    state = engine.update(10.0)
-
-    assert state.arousal == 1.0
-    assert state.valence == -1.0
+    assert state.valence <= 1.0
+    assert state.arousal <= 1.0

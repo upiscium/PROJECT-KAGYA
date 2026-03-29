@@ -4,12 +4,6 @@ PROJECT-KAGYA is a Python prototype for a subjective AI architecture.
 It includes emotion state updates, dual-memory retrieval, a conscious agent,
 sleep consolidation helpers, and a command-line interface.
 
-## Requirements
-
-- Python 3.11+
-- `uv`
-- `nix` (optional, for `nix develop`)
-
 ## Setup
 
 ```bash
@@ -23,50 +17,51 @@ nix develop
 just sync
 ```
 
-## Run the CLI
+## Quick Start
 
-The CLI is exposed as `project-kagya`:
+Configure `settings.toml`, then run the CLI:
 
 ```bash
 uv run project-kagya --input "hello"
 ```
 
-Presets:
+The current CLI reads all runtime settings from `settings.toml`. The default
+sample configuration uses the dummy backend so it can run without a large
+model.
 
-- `--preset lightweight` (default): `Qwen/Qwen2.5-1.5B-Instruct`
-- `--preset qwen3.5-9b`: `Qwen/Qwen3.5-9B-Instruct`
+## Settings
 
-Useful options:
+- `settings.toml` is the single source of truth for runtime configuration
+- `runtime`: input text, backend, initial valence/arousal
+- `model`: base model name, adapter path, 4-bit loading
+- `memory`: retrieval settings
+- `emotion`: allostasis parameters
+- `sleep`: sleep-cycle thresholds and dataset output path
 
-- `--preset`: model preset to load
-- `--model-name`: base model name or path
-- `--adapter-path`: optional LoRA adapter directory
-- `--input`: user message to process
-- `--valence`: current valence value
-- `--arousal`: current arousal value
-
-Example:
+Example run:
 
 ```bash
-uv run project-kagya \
-  --input "How are you?" \
-  --valence 0.2 \
-  --arousal 0.7
+uv run project-kagya --settings settings.toml
 ```
+
+## Implemented Modules
+
+- `src/project_kagya/emotion_engine.py`: valence/arousal update rules
+- `src/project_kagya/surprisal_calculator.py`: masked loss calculation
+- `src/project_kagya/dual_memory_system.py`: episodic and semantic memory
+- `src/project_kagya/conscious_agent.py`: prompt construction and generation
+- `src/project_kagya/main.py`: runtime orchestration
+- `src/project_kagya/sleep_consolidation.py`: sleep-cycle consolidation helpers
+- `src/project_kagya/cli.py`: CLI entrypoint
 
 ## Tests and Checks
 
 - `just test`
-- `just test tests/test_cli.py::test_run_invokes_runtime`
 - `just lint`
 - `just typecheck`
 - `just check-all`
 
-## Project Layout
+## Notes
 
-- `src/project_kagya/cli.py`: CLI entrypoint
-- `src/project_kagya/main.py`: runtime loading and chat flow
-- `src/project_kagya/dual_memory_system.py`: episodic and semantic memory
-- `src/project_kagya/conscious_agent.py`: prompt construction and generation
-- `src/project_kagya/sleep_consolidation.py`: sleep-cycle consolidation helpers
-- `tests/`: automated tests for each module
+- Large-model loading and QLoRA training are scaffolded for future expansion.
+- The current tests use dummy tokenizers and models to keep the suite fast.

@@ -1,102 +1,57 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, cast
-
-from project_kagya.main import ChatRuntime, chat_once
-
-
-@dataclass
-class AgentStub:
-    calls: list[tuple[str, float, float]]
-
-    def generate(self, user_input: str, valence: float, arousal: float) -> str:
-        self.calls.append((user_input, valence, arousal))
-        return "reply"
+from project_kagya.conscious_agent import ConsciousAgent
+from project_kagya.dual_memory_system import DualMemorySystem
+from project_kagya.emotion_engine import EmotionEngineAllostasis
+from project_kagya.main import build_runtime, load_runtime_from_settings
+from project_kagya.settings import (
+    AppSettings,
+    LoggingSettings,
+    MemorySettings,
+    EmotionSettings,
+    RuntimeSettings,
+)
 
 
-def test_chat_once_delegates_to_agent() -> None:
-    agent = AgentStub(calls=[])
-    runtime = ChatRuntime(
-        model=cast(Any, None),
-        tokenizer=cast(Any, None),
-        memory_system=cast(Any, None),
-        agent=cast(Any, agent),
-        sleep_manager=cast(Any, None),
+class DummyTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return [len(word) for word in text.split()]
+
+
+class DummyModel:
+    def __call__(self, **kwargs: object) -> object:
+        return type("Output", (), {"loss": 1.0})()
+
+
+def test_runtime_turn_executes_flow() -> None:
+    memory = DualMemorySystem()
+    memory.save_episodic("hello", "world", 0.1, 0.1)
+    runtime = build_runtime(
+        surprisal_model=DummyModel(),
+        surprisal_tokenizer=DummyTokenizer(),
+        memory=memory,
+        emotion_engine=EmotionEngineAllostasis(),
+        agent=ConsciousAgent(lambda prompt: "<think>planned</think> response"),
     )
 
-    result = chat_once(runtime, "hello", 0.1, 0.2)
+    response = runtime.handle_turn("hello again")
 
-    assert result == "reply"
-    assert agent.calls == [("hello", 0.1, 0.2)]
+    assert response.startswith("<think>")
+    assert len(memory.hippocampus.records) >= 2
 
 
-def test_load_runtime_defaults_to_qwen35_9b(monkeypatch) -> None:
-    from project_kagya import main
-
-    calls: list[tuple[str, str]] = []
-
-    class FakeTokenizer:
-        pass
-
-    class FakeModel:
-        pass
-
-    class FakeDualMemorySystem:
-        def __init__(self):
-            pass
-
-    class FakeConsciousAgent:
-        def __init__(self, memory_system, llm_pipeline):
-            self.memory_system = memory_system
-            self.llm_pipeline = llm_pipeline
-
-    class FakeSleepCycleManager:
-        def __init__(self, memory_system):
-            self.memory_system = memory_system
-
-    monkeypatch.setattr(main, "DualMemorySystem", FakeDualMemorySystem)
-    monkeypatch.setattr(main, "ConsciousAgent", FakeConsciousAgent)
-    monkeypatch.setattr(main, "SleepCycleManager", FakeSleepCycleManager)
-    monkeypatch.setattr(
-        main, "_attach_adapter_if_present", lambda model, adapter_path: model
-    )
-    monkeypatch.setattr(
-        main, "_build_pipeline", lambda model, tokenizer: (model, tokenizer)
+def test_runtime_can_be_built_from_settings() -> None:
+    settings = AppSettings(
+        runtime=RuntimeSettings(
+            backend="dummy",
+            input_text="hello there",
+            initial_valence=0.3,
+            initial_arousal=0.4,
+        ),
+        memory=MemorySettings(top_k=1),
+        emotion=EmotionSettings(optimal_loss=2.0, adaptation_rate=0.2),
+        logging=LoggingSettings(level="DEBUG", file_path="test.log"),
     )
 
-    def fake_load_base_model(model_name: str):
-        calls.append(("base_model", model_name))
-        return FakeTokenizer(), FakeModel()
+    runtime = load_runtime_from_settings(settings)
 
-    monkeypatch.setattr(main, "_load_base_model", fake_load_base_model)
-
-    runtime = main.load_runtime()
-
-    assert runtime.model.__class__.__name__ == "FakeModel"
-    assert calls == [("base_model", "Qwen/Qwen3.5-9B-Instruct")]
-
-
-def test_move_inputs_to_model_device_uses_tensor_to_method() -> None:
-    from project_kagya.main import _move_inputs_to_model_device
-
-    class FakeTensor:
-        def __init__(self):
-            self.devices: list[str] = []
-
-        def to(self, device):
-            self.devices.append(str(device))
-            return self
-
-    class FakeInputs(dict):
-        pass
-
-    class FakeModel:
-        device = "cuda:0"
-
-    inputs = FakeInputs({"input_ids": FakeTensor(), "attention_mask": FakeTensor()})
-
-    moved = _move_inputs_to_model_device(inputs, FakeModel())
-
-    assert moved["input_ids"].devices == ["cuda:0"]
-    assert moved["attention_mask"].devices == ["cuda:0"]
+    assert runtime.valence == 0.3
+    assert runtime.arousal == 0.4

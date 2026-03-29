@@ -1,60 +1,49 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+import importlib
 from typing import Any
 
 
-@dataclass(slots=True)
-class SurprisalResult:
-    loss: float
+@dataclass(frozen=True)
+class SurpriseInputs:
+    input_ids: list[int]
     labels: list[int]
+    attention_mask: list[int]
 
 
-class SurprisalCalculator:
-    def __init__(self, model: Any, tokenizer: Any) -> None:
-        self.model = model
-        self.tokenizer = tokenizer
+def build_surprisal_inputs(
+    context_text: str, new_text: str, tokenizer: Any
+) -> SurpriseInputs:
+    context_ids = list(tokenizer.encode(context_text, add_special_tokens=False))
+    new_ids = list(tokenizer.encode(new_text, add_special_tokens=False))
+    input_ids = context_ids + new_ids
+    labels = [-100] * len(context_ids) + new_ids.copy()
+    attention_mask = [1] * len(input_ids)
+    return SurpriseInputs(
+        input_ids=input_ids, labels=labels, attention_mask=attention_mask
+    )
 
-    def calculate(self, context_text: str, input_text: str) -> SurprisalResult:
-        full_text = f"{context_text}{input_text}"
-        context_ids = self._tokenize_ids(context_text)
-        full_ids = self._tokenize_ids(full_text)
-        labels = [-100] * len(context_ids) + list(full_ids[len(context_ids) :])
 
-        model_inputs = self._prepare_model_inputs(full_ids, labels)
-        loss = self._run_model(model_inputs)
-        return SurprisalResult(loss=loss, labels=labels)
+def compute_surprisal_loss(
+    model: Any, tokenizer: Any, context_text: str, new_text: str
+) -> float:
+    try:  # pragma: no cover - optional dependency at runtime
+        torch_lib = importlib.import_module("torch")
+    except ModuleNotFoundError:  # pragma: no cover - torch is optional in tests
+        torch_lib = None
 
-    def _tokenize_ids(self, text: str) -> list[int]:
-        encoded = self.tokenizer(text, add_special_tokens=False)
-        input_ids = encoded["input_ids"]
-        if input_ids and isinstance(input_ids[0], Sequence):
-            return list(input_ids[0])
-        return list(input_ids)
-
-    def _prepare_model_inputs(
-        self, input_ids: list[int], labels: list[int]
-    ) -> dict[str, Any]:
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-        }
-
-    def _run_model(self, model_inputs: dict[str, Any]) -> float:
-        try:
-            import torch  # type: ignore[import-not-found]
-        except ImportError:
-            torch = None
-
-        no_grad = torch.no_grad() if torch is not None else nullcontext()
-        with no_grad:
-            output = self.model(**model_inputs)
-
-        if isinstance(output, dict):
-            loss = output["loss"]
-        else:
-            loss = output.loss
-
-        return float(loss)
+    inputs = build_surprisal_inputs(context_text, new_text, tokenizer)
+    encoded = {
+        "input_ids": inputs.input_ids,
+        "labels": inputs.labels,
+        "attention_mask": inputs.attention_mask,
+    }
+    context: Any = torch_lib.no_grad() if torch_lib is not None else nullcontext()
+    with context:
+        output = model(**encoded)
+    loss = getattr(output, "loss", output)
+    if hasattr(loss, "item"):
+        return float(loss.item())
+    return float(loss)
