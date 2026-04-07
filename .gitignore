@@ -1,5 +1,19 @@
-__pycache__
-.direnv
-.venv
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
 
+# Virtual environments
+.venv
+.direnv
+
+# Cache files
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# env file
 .env
