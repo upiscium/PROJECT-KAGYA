@@ -1,4 +1,4 @@
-# ADR 0014: MultimodalIngestAPI を画像・音声・動画・テキストの統一入口として採用する
+# ADR 0014: Multimodal FastAPI 実装を本依存込みで採用する
 
 ## Status
 Accepted

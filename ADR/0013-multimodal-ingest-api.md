@@ -1,4 +1,4 @@
-# ADR 0013: Multimodal FastAPI Interface を統一入力の入口として採用する
+# ADR 0013: MultimodalIngestAPI を統一入力の入口として採用する
 
 ## Status
 Accepted
@@ -10,7 +10,7 @@ Accepted
 `MultimodalIngestAPI` は次の方針で扱う。
 
 - `POST /ingest` で画像・音声・動画・テキストをまとめて受ける
-- `POST /chat` でテキスト中心の対話を受ける
+- `POST /chat` でテキスト中心の対話入力を受ける
 - `WS /stream` で逐次応答を扱う
 - モダリティごとに `UploadFile` とテキストを分離して受ける
 - 受信後の重い処理は API 本体から外し、入力正規化層を挟む
