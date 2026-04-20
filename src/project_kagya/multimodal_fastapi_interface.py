@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from starlette.websockets import WebSocketDisconnect
 
 
 @dataclass(slots=True)
@@ -65,6 +66,8 @@ class MultimodalIngestAPI:
                         )
                         continue
                     await websocket.send_json({"status": "ok", "echo": message})
+            except WebSocketDisconnect:
+                return
             except Exception:
                 await websocket.close()
 
