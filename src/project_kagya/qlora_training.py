@@ -46,6 +46,7 @@ class _FallbackQLoRABackend:
         dataset = list(prompts)
         if hasattr(model, "train_on_texts"):
             model.train_on_texts(dataset)
+            return model
         return {
             "prompts": dataset,
             "output_dir": str(output_dir),

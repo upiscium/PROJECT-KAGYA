@@ -22,12 +22,25 @@ just sync
 Configure `settings.toml`, then run the CLI:
 
 ```bash
-uv run project-kagya --input "hello"
+uv run project-kagya
 ```
 
-The current CLI reads all runtime settings from `settings.toml`. The default
-sample configuration uses the dummy backend so it can run without a large
-model.
+The CLI reads runtime settings from `settings.toml`. With no flags it runs the
+embodied-emotion demo. Pass `--settings` to point at another config file.
+
+## Launch Modes
+
+```bash
+uv run project-kagya --demo
+uv run project-kagya --serve
+uv run project-kagya --consolidate
+uv run project-kagya --train
+uv run project-kagya --pipeline full
+```
+
+`--serve` starts the FastAPI ingest app, `--consolidate` writes the sleep JSONL,
+`--train` runs the JSONL training stage, and `--pipeline full` runs the whole
+integration flow.
 
 ## Settings
 
@@ -47,11 +60,15 @@ uv run project-kagya --settings settings.toml
 ## Implemented Modules
 
 - `src/project_kagya/emotion_engine.py`: valence/arousal update rules
+- `src/project_kagya/embodied_emotion.py`: body-state driven emotion modulation
 - `src/project_kagya/surprisal_calculator.py`: masked loss calculation
 - `src/project_kagya/dual_memory_system.py`: episodic and semantic memory
 - `src/project_kagya/conscious_agent.py`: prompt construction and generation
-- `src/project_kagya/main.py`: runtime orchestration
+- `src/project_kagya/multimodal_fastapi_interface.py`: multimodal ingest API
 - `src/project_kagya/sleep_consolidation.py`: sleep-cycle consolidation helpers
+- `src/project_kagya/sleep_consolidation_training.py`: JSONL training pipeline
+- `src/project_kagya/qlora_training.py`: QLoRA training wrapper
+- `src/project_kagya/runtime.py`: settings-driven orchestration
 - `src/project_kagya/cli.py`: CLI entrypoint
 
 ## Tests and Checks
@@ -63,5 +80,5 @@ uv run project-kagya --settings settings.toml
 
 ## Notes
 
-- Large-model loading and QLoRA training are scaffolded for future expansion.
+- Large-model loading and QLoRA training are still backend-dependent.
 - The current tests use dummy tokenizers and models to keep the suite fast.
