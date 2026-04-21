@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+from project_kagya.chat_backend import ChatBackendProtocol, EchoChatBackend
+
 
 @dataclass(slots=True)
 class IngestSummary:
@@ -24,8 +26,11 @@ class StreamSummary:
 
 
 class MultimodalIngestAPI:
-    def __init__(self) -> None:
+    def __init__(self, chat_backend: ChatBackendProtocol | None = None) -> None:
         self.app = FastAPI(title="PROJECT-KAGYA Multimodal Ingest API")
+        self.chat_backend = (
+            chat_backend if chat_backend is not None else EchoChatBackend()
+        )
         self._register_routes()
 
     def _register_routes(self) -> None:
@@ -52,7 +57,7 @@ class MultimodalIngestAPI:
         async def chat(message: str = Form(...)) -> ChatSummary:
             if not message.strip():
                 raise HTTPException(status_code=400, detail="message must not be empty")
-            return ChatSummary(message=message)
+            return ChatSummary(message=self.chat_backend.reply(message))
 
         @self.app.websocket("/stream")
         async def stream(websocket: WebSocket) -> None:
@@ -92,5 +97,5 @@ class MultimodalIngestAPI:
         raise HTTPException(status_code=415, detail="unsupported media type")
 
 
-def create_app() -> FastAPI:
-    return MultimodalIngestAPI().app
+def create_app(chat_backend: ChatBackendProtocol | None = None) -> FastAPI:
+    return MultimodalIngestAPI(chat_backend).app

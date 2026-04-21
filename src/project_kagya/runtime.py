@@ -8,6 +8,7 @@ from typing import Any, Sequence
 import tomllib
 
 from project_kagya.conscious_agent import ConsciousAgent, GeneratedResponse
+from project_kagya.chat_backend import GemmaChatBackend
 from project_kagya.data_quality_evaluation import DataQualityEvaluator, EvaluatedExample
 from project_kagya.drift_control import DriftController
 from project_kagya.dual_memory_system import DualMemorySystem
@@ -44,7 +45,7 @@ class RuntimeConfig:
 
 @dataclass(slots=True)
 class ModelConfig:
-    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_name: str = "google/gemma-4-E4B"
     adapter_path: str = ""
     load_in_4bit: bool = True
 
@@ -152,7 +153,7 @@ class KagyaRuntime:
 
     def run_server(self) -> None:
         self._log("serve: start")
-        app = create_app()
+        app = create_app(self._build_chat_backend())
         try:
             import uvicorn
         except ImportError as exc:  # pragma: no cover - optional runtime dependency
@@ -301,6 +302,17 @@ class KagyaRuntime:
             dream_generator=_SleepDreamGenerator(),
             output_path=self.settings.sleep.dream_dataset_path,
             confidence_threshold=0.5,
+        )
+
+    def _build_chat_backend(self) -> GemmaChatBackend:
+        return GemmaChatBackend(
+            model_name=self.settings.model.model_name,
+            top_k=self.settings.memory.top_k,
+            initial_valence=self.settings.runtime.initial_valence,
+            initial_arousal=self.settings.runtime.initial_arousal,
+            optimal_loss=self.settings.emotion.optimal_loss,
+            load_in_4bit=self.settings.model.load_in_4bit,
+            adapter_path=self.settings.model.adapter_path or None,
         )
 
     def _build_sample_episodes(self) -> list[EpisodicEntry]:

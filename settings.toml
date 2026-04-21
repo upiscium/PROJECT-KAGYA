@@ -5,7 +5,7 @@ initial_valence = 0.0
 initial_arousal = 0.0
 
 [model]
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+model_name = "google/gemma-4-E4B"
 adapter_path = ""
 load_in_4bit = true
 

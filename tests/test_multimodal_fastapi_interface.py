@@ -47,6 +47,19 @@ def test_chat_accepts_message() -> None:
     assert response.json()["message"] == "hello"
 
 
+def test_chat_uses_injected_backend() -> None:
+    class DummyBackend:
+        def reply(self, message: str) -> str:
+            return f"response: {message}"
+
+    client = TestClient(create_app(DummyBackend()))
+
+    response = client.post("/chat", data={"message": "hello"})
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "response: hello"
+
+
 def test_stream_echoes_messages() -> None:
     client = TestClient(create_app())
 
