@@ -205,13 +205,7 @@ def main() -> None:
     from datasets import load_dataset
     from transformers import TrainingArguments
     from trl import SFTTrainer
-
-    try:
-        from unsloth import FastLanguageModel
-    except ImportError as error:
-        raise RuntimeError(
-            "Unsloth could not be imported. Your environment is missing CUDA/CuDNN runtime libraries or compatible GPU support."
-        ) from error
+    from unsloth import FastLanguageModel
 
     dataset_kwargs = {"data_files": {"train": train_file}}
     if validation_file:

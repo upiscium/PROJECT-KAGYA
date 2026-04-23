@@ -37,6 +37,8 @@ def test_render_prompt_falls_back_to_plain_text() -> None:
 
 def test_render_prompt_uses_chat_template_when_available() -> None:
     class Tokenizer:
+        chat_template = "template"
+
         def apply_chat_template(
             self, messages, tokenize=False, add_generation_prompt=True
         ):
@@ -47,5 +49,27 @@ def test_render_prompt_uses_chat_template_when_available() -> None:
     assert prompt == "templated:1:False:True"
 
 
+def test_render_prompt_uses_gemma_turn_tokens_when_available() -> None:
+    tokenizer = SimpleNamespace(sot_token="<|turn>", eot_token="<turn|>")
+
+    prompt = render_prompt(
+        tokenizer,
+        [
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": "hi"},
+        ],
+        "auto",
+    )
+
+    assert (
+        prompt
+        == "<|turn>system\nbe helpful<turn|>\n<|turn>user\nhi<turn|>\n<|turn>assistant\n"
+    )
+
+
 def test_trim_generated_text_removes_prompt_prefix() -> None:
     assert trim_generated_text("prompt", "prompt answer") == "answer"
+
+
+def test_trim_generated_text_discards_gemma_control_tokens() -> None:
+    assert trim_generated_text("prompt", "<unused56><eos>") == ""

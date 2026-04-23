@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -20,11 +21,9 @@ class ChatTurn:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Chat with a Gemma model in the CLI.")
-    parser.add_argument("--model-name", default="google/gemma-4-E4B")
+    parser.add_argument("--model-name", default="google/gemma-4-E4B-it")
     parser.add_argument("--adapter-path", default=None)
-    parser.add_argument(
-        "--backend", choices=["auto", "unsloth", "transformers"], default="auto"
-    )
+    parser.add_argument("--backend", choices=["auto", "unsloth"], default="auto")
     parser.add_argument("--load-in-4bit", action="store_true", default=True)
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.add_argument("--max-seq-length", type=int, default=2048)
@@ -52,10 +51,26 @@ def build_messages(
 def render_prompt(
     tokenizer: Any, messages: Sequence[dict[str, str]], prompt_style: PromptStyle
 ) -> str:
+    turn_start = getattr(tokenizer, "sot_token", None)
+    turn_end = getattr(tokenizer, "eot_token", None)
+    if prompt_style != "plain" and turn_start and turn_end:
+        parts: list[str] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            parts.append(f"{turn_start}{role}\n{content}{turn_end}\n")
+        parts.append(f"{turn_start}assistant\n")
+        return "".join(parts)
+
     if prompt_style != "plain" and hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if chat_template:
+            try:
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except ValueError:
+                pass
 
     lines: list[str] = []
     for message in messages:
@@ -74,36 +89,51 @@ def render_prompt(
 def trim_generated_text(prompt: str, generated_text: str) -> str:
     if generated_text.startswith(prompt):
         return generated_text[len(prompt) :].lstrip()
-    return generated_text.strip()
+    reply = generated_text.strip()
+    for prefix in ("Assistant:", "assistant:"):
+        if reply.startswith(prefix):
+            reply = reply[len(prefix) :].lstrip()
+    for marker in ("<|turn>", "<turn|>", "<|channel>", "<channel|>"):
+        if marker in reply:
+            reply = reply.split(marker, 1)[-1].lstrip()
+    if reply.startswith("<unused"):
+        reply = ""
+    return reply
+
+
+def _has_cuda_device() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+    except Exception:
+        return False
 
 
 def _load_model_and_tokenizer(args: argparse.Namespace):
-    if args.backend in {"auto", "unsloth"}:
-        try:
-            from unsloth import FastLanguageModel
+    if args.backend == "auto" and not _has_cuda_device():
+        raise RuntimeError(
+            "Unsloth requires a CUDA-capable GPU. Use --backend unsloth on a GPU machine."
+        )
 
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=args.model_name,
-                max_seq_length=args.max_seq_length,
-                load_in_4bit=args.load_in_4bit,
-            )
-            model = FastLanguageModel.for_inference(model)
-            return model, tokenizer, "unsloth"
-        except Exception as error:
-            if args.backend == "unsloth":
-                raise RuntimeError(
-                    "Unsloth backend failed to load. Check your CUDA/CuDNN install or use --backend transformers."
-                ) from error
+    if not args.model_name.endswith("-it"):
+        raise RuntimeError(
+            "Use an instruction-tuned Gemma 4 model for chat, for example google/gemma-4-E4B-it."
+        )
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from unsloth import FastLanguageModel
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_name,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=args.load_in_4bit,
+    )
+    model = FastLanguageModel.for_inference(model)
     if args.adapter_path:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, args.adapter_path)
-    return model, tokenizer, "transformers"
+    return model, tokenizer, "unsloth"
 
 
 def main() -> None:
@@ -113,14 +143,8 @@ def main() -> None:
     try:
         model, tokenizer, backend = _load_model_and_tokenizer(args)
     except Exception as error:
-        print(
-            "Failed to start chat. This environment is missing a working GPU/torch stack (for example libcudnn.so.9).",
-            file=sys.stderr,
-        )
-        print(
-            "Install a compatible CUDA/CuDNN runtime or run in a supported environment.",
-            file=sys.stderr,
-        )
+        print("Failed to start chat.", file=sys.stderr)
+        traceback.print_exception(error, file=sys.stderr)
         raise SystemExit(1) from error
 
     history: list[ChatTurn] = []
@@ -146,9 +170,14 @@ def main() -> None:
         messages = build_messages(args.system_prompt, history, user_message)
         prompt = render_prompt(tokenizer, messages, args.prompt_style)
 
-        inputs = tokenizer([prompt], return_tensors="pt")
+        inputs = tokenizer(text=prompt, return_tensors="pt")
         if hasattr(inputs, "to"):
             inputs = inputs.to(model.device)
+        input_ids = (
+            inputs["input_ids"]
+            if isinstance(inputs, dict) or hasattr(inputs, "__getitem__")
+            else None
+        )
         outputs = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
@@ -157,8 +186,11 @@ def main() -> None:
             do_sample=args.temperature > 0,
         )
 
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
-        reply = trim_generated_text(prompt, decoded)
+        if input_ids is not None:
+            outputs = outputs[:, input_ids.shape[-1] :]
+
+        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=False)[0]
+        reply = decoded.strip()
         print(f"assistant> {reply}")
         history.append(ChatTurn(role="user", content=user_message))
         history.append(ChatTurn(role="assistant", content=reply))
