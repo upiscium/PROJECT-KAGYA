@@ -172,6 +172,8 @@ def test_main_wires_training_pipeline(monkeypatch, tmp_path) -> None:
         "validation": str(validation_file),
     }
     assert calls["remove_columns"] == ["text"]
+    assert calls["trainer_kwargs"]["processing_class"] is not None
+    assert calls["trainer_kwargs"]["formatting_func"]({"text": "hello"}) == "hello"
     assert calls["from_pretrained"]["model_name"] == "google/gemma-4-E4B"
     assert calls["train_called"] is True
     assert calls["save_model"] == str(tmp_path / "out")
