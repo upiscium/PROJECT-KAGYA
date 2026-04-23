@@ -249,7 +249,7 @@ def main() -> None:
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         save_strategy="steps",
-        evaluation_strategy="steps" if validation_file else "no",
+        eval_strategy="steps" if validation_file else "no",
         fp16=True,
         bf16=False,
         seed=args.seed,
@@ -259,12 +259,11 @@ def main() -> None:
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=prepared_dataset["train"],
         eval_dataset=prepared_dataset.get("validation"),
         args=training_args,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
+        formatting_func=lambda example: example["text"],
     )
 
     trainer.train()
