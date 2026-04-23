@@ -14,6 +14,7 @@ wheels/
 .mypy_cache
 .pytest_cache
 .ruff_cache
+unsloth_compiled_cache/
 
 # env file
 .env
