@@ -20,6 +20,7 @@ dependencies = [
 project-kagya = "project_kagya.cli:main"
 project-kagya-qlora = "project_kagya.qlora_train:main"
 project-kagya-chat = "project_kagya.chat:main"
+project-kagya-api = "project_kagya.api:main"
 
 [tool.uv]
 package = true

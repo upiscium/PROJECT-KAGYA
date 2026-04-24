@@ -1,34 +1,34 @@
-# ADR 0001: Use Unsloth 4-bit QLoRA for Gemma 4 E4B fine-tuning
+# ADR 0001: Gemma 4 E4B の微調整に Unsloth の 4bit QLoRA を使う
 
-## Status
+## ステータス
 
-Accepted
+承認済み
 
-## Context
+## 背景
 
-We need a practical fine-tuning workflow for `google/gemma-4-E4B` that can run with limited VRAM.
-The repository already depends on `transformers`, `peft`, and `bitsandbytes`, so the main decision is how to wire the training stack.
+`google/gemma-4-E4B` を限られたVRAMで動かせる、実用的な微調整ワークフローが必要だった。
+このリポジトリはすでに `transformers`、`peft`、`bitsandbytes` に依存しているため、主な判断点は学習スタックの組み方だった。
 
-## Decision
+## 決定
 
-Use Unsloth with 4-bit loading as the default path, and expose a CLI that trains QLoRA adapters on top of `google/gemma-4-E4B`.
+Unsloth の 4bit ロードを既定パスとして使い、`google/gemma-4-E4B` の上に QLoRA アダプタを学習するCLIを提供する。
 
-## Rationale
+## 理由
 
-- Unsloth simplifies low-VRAM fine-tuning and reduces boilerplate.
-- 4-bit loading is the most memory-efficient default for this model class.
-- `trl.SFTTrainer` provides a direct fit for text-based supervised fine-tuning.
-- The target module list matches the standard Gemma projection layers and keeps the adapter scope focused.
+- Unsloth は低VRAMでの微調整を簡単にし、定型コードを減らせる。
+- 4bit ロードはこのクラスのモデルで最もメモリ効率のよい既定値である。
+- `trl.SFTTrainer` はテキストベースの教師あり微調整にそのまま適合する。
+- 対象モジュールの一覧は標準的な Gemma の projection 層に一致し、アダプタの範囲を絞れる。
 
-## Consequences
+## 影響
 
-- Users need a compatible GPU stack for `bitsandbytes` and Unsloth.
-- The initial implementation assumes a `text` column and does not include chat-template preprocessing.
-- Training configuration is CLI-driven, so users can tune LoRA rank, sequence length, batch size, and learning rate without editing code.
+- `bitsandbytes` と Unsloth に対応したGPUスタックが必要になる。
+- 初期実装は `text` カラムを前提とし、chat template の前処理は含まない。
+- 学習設定はCLI駆動なので、LoRA rank、sequence length、batch size、learning rate をコード編集なしで調整できる。
 
-## Alternatives Considered
+## 検討した代替案
 
-- Pure `transformers` + `peft`
-  - Rejected because it requires more manual setup for the same QLoRA flow.
-- Full precision fine-tuning
-  - Rejected because it is less practical for large-model experimentation on limited hardware.
+- 純粋な `transformers` + `peft`
+  - 同じ QLoRA フローでも手作業のセットアップが増えるため不採用。
+- フル精度での微調整
+  - 大規模モデルを限られたハードウェアで試す用途に向かないため不採用。
