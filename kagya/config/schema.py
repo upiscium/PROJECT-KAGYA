@@ -42,6 +42,8 @@ class MemorySettings(StrictBaseModel):
     persist_directory: Path
     db1_collection: str = Field(min_length=1)
     db2_collection: str = Field(min_length=1)
+    db1_top_k: int = Field(gt=0)
+    db2_top_k: int = Field(gt=0)
     embedding_model_id: str = Field(min_length=1)
     default_record_type: str = Field(min_length=1)
 
