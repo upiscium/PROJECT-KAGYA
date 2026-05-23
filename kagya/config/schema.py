@@ -19,6 +19,7 @@ class ProjectSettings(StrictBaseModel):
 class ModelSettings(StrictBaseModel):
     primary_id: str = Field(min_length=1)
     fallback_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
     device: str
     dtype: str
     load_in_4bit: bool

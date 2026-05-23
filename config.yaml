@@ -5,6 +5,7 @@ project:
 model:
   primary_id: google/gemma-4-E4B
   fallback_id: google/gemma-4-E2B
+  provider: dummy
   device: auto
   dtype: auto
   load_in_4bit: true
