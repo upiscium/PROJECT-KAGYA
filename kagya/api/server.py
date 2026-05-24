@@ -4,6 +4,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from kagya.api.routes import adapters, chat, debug, memory, sleep
 from kagya.config import Settings, get_settings
 
 
@@ -12,6 +13,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app_settings = settings or get_settings()
     app = FastAPI(title=app_settings.project.name)
+    app.state.settings = app_settings
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.api.cors_origins,
@@ -23,6 +25,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "project": app_settings.project.name}
+
+    app.include_router(chat.router)
+    app.include_router(debug.router)
+    app.include_router(memory.router)
+    app.include_router(sleep.router)
+    app.include_router(adapters.router)
 
     return app
 
