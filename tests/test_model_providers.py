@@ -23,13 +23,14 @@ class FakeProcessor:
         return {"input_ids": torch.tensor([token_ids])}
 
     def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
-        return "decoded output"
+        return " ".join(str(token_id) for token_id in output_ids.tolist())
 
 
 class FakeModel:
     def __init__(self) -> None:
         self.eval_called = False
         self.labels_seen: torch.Tensor | None = None
+        self.generate_kwargs: dict | None = None
 
     def eval(self) -> None:
         self.eval_called = True
@@ -39,7 +40,8 @@ class FakeModel:
         return SimpleNamespace(loss=torch.tensor(2.5))
 
     def generate(self, **kwargs) -> torch.Tensor:
-        return torch.tensor([[1, 2, 3]])
+        self.generate_kwargs = kwargs
+        return torch.tensor([[1, 2, 3, 4, 5]])
 
 
 def test_dummy_provider_is_deterministic() -> None:
@@ -109,6 +111,48 @@ def test_transformers_provider_loads_configured_model_id(monkeypatch: pytest.Mon
     assert loaded["processor_model_id"] == settings.model.primary_id
     assert loaded["model_model_id"] == settings.model.primary_id
     assert "quantization_config" in loaded["model_kwargs"]
+
+
+def test_transformers_generate_decodes_only_new_tokens() -> None:
+    fake_model = FakeModel()
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+
+    generated = provider.generate("prompt has three")
+
+    assert generated == "4 5"
+
+
+def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None:
+    fake_model = FakeModel()
+    settings = load_settings(CONFIG_PATH)
+    settings = settings.model_copy(
+        update={"generation": settings.generation.model_copy(update={"do_sample": False})}
+    )
+    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+
+    provider.generate("hello")
+
+    assert fake_model.generate_kwargs is not None
+    assert "temperature" not in fake_model.generate_kwargs
+    assert "top_p" not in fake_model.generate_kwargs
+    assert fake_model.generate_kwargs["do_sample"] is False
+
+
+def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
+    fake_model = FakeModel()
+    settings = load_settings(CONFIG_PATH)
+    settings = settings.model_copy(
+        update={"generation": settings.generation.model_copy(update={"do_sample": True})}
+    )
+    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+
+    provider.generate("hello")
+
+    assert fake_model.generate_kwargs is not None
+    assert fake_model.generate_kwargs["temperature"] == settings.generation.temperature
+    assert fake_model.generate_kwargs["top_p"] == settings.generation.top_p
+    assert fake_model.generate_kwargs["do_sample"] is True
 
 
 def test_adapter_paths_must_be_approved_by_registry(tmp_path: Path) -> None:

@@ -35,3 +35,11 @@ def test_visible_response_contains_no_closing_think_tag_residue() -> None:
 
     assert "</think>" not in processed.visible_response
     assert processed.visible_response == "Visible orphan text"
+
+
+def test_visible_response_removes_html_like_tag_residue() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("<h1>Title</h1><strong>Answer</strong>")
+
+    assert processed.visible_response == "TitleAnswer"

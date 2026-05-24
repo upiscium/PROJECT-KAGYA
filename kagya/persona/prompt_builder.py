@@ -37,5 +37,6 @@ class PromptBuilder:
                 *(db2_lines or ["- none"]),
                 "",
                 f"User input: {user_input}",
+                "Assistant response:",
             ]
         )

@@ -88,6 +88,7 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     assert "old episode" in result.prompt
     assert "stable semantic memory" in result.prompt
     assert "<think>...</think>" in result.prompt
+    assert result.prompt.endswith("Assistant response:")
     assert provider.prompts == [result.prompt]
 
 

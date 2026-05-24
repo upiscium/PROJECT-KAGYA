@@ -34,14 +34,17 @@ class TransformersProvider:
     def generate(self, prompt: str) -> str:
         inputs = self.processor(text=prompt, return_tensors="pt")
         inputs = self._move_inputs_to_model_device(inputs)
-        output_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=self.settings.generation.max_new_tokens,
-            temperature=self.settings.generation.temperature,
-            top_p=self.settings.generation.top_p,
-            do_sample=self.settings.generation.do_sample,
-        )
-        return self.processor.decode(output_ids[0], skip_special_tokens=True)
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": self.settings.generation.max_new_tokens,
+            "do_sample": self.settings.generation.do_sample,
+        }
+        if self.settings.generation.do_sample:
+            generation_kwargs["temperature"] = self.settings.generation.temperature
+            generation_kwargs["top_p"] = self.settings.generation.top_p
+        output_ids = self.model.generate(**inputs, **generation_kwargs)
+        input_length = inputs["input_ids"].shape[-1]
+        generated_ids = output_ids[0][input_length:]
+        return self.processor.decode(generated_ids, skip_special_tokens=True)
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         if not target_text:
