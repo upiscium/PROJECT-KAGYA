@@ -67,6 +67,10 @@ class QloraSettings(StrictBaseModel):
 
 class AdapterRegistrySettings(StrictBaseModel):
     path: Path
+    eval_result_dir: Path
+    eval_sets: list[Path]
+    trial_threshold: float = Field(ge=0.0, le=1.0)
+    reject_threshold: float = Field(ge=0.0, le=1.0)
     allowed_states: list[str]
     manual_approval_required: bool
 

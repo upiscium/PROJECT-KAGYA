@@ -47,12 +47,18 @@ qlora:
 
 adapter_registry:
   path: .kagya/adapter_registry.json
+  eval_result_dir: .kagya/eval_results
+  eval_sets:
+    - .kagya/eval_sets/default.json
+  trial_threshold: 0.8
+  reject_threshold: 0.4
   allowed_states:
     - candidate
     - trial_active
     - approved
     - active
     - rejected
+    - archived
   manual_approval_required: true
 
 api:
