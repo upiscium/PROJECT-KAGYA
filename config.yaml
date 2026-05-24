@@ -41,8 +41,11 @@ qlora:
   dry_run: true
   r: 16
   alpha: 32
+  lora_alpha: 32
   dropout: 0.05
+  lora_dropout: 0.05
   learning_rate: 0.0002
+  num_train_epochs: 1
   max_steps: 10
 
 adapter_registry:

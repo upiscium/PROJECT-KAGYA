@@ -60,8 +60,11 @@ class QloraSettings(StrictBaseModel):
     dry_run: bool
     r: int = Field(gt=0)
     alpha: int = Field(gt=0)
+    lora_alpha: int = Field(gt=0)
     dropout: float = Field(ge=0.0, lt=1.0)
+    lora_dropout: float = Field(ge=0.0, lt=1.0)
     learning_rate: float = Field(gt=0.0)
+    num_train_epochs: int = Field(gt=0)
     max_steps: int = Field(gt=0)
 
 
