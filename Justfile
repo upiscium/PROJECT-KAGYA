@@ -27,6 +27,11 @@ test target="tests/":
     @echo "==> Running Tests (Pytest) on {{target}}..."
     uv run pytest {{target}} -v
 
+# FastAPI サーバーを起動します
+api:
+    @echo "==> Starting PROJECT-KAGYA FastAPI server..."
+    uv run python -m kagya.api.server
+
 # =============================================================================
 # 複合タスク (Pipelines)
 # =============================================================================
@@ -43,4 +48,3 @@ check-all: lint typecheck test
 sync:
     @echo "==> Syncing dependencies with uv..."
     uv sync
-
