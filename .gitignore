@@ -17,3 +17,6 @@ wheels/
 
 # env file
 .env
+
+# Runtime artifacts
+.kagya/
