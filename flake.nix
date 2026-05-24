@@ -19,6 +19,7 @@
             ruff
             pre-commit
             gnused
+            nodejs_22
           ];
 
           shellHook = ''
@@ -32,4 +33,3 @@
       }
     );
 }
-
