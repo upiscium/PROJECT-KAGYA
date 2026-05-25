@@ -29,7 +29,6 @@ export type EpisodeMemory = {
   id: string;
   user_input: string;
   response: string;
-  hidden_thought?: string | null;
   loss: number;
   emotion_valence: number;
   emotion_arousal: number;
