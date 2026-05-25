@@ -103,6 +103,26 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
     assert data["dry_run"] is True
 
 
+def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    memory = client.app.state.memory_system
+    episode_id = memory.save_episodic(
+        "memory input",
+        "memory output",
+        hidden_thought="private memory thought",
+    )
+
+    search = client.get("/api/memory/search", params={"query": "memory"})
+    detail = client.get(f"/api/memory/episodes/{episode_id}")
+
+    assert search.status_code == 200
+    assert detail.status_code == 200
+    assert "hidden_thought" not in str(search.json())
+    assert "private memory thought" not in str(search.json())
+    assert "hidden_thought" not in detail.json()
+    assert "private memory thought" not in str(detail.json())
+
+
 def _client(tmp_path: Path, *, settings: Settings | None = None) -> TestClient:
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
