@@ -35,6 +35,7 @@ def test_api_settings_come_from_config() -> None:
 
     assert settings.api.host == raw_config["api"]["host"]
     assert settings.api.port == raw_config["api"]["port"]
+    assert settings.api.admin_token_env == raw_config["api"]["admin_token_env"]
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
 
 

@@ -81,6 +81,7 @@ class AdapterRegistrySettings(StrictBaseModel):
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
+    admin_token_env: str = Field(min_length=1)
     cors_origins: list[str]
 
 

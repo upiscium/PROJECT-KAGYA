@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_adapter_registry, get_api_settings, get_model_provider
+from kagya.api.dependencies import get_adapter_registry, get_api_settings, get_model_provider, require_admin
 from kagya.api.schemas.adapter import (
     AdapterEvaluateRequest,
     AdapterEvaluateResponse,
@@ -14,7 +14,7 @@ from kagya.learning import AdapterEntry, AdapterEvaluator, AdapterRegistry, Adap
 from kagya.models import ModelProvider
 
 
-router = APIRouter(prefix="/api/adapters", tags=["adapters"])
+router = APIRouter(prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)])
 
 
 @router.get("", response_model=AdapterListResponse)
