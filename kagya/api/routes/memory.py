@@ -4,12 +4,12 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_memory_system
+from kagya.api.dependencies import get_memory_system, require_admin
 from kagya.api.schemas.memory import EpisodeMemoryResponse, MemorySearchResponse, SemanticMemoryResponse
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
 
 
-router = APIRouter(prefix="/api/memory", tags=["memory"])
+router = APIRouter(prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)])
 
 
 @router.get("/search", response_model=MemorySearchResponse)

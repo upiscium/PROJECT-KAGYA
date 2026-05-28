@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends
 
-from kagya.api.dependencies import get_api_settings, get_main_loop
+from kagya.api.dependencies import get_api_settings, get_main_loop, require_admin
 from kagya.api.routes.chat import chat_response_from_result, reject_unsupported_attachments
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
@@ -17,7 +17,7 @@ from kagya.config import Settings
 from kagya.runtime import KagyaMainLoop
 
 
-router = APIRouter(prefix="/api", tags=["debug"])
+router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
 
 
 @router.post("/chat/debug", response_model=DebugChatResponse)
@@ -26,7 +26,7 @@ def debug_chat(
     main_loop: KagyaMainLoop = Depends(get_main_loop),
     settings: Settings = Depends(get_api_settings),
 ) -> DebugChatResponse:
-    """Development-only debug chat. Future auth must gate this endpoint."""
+    """Development-only debug chat gated by the admin token."""
 
     reject_unsupported_attachments(request)
     result = main_loop.chat(request.message, debug=True)

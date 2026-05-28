@@ -2,12 +2,12 @@
 
 from fastapi import APIRouter, Depends
 
-from kagya.api.dependencies import get_sleep_cycle_manager
+from kagya.api.dependencies import get_sleep_cycle_manager, require_admin
 from kagya.api.schemas.sleep import SleepRunResponse
 from kagya.learning import SleepCycleManager
 
 
-router = APIRouter(prefix="/api/sleep", tags=["sleep"])
+router = APIRouter(prefix="/api/sleep", tags=["sleep"], dependencies=[Depends(require_admin)])
 
 
 @router.post("/run", response_model=SleepRunResponse)

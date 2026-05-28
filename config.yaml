@@ -67,6 +67,7 @@ adapter_registry:
 api:
   host: 127.0.0.1
   port: 8000
+  admin_token_env: KAGYA_ADMIN_TOKEN
   cors_origins:
     - http://localhost:3000
     - http://127.0.0.1:3000

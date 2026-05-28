@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from kagya.models import DummyProvider
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+ADMIN_TOKEN = "test-admin-token"
 
 
 class ThinkingProvider(DummyProvider):
@@ -34,7 +36,11 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
 def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    response = client.post("/api/chat/debug", json={"message": "hello", "attachments": [], "debug": True})
+    response = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={"message": "hello", "attachments": [], "debug": True},
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -65,19 +71,23 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
         dataset_hash="hash",
     )
 
-    invalid = client.post("/api/adapters/adapter-api/activate")
+    invalid = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert invalid.status_code == 400
 
-    evaluated = client.post("/api/adapters/adapter-api/evaluate", json={"deterministic_score": 0.9})
+    evaluated = client.post(
+        "/api/adapters/adapter-api/evaluate",
+        headers=admin_headers(),
+        json={"deterministic_score": 0.9},
+    )
     assert evaluated.status_code == 200
     assert evaluated.json()["status"] == "trial_active"
-    approved = client.post("/api/adapters/adapter-api/approve")
+    approved = client.post("/api/adapters/adapter-api/approve", headers=admin_headers())
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
-    active = client.post("/api/adapters/adapter-api/activate")
+    active = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert active.status_code == 200
     assert active.json()["status"] == "active"
-    listed = client.get("/api/adapters")
+    listed = client.get("/api/adapters", headers=admin_headers())
     assert listed.status_code == 200
     assert listed.json()["adapters"][0]["status"] == "active"
 
@@ -92,7 +102,7 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
         emotion_arousal=0.9,
     )
 
-    response = client.post("/api/sleep/run")
+    response = client.post("/api/sleep/run", headers=admin_headers())
 
     assert response.status_code == 200
     data = response.json()
@@ -112,8 +122,8 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
         hidden_thought="private memory thought",
     )
 
-    search = client.get("/api/memory/search", params={"query": "memory"})
-    detail = client.get(f"/api/memory/episodes/{episode_id}")
+    search = client.get("/api/memory/search", headers=admin_headers(), params={"query": "memory"})
+    detail = client.get(f"/api/memory/episodes/{episode_id}", headers=admin_headers())
 
     assert search.status_code == 200
     assert detail.status_code == 200
@@ -123,7 +133,30 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
     assert "private memory thought" not in str(detail.json())
 
 
-def _client(tmp_path: Path, *, settings: Settings | None = None) -> TestClient:
+def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    assert client.post("/api/chat", json={"message": "hello", "attachments": [], "debug": False}).status_code == 200
+    assert client.post("/api/chat/debug", json={"message": "hello", "attachments": [], "debug": True}).status_code == 401
+    assert client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
+    assert client.post("/api/sleep/run").status_code == 401
+    assert client.get("/api/adapters").status_code == 401
+
+
+def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
+    client = _client(tmp_path, configure_admin_token=False)
+
+    response = client.post("/api/chat/debug", headers=admin_headers(), json={"message": "hello", "attachments": []})
+
+    assert response.status_code == 503
+    assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
+
+
+def _client(tmp_path: Path, *, settings: Settings | None = None, configure_admin_token: bool = True) -> TestClient:
+    if configure_admin_token:
+        os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
+    else:
+        os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = ThinkingProvider()
@@ -156,5 +189,10 @@ def _settings(tmp_path: Path) -> Settings:
                     "eval_sets": [],
                 }
             ),
+            "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
         }
     )
+
+
+def admin_headers() -> dict[str, str]:
+    return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
