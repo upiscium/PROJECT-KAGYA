@@ -1,0 +1,18 @@
+[Unit]
+Description=PROJECT-KAGYA FastAPI backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kagya
+Group=kagya
+WorkingDirectory=/opt/project-kagya
+EnvironmentFile=/etc/project-kagya/backend.env
+Environment=PATH=/home/kagya/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env uv run python -m kagya.api.server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -28,3 +28,76 @@
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`
 - Search for forbidden provider implementation paths.
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
+
+## Deployment
+
+The current deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy terminating HTTPS in front.
+
+### 1. Prepare Host
+
+Create a service user and install the required runtime tools:
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin kagya
+sudo mkdir -p /opt/project-kagya /etc/project-kagya
+sudo chown -R kagya:kagya /opt/project-kagya /etc/project-kagya
+```
+
+Install `git`, `uv`, `nodejs` 22, `npm`, and either `nginx` or `caddy` using your OS package manager or Nix profile. For the real Transformers provider, verify NVIDIA drivers/CUDA before switching away from the default `dummy` provider.
+
+### 2. Install Application
+
+```bash
+sudo -u kagya git clone <repo-url> /opt/project-kagya
+cd /opt/project-kagya
+sudo -u kagya git switch develop
+sudo -u kagya uv sync
+cd frontend
+sudo -u kagya npm ci
+sudo -u kagya npm run build
+```
+
+### 3. Configure Environment
+
+```bash
+sudo cp deploy/env/backend.env.example /etc/project-kagya/backend.env
+sudo cp deploy/env/frontend.env.example /etc/project-kagya/frontend.env
+sudo chmod 600 /etc/project-kagya/*.env
+sudo chown kagya:kagya /etc/project-kagya/*.env
+```
+
+Edit both env files and set a long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to your public HTTPS origin.
+
+Admin warning: `NEXT_PUBLIC_KAGYA_ADMIN_TOKEN` is visible in the browser bundle. Use it only for local/private deployments behind VPN or other network access control. Add real server-side auth before exposing admin pages publicly.
+
+### 4. Install Services
+
+```bash
+sudo cp deploy/systemd/kagya-api.service /etc/systemd/system/kagya-api.service
+sudo cp deploy/systemd/kagya-frontend.service /etc/systemd/system/kagya-frontend.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now kagya-api kagya-frontend
+sudo systemctl status kagya-api kagya-frontend
+```
+
+### 5. Configure Reverse Proxy
+
+For nginx:
+
+```bash
+sudo cp deploy/nginx/kagya.conf /etc/nginx/sites-available/kagya.conf
+sudo ln -s /etc/nginx/sites-available/kagya.conf /etc/nginx/sites-enabled/kagya.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path and replace `kagya.example.com` with your domain.
+
+### 6. Verify Deployment
+
+```bash
+curl -fsS https://kagya.example.com/health
+curl -fsS https://kagya.example.com/api/state/emotion -H "X-KAGYA-Admin-Token: $KAGYA_ADMIN_TOKEN"
+```
+
+Normal chat is public at `POST /api/chat`; debug, memory, sleep, and adapter APIs require the admin token header.

@@ -1,0 +1,7 @@
+kagya.example.com {
+    encode zstd gzip
+
+    reverse_proxy /api/* 127.0.0.1:8000
+    reverse_proxy /health 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:3000
+}
