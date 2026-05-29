@@ -1,0 +1,77 @@
+project:
+  name: PROJECT-KAGYA
+  environment: development
+
+model:
+  primary_id: google/gemma-4-E4B
+  fallback_id: google/gemma-4-E2B
+  provider: dummy
+  device: auto
+  dtype: auto
+  load_in_4bit: true
+
+generation:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  do_sample: true
+
+emotion:
+  baseline_surprisal: 1.0
+  high_emotion_threshold: 0.75
+  decay_rate: 0.05
+
+memory:
+  persist_directory: .kagya/chroma
+  db1_collection: hippocampus
+  db2_collection: cortex
+  db1_top_k: 5
+  db2_top_k: 5
+  embedding_model_id: sentence-transformers/all-MiniLM-L6-v2
+  default_record_type: episodic
+
+sleep:
+  enabled: true
+  dream_dataset_path: .kagya/dreams/dream_dataset.jsonl
+  min_emotion_score: 0.75
+  max_episodes_per_cycle: 100
+
+qlora:
+  output_dir: .kagya/adapters
+  dry_run: true
+  r: 16
+  alpha: 32
+  lora_alpha: 32
+  dropout: 0.05
+  lora_dropout: 0.05
+  learning_rate: 0.0002
+  num_train_epochs: 1
+  max_steps: 10
+
+adapter_registry:
+  path: .kagya/adapter_registry.json
+  eval_result_dir: .kagya/eval_results
+  eval_sets:
+    - .kagya/eval_sets/default.json
+  trial_threshold: 0.8
+  reject_threshold: 0.4
+  allowed_states:
+    - candidate
+    - trial_active
+    - approved
+    - active
+    - rejected
+    - archived
+  manual_approval_required: true
+
+api:
+  host: 127.0.0.1
+  port: 8000
+  admin_token_env: KAGYA_ADMIN_TOKEN
+  cors_origins:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+
+frontend:
+  base_url: http://localhost:3000
+  api_base_url: http://127.0.0.1:8000
