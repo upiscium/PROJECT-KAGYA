@@ -87,14 +87,14 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     assert "optimal_loss:" in result.prompt
     assert "old episode" in result.prompt
     assert "stable semantic memory" in result.prompt
-    assert "hidden_thought" in result.prompt
+    assert "hidden_thought" not in result.prompt
     assert "<think>" not in result.prompt
     assert "Assistant response:" not in result.prompt
-    assert result.prompt.endswith("<start_of_turn>model")
+    assert result.prompt.endswith("Assistant:")
     assert provider.prompts == [result.prompt]
 
 
-def test_prompt_uses_gemma_style_visible_answer_contract(tmp_path: Path) -> None:
+def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(
         settings,
@@ -102,11 +102,10 @@ def test_prompt_uses_gemma_style_visible_answer_contract(tmp_path: Path) -> None
         DualMemorySystem(settings),
     ).chat("answer naturally", debug=True)
 
-    assert result.prompt.startswith("<start_of_turn>user")
-    assert "Answer the user directly and naturally as the assistant." in result.prompt
-    assert "Do not reveal hidden_thought" in result.prompt
-    assert "Do not include XML/HTML tags" in result.prompt
-    assert "<end_of_turn>\n<start_of_turn>model" in result.prompt
+    assert result.prompt.startswith("Context: PROJECT-KAGYA")
+    assert "private local AI assistant" in result.prompt
+    assert "Private runtime data below is for tone and context only" in result.prompt
+    assert "User: answer naturally\nAssistant:" in result.prompt
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
