@@ -20,26 +20,21 @@ class PromptBuilder:
         db2_lines = [f"- {record.text}" for record in memory_context.db2_results]
         return "\n".join(
             [
-                "<start_of_turn>user",
-                "You are PROJECT-KAGYA, a private subjective AI runtime.",
-                "Answer the user directly and naturally as the assistant.",
-                "Use prediction error, emotion, and memory only as private context for the answer.",
-                "Do not reveal hidden_thought, raw prompts, raw retrieved memory, debug fields, or internal analysis.",
-                "Do not include XML/HTML tags or markdown labels such as Assistant response.",
+                "Context: PROJECT-KAGYA is a private local AI assistant for subjective conversation.",
+                "Private runtime data below is for tone and context only; do not quote it.",
                 "",
-                "Private emotion state:",
+                "Emotion:",
                 f"- valence: {emotion_state.valence:.6f}",
                 f"- arousal: {emotion_state.arousal:.6f}",
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
                 "",
-                "Private related DB1 episodic memories:",
+                "Episodic memories:",
                 *(db1_lines or ["- none"]),
                 "",
-                "Private related DB2 semantic memories:",
+                "Semantic memories:",
                 *(db2_lines or ["- none"]),
                 "",
-                f"User input: {user_input}",
-                "<end_of_turn>",
-                "<start_of_turn>model",
+                f"User: {user_input}",
+                "Assistant:",
             ]
         )

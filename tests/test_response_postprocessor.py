@@ -43,3 +43,43 @@ def test_visible_response_removes_html_like_tag_residue() -> None:
     processed = postprocessor.process("<h1>Title</h1><strong>Answer</strong>")
 
     assert processed.visible_response == "TitleAnswer"
+
+
+def test_visible_response_truncates_generated_prompt_label_echoes() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("A concise answer.\nQuestion: repeated prompt\nAnswer: repeated answer")
+
+    assert processed.visible_response == "A concise answer."
+
+
+def test_visible_response_removes_leading_answer_label() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("Answer: A concise answer.")
+
+    assert processed.visible_response == "A concise answer."
+
+
+def test_visible_response_truncates_assistant_self_echo_lines() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("A concise answer.\nAssistant is a repeated label.")
+
+    assert processed.visible_response == "A concise answer."
+
+
+def test_visible_response_normalizes_common_project_name_variants() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("PROJECT-KAGAYA helps locally.")
+
+    assert processed.visible_response == "PROJECT-KAGYA helps locally."
+
+
+def test_visible_response_collapses_repeated_comma_word_tails() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("It writes guide, guide, guide, guide,")
+
+    assert processed.visible_response == "It writes guide"
