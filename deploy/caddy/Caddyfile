@@ -1,4 +1,8 @@
-kagya.example.com {
+# Private/local deployment example. This intentionally binds to loopback only.
+# Access remotely with an SSH tunnel instead of exposing PROJECT-KAGYA as a public website:
+# ssh -L 18080:127.0.0.1:8080 user@host
+http://127.0.0.1:8080 {
+    bind 127.0.0.1
     encode zstd gzip
 
     reverse_proxy /api/* 127.0.0.1:8000
