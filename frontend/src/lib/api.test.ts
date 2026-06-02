@@ -21,12 +21,13 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/chat", expect.objectContaining({ method: "POST" }));
   });
 
-  it("/debug sends requests to /api/chat/debug", async () => {
+  it("/debug sends requests through the server-side admin proxy", async () => {
     fetchMock.mockReturnValue(jsonResponse({}));
 
     await api.debugChat({ message: "hello", attachments: [], debug: true });
 
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/chat/debug", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/chat/debug", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("X-KAGYA-Admin-Token");
   });
 
   it("adapter actions call backend lifecycle endpoints", async () => {
@@ -39,11 +40,11 @@ describe("api client", () => {
     await api.rejectAdapter("a");
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "http://127.0.0.1:8000/api/adapters/a/evaluate",
-      "http://127.0.0.1:8000/api/adapters/a/trial",
-      "http://127.0.0.1:8000/api/adapters/a/approve",
-      "http://127.0.0.1:8000/api/adapters/a/activate",
-      "http://127.0.0.1:8000/api/adapters/a/reject",
+      "/admin-proxy/adapters/a/evaluate",
+      "/admin-proxy/adapters/a/trial",
+      "/admin-proxy/adapters/a/approve",
+      "/admin-proxy/adapters/a/activate",
+      "/admin-proxy/adapters/a/reject",
     ]);
   });
 
@@ -52,6 +53,6 @@ describe("api client", () => {
 
     await api.sleepRun();
 
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/sleep/run", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/sleep/run", expect.objectContaining({ method: "POST" }));
   });
 });

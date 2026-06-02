@@ -12,7 +12,7 @@
 - Normal chat remains public at `POST /api/chat`.
 - Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
 - The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
-- For local frontend admin pages, set `NEXT_PUBLIC_KAGYA_ADMIN_TOKEN` to the same value. Do not expose this in public deployments.
+- Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
 
 ## Model Provider
 
@@ -66,9 +66,9 @@ sudo chmod 600 /etc/project-kagya/*.env
 sudo chown kagya:kagya /etc/project-kagya/*.env
 ```
 
-Edit both env files and set a long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to your public HTTPS origin.
+Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to your public HTTPS origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
 
-Admin warning: `NEXT_PUBLIC_KAGYA_ADMIN_TOKEN` is visible in the browser bundle. Use it only for local/private deployments behind VPN or other network access control. Add real server-side auth before exposing admin pages publicly.
+Admin warning: the frontend no longer exposes the admin token to browser bundles, but admin pages still do not have user login/session handling. Put admin UI behind VPN, SSO, basic auth, or another access-control layer before public deployment.
 
 ### 4. Install Services
 
@@ -100,4 +100,4 @@ curl -fsS https://kagya.example.com/health
 curl -fsS https://kagya.example.com/api/state/emotion -H "X-KAGYA-Admin-Token: $KAGYA_ADMIN_TOKEN"
 ```
 
-Normal chat is public at `POST /api/chat`; debug, memory, sleep, and adapter APIs require the admin token header.
+Normal chat is public at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should be protected by your outer access-control layer.
