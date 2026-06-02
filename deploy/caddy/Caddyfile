@@ -7,5 +7,14 @@ http://127.0.0.1:8080 {
 
     reverse_proxy /api/* 127.0.0.1:8000
     reverse_proxy /health 127.0.0.1:8000
+
+    handle /admin-proxy/* {
+        # Optional extra guard for trusted-network exposure:
+        # basicauth {
+        #     admin <hashed-password-from-caddy-hash-password>
+        # }
+        reverse_proxy 127.0.0.1:3000
+    }
+
     reverse_proxy 127.0.0.1:3000
 }

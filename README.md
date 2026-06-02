@@ -103,8 +103,9 @@ For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path. The provid
 ### 6. Verify Deployment
 
 ```bash
-curl -fsS http://127.0.0.1:8080/health
-curl -fsS http://127.0.0.1:8080/api/state/emotion -H "X-KAGYA-Admin-Token: $KAGYA_ADMIN_TOKEN"
+KAGYA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```
+
+The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-KAGYA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
 
 Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
