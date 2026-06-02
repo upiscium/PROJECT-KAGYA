@@ -29,9 +29,9 @@
 - Search for forbidden provider implementation paths.
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
 
-## Deployment
+## Private Deployment
 
-The current deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy terminating HTTPS in front.
+PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
 
 ### 1. Prepare Host
 
@@ -54,7 +54,6 @@ sudo -u kagya git switch develop
 sudo -u kagya uv sync
 cd frontend
 sudo -u kagya npm ci
-sudo -u kagya npm run build
 ```
 
 ### 3. Configure Environment
@@ -66,9 +65,17 @@ sudo chmod 600 /etc/project-kagya/*.env
 sudo chown kagya:kagya /etc/project-kagya/*.env
 ```
 
-Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to your public HTTPS origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
+Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
 
-Admin warning: the frontend no longer exposes the admin token to browser bundles, but admin pages still do not have user login/session handling. Put admin UI behind VPN, SSO, basic auth, or another access-control layer before public deployment.
+For SSH-tunnel access, run `ssh -L 18080:127.0.0.1:8080 user@host`, set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:18080`, rebuild the frontend, and open `http://127.0.0.1:18080` locally.
+
+Admin warning: the frontend no longer exposes the admin token to browser bundles, but admin pages still do not have user login/session handling. Keep this listener bound to loopback, or put it behind VPN, SSO, basic auth, or another access-control layer.
+
+Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BASE_URL` is embedded at build time:
+
+```bash
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/frontend.env; set +a; cd /opt/project-kagya/frontend && npm run build'
+```
 
 ### 4. Install Services
 
@@ -91,13 +98,13 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path and replace `kagya.example.com` with your domain.
+For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path. The provided example binds to `127.0.0.1:8080` and is meant for local or SSH-tunnel access.
 
 ### 6. Verify Deployment
 
 ```bash
-curl -fsS https://kagya.example.com/health
-curl -fsS https://kagya.example.com/api/state/emotion -H "X-KAGYA-Admin-Token: $KAGYA_ADMIN_TOKEN"
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8080/api/state/emotion -H "X-KAGYA-Admin-Token: $KAGYA_ADMIN_TOKEN"
 ```
 
-Normal chat is public at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should be protected by your outer access-control layer.
+Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
