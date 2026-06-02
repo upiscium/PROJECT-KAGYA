@@ -1,5 +1,5 @@
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
-const ADMIN_TOKEN = process.env.NEXT_PUBLIC_KAGYA_ADMIN_TOKEN;
+const ADMIN_PROXY_BASE_URL = "/admin-proxy";
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
 export type ModelInfo = { model_id: string; adapter_id: string | null };
@@ -74,7 +74,15 @@ export type SleepRunResponse = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  return requestUrl<T>(`${API_BASE_URL}${path}`, init);
+}
+
+async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, init);
+}
+
+async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
@@ -85,26 +93,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function adminInit(init?: RequestInit): RequestInit {
-  if (!ADMIN_TOKEN) {
-    return init ?? {};
-  }
-  return {
-    ...init,
-    headers: { "X-KAGYA-Admin-Token": ADMIN_TOKEN, ...(init?.headers ?? {}) },
-  };
-}
-
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
-  debugChat: (body: ChatRequest) => request<DebugChatResponse>("/api/chat/debug", adminInit({ method: "POST", body: JSON.stringify(body) })),
-  emotion: () => request<Emotion>("/api/state/emotion", adminInit()),
-  memorySearch: (query: string) => request<MemorySearchResponse>(`/api/memory/search?query=${encodeURIComponent(query)}`, adminInit()),
-  sleepRun: () => request<SleepRunResponse>("/api/sleep/run", adminInit({ method: "POST" })),
-  adapters: () => request<AdapterListResponse>("/api/adapters", adminInit()),
-  evaluateAdapter: (adapterId: string, deterministic_score?: number) => request<AdapterEvaluateResponse>(`/api/adapters/${adapterId}/evaluate`, adminInit({ method: "POST", body: JSON.stringify({ deterministic_score }) })),
-  trialAdapter: (adapterId: string) => request<Adapter>(`/api/adapters/${adapterId}/trial`, adminInit({ method: "POST" })),
-  approveAdapter: (adapterId: string) => request<Adapter>(`/api/adapters/${adapterId}/approve`, adminInit({ method: "POST" })),
-  activateAdapter: (adapterId: string) => request<Adapter>(`/api/adapters/${adapterId}/activate`, adminInit({ method: "POST" })),
-  rejectAdapter: (adapterId: string) => request<Adapter>(`/api/adapters/${adapterId}/reject`, adminInit({ method: "POST" })),
+  debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
+  emotion: () => adminRequest<Emotion>("/state/emotion"),
+  memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
+  sleepRun: () => adminRequest<SleepRunResponse>("/sleep/run", { method: "POST" }),
+  adapters: () => adminRequest<AdapterListResponse>("/adapters"),
+  evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),
+  trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),
+  approveAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
+  activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
+  rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
 };
