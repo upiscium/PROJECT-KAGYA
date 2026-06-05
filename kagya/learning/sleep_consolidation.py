@@ -66,7 +66,8 @@ class SleepCycleManager:
 
     def select_high_emotion_episodes(self) -> list[EpisodicMemoryRecord]:
         episodes = self.memory_system._get_unarchived_episodic_records()
-        selected = [episode for episode in episodes if _is_high_emotion(episode)]
+        threshold = self.settings.sleep.min_emotion_score
+        selected = [episode for episode in episodes if _is_high_emotion(episode, threshold)]
         return selected[: self.settings.sleep.max_episodes_per_cycle]
 
     def _generate_semantic_memories(self, episodes: list[EpisodicMemoryRecord]) -> list[str]:
@@ -86,5 +87,5 @@ class SleepCycleManager:
         return semantic_ids
 
 
-def _is_high_emotion(episode: EpisodicMemoryRecord) -> bool:
-    return episode.emotion_arousal > 0.7 or abs(episode.emotion_valence) > 0.6
+def _is_high_emotion(episode: EpisodicMemoryRecord, threshold: float) -> bool:
+    return episode.emotion_arousal > threshold or abs(episode.emotion_valence) > threshold
