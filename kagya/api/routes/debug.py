@@ -35,6 +35,7 @@ def debug_chat(
         hidden_thought=result.hidden_thought,
         loss=result.loss,
         prompt=result.prompt,
+        attachments=request.attachments,
         retrieved_memory=RetrievedMemorySchema(
             db1_results=[
                 RetrievedEpisodeSchema(

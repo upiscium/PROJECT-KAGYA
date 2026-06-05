@@ -22,6 +22,7 @@ export type DebugChatResponse = ChatResponse & {
   hidden_thought: string;
   loss: number;
   prompt: string;
+  attachments: Attachment[];
   retrieved_memory: RetrievedMemory;
   generation_params: { max_new_tokens: number; temperature: number; top_p: number; do_sample: boolean };
 };
