@@ -1,11 +1,11 @@
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_PROXY_BASE_URL = "/api-proxy";
 const ADMIN_PROXY_BASE_URL = "/admin-proxy";
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
 export type ModelInfo = { model_id: string; adapter_id: string | null };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
-export type ChatRequest = { message: string; attachments?: Attachment[]; debug?: boolean };
+export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: boolean };
 export type ChatResponse = {
   episode_id: string;
   response: string;
@@ -74,7 +74,7 @@ export type SleepRunResponse = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  return requestUrl<T>(`${API_BASE_URL}${path}`, init);
+  return requestUrl<T>(`${API_PROXY_BASE_URL}${path.replace(/^\/api/, "")}`, init);
 }
 
 async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {

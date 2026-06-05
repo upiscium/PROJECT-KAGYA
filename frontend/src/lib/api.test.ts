@@ -16,15 +16,15 @@ describe("api client", () => {
   it("/chat sends requests to /api/chat", async () => {
     fetchMock.mockReturnValue(jsonResponse({ episode_id: "e", response: "ok", emotion: { valence: 0, arousal: 0, optimal_loss: 1 }, model: { model_id: "m", adapter_id: null } }));
 
-    await api.chat({ message: "hello", attachments: [], debug: false });
+    await api.chat({ text: "hello", attachments: [], debug: false });
 
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8000/api/chat", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith("/api-proxy/chat", expect.objectContaining({ method: "POST" }));
   });
 
   it("/debug sends requests through the server-side admin proxy", async () => {
     fetchMock.mockReturnValue(jsonResponse({}));
 
-    await api.debugChat({ message: "hello", attachments: [], debug: true });
+    await api.debugChat({ text: "hello", attachments: [], debug: true });
 
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/chat/debug", expect.objectContaining({ method: "POST" }));
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("X-KAGYA-Admin-Token");

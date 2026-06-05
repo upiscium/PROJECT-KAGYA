@@ -20,7 +20,7 @@ export function DebugClient() {
         <h1 className="page-title">Debug</h1>
         <p className="page-subtitle">Development-only view for hidden thought, prompt, loss, memory, and generation params.</p>
       </header>
-      <form className="composer" onSubmit={(event) => { event.preventDefault(); if (message.trim()) mutation.mutate({ message, attachments: [], debug: true }); }}>
+      <form className="composer" onSubmit={(event) => { event.preventDefault(); if (message.trim()) mutation.mutate({ text: message, attachments: [], debug: true }); }}>
         <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Debug a message" />
         <Button disabled={mutation.isPending || !message.trim()} type="submit">Run Debug Chat</Button>
       </form>

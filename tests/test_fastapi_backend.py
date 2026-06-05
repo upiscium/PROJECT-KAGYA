@@ -22,7 +22,7 @@ class ThinkingProvider(DummyProvider):
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    response = client.post("/api/chat", json={"message": "hello", "attachments": [], "debug": False})
+    response = client.post("/api/chat", json={"text": "hello", "attachments": [], "debug": False})
 
     assert response.status_code == 200
     data = response.json()
@@ -33,13 +33,38 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
     assert "<think>" not in str(data)
 
 
+def test_api_chat_accepts_multiple_attachments(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "text": "describe these files",
+            "attachments": [
+                {"type": "image", "url": "file:///tmp/image.png", "name": "image.png"},
+                {"type": "audio", "url": "file:///tmp/audio.wav", "duration_ms": 1200},
+                {"type": "video", "url": "file:///tmp/video.mp4", "content_type": "video/mp4"},
+            ],
+            "debug": False,
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_api_chat_accepts_legacy_message_key(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/api/chat", json={"message": "hello", "attachments": []})
+
+    assert response.status_code == 200
+
+
 def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
     response = client.post(
         "/api/chat/debug",
         headers=admin_headers(),
-        json={"message": "hello", "attachments": [], "debug": True},
+        json={"text": "hello", "attachments": [], "debug": True},
     )
 
     assert response.status_code == 200
@@ -136,8 +161,8 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    assert client.post("/api/chat", json={"message": "hello", "attachments": [], "debug": False}).status_code == 200
-    assert client.post("/api/chat/debug", json={"message": "hello", "attachments": [], "debug": True}).status_code == 401
+    assert client.post("/api/chat", json={"text": "hello", "attachments": [], "debug": False}).status_code == 200
+    assert client.post("/api/chat/debug", json={"text": "hello", "attachments": [], "debug": True}).status_code == 401
     assert client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
     assert client.post("/api/sleep/run").status_code == 401
     assert client.get("/api/adapters").status_code == 401
@@ -146,7 +171,7 @@ def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
 def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
     client = _client(tmp_path, configure_admin_token=False)
 
-    response = client.post("/api/chat/debug", headers=admin_headers(), json={"message": "hello", "attachments": []})
+    response = client.post("/api/chat/debug", headers=admin_headers(), json={"text": "hello", "attachments": []})
 
     assert response.status_code == 503
     assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]

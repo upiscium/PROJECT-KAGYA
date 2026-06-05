@@ -38,4 +38,33 @@ describe("ChatClient", () => {
     expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/retrieved memory/i)).not.toBeInTheDocument();
   });
+
+  it("sends selected attachments with the chat request", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        episode_id: "episode-1",
+        response: "Visible answer",
+        emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+        model: { model_id: "google/gemma-4-E4B", adapter_id: null },
+      }),
+    });
+    renderWithQuery();
+
+    await userEvent.selectOptions(screen.getByLabelText("Attachment type"), "audio");
+    await userEvent.type(screen.getByPlaceholderText("Attachment URL"), "file:///tmp/sample.wav");
+    await userEvent.type(screen.getByPlaceholderText("Optional attachment name"), "sample.wav");
+    await userEvent.click(screen.getByRole("button", { name: "Add Attachment" }));
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "please inspect this");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const request = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api-proxy/chat");
+    expect(request).toEqual({
+      text: "please inspect this",
+      attachments: [{ type: "audio", url: "file:///tmp/sample.wav", name: "sample.wav" }],
+      debug: false,
+    });
+    expect(await screen.findByText(/Attachments: sample.wav/)).toBeInTheDocument();
+  });
 });
