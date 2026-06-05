@@ -58,6 +58,49 @@ def test_debug_chat_accepts_non_empty_attachments(tmp_path: Path) -> None:
     assert response.status_code == 200
 
 
+def test_debug_chat_response_includes_received_attachments(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/api/chat/debug",
+        headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
+        json={
+            "text": "hello",
+            "attachments": [
+                {
+                    "type": "audio",
+                    "url": "file:///tmp/sample.wav",
+                    "name": "sample.wav",
+                    "content_type": "audio/wav",
+                }
+            ],
+            "debug": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["attachments"] == [
+        {
+            "type": "audio",
+            "url": "file:///tmp/sample.wav",
+            "name": "sample.wav",
+            "content_type": "audio/wav",
+        }
+    ]
+
+
+def test_public_chat_response_does_not_include_received_attachments(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/api/chat",
+        json={
+            "text": "hello",
+            "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
+            "debug": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "attachments" not in response.json()
+
+
 def test_tool_executor_skeleton_does_not_execute_registered_tools() -> None:
     registry = ToolRegistry()
     registry.register_declared(

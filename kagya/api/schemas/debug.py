@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from kagya.api.schemas.chat import ChatResponse, EmotionSchema, ModelSchema
+from kagya.api.schemas.chat import AttachmentSchema, ChatResponse, EmotionSchema
 
 
 class RetrievedEpisodeSchema(BaseModel):
@@ -34,6 +34,7 @@ class DebugChatResponse(ChatResponse):
     hidden_thought: str
     loss: float
     prompt: str
+    attachments: list[AttachmentSchema]
     retrieved_memory: RetrievedMemorySchema
     generation_params: GenerationParamsSchema
 
