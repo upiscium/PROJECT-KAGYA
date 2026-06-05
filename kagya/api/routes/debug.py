@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends
 
 from kagya.api.dependencies import get_api_settings, get_main_loop, require_admin
-from kagya.api.routes.chat import chat_response_from_result, reject_unsupported_attachments
+from kagya.api.routes.chat import chat_response_from_result
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
     DebugChatResponse,
@@ -28,8 +28,7 @@ def debug_chat(
 ) -> DebugChatResponse:
     """Development-only debug chat gated by the admin token."""
 
-    reject_unsupported_attachments(request)
-    result = main_loop.chat(request.message, debug=True)
+    result = main_loop.chat(request.text, debug=True)
     base = chat_response_from_result(result)
     return DebugChatResponse(
         **base.model_dump(),

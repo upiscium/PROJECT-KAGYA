@@ -1,9 +1,11 @@
 """Chat API schemas."""
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class AttachmentSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     type: str = Field(min_length=1)
     url: str | None = None
     name: str | None = None
@@ -11,7 +13,9 @@ class AttachmentSchema(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1)
+    model_config = ConfigDict(populate_by_name=True)
+
+    text: str = Field(min_length=1, validation_alias=AliasChoices("text", "message"))
     attachments: list[AttachmentSchema] = Field(default_factory=list)
     debug: bool = False
 

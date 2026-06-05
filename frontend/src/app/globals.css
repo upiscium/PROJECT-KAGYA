@@ -82,6 +82,10 @@ button, input, textarea { font: inherit; }
 .chat-bubble.assistant { justify-self: start; background: rgba(30, 41, 59, 0.7); }
 .chat-bubble p, .record p { white-space: pre-wrap; }
 .composer { display: grid; gap: 0.75rem; }
+.attachment-panel { display: grid; grid-template-columns: minmax(8rem, 0.6fr) 1fr 1fr auto; gap: 0.65rem; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.attachment-chip { align-items: center; background: rgba(125, 211, 252, 0.12); border: 1px solid rgba(125, 211, 252, 0.32); border-radius: 999px; display: inline-flex; gap: 0.5rem; padding: 0.35rem 0.45rem 0.35rem 0.7rem; }
+.attachment-chip button { background: rgba(2, 6, 23, 0.55); border: 1px solid var(--border); border-radius: 999px; color: var(--foreground); cursor: pointer; padding: 0.18rem 0.45rem; }
 .record { border-top: 1px solid var(--border); padding-top: 0.8rem; }
 .record:first-of-type { border-top: 0; padding-top: 0; }
 pre { background: rgba(2, 6, 23, 0.8); border: 1px solid var(--border); border-radius: 0.85rem; overflow: auto; padding: 0.85rem; white-space: pre-wrap; }
@@ -93,4 +97,5 @@ pre { background: rgba(2, 6, 23, 0.8); border: 1px solid var(--border); border-r
   .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .main { padding: 1rem; }
   .page-header { display: block; }
+  .attachment-panel { grid-template-columns: 1fr; }
 }
