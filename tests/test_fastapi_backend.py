@@ -51,6 +51,38 @@ def test_api_chat_accepts_multiple_attachments(tmp_path: Path) -> None:
     )
 
     assert response.status_code == 200
+    assert "prompt" not in response.json()
+
+
+def test_api_chat_debug_includes_attachment_metadata_in_prompt(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={
+            "text": "describe this file",
+            "attachments": [
+                {
+                    "type": "image",
+                    "url": "file:///tmp/image.png",
+                    "name": "image.png",
+                    "content_type": "image/png",
+                    "duration_ms": 1200,
+                }
+            ],
+            "debug": True,
+        },
+    )
+
+    assert response.status_code == 200
+    prompt = response.json()["prompt"]
+    assert "Attachments:" in prompt
+    assert "type=image" in prompt
+    assert "name=image.png" in prompt
+    assert "url=file:///tmp/image.png" in prompt
+    assert "content_type=image/png" in prompt
+    assert "duration_ms" not in prompt
 
 
 def test_api_chat_accepts_legacy_message_key(tmp_path: Path) -> None:

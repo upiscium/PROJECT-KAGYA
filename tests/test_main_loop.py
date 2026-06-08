@@ -94,6 +94,34 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     assert provider.prompts == [result.prompt]
 
 
+def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    result = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+    ).chat(
+        "describe this",
+        debug=True,
+        attachments=[
+            {
+                "type": "image",
+                "name": "image.png",
+                "url": "file:///tmp/image.png",
+                "content_type": "image/png",
+                "ignored": "not shown",
+            }
+        ],
+    )
+
+    assert "Attachments:" in result.prompt
+    assert "type=image" in result.prompt
+    assert "name=image.png" in result.prompt
+    assert "url=file:///tmp/image.png" in result.prompt
+    assert "content_type=image/png" in result.prompt
+    assert "ignored" not in result.prompt
+
+
 def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(

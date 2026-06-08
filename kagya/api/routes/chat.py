@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, main_loop: KagyaMainLoop = Depends(get_main_loop)) -> ChatResponse:
-    result = main_loop.chat(request.text, debug=False)
+    result = main_loop.chat(request.text, debug=False, attachments=attachment_metadata(request))
     return chat_response_from_result(result)
 
 
@@ -27,3 +27,14 @@ def chat_response_from_result(result: ChatResult) -> ChatResponse:
         ),
         model=ModelSchema(model_id=result.model_id, adapter_id=result.adapter_id),
     )
+
+
+def attachment_metadata(request: ChatRequest) -> list[dict[str, str]]:
+    return [
+        {
+            key: value
+            for key, value in attachment.model_dump(include={"type", "name", "url", "content_type"}).items()
+            if value is not None
+        }
+        for attachment in request.attachments
+    ]
