@@ -82,10 +82,13 @@ class QloraTrainer:
             "training_records": len(records),
             "qlora": {
                 "r": self.settings.qlora.r,
+                "alpha": self.settings.qlora.alpha,
                 "lora_alpha": self.settings.qlora.lora_alpha,
+                "dropout": self.settings.qlora.dropout,
                 "lora_dropout": self.settings.qlora.lora_dropout,
                 "learning_rate": self.settings.qlora.learning_rate,
                 "num_train_epochs": self.settings.qlora.num_train_epochs,
+                "max_steps": self.settings.qlora.max_steps,
                 "quantization": "nf4",
                 "compute_dtype": "bfloat16",
             },

@@ -20,6 +20,19 @@
 - Real model smoke should use the Transformers provider and model IDs from `config.yaml` only.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
 
+## Configuration Field Status
+
+Most `config.yaml` fields are active runtime settings. The fields below are intentionally retained but have limited or future-facing behavior:
+
+| Field | Status |
+| --- | --- |
+| `model.fallback_id` | Reserved for future fallback model loading. Current providers load `model.primary_id` only. |
+| `memory.embedding_model_id` | Reserved for a future real embedding backend. Current memory uses deterministic local embeddings. |
+| `adapter_registry.allowed_states` | Reserved as an operator-visible lifecycle contract. Runtime transitions are enforced by `AdapterStatus`. |
+| `adapter_registry.manual_approval_required` | Reserved for future automatic approval policy. Current lifecycle always requires explicit approval before activation. |
+| `qlora.alpha` / `qlora.dropout` | Legacy aliases retained for compatibility; `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing names. Dry-run manifests include both. |
+| `qlora.max_steps` | Reserved for the non-dry-run trainer; dry-run manifests include it for auditability. |
+
 ## Release Checklist
 
 - `uv run pytest`

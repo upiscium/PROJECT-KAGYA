@@ -96,7 +96,10 @@ def test_qlora_dry_run_returns_adapter_candidate_result(tmp_path: Path) -> None:
     assert result.dry_run is True
     assert result.adapter_id.startswith("adapter-")
     assert result.adapter_path.exists()
-    assert (result.adapter_path / "dry_run_manifest.json").exists()
+    manifest = json.loads((result.adapter_path / "dry_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["qlora"]["alpha"] == settings.qlora.alpha
+    assert manifest["qlora"]["dropout"] == settings.qlora.dropout
+    assert manifest["qlora"]["max_steps"] == settings.qlora.max_steps
     assert result.training_records == 1
 
 
