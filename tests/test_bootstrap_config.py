@@ -39,5 +39,20 @@ def test_api_settings_come_from_config() -> None:
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
 
 
+def test_reserved_config_fields_are_documented() -> None:
+    readme = (CONFIG_PATH.parent / "README.md").read_text(encoding="utf-8")
+
+    for field in (
+        "model.fallback_id",
+        "memory.embedding_model_id",
+        "adapter_registry.allowed_states",
+        "adapter_registry.manual_approval_required",
+        "qlora.alpha",
+        "qlora.dropout",
+        "qlora.max_steps",
+    ):
+        assert field in readme
+
+
 def test_fastapi_app_is_importable() -> None:
     assert app.title == load_settings(CONFIG_PATH).project.name
