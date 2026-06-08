@@ -1,6 +1,7 @@
 """Integrated runtime main loop."""
 
 from dataclasses import dataclass
+from typing import Any
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import SurprisalCalculator
@@ -56,12 +57,18 @@ class KagyaMainLoop:
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
 
-    def chat(self, user_input: str, debug: bool = False) -> ChatResult:
+    def chat(
+        self,
+        user_input: str,
+        debug: bool = False,
+        *,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> ChatResult:
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
         memory_context = self.memory_system.retrieve_context(user_input)
-        prompt = self.prompt_builder.build(user_input, emotion_state, memory_context)
+        prompt = self.prompt_builder.build(user_input, emotion_state, memory_context, attachments=attachments or [])
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
         episode_id = self.memory_system.save_episodic(
