@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -151,6 +152,48 @@ def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate
     assert response.status_code == 400
     assert "Configured eval set does not exist" in response.json()["detail"]
     assert registry.lookup("adapter-missing-eval").status.value == "candidate"
+
+
+def test_evaluation_result_endpoints_list_and_return_json(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    result_dir = settings.adapter_registry.eval_result_dir
+    result_dir.mkdir(parents=True)
+    result_path = result_dir / "adapter-api.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "adapter_id": "adapter-api",
+                "score": 0.9,
+                "decision": "trial_active",
+                "eval_sets": ["eval.json"],
+                "case_count": 1,
+                "prompt": "private prompt",
+                "nested": {"hidden_thought": "private thought"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    listed = client.get("/api/evaluations", headers=admin_headers())
+    detail = client.get("/api/evaluations/adapter-api.json", headers=admin_headers())
+
+    assert listed.status_code == 200
+    assert listed.json()["results"][0]["filename"] == "adapter-api.json"
+    assert listed.json()["results"][0]["adapter_id"] == "adapter-api"
+    assert listed.json()["results"][0]["score"] == 0.9
+    assert detail.status_code == 200
+    assert detail.json()["payload"]["decision"] == "trial_active"
+    assert detail.json()["payload"]["prompt"] == "[redacted]"
+    assert detail.json()["payload"]["nested"]["hidden_thought"] == "[redacted]"
+
+
+def test_evaluation_result_endpoints_reject_unsafe_paths(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.get("/api/evaluations/../config.yaml", headers=admin_headers())
+
+    assert response.status_code == 404
 
 
 def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:

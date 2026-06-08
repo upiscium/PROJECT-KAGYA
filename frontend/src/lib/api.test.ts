@@ -30,7 +30,7 @@ describe("api client", () => {
     expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("X-KAGYA-Admin-Token");
   });
 
-  it("adapter actions call backend lifecycle endpoints", async () => {
+  it("admin actions call backend admin endpoints", async () => {
     fetchMock.mockReturnValue(jsonResponse({}));
 
     await api.evaluateAdapter("a");
@@ -38,6 +38,8 @@ describe("api client", () => {
     await api.approveAdapter("a");
     await api.activateAdapter("a");
     await api.rejectAdapter("a");
+    await api.evaluations();
+    await api.evaluationResult("adapter-a.json");
 
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       "/admin-proxy/adapters/a/evaluate",
@@ -45,6 +47,8 @@ describe("api client", () => {
       "/admin-proxy/adapters/a/approve",
       "/admin-proxy/adapters/a/activate",
       "/admin-proxy/adapters/a/reject",
+      "/admin-proxy/evaluations",
+      "/admin-proxy/evaluations/adapter-a.json",
     ]);
   });
 

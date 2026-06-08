@@ -4,7 +4,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from kagya.api.routes import adapters, chat, debug, memory, sleep
+from kagya.api.routes import adapters, chat, debug, evaluations, memory, sleep
 from kagya.config import Settings, get_settings
 
 
@@ -31,6 +31,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(memory.router)
     app.include_router(sleep.router)
     app.include_router(adapters.router)
+    app.include_router(evaluations.router)
 
     return app
 
