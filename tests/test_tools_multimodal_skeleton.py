@@ -15,6 +15,7 @@ from kagya.tools import (
     ToolGenerator,
     ToolRegistry,
     ToolStatus,
+    ToolType,
 )
 
 
@@ -101,7 +102,7 @@ def test_public_chat_response_does_not_include_received_attachments(tmp_path: Pa
     assert "attachments" not in response.json()
 
 
-def test_tool_executor_skeleton_does_not_execute_registered_tools() -> None:
+def test_tool_executor_blocks_non_executable_registered_tools() -> None:
     registry = ToolRegistry()
     registry.register_declared(
         ToolDefinition(
@@ -115,7 +116,74 @@ def test_tool_executor_skeleton_does_not_execute_registered_tools() -> None:
     result = ToolExecutor(registry).execute(ToolExecutionRequest(tool_name="safe_lookup"))
 
     assert result.executed is False
-    assert result.blocked_reason == "Tool execution is disabled in v1.0"
+    assert result.blocked_reason == "Tool type is not executable in the safe milestone"
+
+
+def test_tool_executor_runs_approved_text_template_tools() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="summarize_metadata",
+            description="format known metadata without side effects",
+            tool_type=ToolType.TEXT_TEMPLATE,
+            output_template="{title}: {count} records",
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+    executor = ToolExecutor(registry)
+
+    result = executor.execute(
+        ToolExecutionRequest(
+            tool_name="summarize_metadata",
+            arguments={"title": "Eval", "count": 2},
+        )
+    )
+
+    assert result.executed is True
+    assert result.output == "Eval: 2 records"
+    assert executor.audit_log[-1].tool_name == "summarize_metadata"
+    assert executor.audit_log[-1].executed is True
+    assert executor.audit_log[-1].tool_type == ToolType.TEXT_TEMPLATE
+
+
+def test_tool_executor_blocks_unapproved_text_template_tools() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="unapproved_template",
+            description="not approved yet",
+            tool_type=ToolType.TEXT_TEMPLATE,
+            output_template="hello {name}",
+            status=ToolStatus.APPROVED,
+            human_approved=False,
+        )
+    )
+    executor = ToolExecutor(registry)
+
+    result = executor.execute(ToolExecutionRequest(tool_name="unapproved_template", arguments={"name": "user"}))
+
+    assert result.executed is False
+    assert result.blocked_reason == "Tool execution requires human approval"
+    assert executor.audit_log[-1].executed is False
+
+
+def test_tool_executor_blocks_shell_tools_even_when_approved() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="shell_date",
+            description="unsafe shell execution",
+            tool_type=ToolType.SHELL,
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(ToolExecutionRequest(tool_name="shell_date"))
+
+    assert result.executed is False
+    assert result.blocked_reason == "Shell tool execution is disabled"
 
 
 def test_tool_executor_blocks_unknown_tools() -> None:
@@ -148,6 +216,29 @@ def test_tool_registry_rejects_unapproved_generated_registration() -> None:
         assert "human approval" in str(exc) or "Pending generated" in str(exc)
     else:
         raise AssertionError("Generated tool registration should require human approval")
+
+
+def test_tool_executor_blocks_generated_tools_even_after_approval() -> None:
+    registry = ToolRegistry()
+    proposal = ToolGenerator().propose("generated_template", "generated", "print('no')")
+    approved = registry.approve_generated(
+        ToolDefinition(
+            name=proposal.tool.name,
+            description=proposal.tool.description,
+            tool_type=ToolType.TEXT_TEMPLATE,
+            output_template="hello {name}",
+            status=proposal.tool.status,
+            human_approved=proposal.tool.human_approved,
+            generated=proposal.tool.generated,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name=approved.name, arguments={"name": "user"})
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason == "Generated tool code execution is disabled in v1.0"
 
 
 def _client(tmp_path: Path) -> TestClient:

@@ -12,11 +12,19 @@ class ToolStatus(StrEnum):
     DISABLED = "disabled"
 
 
+class ToolType(StrEnum):
+    METADATA = "metadata"
+    TEXT_TEMPLATE = "text_template"
+    SHELL = "shell"
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
     description: str
     input_schema: dict[str, Any] = field(default_factory=dict)
+    tool_type: ToolType = ToolType.METADATA
+    output_template: str = ""
     status: ToolStatus = ToolStatus.DECLARED
     human_approved: bool = False
     generated: bool = False
@@ -35,3 +43,12 @@ class ToolExecutionResult:
     executed: bool
     output: str | None = None
     blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolAuditEvent:
+    tool_name: str
+    executed: bool
+    status: ToolStatus | None
+    tool_type: ToolType | None
+    reason: str
