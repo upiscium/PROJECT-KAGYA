@@ -21,14 +21,30 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 def test_high_emotion_episode_selection_follows_threshold_rules(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     memory = DualMemorySystem(settings)
-    high_arousal = memory.save_episodic("high arousal", "out", emotion_arousal=0.71)
-    high_valence = memory.save_episodic("high valence", "out", emotion_valence=-0.61)
-    memory.save_episodic("low emotion", "out", emotion_arousal=0.7, emotion_valence=0.6)
+    threshold = settings.sleep.min_emotion_score
+    high_arousal = memory.save_episodic("high arousal", "out", emotion_arousal=threshold + 0.01)
+    high_valence = memory.save_episodic("high valence", "out", emotion_valence=-(threshold + 0.01))
+    memory.save_episodic("low emotion", "out", emotion_arousal=threshold, emotion_valence=threshold)
     manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
 
     selected = manager.select_high_emotion_episodes()
 
     assert {episode.id for episode in selected} == {high_arousal, high_valence}
+
+
+def test_high_emotion_episode_selection_uses_configured_sleep_threshold(tmp_path: Path) -> None:
+    base_settings = _settings_for_sleep(tmp_path)
+    settings = base_settings.model_copy(
+        update={"sleep": base_settings.sleep.model_copy(update={"min_emotion_score": 0.4})}
+    )
+    memory = DualMemorySystem(settings)
+    selected_by_config = memory.save_episodic("configured threshold", "out", emotion_arousal=0.41)
+    memory.save_episodic("below threshold", "out", emotion_valence=-0.4)
+    manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
+
+    selected = manager.select_high_emotion_episodes()
+
+    assert [episode.id for episode in selected] == [selected_by_config]
 
 
 def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -> None:
