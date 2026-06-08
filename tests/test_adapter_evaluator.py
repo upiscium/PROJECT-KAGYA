@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterEvaluationDecision, AdapterEvaluator, AdapterRegistry, AdapterStatus
 from kagya.models import DummyProvider
@@ -62,6 +64,41 @@ def test_evaluator_loads_eval_sets_and_writes_result_json(tmp_path: Path) -> Non
     assert result.eval_set_count == 1
     assert result.case_count == 1
     assert result_data["decision"] == "trial_active"
+
+
+def test_evaluator_fails_when_configured_eval_set_is_missing(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[tmp_path / "missing.json"])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    evaluator = AdapterEvaluator(settings, registry)
+
+    with pytest.raises(ValueError, match="Configured eval set does not exist"):
+        evaluator.evaluate("adapter-a", DummyProvider())
+
+    assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
+
+
+def test_evaluator_allows_deterministic_score_when_eval_set_is_missing(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[tmp_path / "missing.json"])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    evaluator = AdapterEvaluator(settings, registry)
+
+    result = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.9)
+
+    assert result.decision == AdapterEvaluationDecision.TRIAL_ACTIVE
+    assert registry.lookup("adapter-a").status == AdapterStatus.TRIAL_ACTIVE
+
+
+def test_evaluator_fails_when_eval_sets_have_no_cases(tmp_path: Path) -> None:
+    eval_set_path = tmp_path / "empty_eval_set.json"
+    eval_set_path.write_text(json.dumps({"cases": []}), encoding="utf-8")
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    evaluator = AdapterEvaluator(settings, registry)
+
+    with pytest.raises(ValueError, match="No evaluation cases loaded"):
+        evaluator.evaluate("adapter-a", DummyProvider())
+
+    assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
 
 
 def _registry_with_candidate(tmp_path: Path, settings: Settings | None = None) -> AdapterRegistry:

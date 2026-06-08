@@ -124,6 +124,35 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     assert listed.json()["adapters"][0]["status"] == "active"
 
 
+def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_sets": [tmp_path / "missing_eval_set.json"]}
+            )
+        }
+    )
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    registry.register_candidate(
+        adapter_id="adapter-missing-eval",
+        adapter_path=tmp_path / "adapter-missing-eval",
+        dataset_path=tmp_path / "dataset.jsonl",
+        dataset_hash="hash",
+    )
+
+    response = client.post(
+        "/api/adapters/adapter-missing-eval/evaluate",
+        headers=admin_headers(),
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert "Configured eval set does not exist" in response.json()["detail"]
+    assert registry.lookup("adapter-missing-eval").status.value == "candidate"
+
+
 def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
     client = _client(tmp_path)
     memory = client.app.state.memory_system

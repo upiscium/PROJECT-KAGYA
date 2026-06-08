@@ -18,12 +18,14 @@ class EvalSet:
     cases: list[EvalCase]
 
 
-def load_eval_sets(paths: list[Path]) -> list[EvalSet]:
-    """Load JSON eval sets, ignoring missing files for bootstrap environments."""
+def load_eval_sets(paths: list[Path], *, require_existing: bool = False) -> list[EvalSet]:
+    """Load JSON eval sets, optionally failing on missing configured files."""
 
     eval_sets: list[EvalSet] = []
     for path in paths:
         if not path.exists():
+            if require_existing:
+                raise ValueError(f"Configured eval set does not exist: {path}")
             continue
         with path.open("r", encoding="utf-8") as eval_file:
             data = json.load(eval_file)

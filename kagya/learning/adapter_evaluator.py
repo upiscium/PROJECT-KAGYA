@@ -48,7 +48,13 @@ class AdapterEvaluator:
         if entry.status != AdapterStatus.CANDIDATE:
             raise ValueError("Only candidate adapters can be evaluated")
 
-        eval_sets = load_eval_sets(self.settings.adapter_registry.eval_sets)
+        eval_sets = load_eval_sets(
+            self.settings.adapter_registry.eval_sets,
+            require_existing=deterministic_score is None,
+        )
+        case_count = sum(len(eval_set.cases) for eval_set in eval_sets)
+        if deterministic_score is None and case_count == 0:
+            raise ValueError("No evaluation cases loaded; configure eval sets or provide a deterministic score")
         score = deterministic_score if deterministic_score is not None else self._score(provider, eval_sets)
         decision = self._decision(score)
         result_path = self._write_result(adapter_id, score, decision, eval_sets)
@@ -59,7 +65,7 @@ class AdapterEvaluator:
             decision=decision,
             result_path=str(result_path),
             eval_set_count=len(eval_sets),
-            case_count=sum(len(eval_set.cases) for eval_set in eval_sets),
+            case_count=case_count,
         )
 
     def _score(self, provider: ModelProvider, eval_sets: list[EvalSet]) -> float:
