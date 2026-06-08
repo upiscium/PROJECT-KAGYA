@@ -65,6 +65,16 @@ export type Adapter = {
 
 export type AdapterListResponse = { adapters: Adapter[] };
 export type AdapterEvaluateResponse = { adapter_id: string; score: number; decision: string; result_path: string; status: string };
+export type EvaluationResultSummary = {
+  filename: string;
+  adapter_id: string;
+  score: number | null;
+  decision: string | null;
+  case_count: number | null;
+  updated_at: string;
+};
+export type EvaluationResultListResponse = { results: EvaluationResultSummary[] };
+export type EvaluationResultDetail = { filename: string; payload: Record<string, unknown> };
 export type SleepRunResponse = {
   selected_episode_ids: string[];
   semantic_memory_ids: string[];
@@ -106,4 +116,6 @@ export const api = {
   approveAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
   activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
   rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
+  evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
+  evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
 };

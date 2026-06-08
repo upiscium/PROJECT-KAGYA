@@ -14,6 +14,8 @@ const ALLOWED_ROUTES = [
   { method: "POST", pattern: /^sleep\/run$/ },
   { method: "GET", pattern: /^adapters$/ },
   { method: "POST", pattern: /^adapters\/[^/]+\/(evaluate|trial|approve|activate|reject)$/ },
+  { method: "GET", pattern: /^evaluations$/ },
+  { method: "GET", pattern: /^evaluations\/[^/]+\.json$/ },
 ];
 
 export async function GET(request: NextRequest, context: RouteContext) {
