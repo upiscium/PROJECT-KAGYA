@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from kagya.tools.tool_schema import ToolDefinition
+from kagya.tools.tool_schema import ToolDefinition, ToolStatus, ToolType
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,11 @@ class ToolSandbox:
         self.policy = policy or ToolSandboxPolicy()
 
     def validate(self, tool: ToolDefinition) -> None:
+        if tool.status == ToolStatus.DISABLED:
+            raise PermissionError("Tool is disabled")
         if tool.generated and not self.policy.allow_generated_code_execution:
             raise PermissionError("Generated tool code execution is disabled in v1.0")
+        if tool.tool_type == ToolType.SHELL and not self.policy.allow_shell:
+            raise PermissionError("Shell tool execution is disabled")
         if self.policy.require_human_approval and not tool.human_approved:
             raise PermissionError("Tool execution requires human approval")

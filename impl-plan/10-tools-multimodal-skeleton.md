@@ -2,7 +2,7 @@
 
 ## Goal
 
-Prepare schema and extension points for later tool execution and multimodal support without implementing unsafe execution or image processing in v1.0.
+Prepare schema and extension points for later tool execution and multimodal support without implementing unsafe code execution or image processing in v1.0.
 
 ## Target Files
 
@@ -21,9 +21,11 @@ Prepare schema and extension points for later tool execution and multimodal supp
 - Define executor interfaces.
 - Define sandbox interfaces.
 - Define generator interfaces.
+- Only approved static `text_template` tools may execute in the first safe milestone.
 - Do not execute generated code.
 - Do not register generated tools without human approval.
 - Do not run shell commands from generated tools.
+- Record an audit event for every allowed or blocked execution request.
 
 ## Multimodal Skeleton Requirements
 
@@ -36,9 +38,11 @@ Prepare schema and extension points for later tool execution and multimodal supp
 
 - Chat request accepts empty attachments.
 - Non-empty attachments are either ignored safely or rejected with a clear v1.0 unsupported response.
-- Tool executor skeleton does not execute anything.
+- Tool executor runs approved static `text_template` tools only.
+- Tool executor blocks shell tools, generated tools, unknown tools, and unapproved tools.
 - Tool registry does not auto-register generated tools.
 
 ## Completion Criteria
 
 - Extension points exist without introducing unsafe execution paths.
+- The executable milestone is limited to deterministic string formatting from supplied arguments.
