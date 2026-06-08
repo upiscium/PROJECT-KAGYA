@@ -109,9 +109,16 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     approved = client.post("/api/adapters/adapter-api/approve", headers=admin_headers())
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
+    before_activation_chat = client.post("/api/chat", json={"text": "before activation", "attachments": []})
+    assert before_activation_chat.status_code == 200
+    assert before_activation_chat.json()["model"]["adapter_id"] is None
+
     active = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert active.status_code == 200
     assert active.json()["status"] == "active"
+    after_activation_chat = client.post("/api/chat", json={"text": "after activation", "attachments": []})
+    assert after_activation_chat.status_code == 200
+    assert after_activation_chat.json()["model"]["adapter_id"] == "adapter-api"
     listed = client.get("/api/adapters", headers=admin_headers())
     assert listed.status_code == 200
     assert listed.json()["adapters"][0]["status"] == "active"

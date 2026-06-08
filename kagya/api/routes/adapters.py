@@ -1,8 +1,14 @@
 """Adapter lifecycle routes."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from kagya.api.dependencies import get_adapter_registry, get_api_settings, get_model_provider, require_admin
+from kagya.api.dependencies import (
+    get_adapter_registry,
+    get_api_settings,
+    get_model_provider,
+    require_admin,
+    sync_main_loop_to_active_adapter,
+)
 from kagya.api.schemas.adapter import (
     AdapterEvaluateRequest,
     AdapterEvaluateResponse,
@@ -62,9 +68,15 @@ def approve_adapter(adapter_id: str, registry: AdapterRegistry = Depends(get_ada
 
 
 @router.post("/{adapter_id}/activate", response_model=AdapterResponse)
-def activate_adapter(adapter_id: str, registry: AdapterRegistry = Depends(get_adapter_registry)) -> AdapterResponse:
+def activate_adapter(
+    adapter_id: str,
+    request: Request,
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+) -> AdapterResponse:
     try:
-        return adapter_response(registry.activate(adapter_id))
+        entry = registry.activate(adapter_id)
+        sync_main_loop_to_active_adapter(request)
+        return adapter_response(entry)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
