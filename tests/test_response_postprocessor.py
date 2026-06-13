@@ -45,6 +45,14 @@ def test_visible_response_removes_html_like_tag_residue() -> None:
     assert processed.visible_response == "TitleAnswer"
 
 
+def test_visible_response_removes_gemma_turn_tokens() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("<start_of_turn>model\nA concise answer.<end_of_turn>")
+
+    assert processed.visible_response == "A concise answer."
+
+
 def test_visible_response_truncates_generated_prompt_label_echoes() -> None:
     postprocessor = ResponsePostprocessor()
 

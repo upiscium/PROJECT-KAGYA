@@ -32,7 +32,7 @@ class TransformersProvider:
             self.attach_adapter(adapter_path)
 
     def generate(self, prompt: str) -> str:
-        inputs = self.processor(text=prompt, return_tensors="pt")
+        inputs = self.processor(text=self._render_generation_prompt(prompt), return_tensors="pt")
         inputs = self._move_inputs_to_model_device(inputs)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
@@ -45,6 +45,20 @@ class TransformersProvider:
         input_length = inputs["input_ids"].shape[-1]
         generated_ids = output_ids[0][input_length:]
         return self.processor.decode(generated_ids, skip_special_tokens=True)
+
+    def _render_generation_prompt(self, prompt: str) -> str:
+        apply_chat_template = getattr(self.processor, "apply_chat_template", None)
+        if not callable(apply_chat_template):
+            return prompt
+        try:
+            rendered = apply_chat_template(
+                [{"role": "user", "content": _strip_assistant_marker(prompt)}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except TypeError:
+            return prompt
+        return rendered if isinstance(rendered, str) else prompt
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         if not target_text:
@@ -133,3 +147,10 @@ def _iter_registry_entries(registry_data: Any) -> list[dict[str, Any]]:
             if isinstance(path, str) and isinstance(state, str)
         ]
     return []
+
+
+def _strip_assistant_marker(prompt: str) -> str:
+    marker = "\nAssistant:"
+    if prompt.endswith(marker):
+        return prompt[: -len(marker)].rstrip()
+    return prompt
