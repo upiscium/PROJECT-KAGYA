@@ -18,12 +18,33 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 class FakeProcessor:
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
     def __call__(self, *, text: str, return_tensors: str) -> dict[str, torch.Tensor]:
+        self.texts.append(text)
         token_ids = list(range(1, len(text.split()) + 1)) or [0]
         return {"input_ids": torch.tensor([token_ids])}
 
     def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
         return " ".join(str(token_id) for token_id in output_ids.tolist())
+
+
+class FakeChatTemplateProcessor(FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages_seen: list[dict[str, str]] | None = None
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        self.messages_seen = messages
+        suffix = "<start_of_turn>model\n" if add_generation_prompt else ""
+        return f"<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n{suffix}"
 
 
 class FakeModel:
@@ -153,6 +174,28 @@ def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
     assert fake_model.generate_kwargs["temperature"] == settings.generation.temperature
     assert fake_model.generate_kwargs["top_p"] == settings.generation.top_p
     assert fake_model.generate_kwargs["do_sample"] is True
+
+
+def test_transformers_generate_uses_processor_chat_template_when_available() -> None:
+    fake_model = FakeModel()
+    processor = FakeChatTemplateProcessor()
+    provider = TransformersProvider(load_settings(CONFIG_PATH), model=fake_model, processor=processor)
+
+    provider.generate("Context: private runtime\nUser: hello\nAssistant:")
+
+    assert processor.messages_seen == [{"role": "user", "content": "Context: private runtime\nUser: hello"}]
+    assert processor.texts[0].startswith("<start_of_turn>user\n")
+    assert processor.texts[0].endswith("<start_of_turn>model\n")
+    assert "Assistant:" not in processor.texts[0]
+
+
+def test_transformers_generate_falls_back_when_chat_template_is_unavailable() -> None:
+    processor = FakeProcessor()
+    provider = TransformersProvider(load_settings(CONFIG_PATH), model=FakeModel(), processor=processor)
+
+    provider.generate("plain prompt")
+
+    assert processor.texts == ["plain prompt"]
 
 
 def test_adapter_paths_must_be_approved_by_registry(tmp_path: Path) -> None:
