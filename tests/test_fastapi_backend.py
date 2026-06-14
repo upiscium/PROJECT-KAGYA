@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from kagya.api.server import create_app
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem
+from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 
 
@@ -296,7 +296,7 @@ def _client(tmp_path: Path, *, settings: Settings | None = None, configure_admin
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = ThinkingProvider()
-    app.state.memory_system = DualMemorySystem(app_settings)
+    app.state.memory_system = DualMemorySystem(app_settings, embedding_function=DeterministicEmbeddingFunction())
     app.state.adapter_registry = AdapterRegistry(app_settings)
     return TestClient(app)
 

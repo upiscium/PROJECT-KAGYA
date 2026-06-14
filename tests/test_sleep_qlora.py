@@ -11,7 +11,7 @@ from kagya.learning import (
     SleepCycleManager,
     format_training_text,
 )
-from kagya.memory import DualMemorySystem
+from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 
 
@@ -20,7 +20,7 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 def test_high_emotion_episode_selection_follows_threshold_rules(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     threshold = settings.sleep.min_emotion_score
     high_arousal = memory.save_episodic("high arousal", "out", emotion_arousal=threshold + 0.01)
     high_valence = memory.save_episodic("high valence", "out", emotion_valence=-(threshold + 0.01))
@@ -37,7 +37,7 @@ def test_high_emotion_episode_selection_uses_configured_sleep_threshold(tmp_path
     settings = base_settings.model_copy(
         update={"sleep": base_settings.sleep.model_copy(update={"min_emotion_score": 0.4})}
     )
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     selected_by_config = memory.save_episodic("configured threshold", "out", emotion_arousal=0.41)
     memory.save_episodic("below threshold", "out", emotion_valence=-0.4)
     manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
@@ -49,7 +49,7 @@ def test_high_emotion_episode_selection_uses_configured_sleep_threshold(tmp_path
 
 def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     episode_id = memory.save_episodic(
         "dream input",
         "dream output",
@@ -205,7 +205,7 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
 
 def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     registry = AdapterRegistry(settings)
     memory.save_episodic(
         "sleep input",
@@ -253,3 +253,7 @@ def _settings_for_sleep(tmp_path: Path) -> Settings:
             ),
         }
     )
+
+
+def _memory(settings: Settings) -> DualMemorySystem:
+    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())

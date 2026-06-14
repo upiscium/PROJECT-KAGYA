@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
+from kagya.memory import (
+    DeterministicEmbeddingFunction,
+    DualMemorySystem,
+    MemoryRecordType,
+    SentenceTransformerEmbeddingFunction,
+    create_embedding_function,
+)
 from kagya.models import DummyProvider
 
 
@@ -9,7 +15,7 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def test_saving_episodic_record_returns_episode_id(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
 
     episode_id = memory.save_episodic("hello", "world")
 
@@ -17,7 +23,7 @@ def test_saving_episodic_record_returns_episode_id(tmp_path: Path) -> None:
 
 
 def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
     episode_id = memory.save_episodic(
         "I like lunar gardens",
         "Remembering lunar gardens.",
@@ -35,7 +41,7 @@ def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> Non
 
 
 def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
     semantic_id = memory.save_semantic("The user likes lunar gardens.")
 
     context = memory.retrieve_context("lunar gardens")
@@ -45,7 +51,7 @@ def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
 
 
 def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
     episode_id = memory.save_episodic("fact", "response", emotion_arousal=1.0)
 
     semantic_ids = memory.consolidate_to_semantic(DummyProvider())
@@ -58,7 +64,7 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
 
 
 def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path, db1_top_k=2, db2_top_k=1))
+    memory = _memory(_settings_for_tmp_memory(tmp_path, db1_top_k=2, db2_top_k=1))
     for index in range(3):
         memory.save_episodic(f"shared topic episode {index}", "response")
         memory.save_semantic(f"shared topic semantic {index}")
@@ -67,6 +73,40 @@ def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None
 
     assert len(context.db1_results) == 2
     assert len(context.db2_results) == 1
+
+
+def test_default_embedding_function_uses_configured_model_id(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    embedding = create_embedding_function(settings)
+
+    assert isinstance(embedding, SentenceTransformerEmbeddingFunction)
+    assert embedding.model_id == settings.memory.embedding_model_id
+
+
+def test_sentence_transformer_embedding_function_encodes_with_configured_model() -> None:
+    loaded: dict[str, object] = {}
+
+    class FakeModel:
+        def encode(self, texts: list[str], *, normalize_embeddings: bool) -> list[list[float]]:
+            loaded["texts"] = texts
+            loaded["normalize_embeddings"] = normalize_embeddings
+            return [[1.0, 0.0] for _ in texts]
+
+    embedding = SentenceTransformerEmbeddingFunction(
+        "sentence-transformers/test-model",
+        model_loader=lambda model_id: loaded.setdefault("model_id", model_id) and FakeModel(),
+    )
+
+    vectors = embedding(["hello", "world"])
+
+    assert loaded["model_id"] == "sentence-transformers/test-model"
+    assert loaded["texts"] == ["hello", "world"]
+    assert loaded["normalize_embeddings"] is True
+    assert vectors == [[1.0, 0.0], [1.0, 0.0]]
+
+
+def _memory(settings: Settings) -> DualMemorySystem:
+    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
 
 
 def _settings_for_tmp_memory(
