@@ -103,6 +103,106 @@ def test_qlora_dry_run_returns_adapter_candidate_result(tmp_path: Path) -> None:
     assert result.training_records == 1
 
 
+def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    settings = settings.model_copy(update={"qlora": settings.qlora.model_copy(update={"dry_run": False})})
+    dataset_path = settings.sleep.dream_dataset_path
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset_path.write_text(
+        json.dumps({"input": "i", "thought": "t", "output": "o"}) + "\n",
+        encoding="utf-8",
+    )
+    calls: dict[str, object] = {}
+
+    class FakeProcessor:
+        @staticmethod
+        def from_pretrained(model_id: str) -> object:
+            calls["processor_model_id"] = model_id
+            return object()
+
+    class FakeModelLoader:
+        @staticmethod
+        def from_pretrained(model_id: str, **kwargs: object) -> object:
+            calls["model_id"] = model_id
+            calls["model_kwargs"] = kwargs
+            return object()
+
+    class FakeBitsAndBytesConfig:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    class FakeDataset:
+        @staticmethod
+        def from_list(items: list[dict[str, str]]) -> list[dict[str, str]]:
+            calls["dataset"] = items
+            return items
+
+    class FakeLoraConfig:
+        def __init__(self, **kwargs: object) -> None:
+            calls["peft_config"] = kwargs
+
+    class FakeSFTConfig:
+        def __init__(self, **kwargs: object) -> None:
+            calls["training_args"] = kwargs
+
+    class FakeTrainer:
+        def __init__(self, **kwargs: object) -> None:
+            calls["trainer_kwargs"] = kwargs
+
+        def train(self) -> None:
+            calls["trained"] = True
+
+        def save_model(self, path: str) -> None:
+            calls["saved_path"] = path
+
+    monkeypatch.setattr(
+        QloraTrainer,
+        "_load_training_dependencies",
+        lambda self: {
+            "AutoModelForImageTextToText": FakeModelLoader,
+            "AutoProcessor": FakeProcessor,
+            "BitsAndBytesConfig": FakeBitsAndBytesConfig,
+            "Dataset": FakeDataset,
+            "LoraConfig": FakeLoraConfig,
+            "SFTConfig": FakeSFTConfig,
+            "SFTTrainer": FakeTrainer,
+            "prepare_model_for_kbit_training": lambda model: model,
+        },
+    )
+
+    result = QloraTrainer(settings).train(dataset_path)
+
+    manifest = json.loads((result.adapter_path / "training_manifest.json").read_text(encoding="utf-8"))
+    assert result.dry_run is False
+    assert result.training_records == 1
+    assert calls["processor_model_id"] == settings.model.primary_id
+    assert calls["model_id"] == settings.model.primary_id
+    assert calls["trained"] is True
+    assert calls["saved_path"] == str(result.adapter_path)
+    assert calls["dataset"] == [{"text": format_training_text(DreamDatasetRecord("i", "t", "o"))}]
+    assert calls["peft_config"] == {
+        "r": settings.qlora.r,
+        "lora_alpha": settings.qlora.lora_alpha,
+        "lora_dropout": settings.qlora.lora_dropout,
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+    }
+    assert calls["training_args"] == {
+        "output_dir": str(result.adapter_path),
+        "learning_rate": settings.qlora.learning_rate,
+        "num_train_epochs": settings.qlora.num_train_epochs,
+        "max_steps": settings.qlora.max_steps,
+        "per_device_train_batch_size": 1,
+        "logging_steps": 1,
+        "save_strategy": "no",
+        "report_to": [],
+    }
+    assert "quantization_config" in calls["model_kwargs"]
+    assert manifest["dry_run"] is False
+    assert manifest["dataset_hash"] == result.dataset_hash
+    assert manifest["qlora"]["max_steps"] == settings.qlora.max_steps
+
+
 def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     memory = DualMemorySystem(settings)

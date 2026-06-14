@@ -8,6 +8,7 @@ dependencies = [
     "accelerate",
     "bitsandbytes",
     "chromadb",
+    "datasets",
     "fastapi",
     "numpy",
     "peft",
