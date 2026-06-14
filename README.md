@@ -27,7 +27,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 | Field | Status |
 | --- | --- |
 | `model.fallback_id` | Reserved for future fallback model loading. Current providers load `model.primary_id` only. |
-| `memory.embedding_model_id` | Reserved for a future real embedding backend. Current memory uses deterministic local embeddings. |
+| `memory.embedding_model_id` | Active for the default sentence-transformers memory embedding backend. Tests and bootstrap flows can still inject deterministic embeddings explicitly. |
 | `adapter_registry.allowed_states` | Reserved as an operator-visible lifecycle contract. Runtime transitions are enforced by `AdapterStatus`. |
 | `adapter_registry.manual_approval_required` | Reserved for future automatic approval policy. Current lifecycle always requires explicit approval before activation. |
 | `qlora.alpha` / `qlora.dropout` | Legacy aliases retained for compatibility; `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing names. Dry-run manifests include both. |

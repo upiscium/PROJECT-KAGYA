@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from kagya.api.server import create_app
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem
+from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.tools import (
     ToolDefinition,
@@ -246,7 +246,7 @@ def _client(tmp_path: Path) -> TestClient:
     os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
-    app.state.memory_system = DualMemorySystem(settings)
+    app.state.memory_system = DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
     app.state.adapter_registry = AdapterRegistry(settings)
     return TestClient(app)
 

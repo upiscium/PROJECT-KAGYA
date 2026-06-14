@@ -41,6 +41,52 @@ class DeterministicEmbeddingFunction:
         return True
 
 
+class SentenceTransformerEmbeddingFunction:
+    """Chroma embedding function backed by a configured sentence-transformers model."""
+
+    def __init__(self, model_id: str, model_loader: Any | None = None) -> None:
+        self.model_id = model_id
+        self._model_loader = model_loader or _load_sentence_transformer
+        self._model: Any | None = None
+
+    def __call__(self, input: Sequence[str]) -> list[list[float]]:
+        return self._encode(input)
+
+    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
+        return self._encode(input)
+
+    def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
+        return self._encode(input)
+
+    def name(self) -> str:
+        return f"sentence-transformers:{self.model_id}"
+
+    @staticmethod
+    def is_legacy() -> bool:
+        return False
+
+    def _encode(self, input: Sequence[str]) -> list[list[float]]:
+        model = self._get_model()
+        embeddings = model.encode(list(input), normalize_embeddings=True)
+        if hasattr(embeddings, "tolist"):
+            return embeddings.tolist()
+        return [list(vector) for vector in embeddings]
+
+    def _get_model(self) -> Any:
+        if self._model is None:
+            self._model = self._model_loader(self.model_id)
+        return self._model
+
+
+def create_embedding_function(settings: Settings) -> Any:
+    """Create the configured memory embedding function."""
+
+    model_id = settings.memory.embedding_model_id
+    if model_id == "deterministic":
+        return DeterministicEmbeddingFunction()
+    return SentenceTransformerEmbeddingFunction(model_id)
+
+
 class DualMemorySystem:
     """Dual memory backed by DB1 hippocampus and DB2 cortex Chroma collections."""
 
@@ -51,7 +97,7 @@ class DualMemorySystem:
         evaluator: MemoryEvaluator | None = None,
     ) -> None:
         self.settings = settings
-        self.embedding_function = embedding_function or DeterministicEmbeddingFunction()
+        self.embedding_function = embedding_function or create_embedding_function(settings)
         self.evaluator = evaluator or MemoryEvaluator()
         self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
         self.db1 = self.client.get_or_create_collection(
@@ -162,6 +208,14 @@ def _embed_text(text: str) -> list[float]:
         buckets[index % len(buckets)] += float(ord(char) % 31) / 31.0
     magnitude = sum(value * value for value in buckets) ** 0.5 or 1.0
     return [value / magnitude for value in buckets]
+
+
+def _load_sentence_transformer(model_id: str) -> Any:
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError("sentence-transformers is required for configured memory embeddings") from exc
+    return SentenceTransformer(model_id)
 
 
 def _now_iso() -> str:

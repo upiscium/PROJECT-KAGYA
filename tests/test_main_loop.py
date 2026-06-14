@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem
+from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.runtime import KagyaMainLoop
 
@@ -22,7 +22,7 @@ class ThinkingDummyProvider(DummyProvider):
 
 def test_dummy_provider_drives_user_input_to_response_end_to_end(tmp_path: Path) -> None:
     provider = ThinkingDummyProvider()
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
     loop = KagyaMainLoop(_settings_for_tmp_memory(tmp_path), provider, memory)
 
     result = loop.chat("hello", debug=True)
@@ -37,7 +37,7 @@ def test_dummy_provider_drives_user_input_to_response_end_to_end(tmp_path: Path)
 
 def test_db1_receives_saved_episode_with_hidden_thought(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result = loop.chat("remember this", debug=True)
@@ -54,7 +54,7 @@ def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
     result = KagyaMainLoop(
         settings,
         ThinkingDummyProvider(),
-        DualMemorySystem(settings),
+        _memory(settings),
     ).chat("hello", debug=False)
 
     assert "<think>" not in result.response
@@ -63,7 +63,7 @@ def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
 
 def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
     before = loop.emotion_engine.state
 
     result = loop.chat("emotion update", debug=True)
@@ -75,7 +75,7 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
 def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     provider = ThinkingDummyProvider()
-    memory = DualMemorySystem(settings)
+    memory = _memory(settings)
     memory.save_episodic("old episode", "old answer")
     memory.save_semantic("stable semantic memory")
     loop = KagyaMainLoop(settings, provider, memory)
@@ -99,7 +99,7 @@ def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     result = KagyaMainLoop(
         settings,
         ThinkingDummyProvider(),
-        DualMemorySystem(settings),
+        _memory(settings),
     ).chat(
         "describe this",
         debug=True,
@@ -127,7 +127,7 @@ def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     result = KagyaMainLoop(
         settings,
         ThinkingDummyProvider(),
-        DualMemorySystem(settings),
+        _memory(settings),
     ).chat("answer naturally", debug=True)
 
     assert result.prompt.startswith("Context: PROJECT-KAGYA")
@@ -149,3 +149,7 @@ def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
             )
         }
     )
+
+
+def _memory(settings: Settings) -> DualMemorySystem:
+    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
