@@ -20,15 +20,31 @@ class ThinkingProvider(DummyProvider):
     response_text = "<think>debug thought</think>Visible API answer."
 
 
+class EmptyFallbackProvider(DummyProvider):
+    response_text = "<think>primary hidden only</think>"
+
+    def __init__(self) -> None:
+        self.last_model_id = "primary-model"
+        self.last_fallback_used = False
+
+    def generate_fallback(self, prompt: str) -> str:
+        self.last_model_id = "fallback-model"
+        self.last_fallback_used = True
+        return "<think>fallback hidden only</think>"
+
+
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    response = client.post("/api/chat", json={"text": "hello", "attachments": [], "debug": False})
+    response = client.post(
+        "/api/chat", json={"text": "hello", "attachments": [], "debug": False}
+    )
 
     assert response.status_code == 200
     data = response.json()
     assert set(data) == {"episode_id", "response", "emotion", "model"}
     assert data["response"] == "Visible API answer."
+    assert data["model"]["fallback_used"] is False
     assert "hidden_thought" not in data
     assert "prompt" not in data
     assert "<think>" not in str(data)
@@ -44,7 +60,11 @@ def test_api_chat_accepts_multiple_attachments(tmp_path: Path) -> None:
             "attachments": [
                 {"type": "image", "url": "file:///tmp/image.png", "name": "image.png"},
                 {"type": "audio", "url": "file:///tmp/audio.wav", "duration_ms": 1200},
-                {"type": "video", "url": "file:///tmp/video.mp4", "content_type": "video/mp4"},
+                {
+                    "type": "video",
+                    "url": "file:///tmp/video.mp4",
+                    "content_type": "video/mp4",
+                },
             ],
             "debug": False,
         },
@@ -86,9 +106,39 @@ def test_api_chat_debug_includes_attachment_metadata_in_prompt(tmp_path: Path) -
 
 
 def test_api_chat_accepts_legacy_message_key(tmp_path: Path) -> None:
-    response = _client(tmp_path).post("/api/chat", json={"message": "hello", "attachments": []})
+    response = _client(tmp_path).post(
+        "/api/chat", json={"message": "hello", "attachments": []}
+    )
 
     assert response.status_code == 200
+
+
+def test_api_chat_returns_500_when_fallback_has_no_visible_response(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    client.app.state.model_provider = EmptyFallbackProvider()
+
+    response = client.post("/api/chat", json={"text": "hello", "attachments": []})
+
+    assert response.status_code == 500
+    assert "empty visible response" in response.json()["detail"]
+
+
+def test_debug_chat_returns_500_when_fallback_has_no_visible_response(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    client.app.state.model_provider = EmptyFallbackProvider()
+
+    response = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={"text": "hello", "attachments": [], "debug": True},
+    )
+
+    assert response.status_code == 500
+    assert "empty visible response" in response.json()["detail"]
 
 
 def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None:
@@ -114,7 +164,11 @@ def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     app = create_app(settings)
 
-    cors = next(middleware for middleware in app.user_middleware if middleware.cls is CORSMiddleware)
+    cors = next(
+        middleware
+        for middleware in app.user_middleware
+        if middleware.cls is CORSMiddleware
+    )
     assert cors.kwargs["allow_origins"] == settings.api.cors_origins
 
 
@@ -142,14 +196,18 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     approved = client.post("/api/adapters/adapter-api/approve", headers=admin_headers())
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
-    before_activation_chat = client.post("/api/chat", json={"text": "before activation", "attachments": []})
+    before_activation_chat = client.post(
+        "/api/chat", json={"text": "before activation", "attachments": []}
+    )
     assert before_activation_chat.status_code == 200
     assert before_activation_chat.json()["model"]["adapter_id"] is None
 
     active = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert active.status_code == 200
     assert active.json()["status"] == "active"
-    after_activation_chat = client.post("/api/chat", json={"text": "after activation", "attachments": []})
+    after_activation_chat = client.post(
+        "/api/chat", json={"text": "after activation", "attachments": []}
+    )
     assert after_activation_chat.status_code == 200
     assert after_activation_chat.json()["model"]["adapter_id"] == "adapter-api"
     listed = client.get("/api/adapters", headers=admin_headers())
@@ -157,7 +215,9 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     assert listed.json()["adapters"][0]["status"] == "active"
 
 
-def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate(tmp_path: Path) -> None:
+def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate(
+    tmp_path: Path,
+) -> None:
     settings = _settings(tmp_path)
     settings = settings.model_copy(
         update={
@@ -258,7 +318,9 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
         hidden_thought="private memory thought",
     )
 
-    search = client.get("/api/memory/search", headers=admin_headers(), params={"query": "memory"})
+    search = client.get(
+        "/api/memory/search", headers=admin_headers(), params={"query": "memory"}
+    )
     detail = client.get(f"/api/memory/episodes/{episode_id}", headers=admin_headers())
 
     assert search.status_code == 200
@@ -272,9 +334,21 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
-    assert client.post("/api/chat", json={"text": "hello", "attachments": [], "debug": False}).status_code == 200
-    assert client.post("/api/chat/debug", json={"text": "hello", "attachments": [], "debug": True}).status_code == 401
-    assert client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
+    assert (
+        client.post(
+            "/api/chat", json={"text": "hello", "attachments": [], "debug": False}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/chat/debug", json={"text": "hello", "attachments": [], "debug": True}
+        ).status_code
+        == 401
+    )
+    assert (
+        client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
+    )
     assert client.post("/api/sleep/run").status_code == 401
     assert client.get("/api/adapters").status_code == 401
 
@@ -282,13 +356,22 @@ def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
 def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
     client = _client(tmp_path, configure_admin_token=False)
 
-    response = client.post("/api/chat/debug", headers=admin_headers(), json={"text": "hello", "attachments": []})
+    response = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={"text": "hello", "attachments": []},
+    )
 
     assert response.status_code == 503
     assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
 
-def _client(tmp_path: Path, *, settings: Settings | None = None, configure_admin_token: bool = True) -> TestClient:
+def _client(
+    tmp_path: Path,
+    *,
+    settings: Settings | None = None,
+    configure_admin_token: bool = True,
+) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     else:
@@ -296,7 +379,9 @@ def _client(tmp_path: Path, *, settings: Settings | None = None, configure_admin
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = ThinkingProvider()
-    app.state.memory_system = DualMemorySystem(app_settings, embedding_function=DeterministicEmbeddingFunction())
+    app.state.memory_system = DualMemorySystem(
+        app_settings, embedding_function=DeterministicEmbeddingFunction()
+    )
     app.state.adapter_registry = AdapterRegistry(app_settings)
     return TestClient(app)
 
@@ -313,7 +398,9 @@ def _settings(tmp_path: Path) -> Settings:
                 }
             ),
             "sleep": settings.sleep.model_copy(
-                update={"dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl"}
+                update={
+                    "dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl"
+                }
             ),
             "qlora": settings.qlora.model_copy(
                 update={"output_dir": tmp_path / "adapters", "dry_run": True}
@@ -325,7 +412,9 @@ def _settings(tmp_path: Path) -> Settings:
                     "eval_sets": [],
                 }
             ),
-            "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
+            "api": settings.api.model_copy(
+                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
+            ),
         }
     )
 

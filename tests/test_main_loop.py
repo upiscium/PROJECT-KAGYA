@@ -20,7 +20,26 @@ class ThinkingDummyProvider(DummyProvider):
         return self.response_text
 
 
-def test_dummy_provider_drives_user_input_to_response_end_to_end(tmp_path: Path) -> None:
+class ThinkOnlyPrimaryProvider(ThinkingDummyProvider):
+    response_text = "<think>internal only</think>"
+
+    def __init__(self, fallback_response: str = "Fallback visible answer.") -> None:
+        super().__init__()
+        self.fallback_response = fallback_response
+        self.fallback_calls = 0
+        self.last_model_id = "primary-model"
+        self.last_fallback_used = False
+
+    def generate_fallback(self, prompt: str) -> str:
+        self.fallback_calls += 1
+        self.last_model_id = "fallback-model"
+        self.last_fallback_used = True
+        return self.fallback_response
+
+
+def test_dummy_provider_drives_user_input_to_response_end_to_end(
+    tmp_path: Path,
+) -> None:
     provider = ThinkingDummyProvider()
     memory = _memory(_settings_for_tmp_memory(tmp_path))
     loop = KagyaMainLoop(_settings_for_tmp_memory(tmp_path), provider, memory)
@@ -122,6 +141,43 @@ def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     assert "ignored" not in result.prompt
 
 
+def test_empty_visible_primary_response_uses_fallback_and_clears_adapter(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkOnlyPrimaryProvider()
+    result = KagyaMainLoop(
+        settings,
+        provider,
+        _memory(settings),
+        adapter_id="adapter-primary",
+    ).chat("hello", debug=True)
+
+    assert result.response == "Fallback visible answer."
+    assert result.model_id == "fallback-model"
+    assert result.fallback_used is True
+    assert result.adapter_id is None
+    assert provider.fallback_calls == 1
+
+
+def test_empty_visible_fallback_response_raises_runtime_error(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkOnlyPrimaryProvider(fallback_response="<think>still hidden</think>")
+    loop = KagyaMainLoop(
+        settings,
+        provider,
+        _memory(settings),
+    )
+
+    try:
+        loop.chat("hello", debug=True)
+    except RuntimeError as exc:
+        assert "empty visible response" in str(exc)
+        assert provider.fallback_calls == 1
+    else:
+        raise AssertionError("empty fallback output should fail")
+
+
 def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(
@@ -152,4 +208,6 @@ def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
 
 
 def _memory(settings: Settings) -> DualMemorySystem:
-    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
+    return DualMemorySystem(
+        settings, embedding_function=DeterministicEmbeddingFunction()
+    )

@@ -2,7 +2,7 @@ const API_PROXY_BASE_URL = "/api-proxy";
 const ADMIN_PROXY_BASE_URL = "/admin-proxy";
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
-export type ModelInfo = { model_id: string; adapter_id: string | null };
+export type ModelInfo = { model_id: string; adapter_id: string | null; fallback_used: boolean };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
 export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: boolean };

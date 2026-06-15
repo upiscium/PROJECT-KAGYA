@@ -25,7 +25,7 @@ describe("ChatClient", () => {
         episode_id: "episode-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
-        model: { model_id: "google/gemma-4-E4B", adapter_id: null },
+        model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
       }),
     });
     renderWithQuery();
@@ -46,7 +46,7 @@ describe("ChatClient", () => {
         episode_id: "episode-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
-        model: { model_id: "google/gemma-4-E4B", adapter_id: null },
+        model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
       }),
     });
     renderWithQuery();
