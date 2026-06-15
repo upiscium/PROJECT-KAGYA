@@ -7,18 +7,18 @@ default: check-all
 # =============================================================================
 
 # コードの静的解析（Lint）を実行します
-lint target="src/":
+lint target="kagya tests":
     @echo "==> Running Linter (Ruff) on {{target}}..."
     uv run ruff check {{target}}
 
 # コードの自動フォーマットを実行します
-format target="src/":
+format target="kagya tests":
     @echo "==> Running Formatter (Ruff) on {{target}}..."
     uv run ruff format {{target}}
     uv run ruff check --fix {{target}}
 
 # 静的型チェックを実行します
-typecheck target="src/":
+typecheck target="kagya":
     @echo "==> Running Type Checker (Mypy) on {{target}}..."
     uv run mypy {{target}}
 
