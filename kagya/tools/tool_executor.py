@@ -1,8 +1,17 @@
-"""Tool executor skeleton that intentionally executes nothing."""
+"""Tool executor for approved declarative side-effect-free tools."""
+
+import json
 
 from kagya.tools.tool_registry import ToolRegistry
 from kagya.tools.tool_sandbox import ToolSandbox
-from kagya.tools.tool_schema import ToolAuditEvent, ToolExecutionRequest, ToolExecutionResult, ToolStatus, ToolType
+from kagya.tools.tool_schema import (
+    ToolAuditEvent,
+    ToolDefinition,
+    ToolExecutionRequest,
+    ToolExecutionResult,
+    ToolStatus,
+    ToolType,
+)
 
 
 class ToolExecutionBlocked(RuntimeError):
@@ -10,9 +19,11 @@ class ToolExecutionBlocked(RuntimeError):
 
 
 class ToolExecutor:
-    """Executor interface that blocks all execution until sandboxing is implemented."""
+    """Executor for approved declarative safe tool milestones."""
 
-    def __init__(self, registry: ToolRegistry, sandbox: ToolSandbox | None = None) -> None:
+    def __init__(
+        self, registry: ToolRegistry, sandbox: ToolSandbox | None = None
+    ) -> None:
         self.registry = registry
         self.sandbox = sandbox or ToolSandbox()
         self.audit_log: list[ToolAuditEvent] = []
@@ -35,7 +46,9 @@ class ToolExecutor:
                 executed=False,
                 blocked_reason=str(exc),
             )
-            self._audit(tool.name, False, tool.status, tool.tool_type, result.blocked_reason)
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+            )
             return result
         if tool.status != ToolStatus.APPROVED:
             result = ToolExecutionResult(
@@ -43,16 +56,27 @@ class ToolExecutor:
                 executed=False,
                 blocked_reason="Tool must be approved before execution",
             )
-            self._audit(tool.name, False, tool.status, tool.tool_type, result.blocked_reason)
-            return result
-        if tool.tool_type != ToolType.TEXT_TEMPLATE:
-            result = ToolExecutionResult(
-                tool_name=request.tool_name,
-                executed=False,
-                blocked_reason="Tool type is not executable in the safe milestone",
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
             )
-            self._audit(tool.name, False, tool.status, tool.tool_type, result.blocked_reason)
             return result
+        if tool.tool_type == ToolType.TEXT_TEMPLATE:
+            return self._execute_text_template(tool, request)
+        if tool.tool_type == ToolType.METADATA_LOOKUP:
+            return self._execute_metadata_lookup(tool, request)
+        result = ToolExecutionResult(
+            tool_name=request.tool_name,
+            executed=False,
+            blocked_reason="Tool type is not executable in the safe milestone",
+        )
+        self._audit(
+            tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+        )
+        return result
+
+    def _execute_text_template(
+        self, tool: ToolDefinition, request: ToolExecutionRequest
+    ) -> ToolExecutionResult:
         try:
             output = tool.output_template.format_map(_SafeFormatMap(request.arguments))
         except Exception as exc:
@@ -61,10 +85,60 @@ class ToolExecutor:
                 executed=False,
                 blocked_reason=f"Tool template rendering failed: {exc}",
             )
-            self._audit(tool.name, False, tool.status, tool.tool_type, result.blocked_reason)
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+            )
             return result
-        result = ToolExecutionResult(tool_name=request.tool_name, executed=True, output=output)
-        self._audit(tool.name, True, tool.status, tool.tool_type, "executed text_template")
+        result = ToolExecutionResult(
+            tool_name=request.tool_name, executed=True, output=output
+        )
+        self._audit(
+            tool.name, True, tool.status, tool.tool_type, "executed text_template"
+        )
+        return result
+
+    def _execute_metadata_lookup(
+        self, tool: ToolDefinition, request: ToolExecutionRequest
+    ) -> ToolExecutionResult:
+        key = request.arguments.get("key")
+        if not isinstance(key, str):
+            result = ToolExecutionResult(
+                tool_name=request.tool_name,
+                executed=False,
+                blocked_reason="Metadata lookup requires a string key argument",
+            )
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+            )
+            return result
+        if key not in tool.metadata:
+            result = ToolExecutionResult(
+                tool_name=request.tool_name,
+                executed=False,
+                blocked_reason="Metadata key is not available",
+            )
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+            )
+            return result
+        try:
+            output = _stringify_metadata_value(tool.metadata[key])
+        except TypeError as exc:
+            result = ToolExecutionResult(
+                tool_name=request.tool_name,
+                executed=False,
+                blocked_reason=f"Metadata value is not serializable: {exc}",
+            )
+            self._audit(
+                tool.name, False, tool.status, tool.tool_type, result.blocked_reason
+            )
+            return result
+        result = ToolExecutionResult(
+            tool_name=request.tool_name, executed=True, output=output
+        )
+        self._audit(
+            tool.name, True, tool.status, tool.tool_type, "executed metadata_lookup"
+        )
         return result
 
     def _audit(
@@ -89,3 +163,9 @@ class ToolExecutor:
 class _SafeFormatMap(dict[str, object]):
     def __missing__(self, key: str) -> str:
         raise KeyError(f"Missing tool argument: {key}")
+
+
+def _stringify_metadata_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))

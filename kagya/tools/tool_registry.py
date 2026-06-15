@@ -11,7 +11,9 @@ class ToolRegistry:
 
     def register_declared(self, tool: ToolDefinition) -> ToolDefinition:
         if tool.generated and not tool.human_approved:
-            raise ValueError("Generated tools require human approval before registration")
+            raise ValueError(
+                "Generated tools require human approval before registration"
+            )
         if tool.status == ToolStatus.GENERATED_PENDING_APPROVAL:
             raise ValueError("Pending generated tools cannot be registered")
         self._tools[tool.name] = tool
@@ -24,6 +26,7 @@ class ToolRegistry:
             input_schema=tool.input_schema,
             tool_type=tool.tool_type,
             output_template=tool.output_template,
+            metadata=tool.metadata,
             status=ToolStatus.GENERATED_PENDING_APPROVAL,
             human_approved=False,
             generated=True,
@@ -38,6 +41,7 @@ class ToolRegistry:
             input_schema=proposal.input_schema,
             tool_type=proposal.tool_type,
             output_template=proposal.output_template,
+            metadata=proposal.metadata,
             status=ToolStatus.APPROVED,
             human_approved=True,
             generated=True,
