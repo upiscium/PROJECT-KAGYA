@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from kagya.api.dependencies import get_api_settings, require_admin
+from kagya.api.redaction import redact_private_fields
 from kagya.api.schemas.evaluation import (
     EvaluationResultDetail,
     EvaluationResultListResponse,
@@ -17,7 +18,6 @@ from kagya.config import Settings
 
 
 router = APIRouter(prefix="/api/evaluations", tags=["evaluations"], dependencies=[Depends(require_admin)])
-PRIVATE_RESULT_KEYS = {"hidden_thought", "prompt", "raw_prompt", "retrieved_memory"}
 
 
 @router.get("", response_model=EvaluationResultListResponse)
@@ -42,7 +42,7 @@ def get_evaluation_result(
     result_path = settings.adapter_registry.eval_result_dir / filename
     if not result_path.is_file():
         raise HTTPException(status_code=404, detail="Evaluation result not found")
-    return EvaluationResultDetail(filename=filename, payload=_redact_private_fields(_read_json_object(result_path)))
+    return EvaluationResultDetail(filename=filename, payload=redact_private_fields(_read_json_object(result_path)))
 
 
 def _summary_from_path(path: Path) -> EvaluationResultSummary:
@@ -63,17 +63,6 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail=f"Evaluation result is not a JSON object: {path.name}")
     return data
-
-
-def _redact_private_fields(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: "[redacted]" if key in PRIVATE_RESULT_KEYS else _redact_private_fields(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_private_fields(item) for item in value]
-    return value
 
 
 def _optional_float(value: Any) -> float | None:
