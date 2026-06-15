@@ -9,3 +9,10 @@
 - #62 Keep frontend API types aligned with backend schemas.
 - #63 Add real multimodal attachment processing beyond text prompt metadata.
 - #64 Improve adapter evaluation operations.
+- #65 Add real-model smoke test for Transformers provider.
+- #66 Fix project command defaults for package layout.
+- #67 Define configuration migration and compatibility policy.
+- #68 Add admin UI authentication and session layer.
+- #69 Add health, version, and build metadata endpoint.
+- #70 Add data retention and pruning policy for `.kagya` data.
+- #71 Harden frontend error handling and empty states.
