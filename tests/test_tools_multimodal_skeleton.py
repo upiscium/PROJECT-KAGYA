@@ -88,7 +88,9 @@ def test_debug_chat_response_includes_received_attachments(tmp_path: Path) -> No
     ]
 
 
-def test_public_chat_response_does_not_include_received_attachments(tmp_path: Path) -> None:
+def test_public_chat_response_does_not_include_received_attachments(
+    tmp_path: Path,
+) -> None:
     response = _client(tmp_path).post(
         "/api/chat",
         json={
@@ -113,7 +115,9 @@ def test_tool_executor_blocks_non_executable_registered_tools() -> None:
         )
     )
 
-    result = ToolExecutor(registry).execute(ToolExecutionRequest(tool_name="safe_lookup"))
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name="safe_lookup")
+    )
 
     assert result.executed is False
     assert result.blocked_reason == "Tool type is not executable in the safe milestone"
@@ -147,6 +151,100 @@ def test_tool_executor_runs_approved_text_template_tools() -> None:
     assert executor.audit_log[-1].tool_type == ToolType.TEXT_TEMPLATE
 
 
+def test_tool_executor_runs_approved_metadata_lookup_tools() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user", "counts": {"eval_sets": 2}},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+    executor = ToolExecutor(registry)
+
+    owner = executor.execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": "owner"})
+    )
+    counts = executor.execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": "counts"})
+    )
+
+    assert owner.executed is True
+    assert owner.output == "local-user"
+    assert counts.executed is True
+    assert counts.output == '{"eval_sets":2}'
+    assert executor.audit_log[-1].tool_name == "project_metadata"
+    assert executor.audit_log[-1].executed is True
+    assert executor.audit_log[-1].tool_type == ToolType.METADATA_LOOKUP
+
+
+def test_tool_executor_blocks_metadata_lookup_without_string_key() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": 1})
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason == "Metadata lookup requires a string key argument"
+
+
+def test_tool_executor_blocks_unknown_metadata_lookup_key() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": "missing"})
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason == "Metadata key is not available"
+
+
+def test_tool_executor_blocks_non_serializable_metadata_lookup_value() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"bad": object()},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": "bad"})
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason is not None
+    assert result.blocked_reason.startswith("Metadata value is not serializable")
+
+
 def test_tool_executor_blocks_unapproved_text_template_tools() -> None:
     registry = ToolRegistry()
     registry.register_declared(
@@ -161,7 +259,11 @@ def test_tool_executor_blocks_unapproved_text_template_tools() -> None:
     )
     executor = ToolExecutor(registry)
 
-    result = executor.execute(ToolExecutionRequest(tool_name="unapproved_template", arguments={"name": "user"}))
+    result = executor.execute(
+        ToolExecutionRequest(
+            tool_name="unapproved_template", arguments={"name": "user"}
+        )
+    )
 
     assert result.executed is False
     assert result.blocked_reason == "Tool execution requires human approval"
@@ -180,14 +282,41 @@ def test_tool_executor_blocks_shell_tools_even_when_approved() -> None:
         )
     )
 
-    result = ToolExecutor(registry).execute(ToolExecutionRequest(tool_name="shell_date"))
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name="shell_date")
+    )
 
     assert result.executed is False
     assert result.blocked_reason == "Shell tool execution is disabled"
 
 
+def test_tool_executor_blocks_unapproved_metadata_lookup_tools() -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="unapproved_metadata",
+            description="not approved yet",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            status=ToolStatus.APPROVED,
+            human_approved=False,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(
+            tool_name="unapproved_metadata", arguments={"key": "owner"}
+        )
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason == "Tool execution requires human approval"
+
+
 def test_tool_executor_blocks_unknown_tools() -> None:
-    result = ToolExecutor(ToolRegistry()).execute(ToolExecutionRequest(tool_name="missing"))
+    result = ToolExecutor(ToolRegistry()).execute(
+        ToolExecutionRequest(tool_name="missing")
+    )
 
     assert result.executed is False
     assert result.blocked_reason == "Tool is not registered"
@@ -215,7 +344,9 @@ def test_tool_registry_rejects_unapproved_generated_registration() -> None:
     except ValueError as exc:
         assert "human approval" in str(exc) or "Pending generated" in str(exc)
     else:
-        raise AssertionError("Generated tool registration should require human approval")
+        raise AssertionError(
+            "Generated tool registration should require human approval"
+        )
 
 
 def test_tool_executor_blocks_generated_tools_even_after_approval() -> None:
@@ -241,12 +372,37 @@ def test_tool_executor_blocks_generated_tools_even_after_approval() -> None:
     assert result.blocked_reason == "Generated tool code execution is disabled in v1.0"
 
 
+def test_tool_executor_blocks_generated_metadata_lookup_even_after_approval() -> None:
+    registry = ToolRegistry()
+    proposal = ToolGenerator().propose("generated_metadata", "generated", "print('no')")
+    approved = registry.approve_generated(
+        ToolDefinition(
+            name=proposal.tool.name,
+            description=proposal.tool.description,
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            status=proposal.tool.status,
+            human_approved=proposal.tool.human_approved,
+            generated=proposal.tool.generated,
+        )
+    )
+
+    result = ToolExecutor(registry).execute(
+        ToolExecutionRequest(tool_name=approved.name, arguments={"key": "owner"})
+    )
+
+    assert result.executed is False
+    assert result.blocked_reason == "Generated tool code execution is disabled in v1.0"
+
+
 def _client(tmp_path: Path) -> TestClient:
     settings = _settings(tmp_path)
     os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
-    app.state.memory_system = DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
+    app.state.memory_system = DualMemorySystem(
+        settings, embedding_function=DeterministicEmbeddingFunction()
+    )
     app.state.adapter_registry = AdapterRegistry(settings)
     return TestClient(app)
 
@@ -269,6 +425,8 @@ def _settings(tmp_path: Path) -> Settings:
                     "eval_sets": [],
                 }
             ),
-            "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
+            "api": settings.api.model_copy(
+                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
+            ),
         }
     )

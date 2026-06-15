@@ -15,6 +15,7 @@ class ToolStatus(StrEnum):
 class ToolType(StrEnum):
     METADATA = "metadata"
     TEXT_TEMPLATE = "text_template"
+    METADATA_LOOKUP = "metadata_lookup"
     SHELL = "shell"
 
 
@@ -25,6 +26,7 @@ class ToolDefinition:
     input_schema: dict[str, Any] = field(default_factory=dict)
     tool_type: ToolType = ToolType.METADATA
     output_template: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
     status: ToolStatus = ToolStatus.DECLARED
     human_approved: bool = False
     generated: bool = False

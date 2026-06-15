@@ -22,6 +22,7 @@ Prepare schema and extension points for later tool execution and multimodal supp
 - Define sandbox interfaces.
 - Define generator interfaces.
 - Only approved static `text_template` tools may execute in the first safe milestone.
+- The next safe milestone adds approved static `metadata_lookup` tools that read one key from human-approved tool metadata.
 - Do not execute generated code.
 - Do not register generated tools without human approval.
 - Do not run shell commands from generated tools.
@@ -38,11 +39,11 @@ Prepare schema and extension points for later tool execution and multimodal supp
 
 - Chat request accepts empty attachments.
 - Non-empty attachments are either ignored safely or rejected with a clear v1.0 unsupported response.
-- Tool executor runs approved static `text_template` tools only.
+- Tool executor runs approved static `text_template` and `metadata_lookup` tools only.
 - Tool executor blocks shell tools, generated tools, unknown tools, and unapproved tools.
 - Tool registry does not auto-register generated tools.
 
 ## Completion Criteria
 
 - Extension points exist without introducing unsafe execution paths.
-- The executable milestone is limited to deterministic string formatting from supplied arguments.
+- The executable milestones are limited to deterministic string formatting from supplied arguments and static metadata lookup from approved tool definitions.
