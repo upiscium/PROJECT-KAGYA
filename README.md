@@ -18,7 +18,16 @@
 
 - `config.yaml` defaults to the safe `dummy` provider.
 - Real model smoke should use the Transformers provider and model IDs from `config.yaml` only.
+- The Transformers provider lazy-loads `model.primary_id` per request and falls back to `model.fallback_id` when primary loading or generation fails.
+- Chat responses include `model.fallback_used`; fallback responses report the fallback model ID and no active adapter.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
+
+## Safe Tools
+
+- Approved static `text_template` tools can render deterministic strings from supplied arguments.
+- Approved static `metadata_lookup` tools can read one key from human-approved tool metadata.
+- Shell tools, generated code execution, unapproved tools, disabled tools, and unknown tools remain blocked.
+- Tool execution attempts record audit events for both allowed and blocked requests.
 
 ## Configuration Field Status
 
@@ -26,19 +35,21 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 
 | Field | Status |
 | --- | --- |
-| `model.fallback_id` | Reserved for future fallback model loading. Current providers load `model.primary_id` only. |
+| `model.fallback_id` | Active for Transformers per-request fallback generation. Dummy provider ignores it. |
 | `memory.embedding_model_id` | Active for the default sentence-transformers memory embedding backend. Tests and bootstrap flows can still inject deterministic embeddings explicitly. |
 | `adapter_registry.allowed_states` | Reserved as an operator-visible lifecycle contract. Runtime transitions are enforced by `AdapterStatus`. |
 | `adapter_registry.manual_approval_required` | Reserved for future automatic approval policy. Current lifecycle always requires explicit approval before activation. |
 | `qlora.alpha` / `qlora.dropout` | Legacy aliases retained for compatibility; `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing names. Dry-run manifests include both. |
-| `qlora.max_steps` | Reserved for the non-dry-run trainer; dry-run manifests include it for auditability. |
+| `qlora.max_steps` | Active for the minimal non-dry-run trainer and included in dry-run manifests for auditability. |
 
 ## Release Checklist
 
 - `uv run pytest`
-- `nix develop --command npm test` from `frontend/`
-- `nix develop --command npm run build` from `frontend/`
+- `uv run ruff check kagya tests`
+- `npm test -- --run` from `frontend/`
+- `npm run build` from `frontend/`
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`
+- `KAGYA_ADMIN_TOKEN=... scripts/smoke-private-deploy.sh http://127.0.0.1:8080` for private deployments.
 - Search for forbidden provider implementation paths.
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
 
