@@ -1,0 +1,27 @@
+"""Shared helpers for removing private runtime fields from API payloads."""
+
+from typing import Any
+
+
+PRIVATE_FIELD_KEYS = frozenset(
+    {
+        "hidden_thought",
+        "prompt",
+        "raw_prompt",
+        "retrieved_memory",
+    }
+)
+REDACTED_VALUE = "[redacted]"
+
+
+def redact_private_fields(value: Any, *, private_keys: frozenset[str] = PRIVATE_FIELD_KEYS) -> Any:
+    """Return a copy of a nested payload with private fields redacted."""
+
+    if isinstance(value, dict):
+        return {
+            key: REDACTED_VALUE if key in private_keys else redact_private_fields(item, private_keys=private_keys)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_private_fields(item, private_keys=private_keys) for item in value]
+    return value
