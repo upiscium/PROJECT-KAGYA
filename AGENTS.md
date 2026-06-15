@@ -11,8 +11,8 @@
 - Start FastAPI with `just api`; it runs `python -m kagya.api.server` and binds to `api.host`/`api.port` from `config.yaml`.
 - Run all backend tests with `uv run pytest`.
 - Run one backend test file with `uv run pytest tests/test_fastapi_backend.py -q`.
-- `Justfile` defaults `lint`, `format`, and `typecheck` to `src/`; pass the real package explicitly, e.g. `just lint kagya`, `just format kagya`, `just typecheck kagya`.
-- Current baseline: `uv run pytest` passes; `just lint kagya` and `just typecheck kagya` fail on existing issues, so do not assume `just check-all` is green.
+- `Justfile` defaults target the real package layout: `just lint` and `just format` use `kagya tests`; `just typecheck` uses `kagya`.
+- Current baseline: `uv run pytest` and `just lint` pass; `just typecheck` fails on existing mypy issues, so do not assume `just check-all` is green.
 
 ## Frontend Commands
 - Install frontend deps with `npm ci` from `frontend/`.
