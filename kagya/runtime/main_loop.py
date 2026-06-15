@@ -23,6 +23,7 @@ class ChatResult:
     optimal_loss: float
     model_id: str
     adapter_id: str | None
+    fallback_used: bool
     prompt: str
     memory_context: MemoryContext
 
@@ -68,9 +69,27 @@ class KagyaMainLoop:
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
         memory_context = self.memory_system.retrieve_context(user_input)
-        prompt = self.prompt_builder.build(user_input, emotion_state, memory_context, attachments=attachments or [])
-        raw_response = self.agent.generate(prompt)
+        prompt = self.prompt_builder.build(
+            user_input, emotion_state, memory_context, attachments=attachments or []
+        )
+        try:
+            raw_response = self.agent.generate(prompt)
+        except Exception as exc:
+            if _fallback_used(self.provider):
+                raise RuntimeError("Fallback model generation failed") from exc
+            raw_response = _generate_fallback(self.provider, prompt)
         processed_response = self.postprocessor.process(raw_response)
+        if not processed_response.visible_response.strip():
+            if _fallback_used(self.provider):
+                raise RuntimeError("Fallback model produced an empty visible response")
+            raw_response = _generate_fallback(self.provider, prompt)
+            processed_response = self.postprocessor.process(raw_response)
+            if not processed_response.visible_response.strip():
+                raise RuntimeError("Fallback model produced an empty visible response")
+        model_id = str(
+            getattr(self.provider, "last_model_id", self.settings.model.primary_id)
+        )
+        fallback_used = bool(getattr(self.provider, "last_fallback_used", False))
         episode_id = self.memory_system.save_episodic(
             user_input,
             processed_response.visible_response,
@@ -83,13 +102,27 @@ class KagyaMainLoop:
         return ChatResult(
             episode_id=episode_id,
             response=processed_response.visible_response,
-            hidden_thought=processed_response.hidden_thought if debug else processed_response.hidden_thought,
+            hidden_thought=processed_response.hidden_thought
+            if debug
+            else processed_response.hidden_thought,
             loss=loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,
             optimal_loss=emotion_state.optimal_loss,
-            model_id=self.settings.model.primary_id,
-            adapter_id=self.adapter_id,
+            model_id=model_id,
+            adapter_id=None if fallback_used else self.adapter_id,
+            fallback_used=fallback_used,
             prompt=prompt,
             memory_context=memory_context,
         )
+
+
+def _generate_fallback(provider: ModelProvider, prompt: str) -> str:
+    generate_fallback = getattr(provider, "generate_fallback", None)
+    if not callable(generate_fallback):
+        raise RuntimeError("Model generation failed and no fallback model is available")
+    return str(generate_fallback(prompt))
+
+
+def _fallback_used(provider: ModelProvider) -> bool:
+    return bool(getattr(provider, "last_fallback_used", False))

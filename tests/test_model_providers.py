@@ -65,6 +65,12 @@ class FakeModel:
         return torch.tensor([[1, 2, 3, 4, 5]])
 
 
+class FailingGenerateModel(FakeModel):
+    def generate(self, **kwargs) -> torch.Tensor:
+        self.generate_kwargs = kwargs
+        raise RuntimeError("primary generation failed")
+
+
 def test_dummy_provider_is_deterministic() -> None:
     provider = DummyProvider()
 
@@ -105,7 +111,9 @@ def test_transformers_loss_masks_context_tokens() -> None:
     assert fake_model.labels_seen.tolist() == [[-100, -100, 3, 4]]
 
 
-def test_transformers_provider_loads_configured_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transformers_provider_loads_configured_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     loaded: dict[str, object] = {}
 
     def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
@@ -127,17 +135,123 @@ def test_transformers_provider_loads_configured_model_id(monkeypatch: pytest.Mon
     )
 
     settings = load_settings(CONFIG_PATH)
-    TransformersProvider(settings)
+    TransformersProvider(settings).generate("hello")
 
     assert loaded["processor_model_id"] == settings.model.primary_id
     assert loaded["model_model_id"] == settings.model.primary_id
     assert "quantization_config" in loaded["model_kwargs"]
 
 
+def test_transformers_provider_uses_fallback_when_primary_load_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_model_ids: list[str] = []
+
+    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+        return FakeProcessor()
+
+    def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
+        loaded_model_ids.append(model_id)
+        if model_id == load_settings(CONFIG_PATH).model.primary_id:
+            raise RuntimeError("primary load failed")
+        return FakeModel()
+
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoProcessor.from_pretrained",
+        fake_processor_from_pretrained,
+    )
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        fake_model_from_pretrained,
+    )
+    provider = TransformersProvider(load_settings(CONFIG_PATH))
+
+    generated = provider.generate("hello")
+
+    assert generated == "2 3 4 5"
+    assert loaded_model_ids == [
+        load_settings(CONFIG_PATH).model.primary_id,
+        load_settings(CONFIG_PATH).model.fallback_id,
+    ]
+    assert provider.last_model_id == load_settings(CONFIG_PATH).model.fallback_id
+    assert provider.last_fallback_used is True
+
+
+def test_transformers_provider_uses_fallback_when_primary_generation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_model_ids: list[str] = []
+
+    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+        return FakeProcessor()
+
+    def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
+        loaded_model_ids.append(model_id)
+        if model_id == load_settings(CONFIG_PATH).model.primary_id:
+            return FailingGenerateModel()
+        return FakeModel()
+
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoProcessor.from_pretrained",
+        fake_processor_from_pretrained,
+    )
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        fake_model_from_pretrained,
+    )
+    provider = TransformersProvider(load_settings(CONFIG_PATH))
+
+    generated = provider.generate("hello")
+
+    assert generated == "2 3 4 5"
+    assert loaded_model_ids == [
+        load_settings(CONFIG_PATH).model.primary_id,
+        load_settings(CONFIG_PATH).model.fallback_id,
+    ]
+    assert provider.last_fallback_used is True
+
+
+def test_transformers_provider_retries_primary_on_each_request_after_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG_PATH)
+    primary_attempts = 0
+
+    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+        return FakeProcessor()
+
+    def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
+        nonlocal primary_attempts
+        if model_id == settings.model.primary_id:
+            primary_attempts += 1
+            if primary_attempts == 1:
+                raise RuntimeError("primary load failed once")
+        return FakeModel()
+
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoProcessor.from_pretrained",
+        fake_processor_from_pretrained,
+    )
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        fake_model_from_pretrained,
+    )
+    provider = TransformersProvider(settings)
+
+    provider.generate("first")
+    provider.generate("second")
+
+    assert primary_attempts == 2
+    assert provider.last_model_id == settings.model.primary_id
+    assert provider.last_fallback_used is False
+
+
 def test_transformers_generate_decodes_only_new_tokens() -> None:
     fake_model = FakeModel()
     settings = load_settings(CONFIG_PATH)
-    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+    provider = TransformersProvider(
+        settings, model=fake_model, processor=FakeProcessor()
+    )
 
     generated = provider.generate("prompt has three")
 
@@ -148,9 +262,13 @@ def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None
     fake_model = FakeModel()
     settings = load_settings(CONFIG_PATH)
     settings = settings.model_copy(
-        update={"generation": settings.generation.model_copy(update={"do_sample": False})}
+        update={
+            "generation": settings.generation.model_copy(update={"do_sample": False})
+        }
     )
-    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+    provider = TransformersProvider(
+        settings, model=fake_model, processor=FakeProcessor()
+    )
 
     provider.generate("hello")
 
@@ -164,9 +282,13 @@ def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
     fake_model = FakeModel()
     settings = load_settings(CONFIG_PATH)
     settings = settings.model_copy(
-        update={"generation": settings.generation.model_copy(update={"do_sample": True})}
+        update={
+            "generation": settings.generation.model_copy(update={"do_sample": True})
+        }
     )
-    provider = TransformersProvider(settings, model=fake_model, processor=FakeProcessor())
+    provider = TransformersProvider(
+        settings, model=fake_model, processor=FakeProcessor()
+    )
 
     provider.generate("hello")
 
@@ -179,11 +301,15 @@ def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
 def test_transformers_generate_uses_processor_chat_template_when_available() -> None:
     fake_model = FakeModel()
     processor = FakeChatTemplateProcessor()
-    provider = TransformersProvider(load_settings(CONFIG_PATH), model=fake_model, processor=processor)
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=fake_model, processor=processor
+    )
 
     provider.generate("Context: private runtime\nUser: hello\nAssistant:")
 
-    assert processor.messages_seen == [{"role": "user", "content": "Context: private runtime\nUser: hello"}]
+    assert processor.messages_seen == [
+        {"role": "user", "content": "Context: private runtime\nUser: hello"}
+    ]
     assert processor.texts[0].startswith("<start_of_turn>user\n")
     assert processor.texts[0].endswith("<start_of_turn>model\n")
     assert "Assistant:" not in processor.texts[0]
@@ -191,7 +317,9 @@ def test_transformers_generate_uses_processor_chat_template_when_available() -> 
 
 def test_transformers_generate_falls_back_when_chat_template_is_unavailable() -> None:
     processor = FakeProcessor()
-    provider = TransformersProvider(load_settings(CONFIG_PATH), model=FakeModel(), processor=processor)
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=FakeModel(), processor=processor
+    )
 
     provider.generate("plain prompt")
 

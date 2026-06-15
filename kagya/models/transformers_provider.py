@@ -26,14 +26,40 @@ class TransformersProvider:
     ) -> None:
         self.settings = settings
         self.model_id = settings.model.primary_id
-        self.processor = processor or AutoProcessor.from_pretrained(self.model_id)
-        self.model = model or self._load_model(self.model_id)
-        if adapter_path is not None:
+        self.fallback_model_id = settings.model.fallback_id
+        self.adapter_path = adapter_path
+        self.processor = processor
+        self.model = model
+        self._fallback_processor: Any | None = None
+        self._fallback_model: Any | None = None
+        self._adapter_attached = False
+        self.last_model_id = self.model_id
+        self.last_fallback_used = False
+        if model is not None and adapter_path is not None:
             self.attach_adapter(adapter_path)
 
     def generate(self, prompt: str) -> str:
-        inputs = self.processor(text=self._render_generation_prompt(prompt), return_tensors="pt")
-        inputs = self._move_inputs_to_model_device(inputs)
+        self.last_model_id = self.model_id
+        self.last_fallback_used = False
+        try:
+            return self._generate_with(
+                prompt, self._get_primary_model(), self._get_primary_processor()
+            )
+        except Exception:
+            return self.generate_fallback(prompt)
+
+    def generate_fallback(self, prompt: str) -> str:
+        self.last_model_id = self.fallback_model_id
+        self.last_fallback_used = True
+        return self._generate_with(
+            prompt, self._get_fallback_model(), self._get_fallback_processor()
+        )
+
+    def _generate_with(self, prompt: str, model: Any, processor: Any) -> str:
+        inputs = processor(
+            text=self._render_generation_prompt(prompt, processor), return_tensors="pt"
+        )
+        inputs = self._move_inputs_to_model_device(inputs, model)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
             "do_sample": self.settings.generation.do_sample,
@@ -41,13 +67,13 @@ class TransformersProvider:
         if self.settings.generation.do_sample:
             generation_kwargs["temperature"] = self.settings.generation.temperature
             generation_kwargs["top_p"] = self.settings.generation.top_p
-        output_ids = self.model.generate(**inputs, **generation_kwargs)
+        output_ids = model.generate(**inputs, **generation_kwargs)
         input_length = inputs["input_ids"].shape[-1]
         generated_ids = output_ids[0][input_length:]
-        return self.processor.decode(generated_ids, skip_special_tokens=True)
+        return processor.decode(generated_ids, skip_special_tokens=True)
 
-    def _render_generation_prompt(self, prompt: str) -> str:
-        apply_chat_template = getattr(self.processor, "apply_chat_template", None)
+    def _render_generation_prompt(self, prompt: str, processor: Any) -> str:
+        apply_chat_template = getattr(processor, "apply_chat_template", None)
         if not callable(apply_chat_template):
             return prompt
         try:
@@ -64,29 +90,60 @@ class TransformersProvider:
         if not target_text:
             raise ValueError("target_text must not be empty")
 
-        self.model.eval()
+        model = self._get_primary_model()
+        model.eval()
         full_inputs = self._tokenize(context_text + target_text)
         context_inputs = self._tokenize(context_text) if context_text else None
         labels = full_inputs["input_ids"].clone()
-        context_length = 0 if context_inputs is None else context_inputs["input_ids"].shape[1]
+        context_length = (
+            0 if context_inputs is None else context_inputs["input_ids"].shape[1]
+        )
         labels[:, :context_length] = -100
-        full_inputs = self._move_inputs_to_model_device(full_inputs)
+        full_inputs = self._move_inputs_to_model_device(full_inputs, model)
         labels = labels.to(full_inputs["input_ids"].device)
 
         with torch.no_grad():
-            outputs = self.model(**full_inputs, labels=labels)
+            outputs = model(**full_inputs, labels=labels)
         return float(outputs.loss.detach().cpu().item())
 
     def get_model(self) -> Any:
-        return self.model
+        return self._get_primary_model()
 
     def get_processor(self) -> Any:
-        return self.processor
+        return self._get_primary_processor()
 
     def attach_adapter(self, adapter_path: str | Path) -> None:
         if not is_registry_approved_adapter(self.settings, adapter_path):
             raise ValueError("Adapter path is not approved by the adapter registry")
+        if self.model is None:
+            self.model = self._load_model(self.model_id)
         self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
+        self._adapter_attached = True
+
+    def _get_primary_processor(self) -> Any:
+        if self.processor is None:
+            self.processor = AutoProcessor.from_pretrained(self.model_id)
+        return self.processor
+
+    def _get_primary_model(self) -> Any:
+        if self.model is None:
+            self.model = self._load_model(self.model_id)
+            self._adapter_attached = False
+        if self.adapter_path is not None and not self._adapter_attached:
+            self.attach_adapter(self.adapter_path)
+        return self.model
+
+    def _get_fallback_processor(self) -> Any:
+        if self._fallback_processor is None:
+            self._fallback_processor = AutoProcessor.from_pretrained(
+                self.fallback_model_id
+            )
+        return self._fallback_processor
+
+    def _get_fallback_model(self) -> Any:
+        if self._fallback_model is None:
+            self._fallback_model = self._load_model(self.fallback_model_id)
+        return self._fallback_model
 
     def _load_model(self, model_id: str) -> Any:
         load_kwargs: dict[str, Any] = {}
@@ -104,11 +161,17 @@ class TransformersProvider:
         return AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
 
     def _tokenize(self, text: str) -> dict[str, torch.Tensor]:
-        encoded = self.processor(text=text, return_tensors="pt")
-        return {key: value for key, value in encoded.items() if isinstance(value, torch.Tensor)}
+        encoded = self._get_primary_processor()(text=text, return_tensors="pt")
+        return {
+            key: value
+            for key, value in encoded.items()
+            if isinstance(value, torch.Tensor)
+        }
 
-    def _move_inputs_to_model_device(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        device = getattr(self.model, "device", None)
+    def _move_inputs_to_model_device(
+        self, inputs: dict[str, torch.Tensor], model: Any
+    ) -> dict[str, torch.Tensor]:
+        device = getattr(model, "device", None)
         if device is None:
             return inputs
         return {key: value.to(device) for key, value in inputs.items()}
