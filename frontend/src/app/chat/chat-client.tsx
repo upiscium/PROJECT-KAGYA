@@ -57,13 +57,14 @@ export function ChatClient() {
           <h1 className="page-title">Chat</h1>
           <p className="page-subtitle">Normal chat shows only user-facing answers and emotion state.</p>
         </div>
-        {latest ? <Badge>{latest.model.model_id}</Badge> : null}
+        {latest ? <div className="metadata-row"><Badge>{latest.model.model_id}</Badge>{latest.model.fallback_used ? <Badge data-tone="warning">Fallback model</Badge> : null}</div> : null}
       </header>
 
       {latest ? (
         <Card>
           <CardTitle>Current Model</CardTitle>
-          <div className="metadata-row"><span>{latest.model.model_id}</span><span>Adapter: {latest.model.adapter_id ?? "none"}</span></div>
+          <div className="metadata-row"><span>{latest.model.model_id}</span><span>Adapter: {latest.model.adapter_id ?? "none"}</span>{latest.model.fallback_used ? <Badge data-tone="warning">Fallback model</Badge> : <Badge data-tone="accent">Primary model</Badge>}</div>
+          {latest.model.fallback_used ? <p className="muted">The primary model was unavailable for this response, so KAGYA used the configured fallback model without an adapter.</p> : null}
           <EmotionMeter emotion={latest.emotion} />
         </Card>
       ) : null}

@@ -78,7 +78,7 @@ function DebugResult({ result }: { result: DebugChatResponse }) {
       <Card><CardTitle>Visible Response</CardTitle><p>{result.response}</p></Card>
       <Card><CardTitle>Hidden Thought</CardTitle><pre>{result.hidden_thought || "none"}</pre></Card>
       <Card><CardTitle>Loss + Emotion</CardTitle><p>Loss {formatNumber(result.loss)}</p><p>Valence {formatNumber(result.emotion.valence)}</p><p>Arousal {formatNumber(result.emotion.arousal)}</p><p>Optimal loss {formatNumber(result.emotion.optimal_loss)}</p></Card>
-      <Card><CardTitle>Model</CardTitle><p>{result.model.model_id}</p><p>Adapter {result.model.adapter_id ?? "none"}</p></Card>
+      <Card><CardTitle>Model</CardTitle><p>{result.model.model_id}</p><p>Adapter {result.model.adapter_id ?? "none"}</p><p>Fallback: {result.model.fallback_used ? "yes" : "no"}</p>{result.model.fallback_used ? <p className="muted">Fallback responses run without active adapters.</p> : null}</Card>
       <Card><CardTitle>Received Attachments</CardTitle>{result.attachments.length ? result.attachments.map((attachment, index) => <p key={`${attachment.type}-${attachment.url ?? index}`}><Badge>{attachment.type}</Badge> {attachment.name ?? attachment.url ?? "unnamed"}{attachment.content_type ? ` (${attachment.content_type})` : ""}</p>) : <p>none</p>}</Card>
       <Card className="wide"><CardTitle>Raw Prompt</CardTitle><pre>{result.prompt}</pre></Card>
       <Card><CardTitle>Generation Params</CardTitle><pre>{JSON.stringify(result.generation_params, null, 2)}</pre></Card>
