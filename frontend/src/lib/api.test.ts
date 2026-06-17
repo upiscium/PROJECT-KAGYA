@@ -12,6 +12,10 @@ function jsonResponse(body: unknown) {
   return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
 }
 
+function errorResponse(status: number, statusText: string, body: unknown) {
+  return Promise.resolve({ ok: false, status, statusText, text: () => Promise.resolve(JSON.stringify(body)) });
+}
+
 describe("api client", () => {
   it("/chat sends requests to /api/chat", async () => {
     fetchMock.mockReturnValue(jsonResponse({ episode_id: "e", response: "ok", emotion: { valence: 0, arousal: 0, optimal_loss: 1 }, model: { model_id: "m", adapter_id: null, fallback_used: false } }));
@@ -58,5 +62,17 @@ describe("api client", () => {
     await api.sleepRun();
 
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/sleep/run", expect.objectContaining({ method: "POST" }));
+  });
+
+  it("formats backend JSON error details", async () => {
+    fetchMock.mockReturnValue(errorResponse(500, "Internal Server Error", { detail: "Fallback model produced an empty visible response" }));
+
+    await expect(api.chat({ text: "hello" })).rejects.toThrow("Backend failed: Fallback model produced an empty visible response");
+  });
+
+  it("formats unavailable backend errors", async () => {
+    fetchMock.mockRejectedValue(new TypeError("fetch failed"));
+
+    await expect(api.chat({ text: "hello" })).rejects.toThrow("Backend unavailable");
   });
 });

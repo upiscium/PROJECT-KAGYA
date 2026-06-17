@@ -63,4 +63,16 @@ describe("EvaluationsClient", () => {
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/evaluations", expect.any(Object));
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/evaluations/adapter-b.json", expect.any(Object));
   });
+
+  it("shows an empty state when there are no evaluation results", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ results: [] }),
+    });
+
+    renderWithQuery();
+
+    expect(await screen.findByText("No evaluation results yet.")).toBeInTheDocument();
+    expect(screen.getByText("Select an evaluation result to inspect its JSON payload.")).toBeInTheDocument();
+  });
 });

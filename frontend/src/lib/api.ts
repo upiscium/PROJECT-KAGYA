@@ -84,6 +84,18 @@ export type SleepRunResponse = {
   dry_run: boolean | null;
 };
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null = null,
+    readonly statusText: string | null = null,
+    readonly detail: string | null = null,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return requestUrl<T>(`${API_PROXY_BASE_URL}${path.replace(/^\/api/, "")}`, init);
 }
@@ -93,15 +105,50 @@ async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    });
+  } catch (error) {
+    throw new ApiError("Backend unavailable. Check that the API and frontend proxy are running.", null, null, error instanceof Error ? error.message : String(error));
+  }
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`${response.status} ${response.statusText}: ${detail}`);
+    const detail = await readErrorDetail(response);
+    throw new ApiError(formatHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
   }
   return response.json() as Promise<T>;
+}
+
+export function errorMessage(error: unknown): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+async function readErrorDetail(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    return typeof parsed.detail === "string" ? parsed.detail : text;
+  } catch {
+    return text;
+  }
+}
+
+function formatHttpError(status: number, statusText: string, detail: string): string {
+  if (status === 401 || status === 403) {
+    return detail ? `Admin access denied: ${detail}` : "Admin access denied. Check the admin token or private access boundary.";
+  }
+  if (status === 503) {
+    return detail ? `Admin backend is not configured: ${detail}` : "Admin backend is not configured. Check KAGYA_ADMIN_TOKEN.";
+  }
+  if (status >= 500) {
+    return detail ? `Backend failed: ${detail}` : `Backend failed with ${status} ${statusText}.`;
+  }
+  return detail ? `${status} ${statusText}: ${detail}` : `${status} ${statusText}`;
 }
 
 export const api = {

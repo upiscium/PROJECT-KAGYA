@@ -2,7 +2,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, type Attachment, type DebugChatResponse } from "@/lib/api";
+import { api, errorMessage, type Attachment, type DebugChatResponse } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Input, Textarea } from "@/components/ui/input";
@@ -66,7 +66,7 @@ export function DebugClient() {
         ) : null}
         <Button disabled={mutation.isPending || !message.trim()} type="submit">Run Debug Chat</Button>
       </form>
-      {mutation.error ? <p className="error">{mutation.error.message}</p> : null}
+      {mutation.error ? <p className="error">{errorMessage(mutation.error)}</p> : null}
       {result ? <DebugResult result={result} /> : null}
     </div>
   );
@@ -82,8 +82,8 @@ function DebugResult({ result }: { result: DebugChatResponse }) {
       <Card><CardTitle>Received Attachments</CardTitle>{result.attachments.length ? result.attachments.map((attachment, index) => <p key={`${attachment.type}-${attachment.url ?? index}`}><Badge>{attachment.type}</Badge> {attachment.name ?? attachment.url ?? "unnamed"}{attachment.content_type ? ` (${attachment.content_type})` : ""}</p>) : <p>none</p>}</Card>
       <Card className="wide"><CardTitle>Raw Prompt</CardTitle><pre>{result.prompt}</pre></Card>
       <Card><CardTitle>Generation Params</CardTitle><pre>{JSON.stringify(result.generation_params, null, 2)}</pre></Card>
-      <Card><CardTitle>DB1 Episodes</CardTitle>{result.retrieved_memory.db1_results.map((item) => <p key={item.id}><Badge>{item.record_type}</Badge> {item.user_input}</p>)}</Card>
-      <Card><CardTitle>DB2 Semantic</CardTitle>{result.retrieved_memory.db2_results.map((item) => <p key={item.id}><Badge>{item.record_type}</Badge> {item.text}</p>)}</Card>
+      <Card><CardTitle>DB1 Episodes</CardTitle>{result.retrieved_memory.db1_results.length ? result.retrieved_memory.db1_results.map((item) => <p key={item.id}><Badge>{item.record_type}</Badge> {item.user_input}</p>) : <p className="muted">No DB1 episodes retrieved.</p>}</Card>
+      <Card><CardTitle>DB2 Semantic</CardTitle>{result.retrieved_memory.db2_results.length ? result.retrieved_memory.db2_results.map((item) => <p key={item.id}><Badge>{item.record_type}</Badge> {item.text}</p>) : <p className="muted">No DB2 semantic memories retrieved.</p>}</Card>
     </div>
   );
 }
