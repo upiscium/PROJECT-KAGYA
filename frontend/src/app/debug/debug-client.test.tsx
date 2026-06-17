@@ -42,6 +42,7 @@ describe("DebugClient", () => {
     expect(await screen.findByText("internal thought")).toBeInTheDocument();
     expect(screen.getByText("raw prompt")).toBeInTheDocument();
     expect(screen.getByText(/Loss 1.250/)).toBeInTheDocument();
+    expect(screen.getByText("Fallback: no")).toBeInTheDocument();
   });
 
   it("sends and renders debug attachments", async () => {
@@ -118,5 +119,31 @@ describe("DebugClient", () => {
     await userEvent.click(screen.getByRole("button", { name: "Run Debug Chat" }));
 
     expect(await screen.findByText("Admin backend is not configured: KAGYA_ADMIN_TOKEN is not configured")).toBeInTheDocument();
+  });
+
+  it("shows fallback model status explicitly", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        episode_id: "episode-1",
+        response: "Fallback visible answer",
+        hidden_thought: "fallback thought",
+        loss: 1.25,
+        prompt: "raw prompt",
+        attachments: [],
+        emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+        model: { model_id: "google/gemma-4-E2B", adapter_id: null, fallback_used: true },
+        retrieved_memory: { db1_results: [], db2_results: [] },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+      }),
+    });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Debug a message"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Run Debug Chat" }));
+
+    expect(await screen.findByText("Fallback: yes")).toBeInTheDocument();
+    expect(screen.getByText("Fallback responses run without active adapters.")).toBeInTheDocument();
+    expect(screen.getByText("google/gemma-4-E2B")).toBeInTheDocument();
   });
 });
