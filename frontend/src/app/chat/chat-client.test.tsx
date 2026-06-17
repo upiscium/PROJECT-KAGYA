@@ -67,4 +67,21 @@ describe("ChatClient", () => {
     });
     expect(await screen.findByText(/Attachments: sample.wav/)).toBeInTheDocument();
   });
+
+  it("shows a clear public error when backend generation fails", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      text: async () => JSON.stringify({ detail: "Fallback model produced an empty visible response" }),
+    });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Backend failed: Fallback model produced an empty visible response")).toBeInTheDocument();
+    expect(screen.queryByText(/hidden_thought/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
+  });
 });

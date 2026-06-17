@@ -5,7 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
-import { api, type EvaluationResultSummary } from "@/lib/api";
+import { api, errorMessage, type EvaluationResultSummary } from "@/lib/api";
 import { formatNumber, statusTone } from "@/lib/format";
 
 export function EvaluationsClient() {
@@ -24,8 +24,8 @@ export function EvaluationsClient() {
         <h1 className="page-title">Evaluations</h1>
         <p className="page-subtitle">Browse persisted adapter evaluation results from the admin backend.</p>
       </header>
-      {results.error ? <p className="error">{results.error.message}</p> : null}
-      {detail.error ? <p className="error">{detail.error.message}</p> : null}
+      {results.error ? <p className="error">{errorMessage(results.error)}</p> : null}
+      {detail.error ? <p className="error">{errorMessage(detail.error)}</p> : null}
       <div className="grid">
         <Card>
           <CardTitle>Result Files</CardTitle>

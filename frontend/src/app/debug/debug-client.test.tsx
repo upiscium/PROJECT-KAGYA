@@ -79,4 +79,44 @@ describe("DebugClient", () => {
     expect(await screen.findAllByText(/sample.wav/)).toHaveLength(2);
     expect(screen.getByText(/audio\/wav/)).toBeInTheDocument();
   });
+
+  it("shows empty retrieved memory states", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        episode_id: "episode-1",
+        response: "Visible answer",
+        hidden_thought: "",
+        loss: 1.25,
+        prompt: "raw prompt",
+        attachments: [],
+        emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+        model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
+        retrieved_memory: { db1_results: [], db2_results: [] },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+      }),
+    });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Debug a message"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Run Debug Chat" }));
+
+    expect(await screen.findByText("No DB1 episodes retrieved.")).toBeInTheDocument();
+    expect(screen.getByText("No DB2 semantic memories retrieved.")).toBeInTheDocument();
+  });
+
+  it("shows a clear admin configuration error", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      text: async () => JSON.stringify({ detail: "KAGYA_ADMIN_TOKEN is not configured" }),
+    });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Debug a message"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Run Debug Chat" }));
+
+    expect(await screen.findByText("Admin backend is not configured: KAGYA_ADMIN_TOKEN is not configured")).toBeInTheDocument();
+  });
 });

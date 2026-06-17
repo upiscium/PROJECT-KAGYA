@@ -2,7 +2,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, type Attachment, type ChatResponse } from "@/lib/api";
+import { api, errorMessage, type Attachment, type ChatResponse } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Input, Textarea } from "@/components/ui/input";
@@ -110,7 +110,7 @@ export function ChatClient() {
         <Button disabled={mutation.isPending || !message.trim()} type="submit">{mutation.isPending ? "Sending" : "Send"}</Button>
       </form>
 
-      {mutation.error ? <p className="error">{mutation.error.message}</p> : null}
+      {mutation.error ? <p className="error">{errorMessage(mutation.error)}</p> : null}
     </div>
   );
 }
