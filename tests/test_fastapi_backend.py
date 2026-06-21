@@ -160,6 +160,41 @@ def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None
     assert "generation_params" in data
 
 
+def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.get("/api/system/info")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["project"] == "PROJECT-KAGYA"
+    assert data["status"] == "ok"
+    assert data["build"]["version"]
+    assert data["runtime"] == {
+        "environment": "development",
+        "provider": "dummy",
+        "primary_model_id": "google/gemma-4-E4B",
+        "fallback_configured": True,
+        "transformers_4bit": True,
+        "qlora_dry_run": True,
+        "admin_token_configured": True,
+    }
+
+
+def test_system_info_does_not_expose_secrets_or_private_paths(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.get("/api/system/info")
+
+    assert response.status_code == 200
+    payload = response.text
+    assert ADMIN_TOKEN not in payload
+    assert "KAGYA_TEST_ADMIN_TOKEN" not in payload
+    assert str(tmp_path) not in payload
+    assert "hidden_thought" not in payload
+    assert "prompt" not in payload
+
+
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     app = create_app(settings)
