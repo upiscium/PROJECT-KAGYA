@@ -11,5 +11,4 @@
 - #65 Add real-model smoke test for Transformers provider.
 - #67 Define configuration migration and compatibility policy.
 - #68 Add admin UI authentication and session layer.
-- #69 Add health, version, and build metadata endpoint.
 - #70 Add data retention and pruning policy for `.kagya` data.
