@@ -134,3 +134,59 @@ KAGYA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh
 The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-KAGYA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
 
 Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
+
+### 7. Back Up Runtime Data
+
+Backups must include both runtime data and private environment files:
+
+- `.kagya/chroma`: Chroma memory storage.
+- `.kagya/dreams`: generated dream datasets.
+- `.kagya/adapters`: QLoRA dry-run or trained adapter artifacts.
+- `.kagya/eval_results`: adapter evaluation outputs.
+- `.kagya/adapter_registry.json`: adapter lifecycle state.
+- `/etc/project-kagya/*.env`: backend/frontend env files, including `KAGYA_ADMIN_TOKEN`.
+
+Create a restricted archive on the deployment host:
+
+```bash
+cd /opt/project-kagya
+sudo -u kagya KAGYA_BACKUP_DIR=/var/backups/project-kagya scripts/private-backup.sh
+```
+
+Treat backup archives as secrets. They may contain private memories, hidden training thoughts, local paths, adapter artifacts, and admin tokens. Store them with `0600` permissions, encrypt them before off-host transfer, and avoid attaching them to issues or logs.
+
+Before large maintenance, inspect disk usage:
+
+```bash
+sudo du -sh /opt/project-kagya/.kagya /etc/project-kagya
+sudo du -sh /home/kagya/.cache/huggingface 2>/dev/null || true
+```
+
+Model caches are usually reproducible and large; back them up only if bandwidth or model availability requires it. The `.kagya/` directory is application state and should be backed up.
+
+### 8. Restore Runtime Data
+
+Restore onto a host with the same runtime tools installed and the application checkout present. Stop services before replacing local data:
+
+```bash
+sudo systemctl stop kagya-api kagya-frontend
+cd /opt/project-kagya
+sudo KAGYA_APP_DIR=/opt/project-kagya KAGYA_CONFIG_DIR=/etc/project-kagya scripts/private-backup.sh --restore /var/backups/project-kagya/project-kagya-YYYYMMDDTHHMMSSZ.tar.gz
+sudo chown -R kagya:kagya /opt/project-kagya/.kagya /etc/project-kagya
+sudo chmod 600 /etc/project-kagya/*.env
+```
+
+Rebuild the frontend if `frontend.env` changed, then restart services:
+
+```bash
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/frontend.env; set +a; cd /opt/project-kagya/frontend && npm run build'
+sudo systemctl start kagya-api kagya-frontend
+```
+
+Run the private deployment smoke test after restore:
+
+```bash
+KAGYA_ADMIN_TOKEN=replace-with-restored-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+```
+
+If restore changes model provider settings, verify model cache availability before switching away from `dummy`. If restore changes adapter artifacts or registry state, inspect `/adapters` in the admin UI before activating any adapter.
