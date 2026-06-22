@@ -64,6 +64,18 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/sleep/run", expect.objectContaining({ method: "POST" }));
   });
 
+  it("system metadata calls public and admin system endpoints", async () => {
+    fetchMock.mockReturnValue(jsonResponse({}));
+
+    await api.systemInfo();
+    await api.runtimeEvents();
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api-proxy/system/info",
+      "/admin-proxy/system/events",
+    ]);
+  });
+
   it("formats backend JSON error details", async () => {
     fetchMock.mockReturnValue(errorResponse(500, "Internal Server Error", { detail: "Fallback model produced an empty visible response" }));
 
