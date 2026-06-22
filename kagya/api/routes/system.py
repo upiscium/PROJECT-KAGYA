@@ -4,11 +4,18 @@ from importlib.metadata import PackageNotFoundError, version
 import os
 import subprocess
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Request
 
-from kagya.api.dependencies import get_api_settings
+from kagya.api.dependencies import (
+    get_api_settings,
+    get_runtime_event_log,
+    require_admin,
+)
+from kagya.api.observability import RuntimeEvent, RuntimeEventLog
 from kagya.api.schemas.system import (
     BuildInfoSchema,
+    RuntimeEventListResponse,
+    RuntimeEventSchema,
     RuntimeInfoSchema,
     SystemInfoResponse,
 )
@@ -41,6 +48,23 @@ def system_info(settings: Settings = Depends(get_api_settings)) -> SystemInfoRes
     )
 
 
+@router.get(
+    "/events",
+    response_model=RuntimeEventListResponse,
+    dependencies=[Depends(require_admin)],
+)
+def runtime_events(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+) -> RuntimeEventListResponse:
+    """Return recent operator-visible runtime and lifecycle events."""
+
+    events = [event_schema(event) for event in event_log.recent(limit)]
+    events.extend(_tool_audit_event_schemas(request))
+    return RuntimeEventListResponse(events=events[-limit:])
+
+
 def _package_version() -> str:
     try:
         return version("project-kagya")
@@ -65,3 +89,40 @@ def _build_commit() -> str | None:
         return None
     commit = result.stdout.strip()
     return commit or None
+
+
+def event_schema(event: RuntimeEvent) -> RuntimeEventSchema:
+    return RuntimeEventSchema(
+        id=event.id,
+        timestamp=event.timestamp,
+        category=event.category,
+        event_type=event.event_type,
+        message=event.message,
+        metadata=event.metadata,
+    )
+
+
+def _tool_audit_event_schemas(request: Request) -> list[RuntimeEventSchema]:
+    executor = getattr(request.app.state, "tool_executor", None)
+    audit_log = getattr(executor, "audit_log", [])
+    events: list[RuntimeEventSchema] = []
+    for index, audit_event in enumerate(audit_log, start=1):
+        events.append(
+            RuntimeEventSchema(
+                id=-index,
+                timestamp="",
+                category="tool",
+                event_type="executed" if audit_event.executed else "blocked",
+                message="Tool execution audit event",
+                metadata={
+                    "tool_name": audit_event.tool_name,
+                    "status": None
+                    if audit_event.status is None
+                    else audit_event.status.value,
+                    "tool_type": None
+                    if audit_event.tool_type is None
+                    else audit_event.tool_type.value,
+                },
+            )
+        )
+    return events

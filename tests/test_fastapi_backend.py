@@ -10,6 +10,14 @@ from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.tools import (
+    ToolDefinition,
+    ToolExecutionRequest,
+    ToolExecutor,
+    ToolRegistry,
+    ToolStatus,
+    ToolType,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -31,6 +39,13 @@ class EmptyFallbackProvider(DummyProvider):
         self.last_model_id = "fallback-model"
         self.last_fallback_used = True
         return "<think>fallback hidden only</think>"
+
+
+class SuccessfulFallbackProvider(EmptyFallbackProvider):
+    def generate_fallback(self, prompt: str) -> str:
+        self.last_model_id = "fallback-model"
+        self.last_fallback_used = True
+        return "Fallback visible API answer."
 
 
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
@@ -193,6 +208,100 @@ def test_system_info_does_not_expose_secrets_or_private_paths(tmp_path: Path) ->
     assert str(tmp_path) not in payload
     assert "hidden_thought" not in payload
     assert "prompt" not in payload
+
+
+def test_system_events_require_admin_token(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.get("/api/system/events")
+
+    assert response.status_code == 401
+
+
+def test_system_events_include_fallback_without_private_fields(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    client.app.state.model_provider = SuccessfulFallbackProvider()
+
+    chat = client.post("/api/chat", json={"text": "hello", "attachments": []})
+    events = client.get("/api/system/events", headers=admin_headers())
+
+    assert chat.status_code == 200
+    assert events.status_code == 200
+    payload = events.json()
+    assert payload["events"][-1]["category"] == "model"
+    assert payload["events"][-1]["event_type"] == "fallback_used"
+    assert payload["events"][-1]["metadata"]["model_id"] == "fallback-model"
+    assert "hidden_thought" not in events.text
+    assert "prompt" not in events.text
+    assert ADMIN_TOKEN not in events.text
+
+
+def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    memory = client.app.state.memory_system
+    memory.save_episodic("sleep input", "sleep output", emotion_arousal=0.9)
+    registry.register_candidate(
+        adapter_id="adapter-observed",
+        adapter_path=tmp_path / "adapter-observed",
+        dataset_path=tmp_path / "dataset.jsonl",
+        dataset_hash="hash",
+    )
+
+    sleep = client.post("/api/sleep/run", headers=admin_headers())
+    evaluated = client.post(
+        "/api/adapters/adapter-observed/evaluate",
+        headers=admin_headers(),
+        json={"deterministic_score": 0.9},
+    )
+    approved = client.post(
+        "/api/adapters/adapter-observed/approve", headers=admin_headers()
+    )
+    events = client.get("/api/system/events", headers=admin_headers())
+
+    assert sleep.status_code == 200
+    assert evaluated.status_code == 200
+    assert approved.status_code == 200
+    event_pairs = {
+        (event["category"], event["event_type"]) for event in events.json()["events"]
+    }
+    assert ("sleep", "run_completed") in event_pairs
+    assert ("adapter", "evaluated") in event_pairs
+    assert ("adapter", "approved") in event_pairs
+
+
+def test_system_events_include_tool_audit_events(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="safe_template",
+            description="format text",
+            tool_type=ToolType.TEXT_TEMPLATE,
+            output_template="hello {name}",
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+    executor = ToolExecutor(registry)
+    executor.execute(
+        ToolExecutionRequest(tool_name="safe_template", arguments={"name": "operator"})
+    )
+    client.app.state.tool_executor = executor
+
+    response = client.get("/api/system/events", headers=admin_headers())
+
+    assert response.status_code == 200
+    tool_events = [
+        event for event in response.json()["events"] if event["category"] == "tool"
+    ]
+    assert tool_events[-1]["event_type"] == "executed"
+    assert tool_events[-1]["metadata"] == {
+        "tool_name": "safe_template",
+        "status": "approved",
+        "tool_type": "text_template",
+    }
 
 
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
