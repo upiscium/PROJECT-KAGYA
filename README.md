@@ -46,6 +46,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 
 - `uv run pytest`
 - `uv run ruff check kagya tests`
+- `just schema-check`
 - `npm test -- --run` from `frontend/`
 - `npm run build` from `frontend/`
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`

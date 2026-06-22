@@ -27,6 +27,11 @@ test target="tests/":
     @echo "==> Running Tests (Pytest) on {{target}}..."
     uv run pytest {{target}} -v
 
+# Backend OpenAPI schema and frontend API type drift checks
+schema-check:
+    @echo "==> Checking backend schema and frontend API type alignment..."
+    uv run pytest tests/test_frontend_api_schema_sync.py -q
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."

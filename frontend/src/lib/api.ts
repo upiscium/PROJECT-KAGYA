@@ -83,6 +83,26 @@ export type SleepRunResponse = {
   adapter_status: string | null;
   dry_run: boolean | null;
 };
+export type BuildInfo = { version: string; commit: string | null };
+export type RuntimeInfo = {
+  environment: string;
+  provider: string;
+  primary_model_id: string;
+  fallback_configured: boolean;
+  transformers_4bit: boolean;
+  qlora_dry_run: boolean;
+  admin_token_configured: boolean;
+};
+export type SystemInfoResponse = { project: string; status: string; build: BuildInfo; runtime: RuntimeInfo };
+export type RuntimeEvent = {
+  id: number;
+  timestamp: string;
+  category: string;
+  event_type: string;
+  message: string;
+  metadata: Record<string, unknown>;
+};
+export type RuntimeEventListResponse = { events: RuntimeEvent[] };
 
 export class ApiError extends Error {
   constructor(
@@ -165,4 +185,6 @@ export const api = {
   rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
   evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
   evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
+  systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
+  runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),
 };
