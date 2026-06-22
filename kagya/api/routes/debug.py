@@ -2,7 +2,13 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_api_settings, get_main_loop, require_admin
+from kagya.api.dependencies import (
+    get_api_settings,
+    get_main_loop,
+    get_runtime_event_log,
+    require_admin,
+)
+from kagya.api.observability import RuntimeEventLog
 from kagya.api.routes.chat import attachment_metadata, chat_response_from_result
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
@@ -25,6 +31,7 @@ def debug_chat(
     request: ChatRequest,
     main_loop: KagyaMainLoop = Depends(get_main_loop),
     settings: Settings = Depends(get_api_settings),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> DebugChatResponse:
     """Development-only debug chat gated by the admin token."""
 
@@ -34,6 +41,17 @@ def debug_chat(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result.fallback_used:
+        event_log.record(
+            category="model",
+            event_type="fallback_used",
+            message="Debug chat response used the fallback model",
+            metadata={
+                "model_id": result.model_id,
+                "adapter_id": result.adapter_id,
+                "debug": True,
+            },
+        )
     base = chat_response_from_result(result)
     return DebugChatResponse(
         **base.model_dump(),

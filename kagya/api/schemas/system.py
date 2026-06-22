@@ -23,3 +23,16 @@ class SystemInfoResponse(BaseModel):
     status: str
     build: BuildInfoSchema
     runtime: RuntimeInfoSchema
+
+
+class RuntimeEventSchema(BaseModel):
+    id: int
+    timestamp: str
+    category: str
+    event_type: str
+    message: str
+    metadata: dict[str, object]
+
+
+class RuntimeEventListResponse(BaseModel):
+    events: list[RuntimeEventSchema]

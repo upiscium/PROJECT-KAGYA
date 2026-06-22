@@ -2,7 +2,8 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_main_loop
+from kagya.api.dependencies import get_main_loop, get_runtime_event_log
+from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.chat import ChatRequest, ChatResponse, EmotionSchema, ModelSchema
 from kagya.runtime import ChatResult, KagyaMainLoop
 
@@ -12,7 +13,9 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(
-    request: ChatRequest, main_loop: KagyaMainLoop = Depends(get_main_loop)
+    request: ChatRequest,
+    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> ChatResponse:
     try:
         result = main_loop.chat(
@@ -20,6 +23,17 @@ def chat(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result.fallback_used:
+        event_log.record(
+            category="model",
+            event_type="fallback_used",
+            message="Chat response used the fallback model",
+            metadata={
+                "model_id": result.model_id,
+                "adapter_id": result.adapter_id,
+                "debug": False,
+            },
+        )
     return chat_response_from_result(result)
 
 

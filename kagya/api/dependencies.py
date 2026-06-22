@@ -5,8 +5,14 @@ import os
 
 from fastapi import Header, HTTPException, Request, status
 
+from kagya.api.observability import RuntimeEventLog
 from kagya.config import Settings, get_settings
-from kagya.learning import AdapterEntry, AdapterRegistry, AdapterStatus, SleepCycleManager
+from kagya.learning import (
+    AdapterEntry,
+    AdapterRegistry,
+    AdapterStatus,
+    SleepCycleManager,
+)
 from kagya.memory import DualMemorySystem
 from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import KagyaMainLoop
@@ -14,6 +20,14 @@ from kagya.runtime import KagyaMainLoop
 
 def get_api_settings(request: Request) -> Settings:
     return getattr(request.app.state, "settings", None) or get_settings()
+
+
+def get_runtime_event_log(request: Request) -> RuntimeEventLog:
+    event_log = getattr(request.app.state, "runtime_event_log", None)
+    if event_log is None:
+        event_log = RuntimeEventLog()
+        request.app.state.runtime_event_log = event_log
+    return event_log
 
 
 def require_admin(
@@ -28,7 +42,9 @@ def require_admin(
             detail=f"Admin token env var {settings.api.admin_token_env} is not configured",
         )
     if x_kagya_admin_token is None or not compare_digest(x_kagya_admin_token, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token"
+        )
 
 
 def get_model_provider(request: Request) -> ModelProvider:
@@ -88,17 +104,28 @@ def get_sleep_cycle_manager(request: Request) -> SleepCycleManager:
 
 def _get_active_adapter(request: Request) -> AdapterEntry | None:
     return next(
-        (entry for entry in get_adapter_registry(request).list() if entry.status == AdapterStatus.ACTIVE),
+        (
+            entry
+            for entry in get_adapter_registry(request).list()
+            if entry.status == AdapterStatus.ACTIVE
+        ),
         None,
     )
 
 
-def _get_runtime_model_provider(request: Request, active_adapter: AdapterEntry | None) -> ModelProvider:
+def _get_runtime_model_provider(
+    request: Request, active_adapter: AdapterEntry | None
+) -> ModelProvider:
     settings = get_api_settings(request)
     provider_adapter_id = getattr(request.app.state, "model_provider_adapter_id", None)
     if settings.model.provider.lower() == "transformers" and active_adapter is not None:
-        if getattr(request.app.state, "model_provider", None) is None or provider_adapter_id != active_adapter.adapter_id:
-            request.app.state.model_provider = load_model_provider(settings, adapter_path=active_adapter.path)
+        if (
+            getattr(request.app.state, "model_provider", None) is None
+            or provider_adapter_id != active_adapter.adapter_id
+        ):
+            request.app.state.model_provider = load_model_provider(
+                settings, adapter_path=active_adapter.path
+            )
             request.app.state.model_provider_adapter_id = active_adapter.adapter_id
         return request.app.state.model_provider
 
