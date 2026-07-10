@@ -42,10 +42,19 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 | `qlora.alpha` / `qlora.dropout` | Legacy aliases retained for compatibility; `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing names. Dry-run manifests include both. |
 | `qlora.max_steps` | Active for the minimal non-dry-run trainer and included in dry-run manifests for auditability. |
 
+### Configuration Compatibility Policy
+
+- Unknown configuration keys are rejected by the typed schema. Add new fields to `kagya/config/schema.py` and document them here before relying on them.
+- Compatibility aliases may remain in `config.yaml` when they protect existing local deployments. `qlora.alpha` and `qlora.dropout` are retained as legacy aliases, while `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing values.
+- Reserved fields are accepted only when they are documented as operator-visible contracts. `adapter_registry.manual_approval_required` is accepted for future policy work, but current lifecycle transitions still require explicit approval in code.
+- If a compatibility alias diverges from its canonical field, the canonical field wins for runtime behavior unless the field status table says otherwise.
+- Validate a deployment config with `just config-check` or `uv run python -m kagya.config.check /path/to/config.yaml` before upgrading services.
+
 ## Release Checklist
 
 - `uv run pytest`
 - `uv run ruff check kagya tests`
+- `just config-check`
 - `just schema-check`
 - `npm test -- --run` from `frontend/`
 - `npm run build` from `frontend/`
