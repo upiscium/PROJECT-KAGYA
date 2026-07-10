@@ -32,6 +32,11 @@ schema-check:
     @echo "==> Checking backend schema and frontend API type alignment..."
     uv run pytest tests/test_frontend_api_schema_sync.py -q
 
+# Validate runtime configuration and compatibility notes
+config-check config="config.yaml":
+    @echo "==> Checking PROJECT-KAGYA config {{config}}..."
+    uv run python -m kagya.config.check {{config}}
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."
