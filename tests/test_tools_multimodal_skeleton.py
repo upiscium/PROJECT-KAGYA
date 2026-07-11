@@ -10,6 +10,7 @@ from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.tools import (
     ToolDefinition,
+    ToolAuditLog,
     ToolExecutionRequest,
     ToolExecutor,
     ToolGenerator,
@@ -179,6 +180,58 @@ def test_tool_executor_runs_approved_metadata_lookup_tools() -> None:
     assert executor.audit_log[-1].tool_name == "project_metadata"
     assert executor.audit_log[-1].executed is True
     assert executor.audit_log[-1].tool_type == ToolType.METADATA_LOOKUP
+
+
+def test_tool_registry_persists_registered_tools(tmp_path: Path) -> None:
+    registry_path = tmp_path / "tool_registry.json"
+    registry = ToolRegistry(registry_path)
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+
+    restored = ToolRegistry(registry_path)
+
+    tool = restored.lookup("project_metadata")
+    assert tool is not None
+    assert tool.status == ToolStatus.APPROVED
+    assert tool.tool_type == ToolType.METADATA_LOOKUP
+    assert tool.metadata == {"owner": "local-user"}
+
+
+def test_tool_executor_persists_audit_events(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register_declared(
+        ToolDefinition(
+            name="project_metadata",
+            description="read approved static project metadata",
+            tool_type=ToolType.METADATA_LOOKUP,
+            metadata={"owner": "local-user"},
+            human_approved=True,
+            status=ToolStatus.APPROVED,
+        )
+    )
+    audit_log = ToolAuditLog(tmp_path / "tool_audit.jsonl")
+    executor = ToolExecutor(registry, audit_log_store=audit_log)
+
+    executor.execute(
+        ToolExecutionRequest(tool_name="project_metadata", arguments={"key": "owner"})
+    )
+    executor.execute(ToolExecutionRequest(tool_name="missing"))
+
+    restored_events = audit_log.recent(10)
+    assert [event.tool_name for event in restored_events] == [
+        "project_metadata",
+        "missing",
+    ]
+    assert restored_events[0].executed is True
+    assert restored_events[1].executed is False
 
 
 def test_tool_executor_blocks_metadata_lookup_without_string_key() -> None:
@@ -423,6 +476,12 @@ def _settings(tmp_path: Path) -> Settings:
                     "path": tmp_path / "adapter_registry.json",
                     "eval_result_dir": tmp_path / "eval_results",
                     "eval_sets": [],
+                }
+            ),
+            "tools": settings.tools.model_copy(
+                update={
+                    "path": tmp_path / "tool_registry.json",
+                    "audit_path": tmp_path / "tool_audit.jsonl",
                 }
             ),
             "api": settings.api.model_copy(

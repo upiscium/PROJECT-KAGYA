@@ -11,7 +11,9 @@ from kagya.learning import AdapterRegistry
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.tools import (
+    ToolAuditEvent,
     ToolDefinition,
+    ToolAuditLog,
     ToolExecutionRequest,
     ToolExecutor,
     ToolRegistry,
@@ -301,6 +303,35 @@ def test_system_events_include_tool_audit_events(tmp_path: Path) -> None:
         "tool_name": "safe_template",
         "status": "approved",
         "tool_type": "text_template",
+        "reason": "executed text_template",
+    }
+
+
+def test_system_events_include_persisted_tool_audit_events(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    ToolAuditLog(settings.tools.audit_path).append(
+        ToolAuditEvent(
+            tool_name="missing",
+            executed=False,
+            status=None,
+            tool_type=None,
+            reason="Tool is not registered",
+        )
+    )
+
+    response = client.get("/api/system/events", headers=admin_headers())
+
+    assert response.status_code == 200
+    tool_events = [
+        event for event in response.json()["events"] if event["category"] == "tool"
+    ]
+    assert tool_events[-1]["event_type"] == "blocked"
+    assert tool_events[-1]["metadata"] == {
+        "tool_name": "missing",
+        "status": None,
+        "tool_type": None,
+        "reason": "Tool is not registered",
     }
 
 
@@ -554,6 +585,12 @@ def _settings(tmp_path: Path) -> Settings:
                     "path": tmp_path / "adapter_registry.json",
                     "eval_result_dir": tmp_path / "eval_results",
                     "eval_sets": [],
+                }
+            ),
+            "tools": settings.tools.model_copy(
+                update={
+                    "path": tmp_path / "tool_registry.json",
+                    "audit_path": tmp_path / "tool_audit.jsonl",
                 }
             ),
             "api": settings.api.model_copy(

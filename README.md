@@ -208,7 +208,7 @@ Use backups before pruning. `.kagya/` contains private memories, training data, 
 - Never prune `.kagya/adapter_registry.json`; it is the source of adapter lifecycle truth.
 - Do not prune active, approved, trial, candidate, or rejected adapter directories. Only archived adapter artifact directories are eligible for manual pruning.
 - Evaluation results under `.kagya/eval_results` and dream datasets under `.kagya/dreams` may be pruned after they are older than the operator-selected retention window and a backup exists.
-- Runtime event logs are currently in-memory and disappear on process restart. Persisted tool audit logs will get their own retention policy when #59 is implemented.
+- Runtime lifecycle events are currently in-memory and disappear on process restart. Tool registry definitions persist in `.kagya/tool_registry.json`, and tool audit events persist in inspectable JSONL at `.kagya/tool_audit.jsonl`.
 - Hugging Face/model caches are outside `.kagya` and are reproducible. Prune them with provider-specific cache tools only when disk pressure requires it.
 
 Inspect pruning candidates without deleting anything:

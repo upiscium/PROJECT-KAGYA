@@ -64,6 +64,10 @@ adapter_registry:
     - archived
   manual_approval_required: true
 
+tools:
+  path: .kagya/tool_registry.json
+  audit_path: .kagya/tool_audit.jsonl
+
 api:
   host: 127.0.0.1
   port: 8000

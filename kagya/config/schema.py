@@ -78,6 +78,11 @@ class AdapterRegistrySettings(StrictBaseModel):
     manual_approval_required: bool
 
 
+class ToolRegistrySettings(StrictBaseModel):
+    path: Path
+    audit_path: Path
+
+
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
@@ -99,5 +104,6 @@ class Settings(StrictBaseModel):
     sleep: SleepSettings
     qlora: QloraSettings
     adapter_registry: AdapterRegistrySettings
+    tools: ToolRegistrySettings
     api: ApiSettings
     frontend: FrontendSettings

@@ -20,6 +20,7 @@ from kagya.api.schemas.system import (
     SystemInfoResponse,
 )
 from kagya.config import Settings
+from kagya.tools import ToolAuditEvent, ToolAuditLog
 
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -56,12 +57,13 @@ def system_info(settings: Settings = Depends(get_api_settings)) -> SystemInfoRes
 def runtime_events(
     request: Request,
     limit: int = Query(default=50, ge=1, le=100),
+    settings: Settings = Depends(get_api_settings),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> RuntimeEventListResponse:
     """Return recent operator-visible runtime and lifecycle events."""
 
     events = [event_schema(event) for event in event_log.recent(limit)]
-    events.extend(_tool_audit_event_schemas(request))
+    events.extend(_tool_audit_event_schemas(request, settings, limit))
     return RuntimeEventListResponse(events=events[-limit:])
 
 
@@ -102,27 +104,38 @@ def event_schema(event: RuntimeEvent) -> RuntimeEventSchema:
     )
 
 
-def _tool_audit_event_schemas(request: Request) -> list[RuntimeEventSchema]:
+def _tool_audit_event_schemas(
+    request: Request, settings: Settings, limit: int
+) -> list[RuntimeEventSchema]:
+    audit_events = ToolAuditLog(settings.tools.audit_path).recent(limit)
+    if not audit_events:
+        audit_events = _in_memory_tool_audit_events(request)
+    return [
+        _tool_audit_event_schema(index, audit_event)
+        for index, audit_event in enumerate(audit_events[-limit:], start=1)
+    ]
+
+
+def _in_memory_tool_audit_events(request: Request) -> list[ToolAuditEvent]:
     executor = getattr(request.app.state, "tool_executor", None)
-    audit_log = getattr(executor, "audit_log", [])
-    events: list[RuntimeEventSchema] = []
-    for index, audit_event in enumerate(audit_log, start=1):
-        events.append(
-            RuntimeEventSchema(
-                id=-index,
-                timestamp="",
-                category="tool",
-                event_type="executed" if audit_event.executed else "blocked",
-                message="Tool execution audit event",
-                metadata={
-                    "tool_name": audit_event.tool_name,
-                    "status": None
-                    if audit_event.status is None
-                    else audit_event.status.value,
-                    "tool_type": None
-                    if audit_event.tool_type is None
-                    else audit_event.tool_type.value,
-                },
-            )
-        )
-    return events
+    return list(getattr(executor, "audit_log", []))
+
+
+def _tool_audit_event_schema(
+    index: int, audit_event: ToolAuditEvent
+) -> RuntimeEventSchema:
+    return RuntimeEventSchema(
+        id=-index,
+        timestamp=audit_event.timestamp,
+        category="tool",
+        event_type="executed" if audit_event.executed else "blocked",
+        message="Tool execution audit event",
+        metadata={
+            "tool_name": audit_event.tool_name,
+            "status": None if audit_event.status is None else audit_event.status.value,
+            "tool_type": None
+            if audit_event.tool_type is None
+            else audit_event.tool_type.value,
+            "reason": audit_event.reason,
+        },
+    )
