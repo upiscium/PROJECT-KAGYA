@@ -13,6 +13,7 @@
 - Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
 - The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
 - Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
+- Browser login/session auth is intentionally not required for the default private LAN/VPN/SSH-tunnel deployment model. Keep the backend admin token as a lightweight safety gate for state-changing admin APIs, and keep the service off the public internet.
 
 ## Model Provider
 
@@ -103,7 +104,7 @@ Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_
 
 For SSH-tunnel access, run `ssh -L 18080:127.0.0.1:8080 user@host`, set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:18080`, rebuild the frontend, and open `http://127.0.0.1:18080` locally.
 
-Admin warning: the frontend no longer exposes the admin token to browser bundles, but admin pages still do not have user login/session handling. Keep this listener bound to loopback, or put it behind VPN, SSO, basic auth, or another access-control layer.
+Admin warning: the frontend does not expose the admin token to browser bundles, but admin pages do not have browser login/session handling. This is acceptable for the intended private LAN/VPN/SSH-tunnel deployment model. Keep this listener bound to loopback or behind private network access; if you expose it outside that boundary, add SSO, basic auth, or another access-control layer first.
 
 Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BASE_URL` is embedded at build time:
 
