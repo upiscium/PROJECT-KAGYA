@@ -12,6 +12,10 @@ from kagya.models.transformers_provider import (
     TransformersProvider,
     is_registry_approved_adapter,
 )
+from kagya.models.transformers_smoke import (
+    TransformersSmokeError,
+    run_transformers_smoke,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -71,6 +75,46 @@ class FailingGenerateModel(FakeModel):
         raise RuntimeError("primary generation failed")
 
 
+class FakeSmokeProvider:
+    def __init__(self, *, fail_step: str | None = None, empty_generation: bool = False) -> None:
+        self.fail_step = fail_step
+        self.empty_generation = empty_generation
+        self.primary_loaded = False
+        self.fallback_loaded = False
+
+    def _get_primary_processor(self) -> object:
+        if self.fail_step == "primary_load":
+            raise RuntimeError("primary load failed")
+        return object()
+
+    def _get_primary_model(self) -> object:
+        if self.fail_step == "primary_load":
+            raise RuntimeError("primary load failed")
+        self.primary_loaded = True
+        return object()
+
+    def _get_fallback_processor(self) -> object:
+        if self.fail_step == "fallback_load":
+            raise RuntimeError("fallback load failed")
+        return object()
+
+    def _get_fallback_model(self) -> object:
+        if self.fail_step == "fallback_load":
+            raise RuntimeError("fallback load failed")
+        self.fallback_loaded = True
+        return object()
+
+    def _generate_with(self, prompt: str, model: object, processor: object) -> str:
+        if self.fail_step == "primary_generate":
+            raise RuntimeError("primary generation failed")
+        return "" if self.empty_generation else f"generated: {prompt}"
+
+    def generate_fallback(self, prompt: str) -> str:
+        if self.fail_step == "fallback_generate":
+            raise RuntimeError("fallback generation failed")
+        return f"fallback: {prompt}"
+
+
 def test_dummy_provider_is_deterministic() -> None:
     provider = DummyProvider()
 
@@ -84,6 +128,61 @@ def test_model_loader_defaults_to_dummy_provider() -> None:
     assert isinstance(provider, DummyProvider)
 
 
+def test_transformers_smoke_requires_transformers_provider() -> None:
+    with pytest.raises(TransformersSmokeError) as exc_info:
+        run_transformers_smoke(load_settings(CONFIG_PATH))
+
+    assert exc_info.value.category == "configuration"
+
+
+def test_transformers_smoke_runs_primary_and_fallback_checks() -> None:
+    settings = _transformers_settings()
+
+    steps = run_transformers_smoke(
+        settings,
+        prompt="hello",
+        check_fallback=True,
+        provider_factory=lambda settings: FakeSmokeProvider(),
+    )
+
+    assert [step.name for step in steps] == [
+        "primary_load",
+        "primary_generate",
+        "fallback_load",
+        "fallback_generate",
+    ]
+    assert all(step.ok for step in steps)
+
+
+def test_transformers_smoke_distinguishes_generation_failure() -> None:
+    settings = _transformers_settings()
+
+    with pytest.raises(TransformersSmokeError) as exc_info:
+        run_transformers_smoke(
+            settings,
+            provider_factory=lambda settings: FakeSmokeProvider(
+                fail_step="primary_generate"
+            ),
+        )
+
+    assert exc_info.value.category == "generation_failure"
+
+
+def test_transformers_smoke_distinguishes_fallback_failure() -> None:
+    settings = _transformers_settings()
+
+    with pytest.raises(TransformersSmokeError) as exc_info:
+        run_transformers_smoke(
+            settings,
+            check_fallback=True,
+            provider_factory=lambda settings: FakeSmokeProvider(
+                fail_step="fallback_generate"
+            ),
+        )
+
+    assert exc_info.value.category == "fallback_failure"
+
+
 def test_transformers_provider_rejects_empty_target_text() -> None:
     provider = TransformersProvider(
         load_settings(CONFIG_PATH),
@@ -93,6 +192,13 @@ def test_transformers_provider_rejects_empty_target_text() -> None:
 
     with pytest.raises(ValueError, match="target_text"):
         provider.calculate_loss("context", "")
+
+
+def _transformers_settings():
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={"model": settings.model.model_copy(update={"provider": "transformers"})}
+    )
 
 
 def test_transformers_loss_masks_context_tokens() -> None:
