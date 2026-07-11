@@ -60,6 +60,8 @@ function EvaluationRow({ result, selected, onSelect }: { result: EvaluationResul
       </div>
       <h3>{result.adapter_id}</h3>
       <p>Score: {result.score === null ? "n/a" : formatNumber(result.score)}</p>
+      <p>Delta: {result.score_delta === null ? "n/a" : formatNumber(result.score_delta)}{result.regression ? " regression" : ""}</p>
+      <p>Status: {result.status_before ?? "n/a"} -&gt; {result.status_after ?? "n/a"}</p>
       <p>Cases: {result.case_count ?? "n/a"}</p>
       <p className="muted">Updated: {new Date(result.updated_at).toLocaleString()}</p>
       <Button onClick={onSelect} disabled={selected}>{selected ? "Selected" : "View JSON"}</Button>

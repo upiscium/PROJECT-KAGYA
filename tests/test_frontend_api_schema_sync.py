@@ -18,6 +18,7 @@ SCHEMA_TO_FRONTEND_TYPE = {
     "AdapterEvaluateResponse": "AdapterEvaluateResponse",
     "EvaluationResultSummary": "EvaluationResultSummary",
     "EvaluationResultListResponse": "EvaluationResultListResponse",
+    "AdapterEvaluationHistoryResponse": "AdapterEvaluationHistoryResponse",
     "EvaluationResultDetail": "EvaluationResultDetail",
     "SleepRunResponse": "SleepRunResponse",
     "BuildInfoSchema": "BuildInfo",
@@ -55,6 +56,7 @@ def test_frontend_api_client_exposes_backend_routes() -> None:
         "/sleep/run",
         "/adapters",
         "/evaluations",
+        "/evaluations/adapters/",
         "/api-proxy/system/info",
         "/system/events",
     ]

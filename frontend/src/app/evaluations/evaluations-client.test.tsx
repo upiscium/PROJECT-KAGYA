@@ -29,7 +29,12 @@ describe("EvaluationsClient", () => {
                 filename: "adapter-a.json",
                 adapter_id: "adapter-a",
                 score: 0.9,
+                previous_score: 0.7,
+                score_delta: 0.2,
+                regression: false,
                 decision: "trial_active",
+                status_before: "candidate",
+                status_after: "trial_active",
                 case_count: 2,
                 updated_at: "2026-06-08T00:00:00+00:00",
               },
@@ -37,7 +42,12 @@ describe("EvaluationsClient", () => {
                 filename: "adapter-b.json",
                 adapter_id: "adapter-b",
                 score: 0.2,
+                previous_score: 0.5,
+                score_delta: -0.3,
+                regression: true,
                 decision: "rejected",
+                status_before: "candidate",
+                status_after: "rejected",
                 case_count: 1,
                 updated_at: "2026-06-07T00:00:00+00:00",
               },
@@ -57,6 +67,7 @@ describe("EvaluationsClient", () => {
 
     expect(await screen.findByText("adapter-a")).toBeInTheDocument();
     expect(screen.getByText("adapter-b")).toBeInTheDocument();
+    expect(screen.getByText(/-0\.300 regression/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "View JSON" }));
 
     expect(await screen.findByText(/"adapter_id": "adapter-b"/)).toBeInTheDocument();

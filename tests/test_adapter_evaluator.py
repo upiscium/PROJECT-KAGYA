@@ -47,6 +47,26 @@ def test_evaluator_keeps_candidate_with_mid_score(tmp_path: Path) -> None:
     assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
 
 
+def test_evaluator_writes_history_and_score_comparison(tmp_path: Path) -> None:
+    registry = _registry_with_candidate(tmp_path)
+    evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
+
+    first = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.7)
+    second = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.5)
+
+    assert first.result_path != second.result_path
+    result_files = sorted((tmp_path / "eval_results").glob("*.json"))
+    assert len(result_files) == 2
+    second_data = json.loads(Path(second.result_path).read_text(encoding="utf-8"))
+    assert second.previous_score == 0.7
+    assert second.score_delta == pytest.approx(-0.2)
+    assert second.regression is True
+    assert second_data["previous_score"] == 0.7
+    assert second_data["regression"] is True
+    assert second_data["status_before"] == "candidate"
+    assert second_data["status_after"] == "candidate"
+
+
 def test_evaluator_loads_eval_sets_and_writes_result_json(tmp_path: Path) -> None:
     eval_set_path = tmp_path / "eval_set.json"
     eval_set_path.write_text(
