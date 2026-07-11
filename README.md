@@ -199,3 +199,34 @@ KAGYA_ADMIN_TOKEN=replace-with-restored-token scripts/smoke-private-deploy.sh ht
 ```
 
 If restore changes model provider settings, verify model cache availability before switching away from `dummy`. If restore changes adapter artifacts or registry state, inspect `/adapters` in the admin UI before activating any adapter.
+
+### 9. Retention And Pruning
+
+Use backups before pruning. `.kagya/` contains private memories, training data, adapter artifacts, and lifecycle state. The default policy is conservative:
+
+- Never prune `.kagya/chroma` with filesystem commands. Use future memory archive/tag tooling instead so DB1/DB2 invariants are preserved.
+- Never prune `.kagya/adapter_registry.json`; it is the source of adapter lifecycle truth.
+- Do not prune active, approved, trial, candidate, or rejected adapter directories. Only archived adapter artifact directories are eligible for manual pruning.
+- Evaluation results under `.kagya/eval_results` and dream datasets under `.kagya/dreams` may be pruned after they are older than the operator-selected retention window and a backup exists.
+- Runtime event logs are currently in-memory and disappear on process restart. Persisted tool audit logs will get their own retention policy when #59 is implemented.
+- Hugging Face/model caches are outside `.kagya` and are reproducible. Prune them with provider-specific cache tools only when disk pressure requires it.
+
+Inspect pruning candidates without deleting anything:
+
+```bash
+cd /opt/project-kagya
+sudo -u kagya KAGYA_RETENTION_DAYS=30 scripts/private-prune.sh
+```
+
+After a successful backup, apply pruning with explicit confirmation:
+
+```bash
+cd /opt/project-kagya
+sudo -u kagya KAGYA_RETENTION_DAYS=30 scripts/private-prune.sh --apply --confirm PRUNE
+```
+
+Run the private smoke test after pruning if adapter artifacts or dream/eval files were removed:
+
+```bash
+KAGYA_ADMIN_TOKEN=replace-with-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+```
