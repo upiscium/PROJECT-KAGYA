@@ -7,4 +7,3 @@
 - #64 Improve adapter evaluation operations.
 - #65 Add real-model smoke test for Transformers provider.
 - #68 Add admin UI authentication and session layer.
-- #70 Add data retention and pruning policy for `.kagya` data.
