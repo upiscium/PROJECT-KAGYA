@@ -50,8 +50,15 @@ def _attachment_line(attachment: dict[str, object]) -> str:
     fields = [
         ("type", attachment.get("type")),
         ("name", attachment.get("name")),
-        ("url", attachment.get("url")),
         ("content_type", attachment.get("content_type")),
+        ("source", _attachment_source(attachment)),
     ]
     visible = [f"{key}={value}" for key, value in fields if value]
     return f"- {'; '.join(visible) if visible else 'metadata unavailable'}"
+
+
+def _attachment_source(attachment: dict[str, object]) -> str | None:
+    url = attachment.get("url")
+    if not isinstance(url, str) or ":" not in url:
+        return None
+    return url.split(":", 1)[0]

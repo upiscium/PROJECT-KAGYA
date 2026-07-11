@@ -4,6 +4,7 @@ import json
 
 import pytest
 import torch
+from PIL import Image
 
 from kagya.config import load_settings
 from kagya.models.dummy_provider import DummyProvider
@@ -49,6 +50,23 @@ class FakeChatTemplateProcessor(FakeProcessor):
         self.messages_seen = messages
         suffix = "<start_of_turn>model\n" if add_generation_prompt else ""
         return f"<start_of_turn>user\n{messages[0]['content']}<end_of_turn>\n{suffix}"
+
+
+class FakeImageChatTemplateProcessor(FakeChatTemplateProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.images_seen: list[object] | None = None
+
+    def __call__(
+        self,
+        *,
+        text: str,
+        return_tensors: str,
+        images: list[object] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        self.texts.append(text)
+        self.images_seen = images
+        return {"input_ids": torch.tensor([[1, 2]])}
 
 
 class FakeModel:
@@ -419,6 +437,58 @@ def test_transformers_generate_uses_processor_chat_template_when_available() -> 
     assert processor.texts[0].startswith("<start_of_turn>user\n")
     assert processor.texts[0].endswith("<start_of_turn>model\n")
     assert "Assistant:" not in processor.texts[0]
+
+
+def test_transformers_generate_with_image_attachment_uses_image_inputs(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (1, 1), color="white").save(image_path)
+    fake_model = FakeModel()
+    processor = FakeImageChatTemplateProcessor()
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=fake_model, processor=processor
+    )
+
+    generated = provider.generate_with_attachments(
+        "describe image",
+        [
+            {
+                "type": "image",
+                "url": image_path.as_uri(),
+                "name": "sample.png",
+                "content_type": "image/png",
+            }
+        ],
+    )
+
+    assert generated == "3 4 5"
+    assert processor.images_seen is not None
+    assert len(processor.images_seen) == 1
+    assert processor.messages_seen is not None
+    assert processor.messages_seen[0]["content"] == [
+        {"type": "text", "text": "describe image"},
+        {"type": "image"},
+    ]
+
+
+def test_transformers_rejects_invalid_image_attachment(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.txt"
+    image_path.write_text("not an image", encoding="utf-8")
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=FakeModel(), processor=FakeImageChatTemplateProcessor()
+    )
+
+    with pytest.raises(ValueError, match="Unsupported image content type"):
+        provider.generate_with_attachments(
+            "describe image",
+            [
+                {
+                    "type": "image",
+                    "url": image_path.as_uri(),
+                    "name": "sample.txt",
+                    "content_type": "text/plain",
+                }
+            ],
+        )
 
 
 def test_transformers_generate_falls_back_when_chat_template_is_unavailable() -> None:

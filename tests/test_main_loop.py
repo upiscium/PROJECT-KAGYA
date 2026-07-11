@@ -136,7 +136,8 @@ def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     assert "Attachments:" in result.prompt
     assert "type=image" in result.prompt
     assert "name=image.png" in result.prompt
-    assert "url=file:///tmp/image.png" in result.prompt
+    assert "source=file" in result.prompt
+    assert "file:///tmp/image.png" not in result.prompt
     assert "content_type=image/png" in result.prompt
     assert "ignored" not in result.prompt
 

@@ -117,7 +117,8 @@ def test_api_chat_debug_includes_attachment_metadata_in_prompt(tmp_path: Path) -
     assert "Attachments:" in prompt
     assert "type=image" in prompt
     assert "name=image.png" in prompt
-    assert "url=file:///tmp/image.png" in prompt
+    assert "source=file" in prompt
+    assert "file:///tmp/image.png" not in prompt
     assert "content_type=image/png" in prompt
     assert "duration_ms" not in prompt
 
