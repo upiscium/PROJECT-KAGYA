@@ -16,6 +16,7 @@ from kagya.learning import (
 from kagya.memory import DualMemorySystem
 from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import KagyaMainLoop
+from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
 
 
 def get_api_settings(request: Request) -> Settings:
@@ -82,6 +83,26 @@ def get_adapter_registry(request: Request) -> AdapterRegistry:
         registry = AdapterRegistry(get_api_settings(request))
         request.app.state.adapter_registry = registry
     return registry
+
+
+def get_tool_registry(request: Request) -> ToolRegistry:
+    registry = getattr(request.app.state, "tool_registry", None)
+    if registry is None:
+        registry = ToolRegistry(get_api_settings(request).tools.path)
+        request.app.state.tool_registry = registry
+    return registry
+
+
+def get_tool_executor(request: Request) -> ToolExecutor:
+    executor = getattr(request.app.state, "tool_executor", None)
+    if executor is None:
+        settings = get_api_settings(request)
+        executor = ToolExecutor(
+            get_tool_registry(request),
+            audit_log_store=ToolAuditLog(settings.tools.audit_path),
+        )
+        request.app.state.tool_executor = executor
+    return executor
 
 
 def get_main_loop(request: Request) -> KagyaMainLoop:

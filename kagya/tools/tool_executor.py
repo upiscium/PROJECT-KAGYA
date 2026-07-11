@@ -4,6 +4,7 @@ import json
 
 from kagya.tools.tool_registry import ToolRegistry
 from kagya.tools.tool_sandbox import ToolSandbox
+from kagya.tools.tool_audit import ToolAuditLog
 from kagya.tools.tool_schema import (
     ToolAuditEvent,
     ToolDefinition,
@@ -22,11 +23,15 @@ class ToolExecutor:
     """Executor for approved declarative safe tool milestones."""
 
     def __init__(
-        self, registry: ToolRegistry, sandbox: ToolSandbox | None = None
+        self,
+        registry: ToolRegistry,
+        sandbox: ToolSandbox | None = None,
+        audit_log_store: ToolAuditLog | None = None,
     ) -> None:
         self.registry = registry
         self.sandbox = sandbox or ToolSandbox()
         self.audit_log: list[ToolAuditEvent] = []
+        self.audit_log_store = audit_log_store
 
     def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
         tool = self.registry.lookup(request.tool_name)
@@ -149,15 +154,16 @@ class ToolExecutor:
         tool_type: ToolType | None,
         reason: str | None,
     ) -> None:
-        self.audit_log.append(
-            ToolAuditEvent(
-                tool_name=tool_name,
-                executed=executed,
-                status=status,
-                tool_type=tool_type,
-                reason=reason or "",
-            )
+        event = ToolAuditEvent(
+            tool_name=tool_name,
+            executed=executed,
+            status=status,
+            tool_type=tool_type,
+            reason=reason or "",
         )
+        self.audit_log.append(event)
+        if self.audit_log_store is not None:
+            self.audit_log_store.append(event)
 
 
 class _SafeFormatMap(dict[str, object]):

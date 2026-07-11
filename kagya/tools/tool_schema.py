@@ -1,6 +1,7 @@
 """Tool schema types for future safe tool support."""
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -54,3 +55,6 @@ class ToolAuditEvent:
     status: ToolStatus | None
     tool_type: ToolType | None
     reason: str
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    )

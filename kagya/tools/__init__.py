@@ -1,5 +1,6 @@
 """Safe tool and multimodal extension skeletons."""
 
+from kagya.tools.tool_audit import ToolAuditLog
 from kagya.tools.tool_executor import ToolExecutionBlocked, ToolExecutor
 from kagya.tools.tool_generator import GeneratedToolProposal, ToolGenerator
 from kagya.tools.tool_registry import ToolRegistry
@@ -17,6 +18,7 @@ __all__ = [
     "GeneratedToolProposal",
     "ToolDefinition",
     "ToolAuditEvent",
+    "ToolAuditLog",
     "ToolExecutionBlocked",
     "ToolExecutionRequest",
     "ToolExecutionResult",
