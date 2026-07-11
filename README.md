@@ -7,6 +7,60 @@
 - Run frontend tests from `frontend/` with `nix develop --command npm test`.
 - Build the frontend from `frontend/` with `nix develop --command npm run build`.
 
+## Private First Run
+
+Use this path when bringing up PROJECT-KAGYA for yourself on localhost, LAN, VPN, or an SSH tunnel.
+
+1. Install dependencies:
+
+```bash
+uv sync
+cd frontend && npm ci && cd ..
+```
+
+2. Run the fast local sanity checks with the default `dummy` model:
+
+```bash
+uv run pytest
+just config-check
+```
+
+3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers` and choose model IDs your host can load. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
+
+4. Smoke test the real model before starting the app:
+
+```bash
+just transformers-smoke /path/to/transformers-config.yaml
+just transformers-smoke-fallback /path/to/transformers-config.yaml
+```
+
+5. Set a local admin token for backend admin APIs and the frontend admin proxy:
+
+```bash
+export KAGYA_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml
+export KAGYA_BACKEND_URL=http://127.0.0.1:8000
+```
+
+6. Start the API and frontend in separate terminals:
+
+```bash
+just api
+```
+
+```bash
+cd frontend
+npm run dev
+```
+
+7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. Keep this service off the public internet; browser login/session auth is intentionally not part of the default private deployment model.
+
+8. After the first useful session, create a backup because `.kagya/` contains private runtime state:
+
+```bash
+KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
+```
+
 ## Admin Access
 
 - Normal chat remains public at `POST /api/chat`.
