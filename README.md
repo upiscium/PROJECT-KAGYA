@@ -85,6 +85,34 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Shell tools, generated code execution, unapproved tools, disabled tools, and unknown tools remain blocked.
 - Tool execution attempts record audit events for both allowed and blocked requests.
 
+## Production QLoRA Boundary
+
+The committed config keeps `qlora.dry_run: true`. Non-dry-run QLoRA training is an explicit production path and should only be enabled on a host that passes the preflight check:
+
+```bash
+just qlora-prod-check /path/to/production-qlora-config.yaml
+```
+
+Production QLoRA assumptions:
+
+- `model.provider` is `transformers`, and `just transformers-smoke-fallback /path/to/config.yaml` passes first.
+- CUDA is available; CPU training is not part of the supported production path.
+- `model.load_in_4bit` remains enabled for the supported QLoRA path.
+- `datasets`, `peft`, `torch`, `transformers`, and `trl` are installed in the runtime environment.
+- `adapter_registry.eval_sets` points to at least one existing eval set so trained adapters can be evaluated before promotion.
+- `adapter_registry.manual_approval_required` remains true; no trained adapter is activated without explicit operator approval.
+- Interrupted or failed training artifacts should be treated as incomplete and must not be manually registered as approved/active adapters.
+
+Training flow for real adapters:
+
+1. Run the real-model smoke checks.
+2. Run `just qlora-prod-check /path/to/config.yaml`.
+3. Generate a dream dataset from the private runtime.
+4. Run non-dry-run training with `qlora.dry_run: false`.
+5. Register only the produced candidate adapter.
+6. Evaluate the candidate and inspect evaluation history/regressions.
+7. Manually approve and activate only if the evaluation result is acceptable.
+
 ## Configuration Field Status
 
 Most `config.yaml` fields are active runtime settings. The fields below are intentionally retained but have limited or future-facing behavior:
@@ -113,6 +141,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 - `just config-check`
 - `just schema-check`
 - `just transformers-smoke /path/to/transformers-config.yaml` on hosts intended to run real models.
+- `just qlora-prod-check /path/to/production-qlora-config.yaml` before enabling non-dry-run training.
 - `npm test -- --run` from `frontend/`
 - `npm run build` from `frontend/`
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`
