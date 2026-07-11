@@ -1,11 +1,14 @@
 """Memory routes."""
 
-import json
-
 from fastapi import APIRouter, Depends, HTTPException
 
 from kagya.api.dependencies import get_memory_system, require_admin
-from kagya.api.schemas.memory import EpisodeMemoryResponse, MemorySearchResponse, SemanticMemoryResponse
+from kagya.api.schemas.memory import (
+    EpisodeMemoryResponse,
+    MemoryMetadataUpdateRequest,
+    MemorySearchResponse,
+    SemanticMemoryResponse,
+)
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
 
 
@@ -23,40 +26,66 @@ def search_memory(query: str, memory: DualMemorySystem = Depends(get_memory_syst
 
 @router.get("/episodes/{episode_id}", response_model=EpisodeMemoryResponse)
 def get_episode(episode_id: str, memory: DualMemorySystem = Depends(get_memory_system)) -> EpisodeMemoryResponse:
-    result = memory.db1.get(ids=[episode_id], include=["metadatas"])
-    ids = result.get("ids") or []
-    if not ids:
+    record = memory.get_episodic(episode_id)
+    if record is None:
         raise HTTPException(status_code=404, detail="Episode not found")
-    metadata = (result.get("metadatas") or [{}])[0] or {}
-    return EpisodeMemoryResponse(
-        id=episode_id,
-        user_input=str(metadata.get("user_input", "")),
-        response=str(metadata.get("response", "")),
-        loss=float(metadata.get("loss", 0.0)),
-        emotion_valence=float(metadata.get("emotion_valence", 0.0)),
-        emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
-        record_type=str(metadata.get("record_type", "episodic_log")),
-        archived=bool(metadata.get("archived", False)),
-        created_at=str(metadata.get("created_at", "")),
-    )
+    return episode_response(record)
 
 
 @router.get("/semantic/{memory_id}", response_model=SemanticMemoryResponse)
 def get_semantic(memory_id: str, memory: DualMemorySystem = Depends(get_memory_system)) -> SemanticMemoryResponse:
-    result = memory.db2.get(ids=[memory_id], include=["documents", "metadatas"])
-    ids = result.get("ids") or []
-    if not ids:
+    record = memory.get_semantic(memory_id)
+    if record is None:
         raise HTTPException(status_code=404, detail="Semantic memory not found")
-    metadata = (result.get("metadatas") or [{}])[0] or {}
-    document = (result.get("documents") or [""])[0] or ""
-    source_ids = metadata.get("source_episode_ids", "[]")
-    return SemanticMemoryResponse(
-        id=memory_id,
-        text=str(metadata.get("text", document)),
-        source_episode_ids=json.loads(source_ids) if isinstance(source_ids, str) else [],
-        record_type=str(metadata.get("record_type", "semantic_memory")),
-        created_at=str(metadata.get("created_at", "")),
+    return semantic_response(record)
+
+
+@router.post("/episodes/{episode_id}/archive", response_model=EpisodeMemoryResponse)
+def archive_episode(
+    episode_id: str, memory: DualMemorySystem = Depends(get_memory_system)
+) -> EpisodeMemoryResponse:
+    record = memory.archive_episodic(episode_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return episode_response(record)
+
+
+@router.post("/episodes/{episode_id}/metadata", response_model=EpisodeMemoryResponse)
+def update_episode_metadata(
+    episode_id: str,
+    request: MemoryMetadataUpdateRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+) -> EpisodeMemoryResponse:
+    record = memory.update_episodic_metadata(
+        episode_id, tags=request.tags, operator_metadata=request.operator_metadata
     )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return episode_response(record)
+
+
+@router.post("/semantic/{memory_id}/archive", response_model=SemanticMemoryResponse)
+def archive_semantic(
+    memory_id: str, memory: DualMemorySystem = Depends(get_memory_system)
+) -> SemanticMemoryResponse:
+    record = memory.archive_semantic(memory_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+    return semantic_response(record)
+
+
+@router.post("/semantic/{memory_id}/metadata", response_model=SemanticMemoryResponse)
+def update_semantic_metadata(
+    memory_id: str,
+    request: MemoryMetadataUpdateRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+) -> SemanticMemoryResponse:
+    record = memory.update_semantic_metadata(
+        memory_id, tags=request.tags, operator_metadata=request.operator_metadata
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+    return semantic_response(record)
 
 
 def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
@@ -70,6 +99,8 @@ def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
         record_type=record.record_type.value,
         archived=record.archived,
         created_at=record.created_at,
+        tags=record.tags,
+        operator_metadata=record.operator_metadata,
     )
 
 
@@ -79,5 +110,8 @@ def semantic_response(record: SemanticMemoryRecord) -> SemanticMemoryResponse:
         text=record.text,
         source_episode_ids=record.source_episode_ids,
         record_type=record.record_type.value,
+        archived=record.archived,
         created_at=record.created_at,
+        tags=record.tags,
+        operator_metadata=record.operator_metadata,
     )

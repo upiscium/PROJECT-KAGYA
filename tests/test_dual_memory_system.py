@@ -63,6 +63,49 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
     assert memory.retrieve_context("fact").db1_results == []
 
 
+def test_operator_can_archive_episodic_record_without_deleting(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic("archive me", "kept")
+
+    archived = memory.archive_episodic(episode_id)
+
+    assert archived is not None
+    assert archived.archived is True
+    assert memory.db1.get(ids=[episode_id])["ids"] == [episode_id]
+    assert memory.retrieve_context("archive me").db1_results == []
+
+
+def test_operator_can_archive_semantic_record_without_deleting(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic("archive semantic")
+
+    archived = memory.archive_semantic(semantic_id)
+
+    assert archived is not None
+    assert archived.archived is True
+    assert memory.db2.get(ids=[semantic_id])["ids"] == [semantic_id]
+    assert memory.retrieve_context("archive semantic").db2_results == []
+
+
+def test_operator_can_tag_episodic_and_semantic_records(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic("tag episode", "response")
+    semantic_id = memory.save_semantic("tag semantic")
+
+    episode = memory.update_episodic_metadata(
+        episode_id,
+        tags=["review", " review ", "keep"],
+        operator_metadata={"owner": "operator"},
+    )
+    semantic = memory.update_semantic_metadata(semantic_id, tags=["fact"])
+
+    assert episode is not None
+    assert episode.tags == ["review", "keep"]
+    assert episode.operator_metadata == {"owner": "operator"}
+    assert semantic is not None
+    assert semantic.tags == ["fact"]
+
+
 def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None:
     memory = _memory(_settings_for_tmp_memory(tmp_path, db1_top_k=2, db2_top_k=1))
     for index in range(3):
