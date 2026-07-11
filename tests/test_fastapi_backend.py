@@ -432,7 +432,12 @@ def test_evaluation_result_endpoints_list_and_return_json(tmp_path: Path) -> Non
             {
                 "adapter_id": "adapter-api",
                 "score": 0.9,
+                "previous_score": 0.7,
+                "score_delta": 0.2,
+                "regression": False,
                 "decision": "trial_active",
+                "status_before": "candidate",
+                "status_after": "trial_active",
                 "eval_sets": ["eval.json"],
                 "case_count": 1,
                 "prompt": "private prompt",
@@ -443,12 +448,19 @@ def test_evaluation_result_endpoints_list_and_return_json(tmp_path: Path) -> Non
     )
 
     listed = client.get("/api/evaluations", headers=admin_headers())
+    history = client.get(
+        "/api/evaluations/adapters/adapter-api/history", headers=admin_headers()
+    )
     detail = client.get("/api/evaluations/adapter-api.json", headers=admin_headers())
 
     assert listed.status_code == 200
     assert listed.json()["results"][0]["filename"] == "adapter-api.json"
     assert listed.json()["results"][0]["adapter_id"] == "adapter-api"
     assert listed.json()["results"][0]["score"] == 0.9
+    assert listed.json()["results"][0]["score_delta"] == 0.2
+    assert listed.json()["results"][0]["status_after"] == "trial_active"
+    assert history.status_code == 200
+    assert history.json()["results"][0]["filename"] == "adapter-api.json"
     assert detail.status_code == 200
     assert detail.json()["payload"]["decision"] == "trial_active"
     assert detail.json()["payload"]["prompt"] == "[redacted]"

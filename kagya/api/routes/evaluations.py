@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from kagya.api.dependencies import get_api_settings, require_admin
 from kagya.api.redaction import redact_private_fields
 from kagya.api.schemas.evaluation import (
+    AdapterEvaluationHistoryResponse,
     EvaluationResultDetail,
     EvaluationResultListResponse,
     EvaluationResultSummary,
@@ -32,6 +33,27 @@ def list_evaluation_results(settings: Settings = Depends(get_api_settings)) -> E
     )
 
 
+@router.get(
+    "/adapters/{adapter_id}/history", response_model=AdapterEvaluationHistoryResponse
+)
+def get_adapter_evaluation_history(
+    adapter_id: str,
+    settings: Settings = Depends(get_api_settings),
+) -> AdapterEvaluationHistoryResponse:
+    result_dir = settings.adapter_registry.eval_result_dir
+    if not result_dir.exists():
+        return AdapterEvaluationHistoryResponse(adapter_id=adapter_id, results=[])
+    results = [
+        summary
+        for summary in (_summary_from_path(path) for path in result_dir.glob("*.json"))
+        if summary.adapter_id == adapter_id
+    ]
+    return AdapterEvaluationHistoryResponse(
+        adapter_id=adapter_id,
+        results=sorted(results, key=lambda result: result.updated_at, reverse=True),
+    )
+
+
 @router.get("/{filename}", response_model=EvaluationResultDetail)
 def get_evaluation_result(
     filename: str,
@@ -51,7 +73,12 @@ def _summary_from_path(path: Path) -> EvaluationResultSummary:
         filename=path.name,
         adapter_id=str(payload.get("adapter_id", path.stem)),
         score=_optional_float(payload.get("score")),
+        previous_score=_optional_float(payload.get("previous_score")),
+        score_delta=_optional_float(payload.get("score_delta")),
+        regression=bool(payload.get("regression", False)),
         decision=_optional_str(payload.get("decision")),
+        status_before=_optional_str(payload.get("status_before")),
+        status_after=_optional_str(payload.get("status_after")),
         case_count=_optional_int(payload.get("case_count")),
         updated_at=datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(),
     )

@@ -75,11 +75,17 @@ export type EvaluationResultSummary = {
   filename: string;
   adapter_id: string;
   score: number | null;
+  previous_score: number | null;
+  score_delta: number | null;
+  regression: boolean;
   decision: string | null;
+  status_before: string | null;
+  status_after: string | null;
   case_count: number | null;
   updated_at: string;
 };
 export type EvaluationResultListResponse = { results: EvaluationResultSummary[] };
+export type AdapterEvaluationHistoryResponse = { adapter_id: string; results: EvaluationResultSummary[] };
 export type EvaluationResultDetail = { filename: string; payload: Record<string, unknown> };
 export type SleepRunResponse = {
   selected_episode_ids: string[];
@@ -194,6 +200,7 @@ export const api = {
   activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
   rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
   evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
+  adapterEvaluationHistory: (adapterId: string) => adminRequest<AdapterEvaluationHistoryResponse>(`/evaluations/adapters/${encodeURIComponent(adapterId)}/history`),
   evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
   systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
   runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),

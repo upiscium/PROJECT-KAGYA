@@ -17,6 +17,7 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^adapters$/ },
   { method: "POST", pattern: /^adapters\/[^/]+\/(evaluate|trial|approve|activate|reject)$/ },
   { method: "GET", pattern: /^evaluations$/ },
+  { method: "GET", pattern: /^evaluations\/adapters\/[^/]+\/history$/ },
   { method: "GET", pattern: /^evaluations\/[^/]+\.json$/ },
 ];
 
