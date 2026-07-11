@@ -73,7 +73,7 @@ class KagyaMainLoop:
             user_input, emotion_state, memory_context, attachments=attachments or []
         )
         try:
-            raw_response = self.agent.generate(prompt)
+            raw_response = self.agent.generate(prompt, attachments=attachments or [])
         except Exception as exc:
             if _fallback_used(self.provider):
                 raise RuntimeError("Fallback model generation failed") from exc

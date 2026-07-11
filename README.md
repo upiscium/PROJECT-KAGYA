@@ -78,6 +78,21 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Chat responses include `model.fallback_used`; fallback responses report the fallback model ID and no active adapter.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
 
+## Multimodal Attachments
+
+The first real multimodal milestone supports one local image attachment for capable Transformers image-text models.
+
+- Supported attachment type: `image`.
+- Supported URLs: local `file://` URLs only.
+- Supported content types: `image/png`, `image/jpeg`, and `image/webp`.
+- Size limit: 5 MiB per image.
+- Limit: one image per chat request.
+- Dummy and other text-only providers remain metadata-only; they do not load attachment files.
+- Transformers validates and decodes supported image attachments before passing them to the processor.
+- Public chat responses never include raw attachment metadata or local file paths.
+
+Unsupported attachment types or invalid images are rejected by capable multimodal providers with clear errors. Keep local image paths private; prompt metadata records only safe fields such as type, name, content type, and URL scheme.
+
 ## Safe Tools
 
 - Approved static `text_template` tools can render deterministic strings from supplied arguments.
@@ -148,6 +163,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 - `KAGYA_ADMIN_TOKEN=... scripts/smoke-private-deploy.sh http://127.0.0.1:8080` for private deployments.
 - Search for forbidden provider implementation paths.
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
+- Verify public chat responses do not expose local attachment paths.
 
 ## Private Deployment
 

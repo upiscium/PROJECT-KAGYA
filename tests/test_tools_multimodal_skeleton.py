@@ -105,6 +105,23 @@ def test_public_chat_response_does_not_include_received_attachments(
     assert "attachments" not in response.json()
 
 
+def test_public_chat_response_does_not_leak_local_attachment_path(
+    tmp_path: Path,
+) -> None:
+    secret_path = tmp_path / "private-image.png"
+    response = _client(tmp_path).post(
+        "/api/chat",
+        json={
+            "text": "hello",
+            "attachments": [{"type": "image", "url": secret_path.as_uri()}],
+            "debug": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert str(secret_path) not in str(response.json())
+
+
 def test_tool_executor_blocks_non_executable_registered_tools() -> None:
     registry = ToolRegistry()
     registry.register_declared(

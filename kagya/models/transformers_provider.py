@@ -9,6 +9,7 @@ from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
 from kagya.config import Settings
+from kagya.runtime.attachments import ProcessedImageAttachment, validate_image_attachments
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
@@ -16,6 +17,8 @@ LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
 
 class TransformersProvider:
     """Provider backed by the configured Hugging Face Transformers model."""
+
+    supports_multimodal_attachments = True
 
     def __init__(
         self,
@@ -48,6 +51,22 @@ class TransformersProvider:
         except Exception:
             return self.generate_fallback(prompt)
 
+    def generate_with_attachments(
+        self, prompt: str, attachments: list[dict[str, object]]
+    ) -> str:
+        self.last_model_id = self.model_id
+        self.last_fallback_used = False
+        processed = validate_image_attachments(attachments)
+        try:
+            return self._generate_with(
+                prompt,
+                self._get_primary_model(),
+                self._get_primary_processor(),
+                image_attachments=processed,
+            )
+        except Exception:
+            return self.generate_fallback(prompt)
+
     def generate_fallback(self, prompt: str) -> str:
         self.last_model_id = self.fallback_model_id
         self.last_fallback_used = True
@@ -55,10 +74,22 @@ class TransformersProvider:
             prompt, self._get_fallback_model(), self._get_fallback_processor()
         )
 
-    def _generate_with(self, prompt: str, model: Any, processor: Any) -> str:
-        inputs = processor(
-            text=self._render_generation_prompt(prompt, processor), return_tensors="pt"
+    def _generate_with(
+        self,
+        prompt: str,
+        model: Any,
+        processor: Any,
+        *,
+        image_attachments: list[ProcessedImageAttachment] | None = None,
+    ) -> str:
+        rendered = self._render_generation_prompt(
+            prompt, processor, image_attachments=image_attachments or []
         )
+        images = [attachment.image for attachment in image_attachments or []]
+        try:
+            inputs = processor(text=rendered, images=images, return_tensors="pt") if images else processor(text=rendered, return_tensors="pt")
+        except TypeError:
+            inputs = processor(text=rendered, return_tensors="pt")
         inputs = self._move_inputs_to_model_device(inputs, model)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
@@ -72,13 +103,23 @@ class TransformersProvider:
         generated_ids = output_ids[0][input_length:]
         return processor.decode(generated_ids, skip_special_tokens=True)
 
-    def _render_generation_prompt(self, prompt: str, processor: Any) -> str:
+    def _render_generation_prompt(
+        self,
+        prompt: str,
+        processor: Any,
+        *,
+        image_attachments: list[ProcessedImageAttachment] | None = None,
+    ) -> str:
         apply_chat_template = getattr(processor, "apply_chat_template", None)
         if not callable(apply_chat_template):
             return prompt
+        content: str | list[dict[str, Any]] = _strip_assistant_marker(prompt)
+        if image_attachments:
+            content = [{"type": "text", "text": _strip_assistant_marker(prompt)}]
+            content.extend({"type": "image"} for _ in image_attachments)
         try:
             rendered = apply_chat_template(
-                [{"role": "user", "content": _strip_assistant_marker(prompt)}],
+                [{"role": "user", "content": content}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
