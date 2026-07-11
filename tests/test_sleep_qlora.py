@@ -11,6 +11,7 @@ from kagya.learning import (
     SleepCycleManager,
     format_training_text,
 )
+from kagya.learning.qlora_requirements import check_qlora_production_readiness
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 
@@ -201,6 +202,69 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
     assert manifest["dry_run"] is False
     assert manifest["dataset_hash"] == result.dataset_hash
     assert manifest["qlora"]["max_steps"] == settings.qlora.max_steps
+
+
+def test_qlora_prod_check_rejects_default_dry_run_config(tmp_path: Path) -> None:
+    settings = _settings_for_sleep(tmp_path)
+
+    report = check_qlora_production_readiness(
+        settings,
+        dependency_available=lambda name: True,
+        cuda_available=lambda: True,
+    )
+
+    assert report.ready is False
+    assert "qlora.dry_run must be false for production training" in report.failures
+    assert "model.provider must be transformers" in report.failures
+
+
+def test_qlora_prod_check_accepts_ready_boundaries(tmp_path: Path) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    eval_set = tmp_path / "eval_set.json"
+    eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
+    settings = settings.model_copy(
+        update={
+            "model": settings.model.model_copy(update={"provider": "transformers"}),
+            "qlora": settings.qlora.model_copy(update={"dry_run": False}),
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_sets": [eval_set]}
+            ),
+        }
+    )
+
+    report = check_qlora_production_readiness(
+        settings,
+        dependency_available=lambda name: True,
+        cuda_available=lambda: True,
+    )
+
+    assert report.ready is True
+    assert report.failures == []
+
+
+def test_qlora_prod_check_reports_missing_dependency_and_cuda(tmp_path: Path) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    eval_set = tmp_path / "eval_set.json"
+    eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
+    settings = settings.model_copy(
+        update={
+            "model": settings.model.model_copy(update={"provider": "transformers"}),
+            "qlora": settings.qlora.model_copy(update={"dry_run": False}),
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_sets": [eval_set]}
+            ),
+        }
+    )
+
+    report = check_qlora_production_readiness(
+        settings,
+        dependency_available=lambda name: name != "trl",
+        cuda_available=lambda: False,
+    )
+
+    assert report.ready is False
+    assert "missing training dependencies: trl" in report.failures
+    assert "CUDA must be available for the production QLoRA path" in report.failures
 
 
 def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> None:

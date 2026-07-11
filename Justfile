@@ -47,6 +47,11 @@ transformers-smoke-fallback config="config.yaml":
     @echo "==> Running opt-in Transformers provider fallback smoke check..."
     uv run python -m kagya.models.transformers_smoke --config {{config}} --check-fallback
 
+# Check non-dry-run QLoRA production prerequisites without starting training.
+qlora-prod-check config="config.yaml":
+    @echo "==> Checking production QLoRA prerequisites..."
+    uv run python -m kagya.learning.qlora_requirements --config {{config}}
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."
