@@ -37,6 +37,8 @@ export type EpisodeMemory = {
   record_type: string;
   archived: boolean;
   created_at: string;
+  tags: string[];
+  operator_metadata: Record<string, unknown>;
 };
 
 export type SemanticMemory = {
@@ -44,10 +46,14 @@ export type SemanticMemory = {
   text: string;
   source_episode_ids: string[];
   record_type: string;
+  archived: boolean;
   created_at: string;
+  tags: string[];
+  operator_metadata: Record<string, unknown>;
 };
 
 export type MemorySearchResponse = { db1_results: EpisodeMemory[]; db2_results: SemanticMemory[] };
+export type MemoryMetadataUpdate = { tags?: string[]; operator_metadata?: Record<string, unknown> };
 
 export type Adapter = {
   adapter_id: string;
@@ -176,6 +182,10 @@ export const api = {
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
+  archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
+  updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
+  archiveSemanticMemory: (memoryId: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
+  updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
   sleepRun: () => adminRequest<SleepRunResponse>("/sleep/run", { method: "POST" }),
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
   evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),

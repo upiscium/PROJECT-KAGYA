@@ -10,6 +10,8 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^memory\/search$/ },
   { method: "GET", pattern: /^memory\/episodes\/[^/]+$/ },
   { method: "GET", pattern: /^memory\/semantic\/[^/]+$/ },
+  { method: "POST", pattern: /^memory\/episodes\/[^/]+\/(archive|metadata)$/ },
+  { method: "POST", pattern: /^memory\/semantic\/[^/]+\/(archive|metadata)$/ },
   { method: "POST", pattern: /^chat\/debug$/ },
   { method: "POST", pattern: /^sleep\/run$/ },
   { method: "GET", pattern: /^adapters$/ },

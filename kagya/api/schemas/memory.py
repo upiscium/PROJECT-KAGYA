@@ -1,6 +1,13 @@
 """Memory API schemas."""
 
+from typing import Any
+
 from pydantic import BaseModel
+
+
+class MemoryMetadataUpdateRequest(BaseModel):
+    tags: list[str] | None = None
+    operator_metadata: dict[str, Any] | None = None
 
 
 class EpisodeMemoryResponse(BaseModel):
@@ -13,6 +20,8 @@ class EpisodeMemoryResponse(BaseModel):
     record_type: str
     archived: bool
     created_at: str
+    tags: list[str]
+    operator_metadata: dict[str, Any]
 
 
 class SemanticMemoryResponse(BaseModel):
@@ -20,7 +29,10 @@ class SemanticMemoryResponse(BaseModel):
     text: str
     source_episode_ids: list[str]
     record_type: str
+    archived: bool
     created_at: str
+    tags: list[str]
+    operator_metadata: dict[str, Any]
 
 
 class MemorySearchResponse(BaseModel):

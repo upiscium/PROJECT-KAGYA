@@ -26,6 +26,8 @@ class EpisodicMemoryRecord:
     archived: bool = False
     created_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    operator_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -34,8 +36,11 @@ class SemanticMemoryRecord:
     text: str
     source_episode_ids: list[str] = field(default_factory=list)
     record_type: MemoryRecordType = MemoryRecordType.SEMANTIC_MEMORY
+    archived: bool = False
     created_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    operator_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

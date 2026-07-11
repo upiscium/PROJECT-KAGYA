@@ -506,6 +506,36 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
     assert "private memory thought" not in str(detail.json())
 
 
+def test_memory_api_archives_and_tags_records(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    memory = client.app.state.memory_system
+    episode_id = memory.save_episodic("operator episode", "response")
+    semantic_id = memory.save_semantic("operator semantic")
+
+    tagged = client.post(
+        f"/api/memory/episodes/{episode_id}/metadata",
+        headers=admin_headers(),
+        json={"tags": ["review", "keep"], "operator_metadata": {"owner": "ops"}},
+    )
+    archived = client.post(
+        f"/api/memory/episodes/{episode_id}/archive", headers=admin_headers()
+    )
+    semantic_tagged = client.post(
+        f"/api/memory/semantic/{semantic_id}/metadata",
+        headers=admin_headers(),
+        json={"tags": ["fact"]},
+    )
+
+    assert tagged.status_code == 200
+    assert tagged.json()["tags"] == ["review", "keep"]
+    assert tagged.json()["operator_metadata"] == {"owner": "ops"}
+    assert archived.status_code == 200
+    assert archived.json()["archived"] is True
+    assert memory.db1.get(ids=[episode_id])["ids"] == [episode_id]
+    assert semantic_tagged.status_code == 200
+    assert semantic_tagged.json()["tags"] == ["fact"]
+
+
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     client = _client(tmp_path)
 

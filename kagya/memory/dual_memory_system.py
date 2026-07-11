@@ -154,6 +154,7 @@ class DualMemorySystem:
             "text": text,
             "source_episode_ids": json.dumps(source_episode_ids or []),
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
+            "archived": False,
             "created_at": _now_iso(),
             "extra": json.dumps(metadata or {}),
         }
@@ -172,7 +173,11 @@ class DualMemorySystem:
         )
         return MemoryContext(
             db1_results=_episodic_records_from_query(db1_results),
-            db2_results=_semantic_records_from_query(db2_results),
+            db2_results=[
+                record
+                for record in _semantic_records_from_query(db2_results)
+                if not record.archived
+            ],
         )
 
     def consolidate_to_semantic(self, model_provider: ModelProvider) -> list[str]:
@@ -193,13 +198,67 @@ class DualMemorySystem:
         return _episodic_records_from_get(result)
 
     def _archive_episodic(self, episode_id: str) -> None:
+        self.archive_episodic(episode_id)
+
+    def get_episodic(self, episode_id: str) -> EpisodicMemoryRecord | None:
         result = self.db1.get(ids=[episode_id], include=["metadatas"])
-        metadatas = result.get("metadatas") or []
-        if not metadatas:
-            return
-        metadata = dict(metadatas[0])
+        return _first_episode_from_get(result)
+
+    def get_semantic(self, memory_id: str) -> SemanticMemoryRecord | None:
+        result = self.db2.get(ids=[memory_id], include=["documents", "metadatas"])
+        return _first_semantic_from_get(result)
+
+    def archive_episodic(self, episode_id: str) -> EpisodicMemoryRecord | None:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
         metadata["archived"] = True
         self.db1.update(ids=[episode_id], metadatas=[metadata])
+        return self.get_episodic(episode_id)
+
+    def archive_semantic(self, memory_id: str) -> SemanticMemoryRecord | None:
+        result = self.db2.get(ids=[memory_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
+        metadata["archived"] = True
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        return self.get_semantic(memory_id)
+
+    def update_episodic_metadata(
+        self,
+        episode_id: str,
+        *,
+        tags: list[str] | None = None,
+        operator_metadata: dict[str, Any] | None = None,
+    ) -> EpisodicMemoryRecord | None:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
+        metadata["extra"] = json.dumps(
+            _updated_operator_extra(metadata.get("extra"), tags, operator_metadata)
+        )
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+        return self.get_episodic(episode_id)
+
+    def update_semantic_metadata(
+        self,
+        memory_id: str,
+        *,
+        tags: list[str] | None = None,
+        operator_metadata: dict[str, Any] | None = None,
+    ) -> SemanticMemoryRecord | None:
+        result = self.db2.get(ids=[memory_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
+        metadata["extra"] = json.dumps(
+            _updated_operator_extra(metadata.get("extra"), tags, operator_metadata)
+        )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        return self.get_semantic(memory_id)
 
 
 def _embed_text(text: str) -> list[float]:
@@ -248,7 +307,28 @@ def _episodic_records_from_get(result: dict[str, Any]) -> list[EpisodicMemoryRec
     return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
 
 
+def _semantic_records_from_get(result: dict[str, Any]) -> list[SemanticMemoryRecord]:
+    ids = result.get("ids") or []
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+    return [
+        _semantic_record_from_metadata(record_id, document or "", metadata or {})
+        for record_id, document, metadata in zip(ids, documents, metadatas, strict=False)
+    ]
+
+
+def _first_episode_from_get(result: dict[str, Any]) -> EpisodicMemoryRecord | None:
+    records = _episodic_records_from_get(result)
+    return records[0] if records else None
+
+
+def _first_semantic_from_get(result: dict[str, Any]) -> SemanticMemoryRecord | None:
+    records = _semantic_records_from_get(result)
+    return records[0] if records else None
+
+
 def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> EpisodicMemoryRecord:
+    extra = _loads_json_dict(metadata.get("extra"))
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
@@ -260,19 +340,66 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))),
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
-        metadata=_loads_json_dict(metadata.get("extra")),
+        metadata=extra,
+        tags=_operator_tags(extra),
+        operator_metadata=_operator_metadata(extra),
     )
 
 
 def _semantic_record_from_metadata(record_id: str, document: str, metadata: dict[str, Any]) -> SemanticMemoryRecord:
+    extra = _loads_json_dict(metadata.get("extra"))
     return SemanticMemoryRecord(
         id=record_id,
         text=str(metadata.get("text", document)),
         source_episode_ids=_loads_json_list(metadata.get("source_episode_ids")),
         record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))),
+        archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
-        metadata=_loads_json_dict(metadata.get("extra")),
+        metadata=extra,
+        tags=_operator_tags(extra),
+        operator_metadata=_operator_metadata(extra),
     )
+
+
+def _first_metadata(result: dict[str, Any]) -> dict[str, Any] | None:
+    metadatas = result.get("metadatas") or []
+    if not metadatas:
+        return None
+    return dict(metadatas[0] or {})
+
+
+def _updated_operator_extra(
+    raw_extra: Any,
+    tags: list[str] | None,
+    operator_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    extra = _loads_json_dict(raw_extra)
+    if tags is not None:
+        extra["tags"] = _clean_tags(tags)
+    if operator_metadata is not None:
+        extra["operator_metadata"] = operator_metadata
+    return extra
+
+
+def _clean_tags(tags: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for tag in tags:
+        normalized = tag.strip()
+        if normalized and normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _operator_tags(extra: dict[str, Any]) -> list[str]:
+    tags = extra.get("tags")
+    if not isinstance(tags, list):
+        return []
+    return [tag for tag in tags if isinstance(tag, str)]
+
+
+def _operator_metadata(extra: dict[str, Any]) -> dict[str, Any]:
+    metadata = extra.get("operator_metadata")
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def _first_result_list(value: Any) -> list[Any]:
