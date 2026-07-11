@@ -37,6 +37,16 @@ config-check config="config.yaml":
     @echo "==> Checking PROJECT-KAGYA config {{config}}..."
     uv run python -m kagya.config.check {{config}}
 
+# Opt-in smoke test for real Hugging Face Transformers models.
+transformers-smoke config="config.yaml":
+    @echo "==> Running opt-in Transformers provider smoke check..."
+    uv run python -m kagya.models.transformers_smoke --config {{config}}
+
+# Opt-in smoke test for both primary and fallback Transformers models.
+transformers-smoke-fallback config="config.yaml":
+    @echo "==> Running opt-in Transformers provider fallback smoke check..."
+    uv run python -m kagya.models.transformers_smoke --config {{config}} --check-fallback
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."

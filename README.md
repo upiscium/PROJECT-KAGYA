@@ -19,6 +19,7 @@
 
 - `config.yaml` defaults to the safe `dummy` provider.
 - Real model smoke should use the Transformers provider and model IDs from `config.yaml` only.
+- Real model smoke is opt-in and does not run in normal tests. Set `model.provider: transformers` in the target config, then run `just transformers-smoke /path/to/config.yaml`. Use `just transformers-smoke-fallback /path/to/config.yaml` to also load and generate with `model.fallback_id`.
 - The Transformers provider lazy-loads `model.primary_id` per request and falls back to `model.fallback_id` when primary loading or generation fails.
 - Chat responses include `model.fallback_used`; fallback responses report the fallback model ID and no active adapter.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
@@ -57,6 +58,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 - `uv run ruff check kagya tests`
 - `just config-check`
 - `just schema-check`
+- `just transformers-smoke /path/to/transformers-config.yaml` on hosts intended to run real models.
 - `npm test -- --run` from `frontend/`
 - `npm run build` from `frontend/`
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`
