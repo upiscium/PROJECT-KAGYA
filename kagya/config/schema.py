@@ -30,6 +30,8 @@ class GenerationSettings(StrictBaseModel):
     temperature: float = Field(ge=0.0)
     top_p: float = Field(gt=0.0, le=1.0)
     do_sample: bool
+    repetition_penalty: float = Field(default=1.1, ge=1.0)
+    no_repeat_ngram_size: int = Field(default=6, ge=0)
 
 
 class EmotionSettings(StrictBaseModel):

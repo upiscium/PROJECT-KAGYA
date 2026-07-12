@@ -108,4 +108,15 @@ describe("ChatClient", () => {
     expect(screen.queryByText(/hidden_thought/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/raw prompt/i)).not.toBeInTheDocument();
   });
+
+  it("shows a generating indicator while waiting for the response", async () => {
+    fetchMock.mockReturnValue(new Promise(() => undefined));
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByLabelText("KAGYA is generating a response")).toBeInTheDocument();
+    expect(screen.getByText("Generating response...")).toBeInTheDocument();
+  });
 });

@@ -78,6 +78,12 @@ export function ChatClient() {
             {turn.attachments?.length ? <p className="muted">Attachments: {turn.attachments.map((attachment) => attachment.name ?? attachment.url ?? attachment.type).join(", ")}</p> : null}
           </div>
         ))}
+        {mutation.isPending ? (
+          <div className="chat-bubble assistant" aria-live="polite" aria-label="KAGYA is generating a response">
+            <strong>KAGYA</strong>
+            <p className="generating-indicator"><span className="spinner" aria-hidden="true" />Generating response...</p>
+          </div>
+        ) : null}
       </Card>
 
       <form

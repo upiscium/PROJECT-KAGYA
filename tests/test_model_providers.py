@@ -97,7 +97,8 @@ class FakeModel:
 
     def generate(self, **kwargs) -> torch.Tensor:
         self.generate_kwargs = kwargs
-        return torch.tensor([[1, 2, 3, 4, 5]])
+        input_ids = kwargs["input_ids"][0].tolist()
+        return torch.tensor([input_ids + [4, 5]])
 
 
 class FailingGenerateModel(FakeModel):
@@ -305,7 +306,7 @@ def test_transformers_provider_uses_fallback_when_primary_load_fails(
 
     generated = provider.generate("hello")
 
-    assert generated == "2 3 4 5"
+    assert generated == "4 5"
     assert loaded_model_ids == [
         load_settings(CONFIG_PATH).model.primary_id,
         load_settings(CONFIG_PATH).model.fallback_id,
@@ -340,7 +341,7 @@ def test_transformers_provider_uses_fallback_when_primary_generation_fails(
 
     generated = provider.generate("hello")
 
-    assert generated == "2 3 4 5"
+    assert generated == "4 5"
     assert loaded_model_ids == [
         load_settings(CONFIG_PATH).model.primary_id,
         load_settings(CONFIG_PATH).model.fallback_id,
@@ -413,6 +414,8 @@ def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None
     assert "temperature" not in fake_model.generate_kwargs
     assert "top_p" not in fake_model.generate_kwargs
     assert fake_model.generate_kwargs["do_sample"] is False
+    assert fake_model.generate_kwargs["repetition_penalty"] == settings.generation.repetition_penalty
+    assert fake_model.generate_kwargs["no_repeat_ngram_size"] == settings.generation.no_repeat_ngram_size
 
 
 def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
@@ -433,6 +436,8 @@ def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
     assert fake_model.generate_kwargs["temperature"] == settings.generation.temperature
     assert fake_model.generate_kwargs["top_p"] == settings.generation.top_p
     assert fake_model.generate_kwargs["do_sample"] is True
+    assert fake_model.generate_kwargs["repetition_penalty"] == settings.generation.repetition_penalty
+    assert fake_model.generate_kwargs["no_repeat_ngram_size"] == settings.generation.no_repeat_ngram_size
 
 
 def test_transformers_generate_uses_processor_chat_template_when_available() -> None:
@@ -473,7 +478,7 @@ def test_transformers_generate_with_image_attachment_uses_image_inputs(tmp_path:
         ],
     )
 
-    assert generated == "3 4 5"
+    assert generated == "4 5"
     assert processor.images_seen is not None
     assert len(processor.images_seen) == 1
     assert processor.messages_seen is not None
@@ -512,7 +517,9 @@ def test_transformers_generate_falls_back_when_chat_template_is_unavailable() ->
 
     provider.generate("plain prompt")
 
-    assert processor.texts == ["plain prompt"]
+    assert processor.texts == [
+        "plain prompt\n\nRespond once, naturally, and do not repeat yourself.\nAssistant:"
+    ]
 
 
 def test_transformers_generate_falls_back_when_processor_has_no_chat_template() -> None:
@@ -523,7 +530,9 @@ def test_transformers_generate_falls_back_when_processor_has_no_chat_template() 
 
     provider.generate("plain prompt")
 
-    assert processor.texts == ["plain prompt"]
+    assert processor.texts == [
+        "plain prompt\n\nRespond once, naturally, and do not repeat yourself.\nAssistant:"
+    ]
 
 
 def test_adapter_paths_must_be_approved_by_registry(tmp_path: Path) -> None:

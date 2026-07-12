@@ -54,6 +54,9 @@ def _lifespan(settings: Settings):
 def _preload_runtime(app: FastAPI, settings: Settings) -> None:
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
+    embedding_model = getattr(app.state.memory_system.embedding_function, "_get_model", None)
+    if callable(embedding_model):
+        embedding_model()
     if (
         settings.model.provider.lower() == "transformers"
         and getattr(app.state, "model_provider", None) is None
@@ -75,8 +78,9 @@ def main() -> None:
     """Run the development API server."""
 
     settings = get_settings()
+    runtime_app = create_app(settings)
     uvicorn.run(
-        "kagya.api.server:app",
+        runtime_app,
         host=settings.api.host,
         port=settings.api.port,
         reload=False,

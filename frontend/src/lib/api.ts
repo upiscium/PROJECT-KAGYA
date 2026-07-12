@@ -24,7 +24,7 @@ export type DebugChatResponse = ChatResponse & {
   prompt: string;
   attachments: Attachment[];
   retrieved_memory: RetrievedMemory;
-  generation_params: { max_new_tokens: number; temperature: number; top_p: number; do_sample: boolean };
+  generation_params: { max_new_tokens: number; temperature: number; top_p: number; do_sample: boolean; repetition_penalty: number; no_repeat_ngram_size: number };
 };
 
 export type EpisodeMemory = {

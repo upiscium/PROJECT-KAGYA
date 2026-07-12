@@ -31,7 +31,7 @@ describe("DebugClient", () => {
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
         retrieved_memory: { db1_results: [], db2_results: [] },
-        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true, repetition_penalty: 1.1, no_repeat_ngram_size: 6 },
       }),
     });
     renderWithQuery();
@@ -58,7 +58,7 @@ describe("DebugClient", () => {
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
         retrieved_memory: { db1_results: [], db2_results: [] },
-        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true, repetition_penalty: 1.1, no_repeat_ngram_size: 6 },
       }),
     });
     renderWithQuery();
@@ -94,7 +94,7 @@ describe("DebugClient", () => {
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
         retrieved_memory: { db1_results: [], db2_results: [] },
-        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true, repetition_penalty: 1.1, no_repeat_ngram_size: 6 },
       }),
     });
     renderWithQuery();
@@ -134,7 +134,7 @@ describe("DebugClient", () => {
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E2B", adapter_id: null, fallback_used: true },
         retrieved_memory: { db1_results: [], db2_results: [] },
-        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true },
+        generation_params: { max_new_tokens: 8, temperature: 0.7, top_p: 0.95, do_sample: true, repetition_penalty: 1.1, no_repeat_ngram_size: 6 },
       }),
     });
     renderWithQuery();

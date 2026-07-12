@@ -83,6 +83,8 @@ def debug_chat(
             temperature=settings.generation.temperature,
             top_p=settings.generation.top_p,
             do_sample=settings.generation.do_sample,
+            repetition_penalty=settings.generation.repetition_penalty,
+            no_repeat_ngram_size=settings.generation.no_repeat_ngram_size,
         ),
     )
 

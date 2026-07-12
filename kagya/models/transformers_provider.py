@@ -94,7 +94,20 @@ class TransformersProvider:
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
             "do_sample": self.settings.generation.do_sample,
+            "repetition_penalty": self.settings.generation.repetition_penalty,
+            "no_repeat_ngram_size": self.settings.generation.no_repeat_ngram_size,
         }
+        eos_token_id = getattr(processor, "eos_token_id", None)
+        pad_token_id = getattr(processor, "pad_token_id", None)
+        tokenizer = getattr(processor, "tokenizer", None)
+        if eos_token_id is None and tokenizer is not None:
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is None and tokenizer is not None:
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if eos_token_id is not None:
+            generation_kwargs["eos_token_id"] = eos_token_id
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
         if self.settings.generation.do_sample:
             generation_kwargs["temperature"] = self.settings.generation.temperature
             generation_kwargs["top_p"] = self.settings.generation.top_p
@@ -112,7 +125,7 @@ class TransformersProvider:
     ) -> str:
         apply_chat_template = getattr(processor, "apply_chat_template", None)
         if not callable(apply_chat_template):
-            return prompt
+            return _plain_generation_prompt(prompt)
         content: str | list[dict[str, Any]] = _strip_assistant_marker(prompt)
         if image_attachments:
             content = [{"type": "text", "text": _strip_assistant_marker(prompt)}]
@@ -124,7 +137,7 @@ class TransformersProvider:
                 add_generation_prompt=True,
             )
         except (TypeError, ValueError):
-            return prompt
+            return _plain_generation_prompt(prompt)
         return rendered if isinstance(rendered, str) else prompt
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
@@ -258,3 +271,7 @@ def _strip_assistant_marker(prompt: str) -> str:
     if prompt.endswith(marker):
         return prompt[: -len(marker)].rstrip()
     return prompt
+
+
+def _plain_generation_prompt(prompt: str) -> str:
+    return f"{_strip_assistant_marker(prompt)}\n\nRespond once, naturally, and do not repeat yourself.\nAssistant:"

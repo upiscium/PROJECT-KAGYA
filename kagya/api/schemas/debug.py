@@ -28,6 +28,8 @@ class GenerationParamsSchema(BaseModel):
     temperature: float
     top_p: float
     do_sample: bool
+    repetition_penalty: float
+    no_repeat_ngram_size: int
 
 
 class DebugChatResponse(ChatResponse):
