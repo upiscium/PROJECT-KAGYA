@@ -69,6 +69,19 @@ class FakeImageChatTemplateProcessor(FakeChatTemplateProcessor):
         return {"input_ids": torch.tensor([[1, 2]])}
 
 
+class MissingChatTemplateProcessor(FakeProcessor):
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> str:
+        raise ValueError(
+            "Cannot use apply_chat_template because this processor does not have a chat template."
+        )
+
+
 class FakeModel:
     def __init__(self) -> None:
         self.eval_called = False
@@ -493,6 +506,17 @@ def test_transformers_rejects_invalid_image_attachment(tmp_path: Path) -> None:
 
 def test_transformers_generate_falls_back_when_chat_template_is_unavailable() -> None:
     processor = FakeProcessor()
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=FakeModel(), processor=processor
+    )
+
+    provider.generate("plain prompt")
+
+    assert processor.texts == ["plain prompt"]
+
+
+def test_transformers_generate_falls_back_when_processor_has_no_chat_template() -> None:
+    processor = MissingChatTemplateProcessor()
     provider = TransformersProvider(
         load_settings(CONFIG_PATH), model=FakeModel(), processor=processor
     )

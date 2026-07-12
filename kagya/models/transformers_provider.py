@@ -123,7 +123,7 @@ class TransformersProvider:
                 tokenize=False,
                 add_generation_prompt=True,
             )
-        except TypeError:
+        except (TypeError, ValueError):
             return prompt
         return rendered if isinstance(rendered, str) else prompt
 
