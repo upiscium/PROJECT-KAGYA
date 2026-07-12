@@ -20,6 +20,7 @@
             pre-commit
             gnused
             nodejs_22
+            openssl
           ];
 
           shellHook = ''
