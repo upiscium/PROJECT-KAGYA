@@ -27,6 +27,8 @@ just config-check
 
 3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers` and choose model IDs your host can load. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
 
+If you previously used `.kagya/chroma` with another embedding backend, PROJECT-KAGYA creates embedding-versioned Chroma collections for non-legacy embeddings. Old collections are kept on disk but are not mixed with new embedding dimensions.
+
 4. Smoke test the real model before starting the app:
 
 ```bash
@@ -83,7 +85,7 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - `config.yaml` defaults to the safe `dummy` provider.
 - Real model smoke should use the Transformers provider and model IDs from `config.yaml` only.
 - Real model smoke is opt-in and does not run in normal tests. Set `model.provider: transformers` in the target config, then run `just transformers-smoke /path/to/config.yaml`. Use `just transformers-smoke-fallback /path/to/config.yaml` to also load and generate with `model.fallback_id`.
-- The Transformers provider lazy-loads `model.primary_id` per request and falls back to `model.fallback_id` when primary loading or generation fails.
+- FastAPI startup preloads the primary Transformers model and processor so the first chat request does not pay the full model-load cost. The provider still falls back to `model.fallback_id` when primary generation fails.
 - Chat responses include `model.fallback_used`; fallback responses report the fallback model ID and no active adapter.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
 

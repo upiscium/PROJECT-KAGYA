@@ -2,7 +2,9 @@
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
+import hashlib
 import json
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -100,13 +102,21 @@ class DualMemorySystem:
         self.embedding_function = embedding_function or create_embedding_function(settings)
         self.evaluator = evaluator or MemoryEvaluator()
         self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
+        db1_collection = _collection_name_for_embedding(
+            settings.memory.db1_collection, self.embedding_function
+        )
+        db2_collection = _collection_name_for_embedding(
+            settings.memory.db2_collection, self.embedding_function
+        )
         self.db1 = self.client.get_or_create_collection(
-            name=settings.memory.db1_collection,
+            name=db1_collection,
             embedding_function=self.embedding_function,
+            metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
         self.db2 = self.client.get_or_create_collection(
-            name=settings.memory.db2_collection,
+            name=db2_collection,
             embedding_function=self.embedding_function,
+            metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
 
     def save_episodic(
@@ -267,6 +277,27 @@ def _embed_text(text: str) -> list[float]:
         buckets[index % len(buckets)] += float(ord(char) % 31) / 31.0
     magnitude = sum(value * value for value in buckets) ** 0.5 or 1.0
     return [value / magnitude for value in buckets]
+
+
+def _collection_name_for_embedding(base_name: str, embedding_function: Any) -> str:
+    if _is_legacy_embedding(embedding_function):
+        return base_name
+    embedding_name = _embedding_name(embedding_function)
+    digest = hashlib.sha256(embedding_name.encode("utf-8")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", embedding_name).strip("-")[:32]
+    return f"{base_name}-{safe_name}-{digest}"
+
+
+def _embedding_name(embedding_function: Any) -> str:
+    name = getattr(embedding_function, "name", None)
+    if callable(name):
+        return str(name())
+    return embedding_function.__class__.__name__
+
+
+def _is_legacy_embedding(embedding_function: Any) -> bool:
+    is_legacy = getattr(embedding_function, "is_legacy", None)
+    return bool(callable(is_legacy) and is_legacy())
 
 
 def _load_sentence_transformer(model_id: str) -> Any:

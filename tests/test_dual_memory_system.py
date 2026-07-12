@@ -126,6 +126,26 @@ def test_default_embedding_function_uses_configured_model_id(tmp_path: Path) -> 
     assert embedding.model_id == settings.memory.embedding_model_id
 
 
+def test_non_legacy_embedding_uses_versioned_collection_names(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+
+    class NonLegacyEmbedding(DeterministicEmbeddingFunction):
+        @staticmethod
+        def name() -> str:
+            return "sentence-transformers:test-model"
+
+        @staticmethod
+        def is_legacy() -> bool:
+            return False
+
+    memory = DualMemorySystem(settings, embedding_function=NonLegacyEmbedding())
+
+    assert memory.db1.name.startswith(
+        "hippocampus_test-sentence-transformers-test-model-"
+    )
+    assert memory.db2.name.startswith("cortex_test-sentence-transformers-test-model-")
+
+
 def test_sentence_transformer_embedding_function_encodes_with_configured_model() -> None:
     loaded: dict[str, object] = {}
 
