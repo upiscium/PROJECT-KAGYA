@@ -34,17 +34,26 @@ just transformers-smoke /path/to/transformers-config.yaml
 just transformers-smoke-fallback /path/to/transformers-config.yaml
 ```
 
-5. Set a local admin token for backend admin APIs and the frontend admin proxy:
+5. Create local env files. The backend does not auto-load `.env`, so source it before `just api`. Next.js auto-loads `frontend/.env.local` for `npm run dev`.
 
 ```bash
-export KAGYA_ADMIN_TOKEN="$(openssl rand -hex 32)"
-export KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml
-export KAGYA_BACKEND_URL=http://127.0.0.1:8000
+ADMIN_TOKEN="$(openssl rand -hex 32)"
+cat > .env <<EOF
+KAGYA_ADMIN_TOKEN=${ADMIN_TOKEN}
+KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml
+EOF
+
+cat > frontend/.env.local <<EOF
+KAGYA_ADMIN_TOKEN=${ADMIN_TOKEN}
+KAGYA_BACKEND_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:3000
+EOF
 ```
 
 6. Start the API and frontend in separate terminals:
 
 ```bash
+set -a; source .env; set +a
 just api
 ```
 
