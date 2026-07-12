@@ -9,7 +9,7 @@ from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
 from kagya.config import Settings
-from kagya.runtime.attachments import ProcessedImageAttachment, validate_image_attachments
+from kagya.attachments import ProcessedImageAttachment, validate_image_attachments
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}

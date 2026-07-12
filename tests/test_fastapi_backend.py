@@ -50,6 +50,20 @@ class SuccessfulFallbackProvider(EmptyFallbackProvider):
         return "Fallback visible API answer."
 
 
+class PreloadProvider(DummyProvider):
+    def __init__(self) -> None:
+        self.processor_loaded = False
+        self.model_loaded = False
+
+    def get_processor(self) -> object:
+        self.processor_loaded = True
+        return object()
+
+    def get_model(self) -> object:
+        self.model_loaded = True
+        return object()
+
+
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
@@ -346,6 +360,26 @@ def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
         if middleware.cls is CORSMiddleware
     )
     assert cors.kwargs["allow_origins"] == settings.api.cors_origins
+
+
+def test_startup_preloads_transformers_provider(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={"model": settings.model.model_copy(update={"provider": "transformers"})}
+    )
+    provider = PreloadProvider()
+    monkeypatch.setattr("kagya.api.server.load_model_provider", lambda settings: provider)
+    app = create_app(settings)
+    app.state.memory_system = DualMemorySystem(
+        settings, embedding_function=DeterministicEmbeddingFunction()
+    )
+
+    with TestClient(app):
+        pass
+
+    assert provider.processor_loaded is True
+    assert provider.model_loaded is True
+    assert app.state.model_provider is provider
 
 
 def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None:
