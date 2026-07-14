@@ -10,6 +10,7 @@ from kagya.memory import DualMemorySystem, MemoryContext
 from kagya.models import ModelProvider
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_state import SessionState
+from kagya.runtime.agent_state import PersistentAgentState
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class KagyaMainLoop:
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
+        persistent_state: PersistentAgentState | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -57,6 +59,7 @@ class KagyaMainLoop:
         self.agent = agent or ConsciousAgent(provider)
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
+        self.persistent_state = persistent_state or PersistentAgentState()
 
     def chat(
         self,

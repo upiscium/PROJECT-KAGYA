@@ -22,6 +22,10 @@ class AgentEventType(StrEnum):
     MEMORY_UPDATE = "memory_update"
     ADAPTER_READ = "adapter_read"
     ADAPTER_UPDATE = "adapter_update"
+    STATE_SNAPSHOT = "state_snapshot"
+    STATE_EXPORT = "state_export"
+    STATE_RESTORE = "state_restore"
+    STATE_RESET = "state_reset"
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,14 @@ class EventRecorder(Protocol):
     ) -> object: ...
 
 
+class EventCompletionHook(Protocol):
+    def __call__(self, event: AgentEvent) -> None: ...
+
+
+class EventFailureHook(Protocol):
+    def __call__(self, event: AgentEvent, exception: Exception) -> None: ...
+
+
 class AgentRuntimeQueueFull(RuntimeError):
     """Raised when an event cannot be accepted without blocking."""
 
@@ -77,14 +89,21 @@ class AgentRuntime:
         *,
         queue_capacity: int,
         event_recorder: EventRecorder | None = None,
+        initial_sequence: int = 0,
+        completion_hook: EventCompletionHook | None = None,
+        failure_hook: EventFailureHook | None = None,
     ) -> None:
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be greater than zero")
+        if initial_sequence < 0:
+            raise ValueError("initial_sequence must not be negative")
         self._queue: Queue[_Envelope[Any] | object] = Queue(maxsize=queue_capacity)
         self._event_recorder = event_recorder
+        self._completion_hook = completion_hook
+        self._failure_hook = failure_hook
         self._state_lock = Lock()
         self._state = "created"
-        self._sequence = 0
+        self._sequence = initial_sequence
         self._worker: Thread | None = None
 
     def start(self) -> None:
@@ -199,15 +218,30 @@ class AgentRuntime:
                 try:
                     value = envelope.handler()
                 except Exception as exc:
+                    if self._failure_hook is not None:
+                        try:
+                            self._failure_hook(event, exc)
+                        except Exception:
+                            pass
                     self._record(event, "failed", exception_type=type(exc).__name__)
                     if can_deliver:
                         envelope.future.set_exception(exc)
                 else:
-                    self._record(event, "completed")
-                    if can_deliver:
-                        envelope.future.set_result(
-                            AgentEventOutcome(event=event, value=value)
+                    try:
+                        if self._completion_hook is not None:
+                            self._completion_hook(event)
+                    except Exception as exc:
+                        self._record(
+                            event, "failed", exception_type=type(exc).__name__
                         )
+                        if can_deliver:
+                            envelope.future.set_exception(exc)
+                    else:
+                        self._record(event, "completed")
+                        if can_deliver:
+                            envelope.future.set_result(
+                                AgentEventOutcome(event=event, value=value)
+                            )
             finally:
                 self._queue.task_done()
 

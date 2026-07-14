@@ -182,6 +182,8 @@ PROJECT-KAGYA is intended to run as a private/local application, not as a public
 
 The backend uses one process-local agent event queue to serialize chat, sleep, memory administration, and adapter lifecycle operations. Run exactly one Uvicorn worker; multiple workers would create independent subjects and independent event sequences. `api.agent_queue_capacity` bounds waiting work. A full queue returns HTTP 429, shutdown stops accepting work and drains accepted events, and an accepted event continues even if its client disconnects.
 
+The subject's versioned internal-state snapshot defaults to `.kagya/agent_state.json`. Each accepted event is returned only after its sequence and internal state have been atomically written and fsynced. Startup validates or migrates the snapshot and safely falls back to baseline state if it is corrupt. Admin endpoints under `/api/state` provide snapshot, export, restore, and reset operations. Snapshots intentionally exclude conversation turns, event payloads, prompts, attachments, generated text, and hidden thoughts.
+
 ### 1. Prepare Host
 
 Create a service user and install the required runtime tools:
@@ -268,6 +270,7 @@ Backups must include both runtime data and private environment files:
 - `.kagya/adapters`: QLoRA dry-run or trained adapter artifacts.
 - `.kagya/eval_results`: adapter evaluation outputs.
 - `.kagya/adapter_registry.json`: adapter lifecycle state.
+- `.kagya/agent_state.json`: versioned subject state and last processed event sequence.
 - `/etc/project-kagya/*.env`: backend/frontend env files, including `KAGYA_ADMIN_TOKEN`.
 
 Create a restricted archive on the deployment host:

@@ -615,6 +615,40 @@ def test_memory_api_archives_and_tags_records(tmp_path: Path) -> None:
     assert semantic_tagged.json()["tags"] == ["fact"]
 
 
+def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    assert client.get("/api/state/export").status_code == 401
+    chat = client.post("/api/chat", json={"text": "stateful", "attachments": []})
+    assert chat.status_code == 200
+
+    exported = client.get("/api/state/export", headers=admin_headers())
+    assert exported.status_code == 200
+    snapshot = exported.json()
+    assert snapshot["last_processed_event_sequence"] >= 2
+    assert "turns" not in snapshot
+    assert "stateful" not in str(snapshot)
+
+    snapshot["emotion_state"] = {
+        "valence": -0.25,
+        "arousal": 0.4,
+        "optimal_loss": 0.8,
+    }
+    restored = client.post(
+        "/api/state/restore", headers=admin_headers(), json=snapshot
+    )
+    assert restored.status_code == 200
+    assert restored.json()["emotion_state"]["valence"] == -0.25
+
+    reset = client.post("/api/state/reset", headers=admin_headers())
+    assert reset.status_code == 200
+    assert reset.json()["emotion_state"] == {
+        "valence": 0.0,
+        "arousal": 0.0,
+        "optimal_loss": 1.0,
+    }
+    assert client.app.state.main_loop.session_state.turns == []
+
+
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
@@ -701,6 +735,9 @@ def _settings(tmp_path: Path) -> Settings:
                     "path": tmp_path / "tool_registry.json",
                     "audit_path": tmp_path / "tool_audit.jsonl",
                 }
+            ),
+            "agent_state": settings.agent_state.model_copy(
+                update={"path": tmp_path / "agent_state.json"}
             ),
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}

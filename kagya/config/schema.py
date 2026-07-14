@@ -85,6 +85,10 @@ class ToolRegistrySettings(StrictBaseModel):
     audit_path: Path
 
 
+class AgentStateSettings(StrictBaseModel):
+    path: Path = Path(".kagya/agent_state.json")
+
+
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
@@ -108,5 +112,6 @@ class Settings(StrictBaseModel):
     qlora: QloraSettings
     adapter_registry: AdapterRegistrySettings
     tools: ToolRegistrySettings
+    agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     api: ApiSettings
     frontend: FrontendSettings
