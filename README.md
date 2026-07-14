@@ -25,7 +25,7 @@ uv run pytest
 just config-check
 ```
 
-3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers` and choose model IDs your host can load. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
+3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers`. Use instruction-tuned model IDs for chat; the defaults are `google/gemma-4-E4B-it` and `google/gemma-4-E2B-it`. Base variants can treat the prompt as document continuation and produce repetitive or unrelated text. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
 
 If you previously used `.kagya/chroma` with another embedding backend, PROJECT-KAGYA creates embedding-versioned Chroma collections for non-legacy embeddings. Old collections are kept on disk but are not mixed with new embedding dimensions.
 

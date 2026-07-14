@@ -190,6 +190,8 @@ def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     assert result.prompt.startswith("Context: PROJECT-KAGYA")
     assert "private local AI assistant" in result.prompt
     assert "Private runtime data below is for tone and context only" in result.prompt
+    assert "Answer only the latest user message" in result.prompt
+    assert "answer in natural Japanese" in result.prompt
     assert "User: answer naturally\nAssistant:" in result.prompt
 
 

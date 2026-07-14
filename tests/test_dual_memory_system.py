@@ -162,6 +162,32 @@ def test_same_event_and_content_is_deduplicated(tmp_path: Path) -> None:
     assert distinct != first
 
 
+def test_legacy_repetitive_episode_is_quarantined_on_read(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = "legacy-repetitive"
+    response = "\n".join(["あなたはこんにちは"] * 4)
+    memory.db1.add(
+        ids=[episode_id],
+        documents=[f"User: hello\nAssistant: {response}"],
+        metadatas=[
+            {
+                "user_input": "hello",
+                "response": response,
+                "loss": 0.5,
+                "record_type": "episodic_log",
+                "archived": False,
+                "extra": "{}",
+            }
+        ],
+    )
+
+    record = memory.get_episodic(episode_id)
+
+    assert record is not None
+    assert record.lifecycle_status == MemoryLifecycleStatus.QUARANTINED
+    assert memory.retrieve_context("hello").db1_results == []
+
+
 def test_default_embedding_function_uses_configured_model_id(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     embedding = create_embedding_function(settings)
