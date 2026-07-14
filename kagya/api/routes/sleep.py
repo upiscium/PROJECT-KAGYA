@@ -1,15 +1,17 @@
 """Sleep cycle routes."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from kagya.api.dependencies import (
+    execute_agent_event,
+    get_agent_runtime,
     get_runtime_event_log,
     get_sleep_cycle_manager,
     require_admin,
 )
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.sleep import SleepRunResponse
-from kagya.learning import SleepCycleManager
+from kagya.runtime import AgentEventType, AgentRuntime
 
 
 router = APIRouter(
@@ -19,10 +21,16 @@ router = APIRouter(
 
 @router.post("/run", response_model=SleepRunResponse)
 def run_sleep(
-    manager: SleepCycleManager = Depends(get_sleep_cycle_manager),
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> SleepRunResponse:
-    result = manager.run()
+    result = execute_agent_event(
+        runtime,
+        AgentEventType.SLEEP,
+        source="api.sleep",
+        handler=lambda: get_sleep_cycle_manager(request).run(),
+    ).value
     event_log.record(
         category="sleep",
         event_type="run_completed",

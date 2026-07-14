@@ -8,9 +8,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from kagya.api.routes import adapters, chat, debug, evaluations, memory, sleep, system
+from kagya.api.observability import RuntimeEventLog
 from kagya.config import Settings, get_settings
+from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
+from kagya.runtime import AgentRuntime, KagyaMainLoop
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -46,7 +49,11 @@ def _lifespan(settings: Settings):
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _preload_runtime(app, settings)
-        yield
+        try:
+            yield
+        finally:
+            app.state.agent_runtime.shutdown()
+            app.state.agent_runtime = None
 
     return lifespan
 
@@ -57,18 +64,56 @@ def _preload_runtime(app: FastAPI, settings: Settings) -> None:
     embedding_model = getattr(app.state.memory_system.embedding_function, "_get_model", None)
     if callable(embedding_model):
         embedding_model()
-    if (
-        settings.model.provider.lower() == "transformers"
-        and getattr(app.state, "model_provider", None) is None
-    ):
-        provider = load_model_provider(settings)
+    if getattr(app.state, "adapter_registry", None) is None:
+        app.state.adapter_registry = AdapterRegistry(settings)
+    active_adapter = next(
+        (
+            entry
+            for entry in app.state.adapter_registry.list()
+            if entry.status == AdapterStatus.ACTIVE
+        ),
+        None,
+    )
+    if getattr(app.state, "model_provider", None) is None:
+        adapter_path = (
+            active_adapter.path
+            if settings.model.provider.lower() == "transformers"
+            and active_adapter is not None
+            else None
+        )
+        provider = (
+            load_model_provider(settings, adapter_path=adapter_path)
+            if adapter_path is not None
+            else load_model_provider(settings)
+        )
+        app.state.model_provider = provider
+        app.state.model_provider_adapter_id = (
+            None if active_adapter is None else active_adapter.adapter_id
+        )
+    else:
+        provider = app.state.model_provider
+    if settings.model.provider.lower() == "transformers":
         get_processor = getattr(provider, "get_processor", None)
         get_model = getattr(provider, "get_model", None)
         if callable(get_processor):
             get_processor()
         if callable(get_model):
             get_model()
-        app.state.model_provider = provider
+    if getattr(app.state, "main_loop", None) is None:
+        app.state.main_loop = KagyaMainLoop(
+            settings,
+            provider,
+            app.state.memory_system,
+            adapter_id=None if active_adapter is None else active_adapter.adapter_id,
+        )
+    if getattr(app.state, "runtime_event_log", None) is None:
+        app.state.runtime_event_log = RuntimeEventLog()
+    if getattr(app.state, "agent_runtime", None) is None:
+        app.state.agent_runtime = AgentRuntime(
+            queue_capacity=settings.api.agent_queue_capacity,
+            event_recorder=app.state.runtime_event_log,
+        )
+        app.state.agent_runtime.start()
 
 
 app = create_app()

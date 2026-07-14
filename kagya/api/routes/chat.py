@@ -1,11 +1,16 @@
 """Chat routes."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from kagya.api.dependencies import get_main_loop, get_runtime_event_log
+from kagya.api.dependencies import (
+    execute_agent_event,
+    get_agent_runtime,
+    get_main_loop,
+    get_runtime_event_log,
+)
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.chat import ChatRequest, ChatResponse, EmotionSchema, ModelSchema
-from kagya.runtime import ChatResult, KagyaMainLoop
+from kagya.runtime import AgentEventType, AgentRuntime, ChatResult
 
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -14,13 +19,23 @@ router = APIRouter(prefix="/api", tags=["chat"])
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     request: ChatRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    http_request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> ChatResponse:
     try:
-        result = main_loop.chat(
-            request.text, debug=False, attachments=attachment_metadata(request)
-        )
+        result = execute_agent_event(
+            runtime,
+            AgentEventType.CHAT,
+            source="api.chat",
+            handler=lambda: get_main_loop(http_request).chat(
+                request.text, debug=False, attachments=attachment_metadata(request)
+            ),
+            payload={
+                "text": request.text,
+                "attachments": attachment_metadata(request),
+            },
+        ).value
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if result.fallback_used:

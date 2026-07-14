@@ -3,6 +3,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from kagya.api.dependencies import (
+    execute_agent_event,
+    get_agent_runtime,
     get_adapter_registry,
     get_api_settings,
     get_model_provider,
@@ -24,7 +26,7 @@ from kagya.learning import (
     AdapterRegistry,
     AdapterStatus,
 )
-from kagya.models import ModelProvider
+from kagya.runtime import AgentEventType, AgentRuntime
 
 
 router = APIRouter(
@@ -35,9 +37,16 @@ router = APIRouter(
 @router.get("", response_model=AdapterListResponse)
 def list_adapters(
     registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> AdapterListResponse:
+    entries = execute_agent_event(
+        runtime,
+        AgentEventType.ADAPTER_READ,
+        source="api.adapters.list",
+        handler=registry.list,
+    ).value
     return AdapterListResponse(
-        adapters=[adapter_response(entry) for entry in registry.list()]
+        adapters=[adapter_response(entry) for entry in entries]
     )
 
 
@@ -45,17 +54,24 @@ def list_adapters(
 def evaluate_adapter(
     adapter_id: str,
     request: AdapterEvaluateRequest,
+    http_request: Request,
     settings: Settings = Depends(get_api_settings),
     registry: AdapterRegistry = Depends(get_adapter_registry),
-    provider: ModelProvider = Depends(get_model_provider),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> AdapterEvaluateResponse:
     try:
-        result = AdapterEvaluator(settings, registry).evaluate(
-            adapter_id,
-            provider,
-            deterministic_score=request.deterministic_score,
-        )
+        result = execute_agent_event(
+            runtime,
+            AgentEventType.ADAPTER_UPDATE,
+            source="api.adapters.evaluate",
+            handler=lambda: AdapterEvaluator(settings, registry).evaluate(
+                adapter_id,
+                get_model_provider(http_request),
+                deterministic_score=request.deterministic_score,
+            ),
+            payload={"adapter_id": adapter_id},
+        ).value
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     entry = registry.lookup(adapter_id)
@@ -83,21 +99,35 @@ def evaluate_adapter(
 def trial_adapter(
     adapter_id: str,
     registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> AdapterResponse:
-    return _transition(registry, adapter_id, AdapterStatus.TRIAL_ACTIVE, event_log)
+    return execute_agent_event(
+        runtime,
+        AgentEventType.ADAPTER_UPDATE,
+        source="api.adapters.trial",
+        handler=lambda: _transition(
+            registry, adapter_id, AdapterStatus.TRIAL_ACTIVE, event_log
+        ),
+        payload={"adapter_id": adapter_id},
+    ).value
 
 
 @router.post("/{adapter_id}/approve", response_model=AdapterResponse)
 def approve_adapter(
     adapter_id: str,
     registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> AdapterResponse:
     try:
-        entry = registry.approve(adapter_id)
-        _record_adapter_transition(event_log, entry, "approved")
-        return adapter_response(entry)
+        return execute_agent_event(
+            runtime,
+            AgentEventType.ADAPTER_UPDATE,
+            source="api.adapters.approve",
+            handler=lambda: _approve(registry, adapter_id, event_log),
+            payload={"adapter_id": adapter_id},
+        ).value
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -107,13 +137,19 @@ def activate_adapter(
     adapter_id: str,
     request: Request,
     registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> AdapterResponse:
     try:
-        entry = registry.activate(adapter_id)
-        sync_main_loop_to_active_adapter(request)
-        _record_adapter_transition(event_log, entry, "activated")
-        return adapter_response(entry)
+        return execute_agent_event(
+            runtime,
+            AgentEventType.ADAPTER_UPDATE,
+            source="api.adapters.activate",
+            handler=lambda: _activate(
+                request, registry, adapter_id, event_log
+            ),
+            payload={"adapter_id": adapter_id},
+        ).value
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -122,9 +158,18 @@ def activate_adapter(
 def reject_adapter(
     adapter_id: str,
     registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> AdapterResponse:
-    return _transition(registry, adapter_id, AdapterStatus.REJECTED, event_log)
+    return execute_agent_event(
+        runtime,
+        AgentEventType.ADAPTER_UPDATE,
+        source="api.adapters.reject",
+        handler=lambda: _transition(
+            registry, adapter_id, AdapterStatus.REJECTED, event_log
+        ),
+        payload={"adapter_id": adapter_id},
+    ).value
 
 
 def _transition(
@@ -139,6 +184,28 @@ def _transition(
         return adapter_response(entry)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _approve(
+    registry: AdapterRegistry,
+    adapter_id: str,
+    event_log: RuntimeEventLog,
+) -> AdapterResponse:
+    entry = registry.approve(adapter_id)
+    _record_adapter_transition(event_log, entry, "approved")
+    return adapter_response(entry)
+
+
+def _activate(
+    request: Request,
+    registry: AdapterRegistry,
+    adapter_id: str,
+    event_log: RuntimeEventLog,
+) -> AdapterResponse:
+    entry = registry.activate(adapter_id)
+    sync_main_loop_to_active_adapter(request)
+    _record_adapter_transition(event_log, entry, "activated")
+    return adapter_response(entry)
 
 
 def _record_adapter_transition(
