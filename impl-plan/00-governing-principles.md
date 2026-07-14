@@ -13,7 +13,7 @@ This file defines non-negotiable constraints that apply to every implementation 
 - Use Hugging Face Transformers as the single model execution foundation.
 - Use `AutoProcessor` and `AutoModelForImageTextToText` for model loading.
 - Use configured model IDs only. Do not hard-code model IDs in implementation code.
-- Keep `google/gemma-4-E4B` as primary model and `google/gemma-4-E2B` as fallback in configuration.
+- Keep instruction-tuned `google/gemma-4-E4B-it` as primary model and `google/gemma-4-E2B-it` as fallback in configuration.
 - Use the same Transformers-based stack for generation, loss calculation, QLoRA, and adapter evaluation.
 - Treat `<think>` as internal data only. It may appear in logs, learning data, and debug UI/API, but never in normal UI/API responses.
 - Do not physically delete DB1 episodic records in the initial implementation. Use `archived` flags.

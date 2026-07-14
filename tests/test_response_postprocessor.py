@@ -91,3 +91,27 @@ def test_visible_response_collapses_repeated_comma_word_tails() -> None:
     processed = postprocessor.process("It writes guide, guide, guide, guide,")
 
     assert processed.visible_response == "It writes guide"
+
+
+def test_visible_response_removes_leading_sample_response_preface() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process("Sure, here are the corresponding responses:\n\nこんにちは")
+
+    assert processed.visible_response == "こんにちは"
+
+
+def test_visible_response_truncates_model_reasoning_trailer() -> None:
+    postprocessor = ResponsePostprocessor()
+
+    processed = postprocessor.process(
+        "おはようございます！\n\n何かお手伝いできますか？\nthought\nThinking Process:\nprivate reasoning"
+    )
+
+    assert processed.visible_response == "おはようございます！\n\n何かお手伝いできますか？"
+
+
+def test_visible_response_removes_truncated_reasoning_marker() -> None:
+    processed = ResponsePostprocessor().process("お手伝いできますか？thought")
+
+    assert processed.visible_response == "お手伝いできますか？"

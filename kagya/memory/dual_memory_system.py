@@ -24,6 +24,7 @@ from kagya.memory.memory_schema import (
     SemanticMemoryRecord,
     ValidationStatus,
 )
+from kagya.memory.quality import assess_generation_health
 from kagya.models import ModelProvider
 
 
@@ -456,12 +457,24 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
     extra = _loads_json_dict(metadata.get("extra"))
     provenance = extra.get("provenance") if isinstance(extra.get("provenance"), dict) else {}
     health_data = extra.get("generation_health") if isinstance(extra.get("generation_health"), dict) else {}
+    response = str(metadata.get("response", ""))
+    loss = float(metadata.get("loss", 0.0))
+    health = (
+        GenerationHealth(**health_data)
+        if health_data
+        else assess_generation_health(response, loss=loss, fallback_used=False)
+    )
+    default_lifecycle = (
+        MemoryLifecycleStatus.ACTIVE
+        if health.healthy
+        else MemoryLifecycleStatus.QUARANTINED
+    )
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
-        response=str(metadata.get("response", "")),
+        response=response,
         hidden_thought=str(metadata.get("hidden_thought", "")),
-        loss=float(metadata.get("loss", 0.0)),
+        loss=loss,
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
         record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))),
@@ -474,8 +487,8 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         input_kind=MemoryRecordKind.EXTERNAL_CLAIM,
         response_kind=MemoryRecordKind.GENERATED_RESPONSE,
         validation_status=ValidationStatus(str(metadata.get("validation_status", ValidationStatus.UNVERIFIED.value))),
-        lifecycle_status=MemoryLifecycleStatus(str(metadata.get("lifecycle_status", MemoryLifecycleStatus.ACTIVE.value))),
-        generation_health=GenerationHealth(**health_data),
+        lifecycle_status=MemoryLifecycleStatus(str(metadata.get("lifecycle_status", default_lifecycle.value))),
+        generation_health=health,
         content_hash=str(metadata.get("content_hash", _content_hash(str(metadata.get("user_input", "")), str(metadata.get("response", ""))))),
         dedup_key=str(metadata.get("dedup_key", "")),
         source_event_id=_optional_str(provenance.get("source_event_id")),

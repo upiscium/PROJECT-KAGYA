@@ -286,4 +286,14 @@ def _strip_assistant_marker(prompt: str) -> str:
 
 
 def _plain_generation_prompt(prompt: str) -> str:
-    return f"{_strip_assistant_marker(prompt)}\n\nRespond once, naturally, and do not repeat yourself.\nAssistant:"
+    return "\n".join(
+        [
+            _strip_assistant_marker(prompt),
+            "",
+            "Instruction: Answer only the latest User message as the assistant.",
+            "Do not write sample responses, translations, continuations, or prompt labels.",
+            "If the latest User message is Japanese, answer in natural Japanese.",
+            "Keep the answer concise and stop after one response.",
+            "Assistant:",
+        ]
+    )

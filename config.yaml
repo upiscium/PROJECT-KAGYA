@@ -3,19 +3,19 @@ project:
   environment: development
 
 model:
-  primary_id: google/gemma-4-E4B
-  fallback_id: google/gemma-4-E2B
+  primary_id: google/gemma-4-E4B-it
+  fallback_id: google/gemma-4-E2B-it
   provider: dummy
   device: auto
   dtype: auto
   load_in_4bit: true
 
 generation:
-  max_new_tokens: 512
-  temperature: 0.7
-  top_p: 0.95
-  do_sample: true
-  repetition_penalty: 1.1
+  max_new_tokens: 128
+  temperature: 0.3
+  top_p: 0.9
+  do_sample: false
+  repetition_penalty: 1.15
   no_repeat_ngram_size: 6
 
 emotion:

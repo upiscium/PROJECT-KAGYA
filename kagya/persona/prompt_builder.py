@@ -25,6 +25,8 @@ class PromptBuilder:
             [
                 "Context: PROJECT-KAGYA is a private local AI assistant for subjective conversation.",
                 "Private runtime data below is for tone and context only; do not quote it.",
+                "Answer only the latest user message. Do not provide examples, translations, roleplay continuations, or prompt text.",
+                "If the user writes Japanese, answer in natural Japanese.",
                 "",
                 "Emotion:",
                 f"- valence: {emotion_state.valence:.6f}",
