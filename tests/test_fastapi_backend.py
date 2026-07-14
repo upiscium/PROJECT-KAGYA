@@ -1,4 +1,5 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 
@@ -79,6 +80,31 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
     assert "hidden_thought" not in data
     assert "prompt" not in data
     assert "<think>" not in str(data)
+
+
+def test_concurrent_chat_requests_share_one_ordered_subject_state(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        responses = list(
+            executor.map(
+                lambda index: client.post(
+                    "/api/chat",
+                    json={"text": f"message-{index}", "attachments": []},
+                ),
+                range(4),
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200] * 4
+    assert len(client.app.state.main_loop.session_state.turns) == 4
+    completed = [
+        event
+        for event in client.app.state.runtime_event_log.recent()
+        if event.category == "agent" and event.event_type == "completed"
+    ]
+    assert [event.metadata["processing_sequence"] for event in completed] == [1, 2, 3, 4]
+    assert all("text" not in event.metadata for event in completed)
 
 
 def test_api_chat_accepts_multiple_attachments(tmp_path: Path) -> None:
@@ -411,10 +437,16 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     )
     assert before_activation_chat.status_code == 200
     assert before_activation_chat.json()["model"]["adapter_id"] is None
+    previous_loop = client.app.state.main_loop
+    previous_turns = previous_loop.session_state.turns
+    previous_emotion = previous_loop.emotion_engine
 
     active = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert active.status_code == 200
     assert active.json()["status"] == "active"
+    assert client.app.state.main_loop is not previous_loop
+    assert client.app.state.main_loop.session_state.turns is previous_turns
+    assert client.app.state.main_loop.emotion_engine is previous_emotion
     after_activation_chat = client.post(
         "/api/chat", json={"text": "after activation", "attachments": []}
     )

@@ -180,6 +180,8 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
 
+The backend uses one process-local agent event queue to serialize chat, sleep, memory administration, and adapter lifecycle operations. Run exactly one Uvicorn worker; multiple workers would create independent subjects and independent event sequences. `api.agent_queue_capacity` bounds waiting work. A full queue returns HTTP 429, shutdown stops accepting work and drains accepted events, and an accepted event continues even if its client disconnects.
+
 ### 1. Prepare Host
 
 Create a service user and install the required runtime tools:

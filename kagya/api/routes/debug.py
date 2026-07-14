@@ -1,9 +1,11 @@
 """Development-only debug routes."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from kagya.api.dependencies import (
     get_api_settings,
+    execute_agent_event,
+    get_agent_runtime,
     get_main_loop,
     get_runtime_event_log,
     require_admin,
@@ -20,7 +22,7 @@ from kagya.api.schemas.debug import (
     RetrievedSemanticSchema,
 )
 from kagya.config import Settings
-from kagya.runtime import KagyaMainLoop
+from kagya.runtime import AgentEventType, AgentRuntime
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -29,16 +31,26 @@ router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_
 @router.post("/chat/debug", response_model=DebugChatResponse)
 def debug_chat(
     request: ChatRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    http_request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
     settings: Settings = Depends(get_api_settings),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> DebugChatResponse:
     """Development-only debug chat gated by the admin token."""
 
     try:
-        result = main_loop.chat(
-            request.text, debug=True, attachments=attachment_metadata(request)
-        )
+        result = execute_agent_event(
+            runtime,
+            AgentEventType.DEBUG_CHAT,
+            source="api.chat.debug",
+            handler=lambda: get_main_loop(http_request).chat(
+                request.text, debug=True, attachments=attachment_metadata(request)
+            ),
+            payload={
+                "text": request.text,
+                "attachments": attachment_metadata(request),
+            },
+        ).value
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if result.fallback_used:
@@ -91,9 +103,15 @@ def debug_chat(
 
 @router.get("/state/emotion", response_model=EmotionStateResponse)
 def emotion_state(
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> EmotionStateResponse:
-    state = main_loop.emotion_engine.state
+    state = execute_agent_event(
+        runtime,
+        AgentEventType.MEMORY_READ,
+        source="api.state.emotion",
+        handler=lambda: get_main_loop(request).emotion_engine.state,
+    ).value
     return EmotionStateResponse(
         valence=state.valence,
         arousal=state.arousal,

@@ -2,6 +2,8 @@
 
 from hmac import compare_digest
 import os
+from threading import RLock
+from typing import Callable, TypeVar
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -15,8 +17,19 @@ from kagya.learning import (
 )
 from kagya.memory import DualMemorySystem
 from kagya.models import ModelProvider, load_model_provider
-from kagya.runtime import KagyaMainLoop
+from kagya.runtime import (
+    AgentEventOutcome,
+    AgentEventType,
+    AgentRuntime,
+    AgentRuntimeQueueFull,
+    AgentRuntimeStopped,
+    KagyaMainLoop,
+)
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
+
+
+T = TypeVar("T")
+_dependency_lock = RLock()
 
 
 def get_api_settings(request: Request) -> Settings:
@@ -29,6 +42,50 @@ def get_runtime_event_log(request: Request) -> RuntimeEventLog:
         event_log = RuntimeEventLog()
         request.app.state.runtime_event_log = event_log
     return event_log
+
+
+def get_agent_runtime(request: Request) -> AgentRuntime:
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    if runtime is not None:
+        return runtime
+    with _dependency_lock:
+        runtime = getattr(request.app.state, "agent_runtime", None)
+        if runtime is None:
+            runtime = AgentRuntime(
+                queue_capacity=get_api_settings(request).api.agent_queue_capacity,
+                event_recorder=get_runtime_event_log(request),
+            )
+            runtime.start()
+            request.app.state.agent_runtime = runtime
+    return runtime
+
+
+def execute_agent_event(
+    runtime: AgentRuntime,
+    event_type: AgentEventType,
+    *,
+    source: str,
+    handler: Callable[[], T],
+    payload: dict[str, object] | None = None,
+) -> AgentEventOutcome[T]:
+    try:
+        return runtime.execute(
+            event_type,
+            source=source,
+            handler=handler,
+            payload=payload,
+        )
+    except AgentRuntimeQueueFull as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": "1"},
+        ) from exc
+    except AgentRuntimeStopped as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
 
 def require_admin(
@@ -59,10 +116,13 @@ def get_model_provider(request: Request) -> ModelProvider:
 def sync_main_loop_to_active_adapter(request: Request) -> KagyaMainLoop:
     active_adapter = _get_active_adapter(request)
     provider = _get_runtime_model_provider(request, active_adapter)
+    previous_loop = getattr(request.app.state, "main_loop", None)
     main_loop = KagyaMainLoop(
         get_api_settings(request),
         provider,
         get_memory_system(request),
+        session_state=None if previous_loop is None else previous_loop.session_state,
+        emotion_engine=None if previous_loop is None else previous_loop.emotion_engine,
         adapter_id=None if active_adapter is None else active_adapter.adapter_id,
     )
     request.app.state.main_loop = main_loop
@@ -110,7 +170,10 @@ def get_main_loop(request: Request) -> KagyaMainLoop:
     active_adapter = _get_active_adapter(request)
     active_adapter_id = None if active_adapter is None else active_adapter.adapter_id
     if main_loop is None or main_loop.adapter_id != active_adapter_id:
-        main_loop = sync_main_loop_to_active_adapter(request)
+        with _dependency_lock:
+            main_loop = getattr(request.app.state, "main_loop", None)
+            if main_loop is None or main_loop.adapter_id != active_adapter_id:
+                main_loop = sync_main_loop_to_active_adapter(request)
     return main_loop
 
 

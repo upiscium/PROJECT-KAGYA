@@ -67,38 +67,53 @@ class KagyaMainLoop:
     ) -> ChatResult:
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
-        emotion_state = self.emotion_engine.update(loss)
-        memory_context = self.memory_system.retrieve_context(user_input)
-        prompt = self.prompt_builder.build(
-            user_input, emotion_state, memory_context, attachments=attachments or []
-        )
+        previous_emotion_state = self.emotion_engine.state
         try:
-            raw_response = self.agent.generate(prompt, attachments=attachments or [])
-        except Exception as exc:
-            if _fallback_used(self.provider):
-                raise RuntimeError("Fallback model generation failed") from exc
-            raw_response = _generate_fallback(self.provider, prompt)
-        processed_response = self.postprocessor.process(raw_response)
-        if not processed_response.visible_response.strip():
-            if _fallback_used(self.provider):
-                raise RuntimeError("Fallback model produced an empty visible response")
-            raw_response = _generate_fallback(self.provider, prompt)
+            emotion_state = self.emotion_engine.update(loss)
+            memory_context = self.memory_system.retrieve_context(user_input)
+            prompt = self.prompt_builder.build(
+                user_input, emotion_state, memory_context, attachments=attachments or []
+            )
+            try:
+                raw_response = self.agent.generate(
+                    prompt, attachments=attachments or []
+                )
+            except Exception as exc:
+                if _fallback_used(self.provider):
+                    raise RuntimeError("Fallback model generation failed") from exc
+                raw_response = _generate_fallback(self.provider, prompt)
             processed_response = self.postprocessor.process(raw_response)
             if not processed_response.visible_response.strip():
-                raise RuntimeError("Fallback model produced an empty visible response")
-        model_id = str(
-            getattr(self.provider, "last_model_id", self.settings.model.primary_id)
-        )
-        fallback_used = bool(getattr(self.provider, "last_fallback_used", False))
-        episode_id = self.memory_system.save_episodic(
-            user_input,
-            processed_response.visible_response,
-            hidden_thought=processed_response.hidden_thought,
-            loss=loss,
-            emotion_valence=emotion_state.valence,
-            emotion_arousal=emotion_state.arousal,
-        )
-        self.session_state.add_turn(user_input, processed_response.visible_response)
+                if _fallback_used(self.provider):
+                    raise RuntimeError(
+                        "Fallback model produced an empty visible response"
+                    )
+                raw_response = _generate_fallback(self.provider, prompt)
+                processed_response = self.postprocessor.process(raw_response)
+                if not processed_response.visible_response.strip():
+                    raise RuntimeError(
+                        "Fallback model produced an empty visible response"
+                    )
+            model_id = str(
+                getattr(self.provider, "last_model_id", self.settings.model.primary_id)
+            )
+            fallback_used = bool(
+                getattr(self.provider, "last_fallback_used", False)
+            )
+            episode_id = self.memory_system.save_episodic(
+                user_input,
+                processed_response.visible_response,
+                hidden_thought=processed_response.hidden_thought,
+                loss=loss,
+                emotion_valence=emotion_state.valence,
+                emotion_arousal=emotion_state.arousal,
+            )
+            self.session_state.add_turn(
+                user_input, processed_response.visible_response
+            )
+        except Exception:
+            self.emotion_engine.state = previous_emotion_state
+            raise
         return ChatResult(
             episode_id=episode_id,
             response=processed_response.visible_response,
