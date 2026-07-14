@@ -220,6 +220,52 @@ def test_event_log_failure_does_not_stop_processing() -> None:
     runtime.shutdown()
 
 
+def test_restored_sequence_and_completion_hook_define_commit_boundary() -> None:
+    committed: list[int] = []
+    runtime = AgentRuntime(
+        queue_capacity=1,
+        initial_sequence=8,
+        completion_hook=lambda event: committed.append(
+            event.processing_sequence or 0
+        ),
+    )
+    runtime.start()
+
+    outcome = runtime.execute(
+        AgentEventType.CHAT, source="test", handler=lambda: "result"
+    )
+
+    assert committed == [9]
+    assert outcome.event.processing_sequence == 9
+    runtime.shutdown()
+
+
+def test_completion_hook_failure_fails_only_that_event() -> None:
+    attempts = 0
+
+    def checkpoint(event: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("snapshot unavailable")
+
+    runtime = AgentRuntime(queue_capacity=2, completion_hook=checkpoint)
+    runtime.start()
+
+    failed = runtime.submit(
+        AgentEventType.CHAT, source="test", handler=lambda: "mutated"
+    )
+    succeeded = runtime.submit(
+        AgentEventType.CHAT, source="test", handler=lambda: "next"
+    )
+
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        failed.result(timeout=1)
+    assert succeeded.result(timeout=1).value == "next"
+    assert runtime.is_alive is True
+    runtime.shutdown()
+
+
 def _block(entered: Event, release: Event, result: object) -> object:
     entered.set()
     assert release.wait(timeout=1)

@@ -7,13 +7,13 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from kagya.api.routes import adapters, chat, debug, evaluations, memory, sleep, system
+from kagya.api.routes import adapters, chat, debug, evaluations, memory, sleep, state, system
 from kagya.api.observability import RuntimeEventLog
 from kagya.config import Settings, get_settings
 from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
-from kagya.runtime import AgentRuntime, KagyaMainLoop
+from kagya.runtime import AgentRuntime, AgentStateStore, KagyaMainLoop
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -41,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(adapters.router)
     app.include_router(evaluations.router)
     app.include_router(system.router)
+    app.include_router(state.router)
 
     return app
 
@@ -59,6 +60,15 @@ def _lifespan(settings: Settings):
 
 
 def _preload_runtime(app: FastAPI, settings: Settings) -> None:
+    if getattr(app.state, "runtime_event_log", None) is None:
+        app.state.runtime_event_log = RuntimeEventLog()
+    if getattr(app.state, "agent_state_store", None) is None:
+        app.state.agent_state_store = AgentStateStore(
+            settings.agent_state.path, app.state.runtime_event_log
+        )
+    snapshot = app.state.agent_state_store.load(
+        settings.emotion.baseline_surprisal
+    )
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
     embedding_model = getattr(app.state.memory_system.embedding_function, "_get_model", None)
@@ -106,14 +116,29 @@ def _preload_runtime(app: FastAPI, settings: Settings) -> None:
             app.state.memory_system,
             adapter_id=None if active_adapter is None else active_adapter.adapter_id,
         )
-    if getattr(app.state, "runtime_event_log", None) is None:
-        app.state.runtime_event_log = RuntimeEventLog()
+    app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
     if getattr(app.state, "agent_runtime", None) is None:
         app.state.agent_runtime = AgentRuntime(
             queue_capacity=settings.api.agent_queue_capacity,
             event_recorder=app.state.runtime_event_log,
+            initial_sequence=snapshot.last_processed_event_sequence,
+            completion_hook=lambda event: app.state.agent_state_store.save(
+                app.state.agent_state_store.capture(
+                    app.state.main_loop,
+                    _event_sequence(event.processing_sequence),
+                )
+            ),
+            failure_hook=lambda event, exc: app.state.agent_state_store.save_failed_sequence(
+                _event_sequence(event.processing_sequence)
+            ),
         )
         app.state.agent_runtime.start()
+
+
+def _event_sequence(sequence: int | None) -> int:
+    if sequence is None:
+        raise RuntimeError("Agent event has no processing sequence")
+    return sequence
 
 
 app = create_app()
