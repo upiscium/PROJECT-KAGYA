@@ -176,6 +176,12 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
 - Verify public chat responses do not expose local attachment paths.
 
+## Memory And Learning Safety
+
+Episodic memories retain source event, processing sequence, provider/model identity, validation state, content hash, and generation-health metadata. Empty, repetitive, prompt-leaking, or non-finite generations are quarantined: operators can inspect and review them through the memory admin API, but normal retrieval and sleep learning exclude them.
+
+Sleep consolidation uses an explicit pipeline version and attempt ID. A completed episode is not processed twice by the same pipeline version, datasets are written to immutable `dreams/runs/<attempt-id>/` paths, raw hidden thoughts are not copied into new datasets, and semantic memories remain staged until the adapter candidate is registered. Adapter registry mutations use an exclusive sidecar lock and atomic fsynced replacement. Real adapter evaluation runs paired baseline and candidate providers; a candidate that regresses against baseline is not promoted.
+
 ## Private Deployment
 
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.

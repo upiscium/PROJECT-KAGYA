@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.learning import (
@@ -12,7 +13,7 @@ from kagya.learning import (
     format_training_text,
 )
 from kagya.learning.qlora_requirements import check_qlora_production_readiness
-from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
+from kagya.memory import ConsolidationStatus, DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 
 
@@ -63,10 +64,18 @@ def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -
     records = DreamDatasetGenerator().generate([episode], settings.sleep.dream_dataset_path)
 
     lines = settings.sleep.dream_dataset_path.read_text(encoding="utf-8").splitlines()
-    assert records == [DreamDatasetRecord("dream input", "dream thought", "dream output")]
+    assert records == [
+        DreamDatasetRecord(
+            "dream input", "", "dream output", source_id=episode_id
+        )
+    ]
     assert json.loads(lines[0]) == {
+        "schema_version": 2,
+        "source_kind": "verified_episode",
+        "source_id": episode_id,
+        "validation_status": "verified",
         "input": "dream input",
-        "thought": "dream thought",
+        "thought": "",
         "output": "dream output",
     }
 
@@ -81,6 +90,19 @@ def test_dataset_records_include_think_only_in_training_format() -> None:
     assert "<think>" in training_text
     assert "</think>" in training_text
     assert training_text.endswith("output<eos>")
+
+
+def test_committed_dream_dataset_is_not_overwritten(tmp_path: Path) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    memory = _memory(settings)
+    memory.save_episodic("input", "output")
+    episode = memory._get_unarchived_episodic_records()[0]
+    generator = DreamDatasetGenerator()
+
+    generator.generate([episode], settings.sleep.dream_dataset_path)
+
+    with pytest.raises(FileExistsError):
+        generator.generate([episode], settings.sleep.dream_dataset_path)
 
 
 def test_qlora_dry_run_returns_adapter_candidate_result(tmp_path: Path) -> None:
@@ -287,8 +309,39 @@ def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> Non
     assert result.adapter_entry is not None
     assert result.adapter_entry.status == AdapterStatus.CANDIDATE
     assert all(entry.status != AdapterStatus.ACTIVE for entry in registry.list())
-    assert settings.sleep.dream_dataset_path.exists()
+    assert result.dream_dataset_path is not None
+    assert Path(result.dream_dataset_path).exists()
+    assert "/runs/" in result.dream_dataset_path
     assert memory.retrieve_context("DummyProvider deterministic response.").db2_results
+
+    repeated = manager.run()
+    assert repeated.selected_episode_ids == []
+    assert repeated.semantic_memory_ids == []
+
+
+def test_sleep_failure_keeps_staged_semantics_hidden_and_episode_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    memory = _memory(settings)
+    registry = AdapterRegistry(settings)
+    episode_id = memory.save_episodic(
+        "sleep failure", "output", emotion_arousal=0.9
+    )
+    monkeypatch.setattr(
+        registry,
+        "register_candidate",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+    manager = SleepCycleManager(settings, memory, DummyProvider(), registry)
+
+    with pytest.raises(OSError, match="registry unavailable"):
+        manager.run()
+
+    record = memory.get_episodic(episode_id)
+    assert record is not None
+    assert record.consolidation_status == ConsolidationStatus.FAILED
+    assert memory.retrieve_context("sleep failure").db2_results == []
 
 
 def _settings_for_sleep(tmp_path: Path) -> Settings:

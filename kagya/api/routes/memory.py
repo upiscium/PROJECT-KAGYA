@@ -11,10 +11,12 @@ from kagya.api.dependencies import (
 from kagya.api.schemas.memory import (
     EpisodeMemoryResponse,
     MemoryMetadataUpdateRequest,
+    MemoryReviewRequest,
     MemorySearchResponse,
     SemanticMemoryResponse,
 )
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
+from kagya.memory import MemoryLifecycleStatus, ValidationStatus
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -110,6 +112,33 @@ def update_episode_metadata(
     return episode_response(record)
 
 
+@router.post("/episodes/{episode_id}/review", response_model=EpisodeMemoryResponse)
+def review_episode(
+    episode_id: str,
+    request: MemoryReviewRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> EpisodeMemoryResponse:
+    try:
+        validation = ValidationStatus(request.validation_status)
+        lifecycle = MemoryLifecycleStatus(request.lifecycle_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    record = execute_agent_event(
+        runtime,
+        AgentEventType.MEMORY_UPDATE,
+        source="api.memory.episode.review",
+        handler=lambda: memory.review_episodic(
+            episode_id,
+            validation_status=validation,
+            lifecycle_status=lifecycle,
+        ),
+    ).value
+    if record is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return episode_response(record)
+
+
 @router.post("/semantic/{memory_id}/archive", response_model=SemanticMemoryResponse)
 def archive_semantic(
     memory_id: str,
@@ -160,6 +189,19 @@ def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
         created_at=record.created_at,
         tags=record.tags,
         operator_metadata=record.operator_metadata,
+        validation_status=record.validation_status.value,
+        lifecycle_status=record.lifecycle_status.value,
+        generation_healthy=record.generation_health.healthy,
+        generation_health_reasons=record.generation_health.reasons,
+        content_hash=record.content_hash,
+        source_event_id=record.source_event_id,
+        source=record.source,
+        processing_sequence=record.processing_sequence,
+        provider=record.provider,
+        model_id=record.model_id,
+        model_revision=record.model_revision,
+        adapter_id=record.adapter_id,
+        consolidation_status=record.consolidation_status.value,
     )
 
 

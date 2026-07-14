@@ -7,10 +7,13 @@ from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext
+from kagya.memory import ValidationStatus
+from kagya.memory.quality import assess_generation_health
 from kagya.models import ModelProvider
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_state import SessionState
 from kagya.runtime.agent_state import PersistentAgentState
+from kagya.runtime.agent_runtime import current_agent_event
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,12 @@ class KagyaMainLoop:
             fallback_used = bool(
                 getattr(self.provider, "last_fallback_used", False)
             )
+            generation_health = assess_generation_health(
+                processed_response.visible_response,
+                loss=loss,
+                fallback_used=fallback_used,
+            )
+            event = current_agent_event()
             episode_id = self.memory_system.save_episodic(
                 user_input,
                 processed_response.visible_response,
@@ -110,6 +119,21 @@ class KagyaMainLoop:
                 loss=loss,
                 emotion_valence=emotion_state.valence,
                 emotion_arousal=emotion_state.arousal,
+                generation_health=generation_health,
+                source_event_id=None if event is None else event.event_id,
+                source="runtime.chat" if event is None else event.source,
+                processing_sequence=None
+                if event is None
+                else event.processing_sequence,
+                causation_id=None if event is None else event.causation_id,
+                correlation_id=None if event is None else event.correlation_id,
+                provider=self.settings.model.provider,
+                model_id=model_id,
+                model_revision=str(
+                    getattr(self.provider, "model_revision", "unknown")
+                ),
+                adapter_id=None if fallback_used else self.adapter_id,
+                validation_status=ValidationStatus.UNVERIFIED,
             )
             self.session_state.add_turn(
                 user_input, processed_response.visible_response

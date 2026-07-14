@@ -7,6 +7,7 @@ from kagya.runtime.agent_runtime import (
     AgentRuntime,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
+    current_agent_event,
 )
 from kagya.runtime.agent_state import (
     AgentStateSnapshot,
@@ -23,6 +24,7 @@ __all__ = [
     "AgentRuntime",
     "AgentRuntimeQueueFull",
     "AgentRuntimeStopped",
+    "current_agent_event",
     "AgentStateSnapshot",
     "AgentStateStore",
     "ChatResult",

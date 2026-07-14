@@ -1,12 +1,14 @@
 """Sleep-time consolidation and learning cycle."""
 
 from dataclasses import dataclass
+from uuid import uuid4
 
 from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry
 from kagya.learning.dream_dataset_generator import DreamDatasetGenerator
 from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord
+from kagya.memory import ConsolidationStatus, ValidationStatus
 from kagya.models import ModelProvider
 
 
@@ -45,21 +47,70 @@ class SleepCycleManager:
         episodes = self.select_high_emotion_episodes()
         if not episodes:
             return SleepCycleResult([], [], None, None, None)
-        semantic_ids = self._generate_semantic_memories(episodes)
-        self.dream_dataset_generator.generate(episodes, self.settings.sleep.dream_dataset_path)
-        training_result = self.qlora_trainer.train(self.settings.sleep.dream_dataset_path)
-        adapter_entry = self.adapter_registry.register_candidate(
-            adapter_id=training_result.adapter_id,
-            adapter_path=training_result.adapter_path,
-            dataset_path=training_result.dataset_path,
-            dataset_hash=training_result.dataset_hash,
-            base_model=self.settings.model.primary_id,
-            notes="registered by sleep cycle dry-run" if training_result.dry_run else "registered by sleep cycle",
+        attempt_id = str(uuid4())
+        pipeline_version = "sleep-v2"
+        for episode in episodes:
+            self.memory_system.set_consolidation_state(
+                episode.id,
+                status=ConsolidationStatus.IN_PROGRESS,
+                pipeline_version=pipeline_version,
+                attempt_id=attempt_id,
+            )
+        dataset_path = (
+            self.settings.sleep.dream_dataset_path.parent
+            / "runs"
+            / attempt_id
+            / self.settings.sleep.dream_dataset_path.name
         )
+        try:
+            semantic_texts = self._generate_semantic_texts(episodes)
+            self.dream_dataset_generator.generate(episodes, dataset_path)
+            training_result = self.qlora_trainer.train(dataset_path)
+            semantic_ids = [
+                self.memory_system.save_semantic(
+                    text,
+                    source_episode_ids=[episode.id],
+                    metadata={
+                        "source": "sleep_cycle",
+                        "publication_status": "staged",
+                        "attempt_id": attempt_id,
+                        "pipeline_version": pipeline_version,
+                    },
+                )
+                for episode, text in zip(episodes, semantic_texts, strict=True)
+            ]
+            adapter_entry = self.adapter_registry.register_candidate(
+                adapter_id=training_result.adapter_id,
+                adapter_path=training_result.adapter_path,
+                dataset_path=training_result.dataset_path,
+                dataset_hash=training_result.dataset_hash,
+                base_model=self.settings.model.primary_id,
+                notes="registered by sleep cycle dry-run"
+                if training_result.dry_run
+                else "registered by sleep cycle",
+            )
+            for semantic_id in semantic_ids:
+                self.memory_system.publish_semantic(semantic_id)
+            for episode in episodes:
+                self.memory_system.set_consolidation_state(
+                    episode.id,
+                    status=ConsolidationStatus.COMPLETED,
+                    pipeline_version=pipeline_version,
+                    attempt_id=attempt_id,
+                )
+        except Exception:
+            for episode in episodes:
+                self.memory_system.set_consolidation_state(
+                    episode.id,
+                    status=ConsolidationStatus.FAILED,
+                    pipeline_version=pipeline_version,
+                    attempt_id=attempt_id,
+                )
+            raise
         return SleepCycleResult(
             selected_episode_ids=[episode.id for episode in episodes],
             semantic_memory_ids=semantic_ids,
-            dream_dataset_path=str(self.settings.sleep.dream_dataset_path),
+            dream_dataset_path=str(dataset_path),
             training_result=training_result,
             adapter_entry=adapter_entry,
         )
@@ -68,23 +119,27 @@ class SleepCycleManager:
         episodes = self.memory_system._get_unarchived_episodic_records()
         threshold = self.settings.sleep.min_emotion_score
         selected = [episode for episode in episodes if _is_high_emotion(episode, threshold)]
+        selected = [
+            episode
+            for episode in selected
+            if episode.validation_status == ValidationStatus.VERIFIED
+            and episode.generation_health.healthy
+            and not (
+                episode.consolidation_status == ConsolidationStatus.COMPLETED
+                and episode.consolidation_version == "sleep-v2"
+            )
+        ]
         return selected[: self.settings.sleep.max_episodes_per_cycle]
 
-    def _generate_semantic_memories(self, episodes: list[EpisodicMemoryRecord]) -> list[str]:
-        semantic_ids: list[str] = []
+    def _generate_semantic_texts(self, episodes: list[EpisodicMemoryRecord]) -> list[str]:
+        semantic_texts: list[str] = []
         for episode in episodes:
             semantic_text = self.model_provider.generate(
                 "Extract one concise semantic memory from this high-emotion episode.\n"
                 f"User: {episode.user_input}\nAssistant: {episode.response}"
             )
-            semantic_ids.append(
-                self.memory_system.save_semantic(
-                    semantic_text,
-                    source_episode_ids=[episode.id],
-                    metadata={"source": "sleep_cycle"},
-                )
-            )
-        return semantic_ids
+            semantic_texts.append(semantic_text)
+        return semantic_texts
 
 
 def _is_high_emotion(episode: EpisodicMemoryRecord, threshold: float) -> bool:

@@ -1,6 +1,9 @@
 """Single-consumer runtime for ordered agent events."""
 
+from __future__ import annotations
+
 from concurrent.futures import Future
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -12,6 +15,7 @@ from uuid import uuid4
 
 T = TypeVar("T")
 _STOP = object()
+_current_event: ContextVar[AgentEvent | None] = ContextVar("kagya_agent_event", default=None)
 
 
 class AgentEventType(StrEnum):
@@ -215,6 +219,7 @@ class AgentRuntime:
                 )
                 can_deliver = envelope.future.set_running_or_notify_cancel()
                 self._record(event, "started")
+                event_token = _current_event.set(event)
                 try:
                     value = envelope.handler()
                 except Exception as exc:
@@ -242,6 +247,8 @@ class AgentRuntime:
                             envelope.future.set_result(
                                 AgentEventOutcome(event=event, value=value)
                             )
+                finally:
+                    _current_event.reset(event_token)
             finally:
                 self._queue.task_done()
 
@@ -274,3 +281,7 @@ class AgentRuntime:
         except Exception:
             # Observability must never terminate the subject's event consumer.
             return
+
+
+def current_agent_event() -> AgentEvent | None:
+    return _current_event.get()

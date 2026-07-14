@@ -22,10 +22,12 @@ from kagya.api.schemas.adapter import (
 from kagya.config import Settings
 from kagya.learning import (
     AdapterEntry,
+    AdapterEvaluationResult,
     AdapterEvaluator,
     AdapterRegistry,
     AdapterStatus,
 )
+from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -65,10 +67,12 @@ def evaluate_adapter(
             runtime,
             AgentEventType.ADAPTER_UPDATE,
             source="api.adapters.evaluate",
-            handler=lambda: AdapterEvaluator(settings, registry).evaluate(
+            handler=lambda: _evaluate_candidate(
                 adapter_id,
+                request,
+                settings,
+                registry,
                 get_model_provider(http_request),
-                deterministic_score=request.deterministic_score,
             ),
             payload={"adapter_id": adapter_id},
         ).value
@@ -82,6 +86,9 @@ def evaluate_adapter(
         metadata={
             "adapter_id": result.adapter_id,
             "score": result.score,
+            "baseline_score": result.baseline_score,
+            "candidate_score": result.candidate_score,
+            "score_delta": result.score_delta,
             "decision": result.decision.value,
             "status": None if entry is None else entry.status.value,
         },
@@ -184,6 +191,35 @@ def _transition(
         return adapter_response(entry)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _evaluate_candidate(
+    adapter_id: str,
+    request: AdapterEvaluateRequest,
+    settings: Settings,
+    registry: AdapterRegistry,
+    runtime_provider: ModelProvider,
+) -> AdapterEvaluationResult:
+    if request.deterministic_score is not None:
+        return AdapterEvaluator(settings, registry).evaluate(
+            adapter_id,
+            runtime_provider,
+            deterministic_score=request.deterministic_score,
+        )
+    entry = registry.lookup(adapter_id)
+    if entry is None:
+        raise ValueError(f"Unknown adapter: {adapter_id}")
+    baseline = load_model_provider(settings)
+    candidate = load_model_provider(
+        settings,
+        adapter_path=entry.path,
+        allow_candidate_adapter=True,
+    )
+    return AdapterEvaluator(settings, registry).evaluate(
+        adapter_id,
+        candidate,
+        baseline_provider=baseline,
+    )
 
 
 def _approve(

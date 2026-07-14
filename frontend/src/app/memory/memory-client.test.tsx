@@ -34,7 +34,7 @@ describe("MemoryClient", () => {
     fetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({
-        db1_results: [{ id: "episode-1", user_input: "hello", response: "world", record_type: "episodic_log", archived: false, tags: [], operator_metadata: {}, loss: 0, emotion_valence: 0, emotion_arousal: 0, created_at: "" }],
+        db1_results: [{ id: "episode-1", user_input: "hello", response: "world", record_type: "episodic_log", archived: false, tags: [], operator_metadata: {}, loss: 0, emotion_valence: 0, emotion_arousal: 0, created_at: "", validation_status: "verified", lifecycle_status: "active", generation_healthy: true, generation_health_reasons: [], content_hash: "hash", source_event_id: null, source: "test", processing_sequence: null, provider: "dummy", model_id: "dummy", model_revision: "unknown", adapter_id: null, consolidation_status: "pending" }],
         db2_results: [],
       }),
     });

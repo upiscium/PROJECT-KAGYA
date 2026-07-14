@@ -4,9 +4,12 @@ from kagya.config import Settings, load_settings
 from kagya.memory import (
     DeterministicEmbeddingFunction,
     DualMemorySystem,
+    GenerationHealth,
+    MemoryLifecycleStatus,
     MemoryRecordType,
     SentenceTransformerEmbeddingFunction,
     create_embedding_function,
+    ValidationStatus,
 )
 from kagya.models import DummyProvider
 
@@ -116,6 +119,47 @@ def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None
 
     assert len(context.db1_results) == 2
     assert len(context.db2_results) == 1
+
+
+def test_quarantined_generation_is_persisted_but_not_retrieved(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic(
+        "hello",
+        "broken broken broken",
+        generation_health=GenerationHealth(
+            healthy=False, reasons=["repetitive"], repetitive=True
+        ),
+        source_event_id="event-1",
+        processing_sequence=3,
+        provider="dummy",
+        model_id="dummy-model",
+    )
+
+    record = memory.get_episodic(episode_id)
+    assert record is not None
+    assert record.lifecycle_status == MemoryLifecycleStatus.QUARANTINED
+    assert record.source_event_id == "event-1"
+    assert record.processing_sequence == 3
+    assert memory.retrieve_context("hello").db1_results == []
+
+    reviewed = memory.review_episodic(
+        episode_id,
+        validation_status=ValidationStatus.VERIFIED,
+        lifecycle_status=MemoryLifecycleStatus.ACTIVE,
+    )
+    assert reviewed is not None
+    assert [item.id for item in memory.retrieve_context("hello").db1_results] == [episode_id]
+
+
+def test_same_event_and_content_is_deduplicated(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+
+    first = memory.save_episodic("same", "answer", source_event_id="event-1")
+    second = memory.save_episodic("same", "answer", source_event_id="event-1")
+    distinct = memory.save_episodic("same", "answer", source_event_id="event-2")
+
+    assert second == first
+    assert distinct != first
 
 
 def test_default_embedding_function_uses_configured_model_id(tmp_path: Path) -> None:

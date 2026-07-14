@@ -8,6 +8,7 @@ from kagya.runtime import (
     AgentRuntime,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
+    current_agent_event,
 )
 
 
@@ -263,6 +264,23 @@ def test_completion_hook_failure_fails_only_that_event() -> None:
         failed.result(timeout=1)
     assert succeeded.result(timeout=1).value == "next"
     assert runtime.is_alive is True
+    runtime.shutdown()
+
+
+def test_current_event_is_available_only_inside_handler() -> None:
+    runtime = AgentRuntime(queue_capacity=1)
+    runtime.start()
+
+    outcome = runtime.execute(
+        AgentEventType.CHAT,
+        source="test.source",
+        handler=current_agent_event,
+    )
+
+    assert outcome.value is not None
+    assert outcome.value.event_id == outcome.event.event_id
+    assert outcome.value.processing_sequence == 1
+    assert current_agent_event() is None
     runtime.shutdown()
 
 

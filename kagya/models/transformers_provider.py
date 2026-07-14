@@ -26,6 +26,7 @@ class TransformersProvider:
         adapter_path: str | Path | None = None,
         model: Any | None = None,
         processor: Any | None = None,
+        allow_candidate_adapter: bool = False,
     ) -> None:
         self.settings = settings
         self.model_id = settings.model.primary_id
@@ -36,6 +37,7 @@ class TransformersProvider:
         self._fallback_processor: Any | None = None
         self._fallback_model: Any | None = None
         self._adapter_attached = False
+        self.allow_candidate_adapter = allow_candidate_adapter
         self.last_model_id = self.model_id
         self.last_fallback_used = False
         if model is not None and adapter_path is not None:
@@ -167,7 +169,11 @@ class TransformersProvider:
         return self._get_primary_processor()
 
     def attach_adapter(self, adapter_path: str | Path) -> None:
-        if not is_registry_approved_adapter(self.settings, adapter_path):
+        if not is_registry_approved_adapter(
+            self.settings,
+            adapter_path,
+            allow_candidate=self.allow_candidate_adapter,
+        ):
             raise ValueError("Adapter path is not approved by the adapter registry")
         if self.model is None:
             self.model = self._load_model(self.model_id)
@@ -231,7 +237,12 @@ class TransformersProvider:
         return {key: value.to(device) for key, value in inputs.items()}
 
 
-def is_registry_approved_adapter(settings: Settings, adapter_path: str | Path) -> bool:
+def is_registry_approved_adapter(
+    settings: Settings,
+    adapter_path: str | Path,
+    *,
+    allow_candidate: bool = False,
+) -> bool:
     """Return whether an adapter path is registered in a loadable state."""
 
     registry_path = settings.adapter_registry.path
@@ -244,7 +255,8 @@ def is_registry_approved_adapter(settings: Settings, adapter_path: str | Path) -
     for entry in _iter_registry_entries(registry_data):
         path = entry.get("path")
         state = entry.get("state")
-        if path is None or state not in LOADABLE_ADAPTER_STATES:
+        allowed_states = LOADABLE_ADAPTER_STATES | ({"candidate"} if allow_candidate else set())
+        if path is None or state not in allowed_states:
             continue
         if Path(path).expanduser().resolve() == requested_path:
             return True

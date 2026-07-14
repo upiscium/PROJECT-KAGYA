@@ -16,6 +16,20 @@ class MatchingProvider(DummyProvider):
         return f"answer for {prompt}"
 
 
+class ResponseProvider(DummyProvider):
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        self.prompts: list[str] = []
+
+    def generate(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.responses[prompt]
+
+
+class FallbackResponseProvider(ResponseProvider):
+    last_fallback_used = True
+
+
 def test_evaluator_promotes_candidate_to_trial_active_with_high_score(tmp_path: Path) -> None:
     registry = _registry_with_candidate(tmp_path)
     evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
@@ -70,7 +84,7 @@ def test_evaluator_writes_history_and_score_comparison(tmp_path: Path) -> None:
 def test_evaluator_loads_eval_sets_and_writes_result_json(tmp_path: Path) -> None:
     eval_set_path = tmp_path / "eval_set.json"
     eval_set_path.write_text(
-        json.dumps({"cases": [{"prompt": "alpha", "expected": "alpha"}]}),
+        json.dumps({"cases": [{"prompt": "alpha", "expected": "answer for alpha"}]}),
         encoding="utf-8",
     )
     settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
@@ -84,6 +98,115 @@ def test_evaluator_loads_eval_sets_and_writes_result_json(tmp_path: Path) -> Non
     assert result.eval_set_count == 1
     assert result.case_count == 1
     assert result_data["decision"] == "trial_active"
+
+
+def test_evaluator_scores_baseline_and_candidate_on_the_same_cases(tmp_path: Path) -> None:
+    eval_set_path = tmp_path / "paired_eval.json"
+    eval_set_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {"prompt": "first secret prompt", "expected": "red blue"},
+                    {"prompt": "second secret prompt", "expected": "green"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    evaluator = AdapterEvaluator(settings, registry)
+    baseline = ResponseProvider(
+        {
+            "first secret prompt": "red",
+            "second secret prompt": "evergreen",
+        }
+    )
+    candidate = ResponseProvider(
+        {
+            "first secret prompt": "RED, blue!",
+            "second secret prompt": "green",
+        }
+    )
+
+    result = evaluator.evaluate(
+        "adapter-a", candidate, baseline_provider=baseline
+    )
+
+    assert baseline.prompts == candidate.prompts == [
+        "first secret prompt",
+        "second secret prompt",
+    ]
+    assert result.baseline_score == pytest.approx(1 / 3)
+    assert result.candidate_score == 1.0
+    assert result.score == result.candidate_score
+    assert result.score_delta == pytest.approx(2 / 3)
+    assert result.regression is False
+    result_data = json.loads(Path(result.result_path).read_text(encoding="utf-8"))
+    assert result_data["baseline_score"] == pytest.approx(1 / 3)
+    assert result_data["candidate_score"] == 1.0
+    assert "prompt" not in result_data
+    assert "output" not in result_data
+    assert "first secret prompt" not in Path(result.result_path).read_text(encoding="utf-8")
+
+
+def test_paired_regression_cannot_promote_candidate(tmp_path: Path) -> None:
+    eval_set_path = tmp_path / "regression_eval.json"
+    eval_set_path.write_text(
+        json.dumps({"cases": [{"prompt": "case", "expected": "expected"}]}),
+        encoding="utf-8",
+    )
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    baseline = ResponseProvider({"case": "expected"})
+    candidate = ResponseProvider({"case": "unrelated"})
+
+    result = AdapterEvaluator(settings, registry).evaluate(
+        "adapter-a", candidate, baseline_provider=baseline
+    )
+
+    assert result.regression is True
+    assert result.decision == AdapterEvaluationDecision.CANDIDATE
+    assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
+
+
+def test_candidate_fallback_invalidates_paired_evaluation(tmp_path: Path) -> None:
+    eval_set_path = tmp_path / "fallback_eval.json"
+    eval_set_path.write_text(
+        json.dumps({"cases": [{"prompt": "case", "expected": "expected"}]}),
+        encoding="utf-8",
+    )
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+
+    with pytest.raises(ValueError, match="Candidate provider used fallback"):
+        AdapterEvaluator(settings, registry).evaluate(
+            "adapter-a",
+            FallbackResponseProvider({"case": "expected"}),
+            baseline_provider=ResponseProvider({"case": "expected"}),
+        )
+
+    assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
+
+
+def test_evaluator_does_not_treat_substrings_as_exact_matches(tmp_path: Path) -> None:
+    eval_set_path = tmp_path / "substring_eval.json"
+    eval_set_path.write_text(
+        json.dumps({"cases": [{"prompt": "case", "expected": "green"}]}),
+        encoding="utf-8",
+    )
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    registry = _registry_with_candidate(tmp_path, settings=settings)
+    evaluator = AdapterEvaluator(settings, registry)
+
+    result = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "green"}),
+        baseline_provider=ResponseProvider({"case": "evergreen"}),
+    )
+
+    assert result.baseline_score == 0.0
+    assert result.candidate_score == 1.0
 
 
 def test_evaluator_fails_when_configured_eval_set_is_missing(tmp_path: Path) -> None:
