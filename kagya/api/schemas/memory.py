@@ -10,6 +10,11 @@ class MemoryMetadataUpdateRequest(BaseModel):
     operator_metadata: dict[str, Any] | None = None
 
 
+class MemoryReviewRequest(BaseModel):
+    validation_status: str
+    lifecycle_status: str
+
+
 class EpisodeMemoryResponse(BaseModel):
     id: str
     user_input: str
@@ -22,6 +27,19 @@ class EpisodeMemoryResponse(BaseModel):
     created_at: str
     tags: list[str]
     operator_metadata: dict[str, Any]
+    validation_status: str
+    lifecycle_status: str
+    generation_healthy: bool
+    generation_health_reasons: list[str]
+    content_hash: str
+    source_event_id: str | None
+    source: str
+    processing_sequence: int | None
+    provider: str
+    model_id: str
+    model_revision: str
+    adapter_id: str | None
+    consolidation_status: str
 
 
 class SemanticMemoryResponse(BaseModel):

@@ -1,5 +1,6 @@
 """Score-based adapter evaluation gates."""
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -24,6 +25,8 @@ class AdapterEvaluationDecision(StrEnum):
 class AdapterEvaluationResult:
     adapter_id: str
     score: float
+    baseline_score: float | None
+    candidate_score: float
     decision: AdapterEvaluationDecision
     result_path: str
     eval_set_count: int
@@ -47,6 +50,7 @@ class AdapterEvaluator:
         adapter_id: str,
         provider: ModelProvider,
         *,
+        baseline_provider: ModelProvider | None = None,
         deterministic_score: float | None = None,
     ) -> AdapterEvaluationResult:
         entry = self.registry.lookup(adapter_id)
@@ -63,15 +67,31 @@ class AdapterEvaluator:
         case_count = sum(len(eval_set.cases) for eval_set in eval_sets)
         if deterministic_score is None and case_count == 0:
             raise ValueError("No evaluation cases loaded; configure eval sets or provide a deterministic score")
-        score = deterministic_score if deterministic_score is not None else self._score(provider, eval_sets)
+        baseline_score: float | None = None
+        if deterministic_score is None:
+            baseline_score, candidate_score = self._score_pair(
+                provider,
+                baseline_provider or provider,
+                eval_sets,
+            )
+            score_delta = candidate_score - baseline_score
+        else:
+            candidate_score = deterministic_score
+            score_delta = None
+        score = candidate_score
         decision = self._decision(score)
         previous_score = self._previous_score(adapter_id)
-        score_delta = None if previous_score is None else score - previous_score
+        if deterministic_score is not None:
+            score_delta = None if previous_score is None else score - previous_score
         regression = score_delta is not None and score_delta < 0
+        if regression and deterministic_score is None:
+            decision = AdapterEvaluationDecision.CANDIDATE
         status_after = decision.value
         result_path = self._write_result(
             adapter_id,
             score,
+            baseline_score,
+            candidate_score,
             decision,
             eval_sets,
             previous_score=previous_score,
@@ -80,10 +100,17 @@ class AdapterEvaluator:
             status_before=status_before,
             status_after=status_after,
         )
-        self.registry.apply_evaluation(adapter_id, score=score, result_path=result_path)
+        self.registry.apply_evaluation(
+            adapter_id,
+            score=score,
+            result_path=result_path,
+            next_status=AdapterStatus(decision.value),
+        )
         return AdapterEvaluationResult(
             adapter_id=adapter_id,
             score=score,
+            baseline_score=baseline_score,
+            candidate_score=candidate_score,
             decision=decision,
             result_path=str(result_path),
             eval_set_count=len(eval_sets),
@@ -95,16 +122,27 @@ class AdapterEvaluator:
             status_after=status_after,
         )
 
-    def _score(self, provider: ModelProvider, eval_sets: list[EvalSet]) -> float:
+    def _score_pair(
+        self,
+        candidate_provider: ModelProvider,
+        baseline_provider: ModelProvider,
+        eval_sets: list[EvalSet],
+    ) -> tuple[float, float]:
         cases = [case for eval_set in eval_sets for case in eval_set.cases]
         if not cases:
-            return 0.0
-        matches = 0
+            return 0.0, 0.0
+        baseline_total = 0.0
+        candidate_total = 0.0
         for case in cases:
-            output = provider.generate(case.prompt)
-            if case.expected and case.expected in output:
-                matches += 1
-        return matches / len(cases)
+            baseline_output = baseline_provider.generate(case.prompt)
+            if bool(getattr(baseline_provider, "last_fallback_used", False)):
+                raise ValueError("Baseline provider used fallback during evaluation")
+            candidate_output = candidate_provider.generate(case.prompt)
+            if bool(getattr(candidate_provider, "last_fallback_used", False)):
+                raise ValueError("Candidate provider used fallback during evaluation")
+            baseline_total += _output_score(baseline_output, case.expected)
+            candidate_total += _output_score(candidate_output, case.expected)
+        return baseline_total / len(cases), candidate_total / len(cases)
 
     def _decision(self, score: float) -> AdapterEvaluationDecision:
         if score >= self.settings.adapter_registry.trial_threshold:
@@ -117,6 +155,8 @@ class AdapterEvaluator:
         self,
         adapter_id: str,
         score: float,
+        baseline_score: float | None,
+        candidate_score: float,
         decision: AdapterEvaluationDecision,
         eval_sets: list[EvalSet],
         *,
@@ -133,6 +173,8 @@ class AdapterEvaluator:
         payload: dict[str, Any] = {
             "adapter_id": adapter_id,
             "score": score,
+            "baseline_score": baseline_score,
+            "candidate_score": candidate_score,
             "previous_score": previous_score,
             "score_delta": score_delta,
             "regression": regression,
@@ -175,6 +217,23 @@ def _read_result_payload(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _output_score(output: str, expected: str) -> float:
+    expected_tokens = _normalized_tokens(expected)
+    if not expected_tokens:
+        return 0.0
+    output_tokens = _normalized_tokens(output)
+    if output_tokens == expected_tokens:
+        return 1.0
+    if not output_tokens:
+        return 0.0
+    overlap = sum((Counter(output_tokens) & Counter(expected_tokens)).values())
+    return 2 * overlap / (len(output_tokens) + len(expected_tokens))
+
+
+def _normalized_tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", text.casefold())
 
 
 def _safe_filename(adapter_id: str) -> str:

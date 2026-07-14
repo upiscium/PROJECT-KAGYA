@@ -15,9 +15,14 @@ from kagya.memory.consolidation import build_consolidation_prompt
 from kagya.memory.memory_evaluator import MemoryEvaluator
 from kagya.memory.memory_schema import (
     EpisodicMemoryRecord,
+    ConsolidationStatus,
+    GenerationHealth,
+    MemoryLifecycleStatus,
+    MemoryRecordKind,
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
+    ValidationStatus,
 )
 from kagya.models import ModelProvider
 
@@ -130,7 +135,30 @@ class DualMemorySystem:
         emotion_arousal: float = 0.0,
         record_type: MemoryRecordType = MemoryRecordType.EPISODIC_LOG,
         metadata: dict[str, Any] | None = None,
+        generation_health: GenerationHealth | None = None,
+        source_event_id: str | None = None,
+        source: str = "unknown",
+        processing_sequence: int | None = None,
+        causation_id: str | None = None,
+        correlation_id: str | None = None,
+        context_id: str | None = None,
+        provider: str = "unknown",
+        model_id: str = "unknown",
+        model_revision: str = "unknown",
+        adapter_id: str | None = None,
+        validation_status: ValidationStatus = ValidationStatus.VERIFIED,
     ) -> str:
+        health = generation_health or GenerationHealth()
+        lifecycle = (
+            MemoryLifecycleStatus.ACTIVE
+            if health.healthy
+            else MemoryLifecycleStatus.QUARANTINED
+        )
+        content_hash = _content_hash(user_input, response)
+        dedup_key = _dedup_key(source_event_id, content_hash)
+        existing = self.db1.get(where={"dedup_key": dedup_key})
+        if existing.get("ids"):
+            return str(existing["ids"][0])
         episode_id = f"episode-{uuid4()}"
         created_at = _now_iso()
         record_metadata = {
@@ -143,7 +171,28 @@ class DualMemorySystem:
             "record_type": record_type.value,
             "archived": False,
             "created_at": created_at,
-            "extra": json.dumps(metadata or {}),
+            "schema_version": 2,
+            "lifecycle_status": lifecycle.value,
+            "validation_status": validation_status.value,
+            "content_hash": content_hash,
+            "dedup_key": dedup_key,
+            "consolidation_status": ConsolidationStatus.PENDING.value,
+            "extra": json.dumps({
+                **(metadata or {}),
+                "generation_health": health.__dict__,
+                "provenance": {
+                    "source_event_id": source_event_id,
+                    "source": source,
+                    "processing_sequence": processing_sequence,
+                    "causation_id": causation_id,
+                    "correlation_id": correlation_id,
+                    "context_id": context_id,
+                    "provider": provider,
+                    "model_id": model_id,
+                    "model_revision": model_revision,
+                    "adapter_id": adapter_id,
+                },
+            }),
         }
         self.db1.add(
             ids=[episode_id],
@@ -182,11 +231,12 @@ class DualMemorySystem:
             n_results=self.settings.memory.db2_top_k,
         )
         return MemoryContext(
-            db1_results=_episodic_records_from_query(db1_results),
+            db1_results=[record for record in _episodic_records_from_query(db1_results) if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE],
             db2_results=[
                 record
                 for record in _semantic_records_from_query(db2_results)
                 if not record.archived
+                and record.metadata.get("publication_status", "published") == "published"
             ],
         )
 
@@ -205,7 +255,51 @@ class DualMemorySystem:
 
     def _get_unarchived_episodic_records(self) -> list[EpisodicMemoryRecord]:
         result = self.db1.get(where={"archived": False})
-        return _episodic_records_from_get(result)
+        return [record for record in _episodic_records_from_get(result) if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE]
+
+    def review_episodic(
+        self,
+        episode_id: str,
+        *,
+        validation_status: ValidationStatus,
+        lifecycle_status: MemoryLifecycleStatus,
+    ) -> EpisodicMemoryRecord | None:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
+        metadata["validation_status"] = validation_status.value
+        metadata["lifecycle_status"] = lifecycle_status.value
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+        return self.get_episodic(episode_id)
+
+    def set_consolidation_state(
+        self,
+        episode_id: str,
+        *,
+        status: ConsolidationStatus,
+        pipeline_version: str,
+        attempt_id: str,
+    ) -> EpisodicMemoryRecord | None:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            return None
+        metadata["consolidation_status"] = status.value
+        metadata["consolidation_version"] = pipeline_version
+        metadata["consolidation_attempt_id"] = attempt_id
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+        return self.get_episodic(episode_id)
+
+    def publish_semantic(self, memory_id: str) -> None:
+        result = self.db2.get(ids=[memory_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            raise ValueError(f"Unknown semantic memory: {memory_id}")
+        extra = _loads_json_dict(metadata.get("extra"))
+        extra["publication_status"] = "published"
+        metadata["extra"] = json.dumps(extra)
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
 
     def _archive_episodic(self, episode_id: str) -> None:
         self.archive_episodic(episode_id)
@@ -360,6 +454,8 @@ def _first_semantic_from_get(result: dict[str, Any]) -> SemanticMemoryRecord | N
 
 def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> EpisodicMemoryRecord:
     extra = _loads_json_dict(metadata.get("extra"))
+    provenance = extra.get("provenance") if isinstance(extra.get("provenance"), dict) else {}
+    health_data = extra.get("generation_health") if isinstance(extra.get("generation_health"), dict) else {}
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
@@ -374,6 +470,27 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         metadata=extra,
         tags=_operator_tags(extra),
         operator_metadata=_operator_metadata(extra),
+        schema_version=int(metadata.get("schema_version", 1)),
+        input_kind=MemoryRecordKind.EXTERNAL_CLAIM,
+        response_kind=MemoryRecordKind.GENERATED_RESPONSE,
+        validation_status=ValidationStatus(str(metadata.get("validation_status", ValidationStatus.UNVERIFIED.value))),
+        lifecycle_status=MemoryLifecycleStatus(str(metadata.get("lifecycle_status", MemoryLifecycleStatus.ACTIVE.value))),
+        generation_health=GenerationHealth(**health_data),
+        content_hash=str(metadata.get("content_hash", _content_hash(str(metadata.get("user_input", "")), str(metadata.get("response", ""))))),
+        dedup_key=str(metadata.get("dedup_key", "")),
+        source_event_id=_optional_str(provenance.get("source_event_id")),
+        source=str(provenance.get("source", "unknown")),
+        processing_sequence=_optional_int(provenance.get("processing_sequence")),
+        causation_id=_optional_str(provenance.get("causation_id")),
+        correlation_id=_optional_str(provenance.get("correlation_id")),
+        context_id=_optional_str(provenance.get("context_id")),
+        provider=str(provenance.get("provider", "unknown")),
+        model_id=str(provenance.get("model_id", "unknown")),
+        model_revision=str(provenance.get("model_revision", "unknown")),
+        adapter_id=_optional_str(provenance.get("adapter_id")),
+        consolidation_status=ConsolidationStatus(str(metadata.get("consolidation_status", ConsolidationStatus.PENDING.value))),
+        consolidation_version=str(metadata.get("consolidation_version", "")),
+        consolidation_attempt_id=_optional_str(metadata.get("consolidation_attempt_id")),
     )
 
 
@@ -457,3 +574,20 @@ def _loads_json_list(value: Any) -> list[str]:
     except json.JSONDecodeError:
         return []
     return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _content_hash(user_input: str, response: str) -> str:
+    normalized = json.dumps([user_input.strip(), response.strip()], ensure_ascii=False)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _dedup_key(source_event_id: str | None, content_hash: str) -> str:
+    return f"{source_event_id or 'content'}:{content_hash}"
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)

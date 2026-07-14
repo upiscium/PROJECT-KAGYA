@@ -39,6 +39,19 @@ export type EpisodeMemory = {
   created_at: string;
   tags: string[];
   operator_metadata: Record<string, unknown>;
+  validation_status: string;
+  lifecycle_status: string;
+  generation_healthy: boolean;
+  generation_health_reasons: string[];
+  content_hash: string;
+  source_event_id: string | null;
+  source: string;
+  processing_sequence: number | null;
+  provider: string;
+  model_id: string;
+  model_revision: string;
+  adapter_id: string | null;
+  consolidation_status: string;
 };
 
 export type SemanticMemory = {
@@ -54,6 +67,7 @@ export type SemanticMemory = {
 
 export type MemorySearchResponse = { db1_results: EpisodeMemory[]; db2_results: SemanticMemory[] };
 export type MemoryMetadataUpdate = { tags?: string[]; operator_metadata?: Record<string, unknown> };
+export type MemoryReviewUpdate = { validation_status: string; lifecycle_status: string };
 
 export type Adapter = {
   adapter_id: string;
@@ -190,6 +204,7 @@ export const api = {
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
   updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
+  reviewEpisodeMemory: (episodeId: string, body: MemoryReviewUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/review`, { method: "POST", body: JSON.stringify(body) }),
   archiveSemanticMemory: (memoryId: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
   updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
   sleepRun: () => adminRequest<SleepRunResponse>("/sleep/run", { method: "POST" }),
