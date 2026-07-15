@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from kagya.config.compatibility import compatibility_report
-from kagya.config.settings import DEFAULT_CONFIG_PATH, load_settings
+from kagya.config.settings import DEFAULT_CONFIG_PATH, load_settings_with_notes
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,13 +25,13 @@ def main(argv: list[str] | None = None) -> int:
     config_path = Path(args.config)
 
     try:
-        settings = load_settings(config_path)
+        settings, migration_notes = load_settings_with_notes(config_path)
     except (OSError, ValidationError) as exc:
         print(f"Config check failed for {config_path}: {exc}")
         return 1
 
     print(f"Config OK: {config_path}")
-    notes = compatibility_report(settings)
+    notes = [*migration_notes, *compatibility_report(settings)]
     if notes:
         print("Compatibility notes:")
         for note in notes:

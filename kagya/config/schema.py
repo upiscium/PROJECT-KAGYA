@@ -1,6 +1,8 @@
 """Typed configuration schema for PROJECT-KAGYA."""
 
 from pathlib import Path
+from enum import StrEnum
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -23,6 +25,105 @@ class ModelSettings(StrictBaseModel):
     device: str
     dtype: str
     load_in_4bit: bool
+    revision: str = Field(min_length=1)
+    processor_revision: str = Field(min_length=1)
+    fallback_revision: str = Field(min_length=1)
+
+
+class DeploymentMode(StrEnum):
+    STANDALONE = "standalone"
+    SPLIT = "split"
+
+
+class NodeRole(StrEnum):
+    ALL = "all"
+    INFERENCE = "inference"
+    TRAINING_WORKER = "training_worker"
+
+
+class TrainingBackendType(StrEnum):
+    LOCAL = "local"
+    SSH = "ssh"
+    WORKER = "worker"
+
+
+class NodeSettings(StrictBaseModel):
+    id: str = Field(min_length=1)
+    role: NodeRole
+    expected_hostname: str | None = Field(default=None, min_length=1)
+    enforce_hostname_match: bool = False
+
+    @model_validator(mode="after")
+    def validate_node_id(self) -> "NodeSettings":
+        if re.fullmatch(r"[A-Za-z0-9._-]+", self.id) is None:
+            raise ValueError("node.id contains unsafe characters")
+        if self.enforce_hostname_match and self.expected_hostname is None:
+            raise ValueError(
+                "expected_hostname is required when hostname matching is enforced"
+            )
+        return self
+
+
+class ExpectedWorkerModelSettings(StrictBaseModel):
+    model_id: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    processor_revision: str = Field(min_length=1)
+
+
+class RemoteWorkerSettings(StrictBaseModel):
+    node_id: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    port: int = Field(default=22, gt=0, le=65535)
+    user: str = Field(min_length=1)
+    identity_file: Path
+    known_hosts_file: Path
+    remote_inbox: Path
+    remote_results: Path
+    command: Path
+    connect_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    job_timeout_seconds: float = Field(default=86400.0, gt=0.0)
+    poll_interval_seconds: float = Field(default=30.0, gt=0.0)
+    expected_worker_model: ExpectedWorkerModelSettings
+    worker_token_env: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_node_id(self) -> "RemoteWorkerSettings":
+        if re.fullmatch(r"[A-Za-z0-9._-]+", self.node_id) is None:
+            raise ValueError("remote worker node_id contains unsafe characters")
+        return self
+
+
+class WorkerSettings(StrictBaseModel):
+    inbox_directory: Path
+    work_directory: Path
+    result_directory: Path
+    max_concurrent_jobs: int = Field(default=1, gt=0)
+    retain_failed_jobs: bool = True
+    allowed_submitters: list[str] = Field(min_length=1)
+    worker_token_env: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_submitters(self) -> "WorkerSettings":
+        if len(self.allowed_submitters) != len(set(self.allowed_submitters)):
+            raise ValueError("allowed submitter node IDs must be unique")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9._-]+", item) is None
+            for item in self.allowed_submitters
+        ):
+            raise ValueError("allowed submitter node ID contains unsafe characters")
+        return self
+
+
+class DeploymentTrainingSettings(StrictBaseModel):
+    backend: TrainingBackendType
+    remote_worker: RemoteWorkerSettings | None = None
+    worker: WorkerSettings | None = None
+
+
+class DeploymentSettings(StrictBaseModel):
+    mode: DeploymentMode
+    node: NodeSettings
+    training: DeploymentTrainingSettings
 
 
 class GenerationSettings(StrictBaseModel):
@@ -174,3 +275,57 @@ class Settings(StrictBaseModel):
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
     api: ApiSettings
     frontend: FrontendSettings
+    deployment: DeploymentSettings
+
+    @model_validator(mode="after")
+    def validate_deployment_topology(self) -> "Settings":
+        mode = self.deployment.mode
+        role = self.deployment.node.role
+        training = self.deployment.training
+        combination = (mode, role, training.backend)
+        allowed = {
+            (
+                DeploymentMode.STANDALONE,
+                NodeRole.ALL,
+                TrainingBackendType.LOCAL,
+            ),
+            (DeploymentMode.SPLIT, NodeRole.INFERENCE, TrainingBackendType.SSH),
+            (
+                DeploymentMode.SPLIT,
+                NodeRole.TRAINING_WORKER,
+                TrainingBackendType.WORKER,
+            ),
+        }
+        if combination not in allowed:
+            raise ValueError(
+                "invalid deployment mode, node role, and training backend combination"
+            )
+        if role == NodeRole.INFERENCE:
+            remote = training.remote_worker
+            if remote is None or training.worker is not None:
+                raise ValueError(
+                    "split inference requires remote_worker and forbids worker settings"
+                )
+            expected = remote.expected_worker_model
+            if (
+                expected.model_id != self.model.primary_id
+                or expected.revision != self.model.revision
+                or expected.processor_revision != self.model.processor_revision
+            ):
+                raise ValueError(
+                    "remote worker model and revisions must match inference model"
+                )
+            if self.model.revision == "main" or self.model.processor_revision == "main":
+                raise ValueError("split inference requires exact immutable revisions")
+        elif role == NodeRole.TRAINING_WORKER:
+            if training.worker is None or training.remote_worker is not None:
+                raise ValueError(
+                    "training worker requires worker settings and forbids remote_worker"
+                )
+            if self.model.revision == "main" or self.model.processor_revision == "main":
+                raise ValueError("split training worker requires exact immutable revisions")
+        elif training.remote_worker is not None or training.worker is not None:
+            raise ValueError(
+                "standalone deployment forbids remote worker and worker settings"
+            )
+        return self

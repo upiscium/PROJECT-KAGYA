@@ -31,6 +31,8 @@ class TransformersProvider:
         self.settings = settings
         self.model_id = settings.model.primary_id
         self.fallback_model_id = settings.model.fallback_id
+        self.model_revision = settings.model.revision
+        self.processor_revision = settings.model.processor_revision
         self.adapter_path = adapter_path
         self.processor = processor
         self.model = model
@@ -182,7 +184,9 @@ class TransformersProvider:
 
     def _get_primary_processor(self) -> Any:
         if self.processor is None:
-            self.processor = AutoProcessor.from_pretrained(self.model_id)
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_id, revision=self.processor_revision
+            )
         return self.processor
 
     def _get_primary_model(self) -> Any:
@@ -196,7 +200,8 @@ class TransformersProvider:
     def _get_fallback_processor(self) -> Any:
         if self._fallback_processor is None:
             self._fallback_processor = AutoProcessor.from_pretrained(
-                self.fallback_model_id
+                self.fallback_model_id,
+                revision=self.settings.model.fallback_revision,
             )
         return self._fallback_processor
 
@@ -206,7 +211,12 @@ class TransformersProvider:
         return self._fallback_model
 
     def _load_model(self, model_id: str) -> Any:
-        load_kwargs: dict[str, Any] = {}
+        revision = (
+            self.model_revision
+            if model_id == self.model_id
+            else self.settings.model.fallback_revision
+        )
+        load_kwargs: dict[str, Any] = {"revision": revision}
         if self.settings.model.device == "auto":
             load_kwargs["device_map"] = "auto"
         if self.settings.model.dtype != "auto":

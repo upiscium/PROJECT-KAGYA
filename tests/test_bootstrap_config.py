@@ -1,17 +1,20 @@
 from pathlib import Path
+from copy import deepcopy
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
 from kagya.api.server import app
-from kagya.config import Settings, load_settings
+from kagya.config import Settings, load_settings, validate_deployment_hostname
 from kagya.config.check import main as config_check_main
 from kagya.config.compatibility import (
     COMPATIBILITY_FIELDS,
     compatibility_report,
     documented_compatibility_fields,
 )
+from kagya.config.settings import load_settings_with_notes
+from kagya.config.schema import RemoteWorkerSettings
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -35,6 +38,182 @@ def test_model_ids_come_from_config() -> None:
 
     assert settings.model.primary_id == raw_config["model"]["primary_id"]
     assert settings.model.fallback_id == raw_config["model"]["fallback_id"]
+    assert settings.model.primary_id == "google/gemma-4-12B-it"
+    assert settings.model.revision == raw_config["model"]["revision"]
+
+
+def test_legacy_config_migrates_explicitly_to_standalone(tmp_path: Path) -> None:
+    raw = read_raw_config()
+    del raw["deployment"]
+    del raw["model"]["revision"]
+    del raw["model"]["processor_revision"]
+    del raw["model"]["fallback_revision"]
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    settings, notes = load_settings_with_notes(path)
+
+    assert settings.deployment.mode.value == "standalone"
+    assert settings.deployment.node.role.value == "all"
+    assert settings.deployment.training.backend.value == "local"
+    assert any("standalone/all/local" in note for note in notes)
+    assert any("model.revision" in note for note in notes)
+
+
+def test_valid_split_inference_topology_requires_matching_exact_model() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["model"]["revision"] = "model-commit-123"
+    raw["model"]["processor_revision"] = "processor-commit-123"
+    raw["deployment"] = {
+        "mode": "split",
+        "node": {"id": "inference-01", "role": "inference"},
+        "training": {
+            "backend": "ssh",
+            "remote_worker": {
+                "node_id": "worker-01",
+                "host": "10.0.0.22",
+                "port": 22,
+                "user": "kagya-worker",
+                "identity_file": "/etc/kagya/id_worker",
+                "known_hosts_file": "/etc/kagya/known_hosts",
+                "remote_inbox": "/var/lib/kagya/inbox",
+                "remote_results": "/var/lib/kagya/results",
+                "command": "/opt/kagya/bin/kagya-worker",
+                "expected_worker_model": {
+                    "model_id": raw["model"]["primary_id"],
+                    "revision": raw["model"]["revision"],
+                    "processor_revision": raw["model"]["processor_revision"],
+                },
+            },
+        },
+    }
+
+    settings = Settings.model_validate(raw)
+
+    assert settings.deployment.node.role.value == "inference"
+    assert settings.deployment.training.remote_worker is not None
+    assert settings.deployment.training.remote_worker.worker_token_env is None
+
+
+def test_valid_split_training_worker_topology() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["model"]["revision"] = "model-commit-123"
+    raw["model"]["processor_revision"] = "processor-commit-123"
+    raw["deployment"] = {
+        "mode": "split",
+        "node": {"id": "training-01", "role": "training_worker"},
+        "training": {
+            "backend": "worker",
+            "worker": {
+                "inbox_directory": "/var/lib/kagya/inbox",
+                "work_directory": "/var/lib/kagya/work",
+                "result_directory": "/var/lib/kagya/results",
+                "max_concurrent_jobs": 1,
+                "retain_failed_jobs": True,
+                "allowed_submitters": ["inference-01"],
+                "worker_token_env": "KAGYA_WORKER_TOKEN",
+            },
+        },
+    }
+
+    settings = Settings.model_validate(raw)
+
+    assert settings.deployment.training.worker is not None
+    assert settings.deployment.training.worker.allowed_submitters == ["inference-01"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "role", "backend"),
+    [
+        ("standalone", "inference", "local"),
+        ("split", "all", "ssh"),
+        ("split", "training_worker", "local"),
+    ],
+)
+def test_invalid_deployment_combinations_are_rejected(
+    mode: str, role: str, backend: str
+) -> None:
+    raw = deepcopy(read_raw_config())
+    raw["deployment"] = {
+        "mode": mode,
+        "node": {"id": "node-01", "role": role},
+        "training": {"backend": backend},
+    }
+
+    with pytest.raises(ValidationError, match="invalid deployment"):
+        Settings.model_validate(raw)
+
+
+def test_split_inference_rejects_model_revision_mismatch() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["model"]["revision"] = "model-commit-123"
+    raw["model"]["processor_revision"] = "processor-commit-123"
+    raw["deployment"] = {
+        "mode": "split",
+        "node": {"id": "inference-01", "role": "inference"},
+        "training": {
+            "backend": "ssh",
+            "remote_worker": {
+                "node_id": "worker-01",
+                "host": "worker.local",
+                "user": "worker",
+                "identity_file": "/keys/id",
+                "known_hosts_file": "/keys/known_hosts",
+                "remote_inbox": "/inbox",
+                "remote_results": "/results",
+                "command": "/bin/kagya-worker",
+                "expected_worker_model": {
+                    "model_id": raw["model"]["primary_id"],
+                    "revision": "wrong-revision",
+                    "processor_revision": raw["model"]["processor_revision"],
+                },
+            },
+        },
+    }
+
+    with pytest.raises(ValidationError, match="must match inference model"):
+        Settings.model_validate(raw)
+
+
+def test_deployment_schema_rejects_plaintext_worker_secret() -> None:
+    fields = RemoteWorkerSettings.model_fields
+
+    assert "password" not in fields
+    assert "worker_token" not in fields
+    assert "identity_file" in fields
+    assert "known_hosts_file" in fields
+    assert "worker_token_env" in fields
+
+
+def test_hostname_enforcement_requires_expected_hostname() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["deployment"]["node"]["enforce_hostname_match"] = True
+
+    with pytest.raises(ValidationError, match="expected_hostname"):
+        Settings.model_validate(raw)
+
+
+def test_hostname_validation_can_be_enforced_or_disabled() -> None:
+    settings = load_settings(CONFIG_PATH)
+    enforced = settings.model_copy(
+        update={
+            "deployment": settings.deployment.model_copy(
+                update={
+                    "node": settings.deployment.node.model_copy(
+                        update={
+                            "expected_hostname": "expected-host",
+                            "enforce_hostname_match": True,
+                        }
+                    )
+                }
+            )
+        }
+    )
+
+    validate_deployment_hostname(enforced, actual_hostname="expected-host")
+    with pytest.raises(RuntimeError, match="startup host"):
+        validate_deployment_hostname(enforced, actual_hostname="other-host")
+    validate_deployment_hostname(settings, actual_hostname="other-host")
 
 
 def test_api_settings_come_from_config() -> None:
