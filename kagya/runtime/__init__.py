@@ -34,6 +34,7 @@ from kagya.runtime.working_memory import (
     WorkingMemoryView,
     working_memory_item,
 )
+from kagya.runtime.bootstrap import RemoteTrainingDispatcher, TrainingWorkerRuntime
 
 __all__ = [
     "AgentEvent",
@@ -64,4 +65,6 @@ __all__ = [
     "WorkingMemorySelection",
     "WorkingMemoryView",
     "working_memory_item",
+    "RemoteTrainingDispatcher",
+    "TrainingWorkerRuntime",
 ]
