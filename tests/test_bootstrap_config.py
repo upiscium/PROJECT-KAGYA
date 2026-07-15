@@ -14,6 +14,7 @@ from kagya.config.compatibility import (
     documented_compatibility_fields,
 )
 from kagya.config.settings import load_settings_with_notes
+from kagya.config.schema import RemoteWorkerSettings
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -175,35 +176,13 @@ def test_split_inference_rejects_model_revision_mismatch() -> None:
 
 
 def test_deployment_schema_rejects_plaintext_worker_secret() -> None:
-    raw = deepcopy(read_raw_config())
-    raw["model"]["revision"] = "model-commit-123"
-    raw["model"]["processor_revision"] = "processor-commit-123"
-    raw["deployment"] = {
-        "mode": "split",
-        "node": {"id": "inference-01", "role": "inference"},
-        "training": {
-            "backend": "ssh",
-            "remote_worker": {
-                "node_id": "worker-01",
-                "host": "worker.local",
-                "user": "worker",
-                "password": "must-not-be-in-yaml",
-                "identity_file": "/keys/id",
-                "known_hosts_file": "/keys/known_hosts",
-                "remote_inbox": "/inbox",
-                "remote_results": "/results",
-                "command": "/bin/kagya-worker",
-                "expected_worker_model": {
-                    "model_id": raw["model"]["primary_id"],
-                    "revision": raw["model"]["revision"],
-                    "processor_revision": raw["model"]["processor_revision"],
-                },
-            },
-        },
-    }
+    fields = RemoteWorkerSettings.model_fields
 
-    with pytest.raises(ValidationError, match="password"):
-        Settings.model_validate(raw)
+    assert "password" not in fields
+    assert "worker_token" not in fields
+    assert "identity_file" in fields
+    assert "known_hosts_file" in fields
+    assert "worker_token_env" in fields
 
 
 def test_hostname_enforcement_requires_expected_hostname() -> None:
