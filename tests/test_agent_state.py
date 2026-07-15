@@ -60,7 +60,8 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.emotion_engine.state == EmotionState(0.2, 0.4, 0.8)
     assert restored_loop.persistent_state.active_goals == [{"id": "goal-1"}]
     assert restored_loop.persistent_state.commitments == [{"id": "promise-1"}]
-    assert restored_loop.persistent_state.values == {"care": 0.9}
+    assert restored_loop.persistent_state.values["schema_version"] == 1
+    assert restored_loop.value_system.get("care").weight == 0.9
     assert restored_loop.persistent_state.self_model == {"certainty": 0.5}
     assert restored_loop.working_memory.items[0].reference == "episode:one"
     assert loaded.working_memory.items[0].content is None

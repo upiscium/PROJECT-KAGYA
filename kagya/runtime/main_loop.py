@@ -1,15 +1,23 @@
 """Integrated runtime main loop."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.cognition import (
+    ActionScore,
     AppraisalResult,
     AppraisalSignals,
     CognitiveAppraiser,
     LossMeasurement,
     SurprisalCalculator,
+    ValueConflictDefinition,
+    ValueEvidence,
+    ValueState,
+    ValueSystem,
+    ValueUpdateKind,
+    ValueUpdateRecord,
 )
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
@@ -102,8 +110,35 @@ class KagyaMainLoop:
         )
         self.context_registry = context_registry or ContextRegistry()
         self.appraiser = appraiser or CognitiveAppraiser()
+        self.value_system = ValueSystem(
+            seeds=[
+                ValueState(
+                    value_id=seed.value_id,
+                    name=seed.name,
+                    weight=seed.weight,
+                    confidence=seed.confidence,
+                    stability=seed.stability,
+                    source=seed.source,
+                    origin=seed.origin,
+                    last_updated_at=datetime.now(UTC).isoformat(),
+                    allowed_update_rate=seed.allowed_update_rate,
+                )
+                for seed in settings.values.seeds
+            ],
+            conflicts=[
+                ValueConflictDefinition(
+                    left_value_id=conflict.left_value_id,
+                    right_value_id=conflict.right_value_id,
+                    name=conflict.name,
+                )
+                for conflict in settings.values.conflicts
+            ],
+            max_update_per_event=settings.values.max_update_per_event,
+            max_total_update_per_event=settings.values.max_total_update_per_event,
+        )
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
+        self.restore_value_state()
 
     def chat(
         self,
@@ -340,6 +375,61 @@ class KagyaMainLoop:
         self.persistent_state.extensions["appraisal_calibration"] = (
             self.surprisal_calculator.export_history()
         )
+
+    def restore_value_state(self) -> None:
+        self.value_system.restore(self.persistent_state.values)
+        self._persist_value_state()
+
+    def _persist_value_state(self) -> None:
+        self.persistent_state.values = self.value_system.to_json()
+
+    def apply_value_impacts(
+        self,
+        appraisal: AppraisalResult,
+        impacts: dict[str, float],
+        *,
+        kind: ValueUpdateKind,
+        memory_ids: tuple[str, ...] = (),
+        source: str = "runtime",
+        proposal_id: str | None = None,
+    ) -> list[ValueUpdateRecord]:
+        event = current_agent_event()
+        evidence = ValueEvidence(
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+            memory_ids=memory_ids,
+            source=source,
+        )
+        proposals = self.value_system.proposals_from_appraisal(
+            appraisal,
+            impacts,
+            kind=kind,
+            evidence=evidence,
+            proposal_id=proposal_id,
+        )
+        records = self.value_system.apply(proposals)
+        self._persist_value_state()
+        return records
+
+    def evaluate_value_options(
+        self, options: dict[str, dict[str, float]]
+    ) -> list[ActionScore]:
+        return self.value_system.evaluate(options)
+
+    def freeze_value(self, value_id: str, *, frozen: bool) -> ValueState:
+        state = self.value_system.freeze(value_id, frozen=frozen)
+        self._persist_value_state()
+        return state
+
+    def rollback_value(self, value_id: str, *, target_revision: int) -> ValueState:
+        state = self.value_system.rollback(value_id, target_revision=target_revision)
+        self._persist_value_state()
+        return state
+
+    def reset_values(self, value_ids: tuple[str, ...] | None = None) -> list[ValueState]:
+        states = self.value_system.reset(value_ids)
+        self._persist_value_state()
+        return states
 
     def _resolve_context(
         self,
