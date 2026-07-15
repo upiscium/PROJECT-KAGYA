@@ -20,6 +20,8 @@ from kagya.api.schemas.debug import (
     RetrievedEpisodeSchema,
     RetrievedMemorySchema,
     RetrievedSemanticSchema,
+    WorkingMemoryDecisionSchema,
+    WorkingMemoryViewSchema,
 )
 from kagya.config import Settings
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -97,6 +99,25 @@ def debug_chat(
             do_sample=settings.generation.do_sample,
             repetition_penalty=settings.generation.repetition_penalty,
             no_repeat_ngram_size=settings.generation.no_repeat_ngram_size,
+        ),
+        working_memory=WorkingMemoryViewSchema(
+            items=[
+                WorkingMemoryDecisionSchema(
+                    item_id=decision.item_id,
+                    kind=decision.kind.value,
+                    selected=decision.selected,
+                    score=decision.score,
+                    reasons=list(decision.reasons),
+                    activation=decision.activation,
+                    salience=decision.salience,
+                    retention_reason=decision.retention_reason.value,
+                    reference=decision.reference,
+                )
+                for decision in result.working_memory_view.decisions
+            ],
+            token_count=result.working_memory_view.token_count,
+            item_capacity=result.working_memory_view.item_capacity,
+            token_capacity=result.working_memory_view.token_capacity,
         ),
     )
 

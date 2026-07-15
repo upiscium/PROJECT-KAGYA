@@ -1,6 +1,8 @@
 from pathlib import Path
 
+import pytest
 import yaml
+from pydantic import ValidationError
 
 from kagya.api.server import app
 from kagya.config import Settings, load_settings
@@ -43,6 +45,24 @@ def test_api_settings_come_from_config() -> None:
     assert settings.api.port == raw_config["api"]["port"]
     assert settings.api.admin_token_env == raw_config["api"]["admin_token_env"]
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
+
+
+def test_working_memory_capacities_come_from_config() -> None:
+    raw_config = read_raw_config()
+    settings = load_settings(CONFIG_PATH)
+
+    assert settings.working_memory.item_capacity == raw_config["working_memory"]["item_capacity"]
+    assert settings.working_memory.token_capacity == raw_config["working_memory"]["token_capacity"]
+
+
+def test_working_memory_capacities_must_be_positive() -> None:
+    settings = load_settings(CONFIG_PATH)
+
+    with pytest.raises(ValidationError):
+        settings.working_memory.__class__(
+            item_capacity=0,
+            token_capacity=1,
+        )
 
 
 def test_reserved_config_fields_are_documented() -> None:

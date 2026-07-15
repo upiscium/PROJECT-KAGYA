@@ -97,7 +97,22 @@ def test_concurrent_chat_requests_share_one_ordered_subject_state(tmp_path: Path
         )
 
     assert [response.status_code for response in responses] == [200] * 4
-    assert len(client.app.state.main_loop.session_state.turns) == 4
+    assert client.app.state.main_loop.session_state.turns == []
+    assert (
+        len(client.app.state.main_loop.working_memory.items)
+        <= client.app.state.settings.working_memory.item_capacity
+    )
+    assert (
+        len(
+            [
+                item
+                for item in client.app.state.main_loop.working_memory.items
+                if item.reference and item.reference.startswith("episode:")
+            ]
+        )
+        == 4
+    )
+    assert len(client.app.state.memory_system.db1.get()["ids"]) == 4
     completed = [
         event
         for event in client.app.state.runtime_event_log.recent()
@@ -216,6 +231,10 @@ def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None
     assert "prompt" in data
     assert "retrieved_memory" in data
     assert "generation_params" in data
+    assert data["working_memory"]["item_capacity"] > 0
+    assert data["working_memory"]["token_capacity"] > 0
+    assert data["working_memory"]["items"]
+    assert "rendered_content" not in str(data["working_memory"])
 
 
 def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:

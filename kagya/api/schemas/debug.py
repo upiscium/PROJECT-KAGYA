@@ -32,6 +32,25 @@ class GenerationParamsSchema(BaseModel):
     no_repeat_ngram_size: int
 
 
+class WorkingMemoryDecisionSchema(BaseModel):
+    item_id: str
+    kind: str
+    selected: bool
+    score: float
+    reasons: list[str]
+    activation: float
+    salience: float
+    retention_reason: str
+    reference: str | None
+
+
+class WorkingMemoryViewSchema(BaseModel):
+    items: list[WorkingMemoryDecisionSchema]
+    token_count: int
+    item_capacity: int
+    token_capacity: int
+
+
 class DebugChatResponse(ChatResponse):
     hidden_thought: str
     loss: float
@@ -39,6 +58,7 @@ class DebugChatResponse(ChatResponse):
     attachments: list[AttachmentSchema]
     retrieved_memory: RetrievedMemorySchema
     generation_params: GenerationParamsSchema
+    working_memory: WorkingMemoryViewSchema
 
 
 class EmotionStateResponse(EmotionSchema):

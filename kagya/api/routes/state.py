@@ -83,6 +83,7 @@ def reset_snapshot(
             default_agent_state_snapshot(settings.emotion.baseline_surprisal),
         )
         main_loop.session_state.turns.clear()
+        main_loop.working_memory.clear()
 
     execute_agent_event(
         runtime,

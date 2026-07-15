@@ -11,9 +11,14 @@ import tempfile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from kagya.body import EmotionState
+from kagya.runtime.working_memory import (
+    RetentionReason,
+    WorkingMemoryItem,
+    WorkingMemoryKind,
+)
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION = 1
+CURRENT_AGENT_STATE_SCHEMA_VERSION = 2
 
 
 class _StateModel(BaseModel):
@@ -26,7 +31,23 @@ class EmotionStateSnapshot(_StateModel):
     optimal_loss: float = Field(ge=0.0, allow_inf_nan=False)
 
 
+class WorkingMemoryItemSnapshot(_StateModel):
+    item_id: str
+    kind: str
+    content: str | None = None
+    reference: str | None = None
+    source_event_id: str | None = None
+    source_event_sequence: int | None = None
+    context_id: str | None = None
+    activation: float = Field(ge=0.0, le=1.0)
+    salience: float = Field(ge=0.0, le=1.0)
+    created_at: datetime
+    last_accessed_at: datetime
+    retention_reason: str
+
+
 class WorkingMemoryStateSnapshot(_StateModel):
+    items: list[WorkingMemoryItemSnapshot] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     extensions: dict[str, Any] = Field(default_factory=dict)
 
@@ -44,7 +65,7 @@ class IdentityStateSnapshot(_StateModel):
 
 
 class AgentStateSnapshot(_StateModel):
-    schema_version: Literal[1] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[2] = CURRENT_AGENT_STATE_SCHEMA_VERSION
     saved_at: datetime
     last_processed_event_sequence: int = Field(ge=0)
     emotion_state: EmotionStateSnapshot
@@ -96,7 +117,10 @@ class AgentStateStore:
             version = raw.get("schema_version")
             if version == 0:
                 raw = _migrate_v0(raw)
-                self._record("migrated", {"from_version": 0, "to_version": 1})
+                self._record("migrated", {"from_version": 0, "to_version": 2})
+            elif version == 1:
+                raw = _migrate_v1(raw)
+                self._record("migrated", {"from_version": 1, "to_version": 2})
             elif version != CURRENT_AGENT_STATE_SCHEMA_VERSION:
                 raise UnsupportedStateVersion(version)
             snapshot = AgentStateSnapshot.model_validate(raw)
@@ -147,6 +171,7 @@ class AgentStateStore:
                 optimal_loss=emotion.optimal_loss,
             ),
             working_memory=WorkingMemoryStateSnapshot(
+                items=[_working_memory_item_snapshot(item) for item in main_loop.working_memory.items],
                 metadata=state.working_memory_metadata,
                 extensions=state.working_memory_extensions,
             ),
@@ -166,6 +191,9 @@ class AgentStateStore:
     def restore_into(self, main_loop: Any, snapshot: AgentStateSnapshot) -> None:
         main_loop.emotion_engine.state = EmotionState(**snapshot.emotion_state.model_dump())
         main_loop.persistent_state = persistent_state_from_snapshot(snapshot)
+        main_loop.working_memory.restore(
+            [_working_memory_item_from_snapshot(item) for item in snapshot.working_memory.items]
+        )
 
     def save_failed_sequence(self, sequence: int) -> None:
         if self.last_snapshot is None:
@@ -221,7 +249,7 @@ def persistent_state_from_snapshot(snapshot: AgentStateSnapshot) -> PersistentAg
 
 def _migrate_v0(raw: dict[str, Any]) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "saved_at": datetime.now(UTC).isoformat(),
         "last_processed_event_sequence": raw.get("last_event_sequence", 0),
         "emotion_state": raw.get("emotion", {}),
@@ -230,6 +258,51 @@ def _migrate_v0(raw: dict[str, Any]) -> dict[str, Any]:
         "identity": {},
         "extensions": {},
     }
+
+
+def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(raw)
+    migrated["schema_version"] = 2
+    working_memory = dict(migrated.get("working_memory") or {})
+    working_memory["items"] = []
+    migrated["working_memory"] = working_memory
+    return migrated
+
+
+def _working_memory_item_snapshot(item: WorkingMemoryItem) -> WorkingMemoryItemSnapshot:
+    return WorkingMemoryItemSnapshot(
+        item_id=item.item_id,
+        kind=item.kind.value,
+        content=None if item.reference is not None else item.content,
+        reference=item.reference,
+        source_event_id=item.source_event_id,
+        source_event_sequence=item.source_event_sequence,
+        context_id=item.context_id,
+        activation=item.activation,
+        salience=item.salience,
+        created_at=item.created_at,
+        last_accessed_at=item.last_accessed_at,
+        retention_reason=item.retention_reason.value,
+    )
+
+
+def _working_memory_item_from_snapshot(
+    item: WorkingMemoryItemSnapshot,
+) -> WorkingMemoryItem:
+    return WorkingMemoryItem(
+        item_id=item.item_id,
+        kind=WorkingMemoryKind(item.kind),
+        content=item.content,
+        reference=item.reference,
+        source_event_id=item.source_event_id,
+        source_event_sequence=item.source_event_sequence,
+        context_id=item.context_id,
+        activation=item.activation,
+        salience=item.salience,
+        created_at=item.created_at,
+        last_accessed_at=item.last_accessed_at,
+        retention_reason=RetentionReason(item.retention_reason),
+    )
 
 
 def _contains_forbidden_key(value: Any, forbidden: set[str]) -> bool:

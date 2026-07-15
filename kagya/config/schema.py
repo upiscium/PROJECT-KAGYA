@@ -89,6 +89,11 @@ class AgentStateSettings(StrictBaseModel):
     path: Path = Path(".kagya/agent_state.json")
 
 
+class WorkingMemorySettings(StrictBaseModel):
+    item_capacity: int = Field(default=32, gt=0)
+    token_capacity: int = Field(default=2048, gt=0)
+
+
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
@@ -113,5 +118,6 @@ class Settings(StrictBaseModel):
     adapter_registry: AdapterRegistrySettings
     tools: ToolRegistrySettings
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
+    working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     api: ApiSettings
     frontend: FrontendSettings

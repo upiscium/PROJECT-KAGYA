@@ -25,6 +25,12 @@ export type DebugChatResponse = ChatResponse & {
   attachments: Attachment[];
   retrieved_memory: RetrievedMemory;
   generation_params: { max_new_tokens: number; temperature: number; top_p: number; do_sample: boolean; repetition_penalty: number; no_repeat_ngram_size: number };
+  working_memory: {
+    items: Array<{ item_id: string; kind: string; selected: boolean; score: number; reasons: string[]; activation: number; salience: number; retention_reason: string; reference: string | null }>;
+    token_count: number;
+    item_capacity: number;
+    token_capacity: number;
+  };
 };
 
 export type EpisodeMemory = {

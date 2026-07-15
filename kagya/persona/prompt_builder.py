@@ -1,7 +1,7 @@
 """Prompt construction for the conscious runtime loop."""
 
 from kagya.body import EmotionState
-from kagya.memory import MemoryContext
+from kagya.runtime.working_memory import WorkingMemoryView
 
 
 class PromptBuilder:
@@ -11,15 +11,14 @@ class PromptBuilder:
         self,
         user_input: str,
         emotion_state: EmotionState,
-        memory_context: MemoryContext,
+        working_memory: WorkingMemoryView,
         *,
         attachments: list[dict[str, object]] | None = None,
     ) -> str:
-        db1_lines = [
-            f"- User: {record.user_input} | Assistant: {record.response}"
-            for record in memory_context.db1_results
+        working_memory_lines = [
+            f"- [{selection.item.kind.value}] {selection.rendered_content}"
+            for selection in working_memory.selected
         ]
-        db2_lines = [f"- {record.text}" for record in memory_context.db2_results]
         attachment_lines = [_attachment_line(attachment) for attachment in attachments or []]
         return "\n".join(
             [
@@ -33,11 +32,8 @@ class PromptBuilder:
                 f"- arousal: {emotion_state.arousal:.6f}",
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
                 "",
-                "Episodic memories:",
-                *(db1_lines or ["- none"]),
-                "",
-                "Semantic memories:",
-                *(db2_lines or ["- none"]),
+                "Working memory:",
+                *(working_memory_lines or ["- none"]),
                 "",
                 "Attachments:",
                 *(attachment_lines or ["- none"]),
