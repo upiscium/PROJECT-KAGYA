@@ -3,6 +3,7 @@
 from pathlib import Path
 from enum import StrEnum
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -208,6 +209,32 @@ class QloraSettings(StrictBaseModel):
     learning_rate: float = Field(gt=0.0)
     num_train_epochs: int = Field(gt=0)
     max_steps: int = Field(gt=0)
+    gradient_checkpointing: bool = True
+    gradient_accumulation_steps: int = Field(default=8, gt=0)
+    max_sequence_length: int = Field(default=512, gt=0)
+    optimizer: Literal["paged_adamw_8bit"] = "paged_adamw_8bit"
+    seed: int = Field(default=42, ge=0)
+    target_modules: list[str] = Field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        min_length=1,
+    )
+    resume_policy: Literal["never"] = "never"
+
+    @model_validator(mode="after")
+    def validate_target_modules(self) -> "QloraSettings":
+        if len(self.target_modules) != len(set(self.target_modules)):
+            raise ValueError("qlora.target_modules must be unique")
+        if any(re.fullmatch(r"[A-Za-z0-9_]+", item) is None for item in self.target_modules):
+            raise ValueError("qlora.target_modules contains an unsafe module name")
+        return self
 
 
 class AdapterRegistrySettings(StrictBaseModel):

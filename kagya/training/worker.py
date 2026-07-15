@@ -310,9 +310,7 @@ class TrainingWorkerService:
                 pid=None,
             )
         try:
-            result = QloraTrainer(self.settings).train(
-                work_path / manifest.dataset_path
-            )
+            result = QloraTrainer(self.settings).train_bundle(work_path)
             adapter_files = {
                 (
                     Path("adapter") / item.relative_to(result.adapter_path)
@@ -333,6 +331,12 @@ class TrainingWorkerService:
                 base_model_revision=manifest.base_model_revision,
                 parent_adapter_id=manifest.parent_adapter_id,
             )
+            trainer_manifest_path = result.adapter_path / "training_manifest.json"
+            trainer_manifest = (
+                json.loads(trainer_manifest_path.read_text("utf-8"))
+                if trainer_manifest_path.exists()
+                else {}
+            )
             result_path = self.contract.finalize_result(
                 self.worker.result_directory,
                 result_manifest,
@@ -340,6 +344,8 @@ class TrainingWorkerService:
                     "dry_run": result.dry_run,
                     "training_records": result.training_records,
                     "dataset_hash": result.dataset_hash,
+                    "metrics": trainer_manifest.get("metrics", {}),
+                    "environment": trainer_manifest.get("environment", {}),
                 },
                 evaluation={},
                 adapter_files=adapter_files,

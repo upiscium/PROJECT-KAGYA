@@ -138,17 +138,25 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
     calls: dict[str, object] = {}
 
     class FakeProcessor:
+        chat_template = "gemma-template"
+        tokenizer = object()
+
         @staticmethod
-        def from_pretrained(model_id: str) -> object:
+        def from_pretrained(model_id: str, **kwargs: object) -> object:
             calls["processor_model_id"] = model_id
-            return object()
+            calls["processor_kwargs"] = kwargs
+            return FakeProcessor()
 
     class FakeModelLoader:
         @staticmethod
         def from_pretrained(model_id: str, **kwargs: object) -> object:
             calls["model_id"] = model_id
             calls["model_kwargs"] = kwargs
-            return object()
+            class Model:
+                def named_modules(self):
+                    return [(f"model.{name}", object()) for name in settings.qlora.target_modules]
+
+            return Model()
 
     class FakeBitsAndBytesConfig:
         def __init__(self, **kwargs: object) -> None:
@@ -172,8 +180,9 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
         def __init__(self, **kwargs: object) -> None:
             calls["trainer_kwargs"] = kwargs
 
-        def train(self) -> None:
+        def train(self, **kwargs: object) -> None:
             calls["trained"] = True
+            calls["train_kwargs"] = kwargs
 
         def save_model(self, path: str) -> None:
             calls["saved_path"] = path
@@ -189,7 +198,7 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
             "LoraConfig": FakeLoraConfig,
             "SFTConfig": FakeSFTConfig,
             "SFTTrainer": FakeTrainer,
-            "prepare_model_for_kbit_training": lambda model: model,
+            "prepare_model_for_kbit_training": lambda model, **kwargs: model,
         },
     )
 
@@ -199,28 +208,38 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
     assert result.dry_run is False
     assert result.training_records == 1
     assert calls["processor_model_id"] == settings.model.primary_id
+    assert calls["processor_kwargs"] == {"revision": settings.model.processor_revision}
     assert calls["model_id"] == settings.model.primary_id
     assert calls["trained"] is True
-    assert calls["saved_path"] == str(result.adapter_path)
+    assert Path(calls["saved_path"]).name == f".{result.adapter_id}.tmp"
     assert calls["dataset"] == [{"text": format_training_text(DreamDatasetRecord("i", "t", "o"))}]
     assert calls["peft_config"] == {
         "r": settings.qlora.r,
         "lora_alpha": settings.qlora.lora_alpha,
         "lora_dropout": settings.qlora.lora_dropout,
+        "target_modules": settings.qlora.target_modules,
         "bias": "none",
         "task_type": "CAUSAL_LM",
     }
     assert calls["training_args"] == {
-        "output_dir": str(result.adapter_path),
+        "output_dir": str(Path(calls["saved_path"])),
         "learning_rate": settings.qlora.learning_rate,
         "num_train_epochs": settings.qlora.num_train_epochs,
         "max_steps": settings.qlora.max_steps,
         "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": settings.qlora.gradient_accumulation_steps,
+        "gradient_checkpointing": True,
+        "max_length": settings.qlora.max_sequence_length,
+        "optim": "paged_adamw_8bit",
+        "bf16": True,
+        "seed": settings.qlora.seed,
         "logging_steps": 1,
         "save_strategy": "no",
         "report_to": [],
     }
+    assert calls["train_kwargs"] == {"resume_from_checkpoint": False}
     assert "quantization_config" in calls["model_kwargs"]
+    assert calls["model_kwargs"]["revision"] == settings.model.revision
     assert manifest["dry_run"] is False
     assert manifest["dataset_hash"] == result.dataset_hash
     assert manifest["qlora"]["max_steps"] == settings.qlora.max_steps
@@ -246,7 +265,13 @@ def test_qlora_prod_check_accepts_ready_boundaries(tmp_path: Path) -> None:
     eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
     settings = settings.model_copy(
         update={
-            "model": settings.model.model_copy(update={"provider": "transformers"}),
+            "model": settings.model.model_copy(
+                update={
+                    "provider": "transformers",
+                    "revision": "model-commit",
+                    "processor_revision": "processor-commit",
+                }
+            ),
             "qlora": settings.qlora.model_copy(update={"dry_run": False}),
             "adapter_registry": settings.adapter_registry.model_copy(
                 update={"eval_sets": [eval_set]}
@@ -270,7 +295,13 @@ def test_qlora_prod_check_reports_missing_dependency_and_cuda(tmp_path: Path) ->
     eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
     settings = settings.model_copy(
         update={
-            "model": settings.model.model_copy(update={"provider": "transformers"}),
+            "model": settings.model.model_copy(
+                update={
+                    "provider": "transformers",
+                    "revision": "model-commit",
+                    "processor_revision": "processor-commit",
+                }
+            ),
             "qlora": settings.qlora.model_copy(update={"dry_run": False}),
             "adapter_registry": settings.adapter_registry.model_copy(
                 update={"eval_sets": [eval_set]}
