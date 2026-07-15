@@ -130,6 +130,33 @@ def test_previous_exchange_reaches_prompt_through_bounded_working_memory(
     assert len(loop.working_memory.items) <= settings.working_memory.item_capacity
 
 
+def test_cross_context_memory_is_marked_with_its_origin(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
+    loop.chat(
+        "shared project detail",
+        context_id="ctx-first",
+        create_context=True,
+        interlocutor_key="person-a",
+    )
+
+    result = loop.chat(
+        "shared project",
+        debug=True,
+        context_id="ctx-second",
+        create_context=True,
+        interlocutor_key="person-b",
+    )
+
+    assert "Current context:\n- id: ctx-second" in result.prompt
+    assert "source_context=ctx-first" in result.prompt
+    assert any(
+        decision.cross_context
+        for decision in result.working_memory_view.decisions
+        if decision.item_id.startswith("episode:")
+    )
+
+
 def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(

@@ -2,6 +2,7 @@
 
 from kagya.body import EmotionState
 from kagya.runtime.working_memory import WorkingMemoryView
+from kagya.runtime.context import ContextFrame
 
 
 class PromptBuilder:
@@ -13,10 +14,15 @@ class PromptBuilder:
         emotion_state: EmotionState,
         working_memory: WorkingMemoryView,
         *,
+        current_context: ContextFrame,
         attachments: list[dict[str, object]] | None = None,
     ) -> str:
         working_memory_lines = [
-            f"- [{selection.item.kind.value}] {selection.rendered_content}"
+            (
+                f"- [{selection.item.kind.value}; {selection.context_relation}; "
+                f"source_context={selection.item.context_id or 'global'}] "
+                f"{selection.rendered_content}"
+            )
             for selection in working_memory.selected
         ]
         attachment_lines = [_attachment_line(attachment) for attachment in attachments or []]
@@ -31,6 +37,14 @@ class PromptBuilder:
                 f"- valence: {emotion_state.valence:.6f}",
                 f"- arousal: {emotion_state.arousal:.6f}",
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
+                "",
+                "Current context:",
+                f"- id: {current_context.context_id}",
+                f"- type: {current_context.context_type}",
+                f"- channel: {current_context.source_channel}",
+                f"- participants: {', '.join(current_context.participant_ids) or 'none'}",
+                f"- topic: {current_context.active_topic or 'unspecified'}",
+                f"- task: {current_context.active_task or 'unspecified'}",
                 "",
                 "Working memory:",
                 *(working_memory_lines or ["- none"]),

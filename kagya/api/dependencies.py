@@ -99,6 +99,8 @@ def execute_agent_event(
     source: str,
     handler: Callable[[], T],
     payload: dict[str, object] | None = None,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
 ) -> AgentEventOutcome[T]:
     try:
         return runtime.execute(
@@ -106,6 +108,8 @@ def execute_agent_event(
             source=source,
             handler=handler,
             payload=payload,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
     except AgentRuntimeQueueFull as exc:
         raise HTTPException(
@@ -157,6 +161,9 @@ def sync_main_loop_to_active_adapter(request: Request) -> KagyaMainLoop:
         emotion_engine=None if previous_loop is None else previous_loop.emotion_engine,
         persistent_state=None if previous_loop is None else previous_loop.persistent_state,
         working_memory=None if previous_loop is None else previous_loop.working_memory,
+        context_registry=None
+        if previous_loop is None
+        else previous_loop.context_registry,
         adapter_id=None if active_adapter is None else active_adapter.adapter_id,
     )
     request.app.state.main_loop = main_loop

@@ -1,6 +1,7 @@
 """Development-only debug routes."""
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from uuid import uuid4
 
 from kagya.api.dependencies import (
     get_api_settings,
@@ -40,19 +41,32 @@ def debug_chat(
 ) -> DebugChatResponse:
     """Development-only debug chat gated by the admin token."""
 
+    context_id = request.context_id or f"ctx-{uuid4()}"
     try:
         result = execute_agent_event(
             runtime,
             AgentEventType.DEBUG_CHAT,
             source="api.chat.debug",
             handler=lambda: get_main_loop(http_request).chat(
-                request.text, debug=True, attachments=attachment_metadata(request)
+                request.text,
+                debug=True,
+                attachments=attachment_metadata(request),
+                context_id=context_id,
+                source_channel="api.chat.debug",
+                source_session_id=request.client_session_id,
+                interlocutor_key=request.interlocutor_key,
+                create_context=request.context_id is None,
             ),
             payload={
                 "text": request.text,
                 "attachments": attachment_metadata(request),
             },
+            correlation_id=context_id,
         ).value
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Context not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if result.fallback_used:
@@ -80,6 +94,11 @@ def debug_chat(
                     user_input=record.user_input,
                     response=record.response,
                     record_type=record.record_type.value,
+                    context_id=record.context_id,
+                    semantic_relevance=record.semantic_relevance,
+                    context_compatibility=record.context_compatibility,
+                    context_relation=record.context_relation,
+                    cross_context=record.cross_context,
                 )
                 for record in result.memory_context.db1_results
             ],
@@ -88,6 +107,11 @@ def debug_chat(
                     id=record.id,
                     text=record.text,
                     record_type=record.record_type.value,
+                    context_id=record.context_id,
+                    semantic_relevance=record.semantic_relevance,
+                    context_compatibility=record.context_compatibility,
+                    context_relation=record.context_relation,
+                    cross_context=record.cross_context,
                 )
                 for record in result.memory_context.db2_results
             ],
@@ -112,6 +136,10 @@ def debug_chat(
                     salience=decision.salience,
                     retention_reason=decision.retention_reason.value,
                     reference=decision.reference,
+                    context_id=decision.context_id,
+                    context_compatibility=decision.context_compatibility,
+                    context_relation=decision.context_relation,
+                    cross_context=decision.cross_context,
                 )
                 for decision in result.working_memory_view.decisions
             ],

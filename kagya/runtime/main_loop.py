@@ -22,6 +22,7 @@ from kagya.runtime.working_memory import (
     WorkingMemoryView,
     working_memory_item,
 )
+from kagya.runtime.context import ContextFrame, ContextRegistry, InterlocutorModel
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class ChatResult:
     prompt: str
     memory_context: MemoryContext
     working_memory_view: WorkingMemoryView
+    context_id: str
 
 
 class KagyaMainLoop:
@@ -58,6 +60,7 @@ class KagyaMainLoop:
         adapter_id: str | None = None,
         persistent_state: PersistentAgentState | None = None,
         working_memory: WorkingMemory | None = None,
+        context_registry: ContextRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -77,6 +80,8 @@ class KagyaMainLoop:
             item_capacity=settings.working_memory.item_capacity,
             token_capacity=settings.working_memory.token_capacity,
         )
+        self.context_registry = context_registry or ContextRegistry()
+        self.default_context_id: str | None = None
 
     def chat(
         self,
@@ -84,25 +89,63 @@ class KagyaMainLoop:
         debug: bool = False,
         *,
         attachments: list[dict[str, Any]] | None = None,
+        context_id: str | None = None,
+        source_channel: str = "runtime.chat",
+        source_session_id: str | None = None,
+        interlocutor_key: str | None = None,
+        create_context: bool = False,
     ) -> ChatResult:
+        previous_context_frames = self.context_registry.frames
+        previous_interlocutors = self.context_registry.interlocutors
+        previous_default_context_id = self.default_context_id
+        current_context = self._resolve_context(
+            context_id,
+            source_channel=source_channel,
+            source_session_id=source_session_id,
+            interlocutor_key=interlocutor_key,
+            create_context=create_context,
+        )
         previous_working_memory = self.working_memory.items
-        self.working_memory.advance()
-        context_view = self.working_memory.select(resolver=self._resolve_working_memory)
-        context_text = context_view.context_text()
-        loss = self.surprisal_calculator.calculate(context_text, user_input)
         previous_emotion_state = self.emotion_engine.state
         try:
+            self.working_memory.advance()
+
+            def compatibility(source_id: str | None) -> tuple[float, str]:
+                return self.context_registry.compatibility(source_id, current_context)
+
+            context_view = self.working_memory.select(
+                resolver=self._resolve_working_memory,
+                context_compatibility=compatibility,
+            )
+            context_text = context_view.context_text()
+            loss = self.surprisal_calculator.calculate(context_text, user_input)
+        except Exception:
+            self.working_memory.restore(previous_working_memory)
+            self.context_registry.restore(
+                previous_context_frames, previous_interlocutors
+            )
+            self.default_context_id = previous_default_context_id
+            raise
+        try:
             emotion_state = self.emotion_engine.update(loss)
-            memory_context = self.memory_system.retrieve_context(user_input)
+            memory_context = self.memory_system.retrieve_context(
+                user_input,
+                current_context_id=current_context.context_id,
+                context_compatibility=compatibility,
+            )
             event = current_agent_event()
-            self._admit_runtime_context(memory_context, emotion_state, event)
+            self._admit_runtime_context(
+                memory_context, emotion_state, event, current_context
+            )
             working_memory_view = self.working_memory.select(
-                resolver=self._resolve_working_memory
+                resolver=self._resolve_working_memory,
+                context_compatibility=compatibility,
             )
             prompt = self.prompt_builder.build(
                 user_input,
                 emotion_state,
                 working_memory_view,
+                current_context=current_context,
                 attachments=attachments or [],
             )
             try:
@@ -151,6 +194,9 @@ class KagyaMainLoop:
                 else event.processing_sequence,
                 causation_id=None if event is None else event.causation_id,
                 correlation_id=None if event is None else event.correlation_id,
+                context_id=current_context.context_id,
+                source_channel=current_context.source_channel,
+                source_session_id=current_context.source_session_id,
                 provider=self.settings.model.provider,
                 model_id=model_id,
                 model_revision=str(
@@ -158,6 +204,9 @@ class KagyaMainLoop:
                 ),
                 adapter_id=None if fallback_used else self.adapter_id,
                 validation_status=ValidationStatus.UNVERIFIED,
+            )
+            self.context_registry.record_shared_history(
+                current_context.participant_ids, f"episode:{episode_id}"
             )
             self.working_memory.admit(
                 working_memory_item(
@@ -168,7 +217,10 @@ class KagyaMainLoop:
                     source_event_sequence=None
                     if event is None
                     else event.processing_sequence,
-                    context_id=None if event is None else event.correlation_id,
+                    context_id=current_context.context_id,
+                    source="runtime.chat" if event is None else event.source,
+                    source_channel=current_context.source_channel,
+                    source_session_id=current_context.source_session_id,
                     activation=1.0,
                     salience=max(0.5, emotion_state.arousal),
                     retention_reason=RetentionReason.RECENT_CONTEXT,
@@ -177,6 +229,10 @@ class KagyaMainLoop:
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)
+            self.context_registry.restore(
+                previous_context_frames, previous_interlocutors
+            )
+            self.default_context_id = previous_default_context_id
             raise
         return ChatResult(
             episode_id=episode_id,
@@ -194,17 +250,54 @@ class KagyaMainLoop:
             prompt=prompt,
             memory_context=memory_context,
             working_memory_view=working_memory_view,
+            context_id=current_context.context_id,
         )
+
+    def _resolve_context(
+        self,
+        context_id: str | None,
+        *,
+        source_channel: str,
+        source_session_id: str | None,
+        interlocutor_key: str | None,
+        create_context: bool,
+    ) -> ContextFrame:
+        identifier = context_id or self.default_context_id
+        participants = () if interlocutor_key is None else (interlocutor_key,)
+        if identifier is None or (
+            create_context and self.context_registry.get(identifier) is None
+        ):
+            frame = self.context_registry.create(
+                context_id=identifier,
+                source_channel=source_channel,
+                source_session_id=source_session_id,
+                participant_ids=participants,
+            )
+            self.default_context_id = frame.context_id
+        else:
+            frame = self.context_registry.get(identifier)
+            if frame is None:
+                raise KeyError(identifier)
+            frame = self.context_registry.resume(identifier)
+        if (
+            interlocutor_key is not None
+            and self.context_registry.get_interlocutor(interlocutor_key) is None
+        ):
+            self.context_registry.register_interlocutor(
+                InterlocutorModel(identity_key=interlocutor_key)
+            )
+        return frame
 
     def _admit_runtime_context(
         self,
         memory_context: MemoryContext,
         emotion_state: EmotionState,
         event: Any,
+        current_context: ContextFrame,
     ) -> None:
         event_id = None if event is None else event.event_id
         event_sequence = None if event is None else event.processing_sequence
-        context_id = None if event is None else event.correlation_id
+        context_id = current_context.context_id
         for record in memory_context.db1_results:
             self.working_memory.admit(
                 working_memory_item(
@@ -214,6 +307,9 @@ class KagyaMainLoop:
                     source_event_id=record.source_event_id,
                     source_event_sequence=record.processing_sequence,
                     context_id=record.context_id,
+                    source=record.source,
+                    source_channel=record.source_channel,
+                    source_session_id=record.source_session_id,
                     activation=0.7,
                     salience=0.6,
                 )
@@ -224,9 +320,12 @@ class KagyaMainLoop:
                     item_id=f"semantic:{record.id}",
                     kind=WorkingMemoryKind.SEMANTIC,
                     reference=f"semantic:{record.id}",
-                    source_event_id=event_id,
-                    source_event_sequence=event_sequence,
-                    context_id=context_id,
+                    source_event_id=None,
+                    source_event_sequence=None,
+                    context_id=record.context_id,
+                    source=record.source,
+                    source_channel=record.source_channel,
+                    source_session_id=record.source_session_id,
                     activation=0.65,
                     salience=0.65,
                 )
@@ -242,6 +341,9 @@ class KagyaMainLoop:
                 source_event_id=event_id,
                 source_event_sequence=event_sequence,
                 context_id=context_id,
+                source="runtime.emotion",
+                source_channel=current_context.source_channel,
+                source_session_id=current_context.source_session_id,
                 activation=1.0,
                 salience=max(0.5, emotion_state.arousal),
                 retention_reason=RetentionReason.CURRENT_EMOTION,

@@ -22,6 +22,7 @@ describe("ChatClient", () => {
     fetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({
+        context_id: "ctx-1",
         episode_id: "episode-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
@@ -45,6 +46,7 @@ describe("ChatClient", () => {
     fetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({
+        context_id: "ctx-1",
         episode_id: "episode-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
@@ -91,6 +93,7 @@ describe("ChatClient", () => {
     fetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({
+        context_id: "ctx-1",
         episode_id: "episode-1",
         response: "Fallback answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
@@ -118,5 +121,28 @@ describe("ChatClient", () => {
 
     expect(await screen.findByLabelText("KAGYA is generating a response")).toBeInTheDocument();
     expect(screen.getByText("Generating response...")).toBeInTheDocument();
+  });
+
+  it("reuses the server context id for the next message", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        context_id: "ctx-stable",
+        episode_id: "episode-1",
+        response: "Visible answer",
+        emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+        model: { model_id: "model", adapter_id: null, fallback_used: false },
+      }),
+    });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "first");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText("Visible answer");
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "second");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const secondRequest = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+    expect(secondRequest.context_id).toBe("ctx-stable");
   });
 });

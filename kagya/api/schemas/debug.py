@@ -10,12 +10,22 @@ class RetrievedEpisodeSchema(BaseModel):
     user_input: str
     response: str
     record_type: str
+    context_id: str | None
+    semantic_relevance: float
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 class RetrievedSemanticSchema(BaseModel):
     id: str
     text: str
     record_type: str
+    context_id: str | None
+    semantic_relevance: float
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 class RetrievedMemorySchema(BaseModel):
@@ -42,6 +52,10 @@ class WorkingMemoryDecisionSchema(BaseModel):
     salience: float
     retention_reason: str
     reference: str | None
+    context_id: str | None
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 class WorkingMemoryViewSchema(BaseModel):

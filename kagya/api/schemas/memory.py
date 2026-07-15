@@ -40,6 +40,13 @@ class EpisodeMemoryResponse(BaseModel):
     model_revision: str
     adapter_id: str | None
     consolidation_status: str
+    context_id: str | None
+    source_channel: str
+    source_session_id: str | None
+    semantic_relevance: float
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 class SemanticMemoryResponse(BaseModel):
@@ -51,6 +58,13 @@ class SemanticMemoryResponse(BaseModel):
     created_at: str
     tags: list[str]
     operator_metadata: dict[str, Any]
+    context_id: str | None
+    source_channel: str
+    source_session_id: str | None
+    semantic_relevance: float
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 class MemorySearchResponse(BaseModel):

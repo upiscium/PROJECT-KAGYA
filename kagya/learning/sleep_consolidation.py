@@ -75,6 +75,9 @@ class SleepCycleManager:
                         "publication_status": "staged",
                         "attempt_id": attempt_id,
                         "pipeline_version": pipeline_version,
+                        "context_id": episode.context_id,
+                        "source_channel": episode.source_channel,
+                        "source_session_id": episode.source_session_id,
                     },
                 )
                 for episode, text in zip(episodes, semantic_texts, strict=True)

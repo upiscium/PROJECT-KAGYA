@@ -74,12 +74,69 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
 
     assert response.status_code == 200
     data = response.json()
-    assert set(data) == {"episode_id", "response", "emotion", "model"}
+    assert set(data) == {"context_id", "episode_id", "response", "emotion", "model"}
     assert data["response"] == "Visible API answer."
     assert data["model"]["fallback_used"] is False
     assert "hidden_thought" not in data
     assert "prompt" not in data
     assert "<think>" not in str(data)
+
+
+def test_chat_creates_and_resumes_explicit_context(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    first = client.post("/api/chat", json={"text": "first", "attachments": []})
+    context_id = first.json()["context_id"]
+
+    second = client.post(
+        "/api/chat",
+        json={"text": "continue", "attachments": [], "context_id": context_id},
+    )
+
+    assert second.status_code == 200
+    assert second.json()["context_id"] == context_id
+    episode = client.app.state.memory_system.get_episodic(second.json()["episode_id"])
+    assert episode is not None
+    assert episode.context_id == context_id
+    assert episode.correlation_id == context_id
+    assert episode.source_channel == "api.chat"
+    completed = [
+        event
+        for event in client.app.state.runtime_event_log.recent()
+        if event.category == "agent" and event.event_type == "completed"
+    ]
+    assert completed[-1].metadata["correlation_id"] == context_id
+
+
+def test_chat_rejects_unknown_context(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/api/chat",
+        json={"text": "continue", "context_id": "ctx-missing", "attachments": []},
+    )
+
+    assert response.status_code == 404
+
+
+def test_chat_rejects_closed_context(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    first = client.post("/api/chat", json={"text": "first", "attachments": []})
+    context_id = first.json()["context_id"]
+    suspended = client.post(
+        f"/api/contexts/{context_id}/suspend", headers=admin_headers()
+    )
+    resumed = client.post(
+        f"/api/contexts/{context_id}/resume", headers=admin_headers()
+    )
+    ended = client.post(f"/api/contexts/{context_id}/end", headers=admin_headers())
+
+    response = client.post(
+        "/api/chat",
+        json={"text": "continue", "context_id": context_id, "attachments": []},
+    )
+
+    assert suspended.json()["status"] == "suspended"
+    assert resumed.json()["status"] == "active"
+    assert ended.json()["status"] == "closed"
+    assert response.status_code == 409
 
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(tmp_path: Path) -> None:

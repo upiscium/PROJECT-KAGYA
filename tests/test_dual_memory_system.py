@@ -162,6 +162,39 @@ def test_same_event_and_content_is_deduplicated(tmp_path: Path) -> None:
     assert distinct != first
 
 
+def test_retrieval_keeps_semantic_and_context_scores_separate(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    same_id = memory.save_episodic(
+        "shared topic same",
+        "answer",
+        source_event_id="same-event",
+        context_id="ctx-current",
+        source_channel="api.chat",
+        source_session_id="session-1",
+    )
+    other_id = memory.save_episodic(
+        "shared topic other",
+        "answer",
+        source_event_id="other-event",
+        context_id="ctx-other",
+    )
+
+    context = memory.retrieve_context(
+        "shared topic",
+        current_context_id="ctx-current",
+    )
+
+    records = {record.id: record for record in context.db1_results}
+    assert records[same_id].context_compatibility == 1.0
+    assert records[same_id].context_relation == "same_context"
+    assert records[same_id].cross_context is False
+    assert records[same_id].source_channel == "api.chat"
+    assert records[same_id].source_session_id == "session-1"
+    assert records[other_id].context_compatibility == 0.2
+    assert records[other_id].cross_context is True
+    assert records[same_id].semantic_relevance >= 0.0
+
+
 def test_legacy_repetitive_episode_is_quarantined_on_read(tmp_path: Path) -> None:
     memory = _memory(_settings_for_tmp_memory(tmp_path))
     episode_id = "legacy-repetitive"

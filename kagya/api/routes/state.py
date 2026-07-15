@@ -84,6 +84,7 @@ def reset_snapshot(
         )
         main_loop.session_state.turns.clear()
         main_loop.working_memory.clear()
+        main_loop.context_registry.clear()
 
     execute_agent_event(
         runtime,

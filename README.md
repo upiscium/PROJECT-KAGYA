@@ -186,6 +186,10 @@ Sleep consolidation uses an explicit pipeline version and attempt ID. A complete
 
 The active subject uses finite attention-based working memory instead of an unbounded conversation transcript. `working_memory.item_capacity` limits resident items and `working_memory.token_capacity` limits the selected view rendered into prompts. Recent episodes and semantic memories are retained as DB references, while goals, commitments, unresolved items, and current emotion receive explicit retention priority. Eviction only removes an item from working memory; it never deletes long-term DB1/DB2 records. Admin debug chat reports selection scores and reasons without exposing selected content.
 
+## Context Model
+
+Chat responses return an opaque `context_id`; clients resend it to resume the same situation. Context frames distinguish channel, client session, participants, topic/task, parent/related contexts, and active/suspended/closed lifecycle state without splitting the subject's global emotion or identity. Retrieval keeps semantic relevance and context compatibility as separate scores. Cross-context memories remain available but are explicitly marked with their source context and relationship. Interlocutor keys are unverified correlation hints, not authenticated identity claims. Context lifecycle administration is available under `/api/contexts/*` with the admin token.
+
 ## Private Deployment
 
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
