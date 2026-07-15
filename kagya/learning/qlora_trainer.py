@@ -2,13 +2,23 @@
 
 from dataclasses import dataclass
 import hashlib
+from importlib import metadata
 import json
+import math
+import os
 from pathlib import Path
+import shutil
 from typing import Any
 from uuid import uuid4
 
 from kagya.config import Settings
 from kagya.learning.dream_dataset_generator import DreamDatasetRecord, format_training_text
+
+
+class QloraTrainingError(RuntimeError):
+    def __init__(self, category: str, detail: str) -> None:
+        super().__init__(f"{category}: {detail}")
+        self.category = category
 
 
 @dataclass(frozen=True)
@@ -27,29 +37,53 @@ class QloraTrainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
+    def train_bundle(self, bundle_path: Path) -> QloraTrainingResult:
+        from kagya.training.artifacts import TrainingArtifactContract
+
+        manifest = TrainingArtifactContract().validate_bundle(
+            bundle_path,
+            expected_model_id=self.settings.model.primary_id,
+            expected_model_revision=self.settings.model.revision,
+            expected_processor_revision=self.settings.model.processor_revision,
+        )
+        if manifest.chat_template_version != "gemma-v1":
+            raise QloraTrainingError("chat_template_mismatch", manifest.chat_template_version)
+        if manifest.dataset_format_version != "dream-v2":
+            raise QloraTrainingError("dataset_version_mismatch", manifest.dataset_format_version)
+        if manifest.parent_adapter_id is not None:
+            raise QloraTrainingError(
+                "parent_adapter_unsupported",
+                "continued training is disabled until parent adapter validation is implemented",
+            )
+        return self.train(bundle_path / manifest.dataset_path)
+
     def train(self, dataset_path: Path) -> QloraTrainingResult:
         records = self._load_dataset(dataset_path)
         dataset_hash = _hash_file(dataset_path)
         adapter_id = f"adapter-{uuid4()}"
         adapter_path = self.settings.qlora.output_dir / adapter_id
-        adapter_path.mkdir(parents=True, exist_ok=True)
-        if self.settings.qlora.dry_run:
-            self._write_dry_run_manifest(adapter_path, dataset_path, dataset_hash, records)
-            return QloraTrainingResult(
-                adapter_id=adapter_id,
-                adapter_path=adapter_path,
-                dataset_path=dataset_path,
-                dataset_hash=dataset_hash,
-                dry_run=True,
-                training_records=len(records),
-            )
-        self._run_training(adapter_path, dataset_path, dataset_hash, records)
+        staging_path = self.settings.qlora.output_dir / f".{adapter_id}.tmp"
+        self.settings.qlora.output_dir.mkdir(parents=True, exist_ok=True)
+        staging_path.mkdir()
+        try:
+            if self.settings.qlora.dry_run:
+                self._write_dry_run_manifest(
+                    staging_path, dataset_path, dataset_hash, records
+                )
+            else:
+                self._run_training(staging_path, dataset_path, dataset_hash, records)
+            if not any(staging_path.iterdir()):
+                raise QloraTrainingError("empty_adapter", "trainer produced no files")
+            os.rename(staging_path, adapter_path)
+        except Exception:
+            shutil.rmtree(staging_path, ignore_errors=True)
+            raise
         return QloraTrainingResult(
             adapter_id=adapter_id,
             adapter_path=adapter_path,
             dataset_path=dataset_path,
             dataset_hash=dataset_hash,
-            dry_run=False,
+            dry_run=self.settings.qlora.dry_run,
             training_records=len(records),
         )
 
@@ -95,12 +129,28 @@ class QloraTrainer:
         records: list[DreamDatasetRecord],
     ) -> None:
         deps = self._load_training_dependencies()
-        processor = deps["AutoProcessor"].from_pretrained(self.settings.model.primary_id)
+        processor = deps["AutoProcessor"].from_pretrained(
+            self.settings.model.primary_id,
+            revision=self.settings.model.processor_revision,
+        )
+        if not getattr(processor, "chat_template", None):
+            raise QloraTrainingError(
+                "chat_template_mismatch", "processor has no configured chat template"
+            )
+        if getattr(processor, "tokenizer", None) is None:
+            raise QloraTrainingError(
+                "tokenizer_mismatch", "processor has no tokenizer"
+            )
         model = deps["AutoModelForImageTextToText"].from_pretrained(
             self.settings.model.primary_id,
+            revision=self.settings.model.revision,
             **self._model_load_kwargs(deps["BitsAndBytesConfig"]),
         )
-        model = deps["prepare_model_for_kbit_training"](model)
+        self._validate_target_modules(model)
+        model = deps["prepare_model_for_kbit_training"](
+            model,
+            use_gradient_checkpointing=self.settings.qlora.gradient_checkpointing,
+        )
         dataset = deps["Dataset"].from_list(
             [{"text": format_training_text(record)} for record in records]
         )
@@ -108,6 +158,7 @@ class QloraTrainer:
             r=self.settings.qlora.r,
             lora_alpha=self.settings.qlora.lora_alpha,
             lora_dropout=self.settings.qlora.lora_dropout,
+            target_modules=self.settings.qlora.target_modules,
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -117,18 +168,45 @@ class QloraTrainer:
             num_train_epochs=self.settings.qlora.num_train_epochs,
             max_steps=self.settings.qlora.max_steps,
             per_device_train_batch_size=1,
+            gradient_accumulation_steps=self.settings.qlora.gradient_accumulation_steps,
+            gradient_checkpointing=self.settings.qlora.gradient_checkpointing,
+            max_length=self.settings.qlora.max_sequence_length,
+            optim=self.settings.qlora.optimizer,
+            bf16=True,
+            seed=self.settings.qlora.seed,
             logging_steps=1,
             save_strategy="no",
             report_to=[],
         )
         trainer = self._build_trainer(deps, model, processor, dataset, peft_config, training_args)
-        trainer.train()
+        try:
+            output = trainer.train(resume_from_checkpoint=False)
+        except Exception as exc:
+            if exc.__class__.__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower():
+                raise QloraTrainingError("cuda_oom", str(exc)) from exc
+            raise QloraTrainingError("training_failed", str(exc)) from exc
+        metrics = getattr(output, "metrics", {}) if output is not None else {}
+        if any(isinstance(value, float) and not math.isfinite(value) for value in metrics.values()):
+            raise QloraTrainingError("non_finite_metrics", "training returned NaN or infinity")
         trainer.save_model(str(adapter_path))
-        self._write_training_manifest(adapter_path, dataset_path, dataset_hash, records)
+        self._write_training_manifest(
+            adapter_path, dataset_path, dataset_hash, records, metrics=metrics
+        )
+
+    def _validate_target_modules(self, model: Any) -> None:
+        named_modules = getattr(model, "named_modules", None)
+        if not callable(named_modules):
+            raise QloraTrainingError("target_module_mismatch", "model exposes no named modules")
+        available = {name.rsplit(".", 1)[-1] for name, _module in named_modules()}
+        missing = set(self.settings.qlora.target_modules) - available
+        if missing:
+            raise QloraTrainingError(
+                "target_module_mismatch", "missing modules: " + ", ".join(sorted(missing))
+            )
 
     def _load_training_dependencies(self) -> dict[str, Any]:
         try:
-            from datasets import Dataset
+            from datasets import Dataset  # type: ignore[import-untyped]
             from peft import LoraConfig, prepare_model_for_kbit_training
             from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
             from trl import SFTConfig, SFTTrainer
@@ -197,8 +275,12 @@ class QloraTrainer:
         dataset_path: Path,
         dataset_hash: str,
         records: list[DreamDatasetRecord],
+        *,
+        metrics: dict[str, Any],
     ) -> None:
         manifest = self._training_manifest(False, dataset_path, dataset_hash, records)
+        manifest["metrics"] = metrics
+        manifest["environment"] = self._environment_metadata()
         with (adapter_path / "training_manifest.json").open("w", encoding="utf-8") as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
@@ -212,6 +294,8 @@ class QloraTrainer:
         return {
             "dry_run": dry_run,
             "base_model": self.settings.model.primary_id,
+            "base_model_revision": self.settings.model.revision,
+            "processor_revision": self.settings.model.processor_revision,
             "dataset_path": str(dataset_path),
             "dataset_hash": dataset_hash,
             "training_records": len(records),
@@ -224,10 +308,35 @@ class QloraTrainer:
                 "learning_rate": self.settings.qlora.learning_rate,
                 "num_train_epochs": self.settings.qlora.num_train_epochs,
                 "max_steps": self.settings.qlora.max_steps,
+                "gradient_checkpointing": self.settings.qlora.gradient_checkpointing,
+                "gradient_accumulation_steps": self.settings.qlora.gradient_accumulation_steps,
+                "max_sequence_length": self.settings.qlora.max_sequence_length,
+                "optimizer": self.settings.qlora.optimizer,
+                "seed": self.settings.qlora.seed,
+                "target_modules": self.settings.qlora.target_modules,
+                "resume_policy": self.settings.qlora.resume_policy,
                 "quantization": "nf4",
                 "compute_dtype": "bfloat16",
             },
         }
+
+    @staticmethod
+    def _environment_metadata() -> dict[str, Any]:
+        versions: dict[str, str | None] = {}
+        for package in ("torch", "transformers", "peft", "trl", "bitsandbytes"):
+            try:
+                versions[package] = metadata.version(package)
+            except metadata.PackageNotFoundError:
+                versions[package] = None
+        try:
+            import torch
+
+            cuda = torch.version.cuda
+            gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        except ImportError:
+            cuda = None
+            gpu = None
+        return {"packages": versions, "cuda": cuda, "gpu": gpu}
 
 
 def _hash_file(path: Path) -> str:

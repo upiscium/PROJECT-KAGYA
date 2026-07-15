@@ -141,6 +141,8 @@ Production QLoRA assumptions:
 - `adapter_registry.manual_approval_required` remains true; no trained adapter is activated without explicit operator approval.
 - Interrupted or failed training artifacts should be treated as incomplete and must not be manually registered as approved/active adapters.
 - Training inputs and outputs use immutable `training-<job-id>/` and `result-<job-id>/` directories. Payload checksums exclude only `checksums.sha256` itself; unknown schemas, unsafe paths, symlinks, revision mismatches, partial artifacts, and overwrite attempts are rejected before transport or import.
+- The RTX 3090 24GB baseline uses NF4, BF16 compute, gradient checkpointing, accumulation of 8, sequence length 512, `paged_adamw_8bit`, and batch size 1. Reduce sequence length before changing quantization when resolving OOM.
+- `resume_policy: never` intentionally restarts failed jobs from the immutable bundle. Parent-adapter continuation is rejected until parent hash and base compatibility validation are implemented.
 
 Training flow for real adapters:
 
@@ -151,6 +153,8 @@ Training flow for real adapters:
 5. Register only the produced candidate adapter.
 6. Evaluate the candidate and inspect evaluation history/regressions.
 7. Manually approve and activate only if the evaluation result is acceptable.
+
+For the manual RTX 3090 integration check, pin `model.revision` and `model.processor_revision` to immutable commits on both nodes, set `model.provider: transformers` and `qlora.dry_run: false`, run the production preflight, then submit a short `dream-v2`/`gemma-v1` bundle through `kagya-worker run`. Preserve the resulting `result.json`, `training_metrics.json`, checksums, GPU name, CUDA/package versions, peak VRAM observation, and a successful adapter-load generation as the execution record. This hardware check is intentionally opt-in and is not run in CI.
 
 ## Configuration Field Status
 
@@ -166,6 +170,8 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 | `adapter_registry.manual_approval_required` | Reserved for future automatic approval policy. Current lifecycle always requires explicit approval before activation. |
 | `qlora.alpha` / `qlora.dropout` | Legacy aliases retained for compatibility; `qlora.lora_alpha` and `qlora.lora_dropout` are the training-facing names. Dry-run manifests include both. |
 | `qlora.max_steps` | Active for the minimal non-dry-run trainer and included in dry-run manifests for auditability. |
+| `qlora.gradient_checkpointing` / `gradient_accumulation_steps` / `max_sequence_length` | Active RTX 3090 memory controls for real QLoRA. |
+| `qlora.optimizer` / `seed` / `target_modules` / `resume_policy` | Strict reproducibility and Gemma adapter contract. Only paged 8-bit AdamW and restart-from-bundle are currently supported. |
 
 ### Configuration Compatibility Policy
 

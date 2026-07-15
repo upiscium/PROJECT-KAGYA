@@ -205,7 +205,7 @@ class LocalTrainingBackend:
         if job.job_id in self._cancelled:
             self._statuses[job.job_id] = TrainingJobStatus.CANCELLED
             return job.job_id
-        result = self.trainer.train(bundle_path / "dataset.jsonl")
+        result = self.trainer.train_bundle(bundle_path)
         self._results[job.job_id] = result
         self._statuses[job.job_id] = TrainingJobStatus.SUCCEEDED
         return job.job_id

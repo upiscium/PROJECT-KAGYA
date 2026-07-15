@@ -40,6 +40,10 @@ def check_qlora_production_readiness(
         failures.append("qlora.dry_run must be false for production training")
     if settings.model.provider.lower() != "transformers":
         failures.append("model.provider must be transformers")
+    if settings.model.primary_id != "google/gemma-4-12B-it":
+        failures.append("model.primary_id must be google/gemma-4-12B-it")
+    if settings.model.revision == "main" or settings.model.processor_revision == "main":
+        failures.append("model and processor revisions must be immutable exact revisions")
     if not settings.model.load_in_4bit:
         failures.append("model.load_in_4bit must be true for the supported QLoRA path")
     if not settings.adapter_registry.manual_approval_required:

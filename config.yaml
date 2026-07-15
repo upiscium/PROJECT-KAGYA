@@ -96,6 +96,20 @@ qlora:
   learning_rate: 0.0002
   num_train_epochs: 1
   max_steps: 10
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 8
+  max_sequence_length: 512
+  optimizer: paged_adamw_8bit
+  seed: 42
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  resume_policy: never
 
 adapter_registry:
   path: .kagya/adapter_registry.json
