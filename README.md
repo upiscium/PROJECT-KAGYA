@@ -182,6 +182,10 @@ Episodic memories retain source event, processing sequence, provider/model ident
 
 Sleep consolidation uses an explicit pipeline version and attempt ID. A completed episode is not processed twice by the same pipeline version, datasets are written to immutable `dreams/runs/<attempt-id>/` paths, raw hidden thoughts are not copied into new datasets, and semantic memories remain staged until the adapter candidate is registered. Adapter registry mutations use an exclusive sidecar lock and atomic fsynced replacement. Real adapter evaluation runs paired baseline and candidate providers; a candidate that regresses against baseline is not promoted.
 
+## Working Memory
+
+The active subject uses finite attention-based working memory instead of an unbounded conversation transcript. `working_memory.item_capacity` limits resident items and `working_memory.token_capacity` limits the selected view rendered into prompts. Recent episodes and semantic memories are retained as DB references, while goals, commitments, unresolved items, and current emotion receive explicit retention priority. Eviction only removes an item from working memory; it never deletes long-term DB1/DB2 records. Admin debug chat reports selection scores and reasons without exposing selected content.
+
 ## Private Deployment
 
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.

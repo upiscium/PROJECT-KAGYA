@@ -16,6 +16,16 @@ from kagya.runtime.agent_state import (
 )
 from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
 from kagya.runtime.session_state import SessionTurn, SessionState
+from kagya.runtime.working_memory import (
+    RetentionReason,
+    WorkingMemory,
+    WorkingMemoryDecision,
+    WorkingMemoryItem,
+    WorkingMemoryKind,
+    WorkingMemorySelection,
+    WorkingMemoryView,
+    working_memory_item,
+)
 
 __all__ = [
     "AgentEvent",
@@ -32,4 +42,12 @@ __all__ = [
     "PersistentAgentState",
     "SessionState",
     "SessionTurn",
+    "RetentionReason",
+    "WorkingMemory",
+    "WorkingMemoryDecision",
+    "WorkingMemoryItem",
+    "WorkingMemoryKind",
+    "WorkingMemorySelection",
+    "WorkingMemoryView",
+    "working_memory_item",
 ]

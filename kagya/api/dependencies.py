@@ -156,6 +156,7 @@ def sync_main_loop_to_active_adapter(request: Request) -> KagyaMainLoop:
         session_state=None if previous_loop is None else previous_loop.session_state,
         emotion_engine=None if previous_loop is None else previous_loop.emotion_engine,
         persistent_state=None if previous_loop is None else previous_loop.persistent_state,
+        working_memory=None if previous_loop is None else previous_loop.working_memory,
         adapter_id=None if active_adapter is None else active_adapter.adapter_id,
     )
     request.app.state.main_loop = main_loop

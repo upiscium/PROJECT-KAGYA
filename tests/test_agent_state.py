@@ -7,7 +7,13 @@ from kagya.body import EmotionState
 from kagya.config import load_settings
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
-from kagya.runtime import AgentStateSnapshot, AgentStateStore, KagyaMainLoop
+from kagya.runtime import (
+    AgentStateSnapshot,
+    AgentStateStore,
+    KagyaMainLoop,
+    WorkingMemoryKind,
+    working_memory_item,
+)
 from kagya.runtime.agent_state import EmotionStateSnapshot
 
 
@@ -22,6 +28,15 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     loop.persistent_state.commitments = [{"id": "promise-1"}]
     loop.persistent_state.values = {"care": 0.9}
     loop.persistent_state.self_model = {"certainty": 0.5}
+    loop.working_memory.admit(
+        working_memory_item(
+            item_id="episode:one",
+            kind=WorkingMemoryKind.CONVERSATION,
+            reference="episode:one",
+            source_event_id="event-1",
+            source_event_sequence=4,
+        )
+    )
     store = AgentStateStore(tmp_path / "agent_state.json")
 
     saved = store.save(store.capture(loop, 12))
@@ -35,6 +50,8 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.persistent_state.commitments == [{"id": "promise-1"}]
     assert restored_loop.persistent_state.values == {"care": 0.9}
     assert restored_loop.persistent_state.self_model == {"certainty": 0.5}
+    assert restored_loop.working_memory.items[0].reference == "episode:one"
+    assert loaded.working_memory.items[0].content is None
 
 
 def test_corrupt_snapshot_uses_safe_defaults_without_reading_temp(tmp_path: Path) -> None:
@@ -66,18 +83,47 @@ def test_v0_snapshot_migrates_to_current_schema(tmp_path: Path) -> None:
 
     snapshot = AgentStateStore(path).load(1.0)
 
-    assert snapshot.schema_version == 1
+    assert snapshot.schema_version == 2
     assert snapshot.last_processed_event_sequence == 7
     assert snapshot.emotion_state.valence == 0.1
 
 
+def test_v1_snapshot_migrates_with_empty_working_memory_items(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "saved_at": datetime.now(UTC).isoformat(),
+                "last_processed_event_sequence": 5,
+                "emotion_state": {
+                    "valence": 0.1,
+                    "arousal": 0.2,
+                    "optimal_loss": 0.9,
+                },
+                "working_memory": {"metadata": {}, "extensions": {}},
+                "motivation": {"active_goals": [], "commitments": [], "extensions": {}},
+                "identity": {"values": {}, "self_model": {}, "extensions": {}},
+                "extensions": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = AgentStateStore(path).load(1.0)
+
+    assert snapshot.schema_version == 2
+    assert snapshot.last_processed_event_sequence == 5
+    assert snapshot.working_memory.items == []
+
+
 def test_future_snapshot_version_is_rejected_with_fallback(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
-    path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 3}), encoding="utf-8")
 
     snapshot = AgentStateStore(path).load(0.6)
 
-    assert snapshot.schema_version == 1
+    assert snapshot.schema_version == 2
     assert snapshot.emotion_state.optimal_loss == 0.6
 
 

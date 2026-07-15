@@ -32,6 +32,10 @@ memory:
   embedding_model_id: sentence-transformers/all-MiniLM-L6-v2
   default_record_type: episodic
 
+working_memory:
+  item_capacity: 32
+  token_capacity: 2048
+
 sleep:
   enabled: true
   dream_dataset_path: .kagya/dreams/dream_dataset.jsonl

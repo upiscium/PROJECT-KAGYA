@@ -113,6 +113,23 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     assert provider.prompts == [result.prompt]
 
 
+def test_previous_exchange_reaches_prompt_through_bounded_working_memory(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkingDummyProvider()
+    loop = KagyaMainLoop(settings, provider, _memory(settings))
+
+    first = loop.chat("first topic", debug=True)
+    second = loop.chat("continue", debug=True)
+
+    assert "Working memory:" in second.prompt
+    assert "first topic" in second.prompt
+    assert first.response in second.prompt
+    assert loop.session_state.turns == []
+    assert len(loop.working_memory.items) <= settings.working_memory.item_capacity
+
+
 def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(
@@ -169,12 +186,14 @@ def test_empty_visible_fallback_response_raises_runtime_error(tmp_path: Path) ->
         provider,
         _memory(settings),
     )
+    working_memory_before = loop.working_memory.items
 
     try:
         loop.chat("hello", debug=True)
     except RuntimeError as exc:
         assert "empty visible response" in str(exc)
         assert provider.fallback_calls == 1
+        assert loop.working_memory.items == working_memory_before
     else:
         raise AssertionError("empty fallback output should fail")
 
