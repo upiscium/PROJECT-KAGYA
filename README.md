@@ -140,6 +140,7 @@ Production QLoRA assumptions:
 - `adapter_registry.eval_sets` points to at least one existing eval set so trained adapters can be evaluated before promotion.
 - `adapter_registry.manual_approval_required` remains true; no trained adapter is activated without explicit operator approval.
 - Interrupted or failed training artifacts should be treated as incomplete and must not be manually registered as approved/active adapters.
+- Training inputs and outputs use immutable `training-<job-id>/` and `result-<job-id>/` directories. Payload checksums exclude only `checksums.sha256` itself; unknown schemas, unsafe paths, symlinks, revision mismatches, partial artifacts, and overwrite attempts are rejected before transport or import.
 
 Training flow for real adapters:
 
