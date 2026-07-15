@@ -21,7 +21,7 @@ export type RetrievedMemory = {
 
 export type DebugChatResponse = ChatResponse & {
   hidden_thought: string;
-  loss: number;
+  loss: number | null;
   prompt: string;
   attachments: Attachment[];
   retrieved_memory: RetrievedMemory;
@@ -32,6 +32,9 @@ export type DebugChatResponse = ChatResponse & {
     item_capacity: number;
     token_capacity: number;
   };
+  loss_measurement: { raw_loss: number | null; mean_token_loss: number | null; target_token_count: number | null; model_key: string; valid: boolean; invalid_reason: string | null; calibrated_novelty: number | null };
+  appraisal: { novelty: number | null; goal_progress: number; threat: number; controllability: number; certainty: number; social_relevance: number; effort_cost: number; novelty_valid: boolean; reasons: string[] };
+  emotion_update: { valence_contributions: Record<string, number>; arousal_contributions: Record<string, number>; reasons: string[] };
 };
 
 export type EpisodeMemory = {

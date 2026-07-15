@@ -52,6 +52,7 @@ def chat(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    record_appraisal(event_log, result, debug=False)
     if result.fallback_used:
         event_log.record(
             category="model",
@@ -81,6 +82,32 @@ def chat_response_from_result(result: ChatResult) -> ChatResponse:
             adapter_id=result.adapter_id,
             fallback_used=result.fallback_used,
         ),
+    )
+
+
+def record_appraisal(
+    event_log: RuntimeEventLog, result: ChatResult, *, debug: bool
+) -> None:
+    event_log.record(
+        category="appraisal",
+        event_type="evaluated"
+        if result.loss_measurement.valid
+        else "measurement_invalid",
+        message="Cognitive appraisal completed",
+        metadata={
+            "model_key": result.loss_measurement.model_key,
+            "measurement_valid": result.loss_measurement.valid,
+            "invalid_reason": result.loss_measurement.invalid_reason,
+            "novelty": result.appraisal.novelty,
+            "goal_progress": result.appraisal.goal_progress,
+            "threat": result.appraisal.threat,
+            "controllability": result.appraisal.controllability,
+            "certainty": result.appraisal.certainty,
+            "social_relevance": result.appraisal.social_relevance,
+            "effort_cost": result.appraisal.effort_cost,
+            "reasons": list(result.emotion_update.reasons),
+            "debug": debug,
+        },
     )
 
 

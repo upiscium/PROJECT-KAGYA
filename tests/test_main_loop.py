@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 
 from kagya.config import Settings, load_settings
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
@@ -35,6 +36,11 @@ class ThinkOnlyPrimaryProvider(ThinkingDummyProvider):
         self.last_model_id = "fallback-model"
         self.last_fallback_used = True
         return self.fallback_response
+
+
+class InvalidLossThinkingProvider(ThinkingDummyProvider):
+    def calculate_loss(self, context_text: str, target_text: str) -> float:
+        return math.nan
 
 
 def test_dummy_provider_drives_user_input_to_response_end_to_end(
@@ -88,7 +94,27 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     result = loop.chat("emotion update", debug=True)
 
     assert result.arousal != before.arousal
-    assert result.optimal_loss != before.optimal_loss
+    assert result.valence != before.valence
+
+
+def test_invalid_loss_does_not_abort_chat_or_become_zero_novelty(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+
+    result = KagyaMainLoop(
+        settings, InvalidLossThinkingProvider(), memory
+    ).chat("hello", debug=True)
+
+    assert result.response == "Visible runtime answer."
+    assert result.loss is None
+    assert result.loss_measurement.valid is False
+    assert result.appraisal.novelty is None
+    assert "novelty_omitted" in result.emotion_update.reasons
+    stored = memory.get_episodic(result.episode_id)
+    assert stored is not None
+    assert stored.generation_health.non_finite_score is True
 
 
 def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
@@ -221,6 +247,7 @@ def test_empty_visible_fallback_response_raises_runtime_error(tmp_path: Path) ->
         assert "empty visible response" in str(exc)
         assert provider.fallback_calls == 1
         assert loop.working_memory.items == working_memory_before
+        assert loop.surprisal_calculator.history == {}
     else:
         raise AssertionError("empty fallback output should fail")
 

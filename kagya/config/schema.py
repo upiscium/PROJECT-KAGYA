@@ -38,6 +38,20 @@ class EmotionSettings(StrictBaseModel):
     baseline_surprisal: float = Field(ge=0.0)
     high_emotion_threshold: float = Field(ge=0.0, le=1.0)
     decay_rate: float = Field(ge=0.0)
+    appraisal_response_rate: float = Field(default=0.4, ge=0.0, le=1.0)
+    resting_valence: float = Field(default=0.0, ge=-1.0, le=1.0)
+    resting_arousal: float = Field(default=0.0, ge=0.0, le=1.0)
+    valence_recovery_rate: float = Field(default=0.01, ge=0.0)
+    arousal_recovery_rate: float = Field(default=0.02, ge=0.0)
+
+
+class AppraisalSettings(StrictBaseModel):
+    initial_loss_scale: float = Field(default=0.5, gt=0.0)
+    minimum_loss_scale: float = Field(default=0.1, gt=0.0)
+    default_controllability: float = Field(default=0.6, ge=0.0, le=1.0)
+    default_certainty: float = Field(default=0.7, ge=0.0, le=1.0)
+    timer_enabled: bool = False
+    timer_interval_seconds: float = Field(default=60.0, gt=0.0)
 
 
 class MemorySettings(StrictBaseModel):
@@ -112,6 +126,7 @@ class Settings(StrictBaseModel):
     model: ModelSettings
     generation: GenerationSettings
     emotion: EmotionSettings
+    appraisal: AppraisalSettings = Field(default_factory=AppraisalSettings)
     memory: MemorySettings
     sleep: SleepSettings
     qlora: QloraSettings

@@ -25,6 +25,7 @@ from kagya.runtime import (
     AgentRuntimeStopped,
     AgentStateStore,
     KagyaMainLoop,
+    EmotionTimer,
 )
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
 
@@ -72,6 +73,16 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
             )
             runtime.start()
             request.app.state.agent_runtime = runtime
+            if get_api_settings(request).appraisal.timer_enabled:
+                timer = EmotionTimer(
+                    runtime,
+                    lambda elapsed: request.app.state.main_loop.advance_time(elapsed),
+                    interval_seconds=get_api_settings(
+                        request
+                    ).appraisal.timer_interval_seconds,
+                )
+                timer.start()
+                request.app.state.emotion_timer = timer
     return runtime
 
 

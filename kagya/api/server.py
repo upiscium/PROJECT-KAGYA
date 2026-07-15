@@ -13,7 +13,7 @@ from kagya.config import Settings, get_settings
 from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
-from kagya.runtime import AgentRuntime, AgentStateStore, KagyaMainLoop
+from kagya.runtime import AgentRuntime, AgentStateStore, EmotionTimer, KagyaMainLoop
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -54,6 +54,10 @@ def _lifespan(settings: Settings):
         try:
             yield
         finally:
+            timer = getattr(app.state, "emotion_timer", None)
+            if timer is not None:
+                timer.stop()
+                app.state.emotion_timer = None
             app.state.agent_runtime.shutdown()
             app.state.agent_runtime = None
 
@@ -134,6 +138,13 @@ def _preload_runtime(app: FastAPI, settings: Settings) -> None:
             ),
         )
         app.state.agent_runtime.start()
+    if settings.appraisal.timer_enabled and getattr(app.state, "emotion_timer", None) is None:
+        app.state.emotion_timer = EmotionTimer(
+            app.state.agent_runtime,
+            lambda elapsed: app.state.main_loop.advance_time(elapsed),
+            interval_seconds=settings.appraisal.timer_interval_seconds,
+        )
+        app.state.emotion_timer.start()
 
 
 def _event_sequence(sequence: int | None) -> int:

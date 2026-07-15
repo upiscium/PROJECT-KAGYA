@@ -31,6 +31,7 @@ class AgentEventType(StrEnum):
     STATE_RESTORE = "state_restore"
     STATE_RESET = "state_reset"
     CONTEXT_UPDATE = "context_update"
+    EMOTION_TICK = "emotion_tick"
 
 
 @dataclass(frozen=True)

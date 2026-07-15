@@ -292,6 +292,9 @@ def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None
     assert data["working_memory"]["token_capacity"] > 0
     assert data["working_memory"]["items"]
     assert "rendered_content" not in str(data["working_memory"])
+    assert data["loss_measurement"]["valid"] is True
+    assert data["appraisal"]["novelty_valid"] is True
+    assert data["emotion_update"]["valence_contributions"]
 
 
 def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:
@@ -353,6 +356,23 @@ def test_system_events_include_fallback_without_private_fields(tmp_path: Path) -
     assert "hidden_thought" not in events.text
     assert "prompt" not in events.text
     assert ADMIN_TOKEN not in events.text
+
+
+def test_system_events_include_safe_appraisal_components(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    chat = client.post("/api/chat", json={"text": "hello", "attachments": []})
+    events = client.get("/api/system/events", headers=admin_headers())
+
+    assert chat.status_code == 200
+    appraisal_events = [
+        event
+        for event in events.json()["events"]
+        if event["category"] == "appraisal"
+    ]
+    assert appraisal_events[-1]["metadata"]["measurement_valid"] is True
+    assert "novelty" in appraisal_events[-1]["metadata"]
+    assert "hello" not in str(appraisal_events[-1])
+    assert "prompt" not in str(appraisal_events[-1])
 
 
 def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> None:
