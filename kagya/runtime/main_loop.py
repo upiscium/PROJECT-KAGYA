@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.cognition import (
@@ -24,6 +25,17 @@ from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.memory.quality import assess_generation_health
 from kagya.models import ModelProvider
+from kagya.motivation import (
+    Commitment,
+    CommitmentStatus,
+    CommitmentStore,
+    Goal,
+    GoalDecision,
+    GoalDecisionInput,
+    GoalManager,
+    GoalStatus,
+    GoalType,
+)
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_state import SessionState
 from kagya.runtime.agent_state import PersistentAgentState
@@ -136,9 +148,12 @@ class KagyaMainLoop:
             max_update_per_event=settings.values.max_update_per_event,
             max_total_update_per_event=settings.values.max_total_update_per_event,
         )
+        self.goal_manager = GoalManager()
+        self.commitment_store = CommitmentStore()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
+        self.restore_motivation_state()
 
     def chat(
         self,
@@ -431,6 +446,330 @@ class KagyaMainLoop:
         self._persist_value_state()
         return states
 
+    def restore_motivation_state(self) -> None:
+        decisions = self.persistent_state.motivation_extensions.get(
+            "goal_decisions", []
+        )
+        self.goal_manager.restore(
+            self.persistent_state.active_goals,
+            decisions if isinstance(decisions, list) else [],
+        )
+        self.commitment_store.restore(self.persistent_state.commitments)
+        self._persist_motivation_state()
+
+    def _persist_motivation_state(self) -> None:
+        self.persistent_state.active_goals = self.goal_manager.goals_json()
+        self.persistent_state.commitments = self.commitment_store.to_json()
+        self.persistent_state.motivation_extensions["goal_decisions"] = (
+            self.goal_manager.decisions_json()
+        )
+
+    def propose_goal(
+        self,
+        *,
+        goal_type: GoalType,
+        description: str,
+        structured_target: dict[str, Any] | None = None,
+        origin_value_id: str | None = None,
+        priority: float = 0.5,
+        urgency: float = 0.5,
+        expected_utility: float = 0.5,
+        confidence: float = 0.5,
+        dependency_ids: tuple[str, ...] = (),
+        conflict_ids: tuple[str, ...] = (),
+        deadline: str | None = None,
+        value_effects: dict[str, float] | None = None,
+        needs_information: bool = False,
+        goal_id: str | None = None,
+    ) -> Goal:
+        event = current_agent_event()
+        if origin_value_id is not None:
+            self.value_system.get(origin_value_id)
+        if value_effects:
+            self.value_system.evaluate({"goal_proposal": value_effects})
+        goal = self.goal_manager.propose(
+            goal_type=goal_type,
+            description=description,
+            structured_target=structured_target,
+            origin_event_id=None if event is None else event.event_id,
+            origin_value_id=origin_value_id,
+            priority=priority,
+            urgency=urgency,
+            expected_utility=expected_utility,
+            confidence=confidence,
+            dependency_ids=dependency_ids,
+            conflict_ids=conflict_ids,
+            deadline=deadline,
+            value_effects=value_effects,
+            needs_information=needs_information,
+            goal_id=goal_id,
+        )
+        self._persist_motivation_state()
+        return goal
+
+    def adopt_goal(self, goal_id: str) -> GoalDecision:
+        event = current_agent_event()
+        value_scores = self._goal_value_scores()
+        previous_status = self.goal_manager.get(goal_id).status
+        decision = self.goal_manager.adopt(
+            goal_id,
+            value_score=value_scores.get(goal_id, 0.0),
+            value_scores=value_scores,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        goal = self.goal_manager.get(goal_id)
+        if previous_status != GoalStatus.FAILED and goal.status == GoalStatus.FAILED:
+            self._apply_goal_outcome_appraisal(goal, GoalStatus.FAILED)
+            self._sync_commitment_from_goal(
+                goal, GoalStatus.FAILED, "deadline_expired", None
+            )
+        self._sync_motivation_working_memory()
+        self._persist_motivation_state()
+        return decision
+
+    def transition_goal(
+        self,
+        goal_id: str,
+        status: GoalStatus,
+        *,
+        reason: str,
+        outcome: str | None = None,
+    ) -> Goal:
+        event = current_agent_event()
+        goal = self.goal_manager.transition(
+            goal_id,
+            status,
+            reason=reason,
+            outcome=outcome,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._apply_goal_outcome_appraisal(goal, status)
+        self._sync_commitment_from_goal(goal, status, reason, outcome)
+        self._sync_motivation_working_memory()
+        self._persist_motivation_state()
+        return goal
+
+    def reevaluate_goals(self) -> list[GoalDecision]:
+        event = current_agent_event()
+        previous_statuses = {
+            goal.goal_id: goal.status for goal in self.goal_manager.goals.values()
+        }
+        decisions = self.goal_manager.reevaluate(
+            value_scores=self._goal_value_scores(),
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        for goal in self.goal_manager.goals.values():
+            if (
+                previous_statuses.get(goal.goal_id) != GoalStatus.FAILED
+                and goal.status == GoalStatus.FAILED
+            ):
+                self._apply_goal_outcome_appraisal(goal, GoalStatus.FAILED)
+                self._sync_commitment_from_goal(
+                    goal, GoalStatus.FAILED, "deadline_expired", None
+                )
+        self._sync_motivation_working_memory()
+        self._persist_motivation_state()
+        return decisions
+
+    def goal_decision_input(self) -> GoalDecisionInput:
+        return self.goal_manager.decision_input(
+            value_scores=self._goal_value_scores(),
+            active_commitment_ids=(
+                item.commitment_id
+                for item in self.commitment_store.list_commitments(
+                    CommitmentStatus.ACTIVE
+                )
+            ),
+        )
+
+    def create_commitment(
+        self,
+        *,
+        description: str,
+        priority: float = 0.7,
+        urgency: float = 0.7,
+        expected_utility: float = 0.7,
+        confidence: float = 0.8,
+        deadline: str | None = None,
+        value_effects: dict[str, float] | None = None,
+        conflict_ids: tuple[str, ...] = (),
+        commitment_id: str | None = None,
+    ) -> Commitment:
+        event = current_agent_event()
+        identifier = commitment_id or str(uuid4())
+        goal = self.propose_goal(
+            goal_type=GoalType.COMMITMENT,
+            description=description,
+            priority=priority,
+            urgency=urgency,
+            expected_utility=expected_utility,
+            confidence=confidence,
+            conflict_ids=conflict_ids,
+            deadline=deadline,
+            value_effects=value_effects,
+            goal_id=f"commitment:{identifier}",
+        )
+        commitment = self.commitment_store.create(
+            description=description,
+            related_goal_id=goal.goal_id,
+            origin_event_id=None if event is None else event.event_id,
+            deadline=deadline,
+            commitment_id=identifier,
+        )
+        self.adopt_goal(goal.goal_id)
+        self._sync_motivation_working_memory()
+        self._persist_motivation_state()
+        return self.commitment_store.get(commitment.commitment_id)
+
+    def transition_commitment(
+        self,
+        commitment_id: str,
+        status: CommitmentStatus,
+        *,
+        reason: str,
+        outcome: str | None = None,
+    ) -> Commitment:
+        if status == CommitmentStatus.ACTIVE:
+            raise ValueError("Commitment is already active")
+        event = current_agent_event()
+        commitment = self.commitment_store.get(commitment_id)
+        goal = self.goal_manager.goals.get(commitment.related_goal_id)
+        if goal is not None and goal.status not in {
+            GoalStatus.COMPLETED,
+            GoalStatus.ABANDONED,
+            GoalStatus.FAILED,
+        }:
+            mapped_status = {
+                CommitmentStatus.FULFILLED: GoalStatus.COMPLETED,
+                CommitmentStatus.RELEASED: GoalStatus.ABANDONED,
+                CommitmentStatus.BREACHED: GoalStatus.FAILED,
+            }[status]
+            self.transition_goal(
+                goal.goal_id,
+                mapped_status,
+                reason=f"commitment_{status.value}:{reason}",
+                outcome=outcome,
+            )
+            return self.commitment_store.get(commitment_id)
+        commitment = self.commitment_store.transition(
+            commitment_id,
+            status,
+            reason=reason,
+            outcome=outcome,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._sync_motivation_working_memory()
+        self._persist_motivation_state()
+        return commitment
+
+    def _goal_value_scores(self) -> dict[str, float]:
+        options = {
+            goal.goal_id: goal.value_effects
+            for goal in self.goal_manager.goals.values()
+            if goal.value_effects
+        }
+        if not options:
+            return {}
+        return {
+            score.option_id: score.total_score
+            for score in self.value_system.evaluate(options)
+        }
+
+    def _apply_goal_outcome_appraisal(
+        self, goal: Goal, status: GoalStatus
+    ) -> None:
+        progress = {
+            GoalStatus.COMPLETED: 1.0,
+            GoalStatus.FAILED: -1.0,
+            GoalStatus.ABANDONED: -0.5,
+        }.get(status)
+        if progress is None:
+            return
+        self.emotion_engine.update_from_appraisal(
+            AppraisalResult(
+                novelty=None,
+                goal_progress=progress,
+                threat=0.0,
+                controllability=0.5,
+                certainty=goal.confidence,
+                social_relevance=0.0,
+                effort_cost=0.0,
+                novelty_valid=False,
+                reasons=(f"goal_{status.value}",),
+            )
+        )
+
+    def _sync_commitment_from_goal(
+        self,
+        goal: Goal,
+        status: GoalStatus,
+        reason: str,
+        outcome: str | None,
+    ) -> None:
+        commitment = next(
+            (
+                item
+                for item in self.commitment_store.commitments.values()
+                if item.related_goal_id == goal.goal_id
+                and item.status == CommitmentStatus.ACTIVE
+            ),
+            None,
+        )
+        mapped = {
+            GoalStatus.COMPLETED: CommitmentStatus.FULFILLED,
+            GoalStatus.ABANDONED: CommitmentStatus.RELEASED,
+            GoalStatus.FAILED: CommitmentStatus.BREACHED,
+        }.get(status)
+        if commitment is None or mapped is None:
+            return
+        event = current_agent_event()
+        self.commitment_store.transition(
+            commitment.commitment_id,
+            mapped,
+            reason=f"goal_{status.value}:{reason}",
+            outcome=outcome,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+
+    def _sync_motivation_working_memory(self) -> None:
+        for goal in self.goal_manager.goals.values():
+            item_id = f"goal:{goal.goal_id}"
+            if goal.status == GoalStatus.ACTIVE:
+                self.working_memory.admit(
+                    working_memory_item(
+                        item_id=item_id,
+                        kind=WorkingMemoryKind.GOAL,
+                        content=goal.description,
+                        activation=0.9,
+                        salience=max(goal.priority, goal.urgency),
+                        retention_reason=RetentionReason.ONGOING_GOAL,
+                        source="runtime.goal_manager",
+                    )
+                )
+            else:
+                self.working_memory.forget(item_id)
+        for commitment in self.commitment_store.commitments.values():
+            item_id = f"commitment:{commitment.commitment_id}"
+            if commitment.status == CommitmentStatus.ACTIVE:
+                self.working_memory.admit(
+                    working_memory_item(
+                        item_id=item_id,
+                        kind=WorkingMemoryKind.COMMITMENT,
+                        content=commitment.description,
+                        activation=0.9,
+                        salience=0.9,
+                        retention_reason=RetentionReason.ACTIVE_COMMITMENT,
+                        source="runtime.commitment_store",
+                    )
+                )
+            else:
+                self.working_memory.forget(item_id)
+
     def _resolve_context(
         self,
         context_id: str | None,
@@ -528,14 +867,16 @@ class KagyaMainLoop:
             )
         )
         self._admit_structured_state(
-            self.persistent_state.active_goals,
+            self.goal_manager.goals_json(),
             kind=WorkingMemoryKind.GOAL,
             reason=RetentionReason.ONGOING_GOAL,
+            required_status=GoalStatus.ACTIVE.value,
         )
         self._admit_structured_state(
-            self.persistent_state.commitments,
+            self.commitment_store.to_json(),
             kind=WorkingMemoryKind.COMMITMENT,
             reason=RetentionReason.ACTIVE_COMMITMENT,
+            required_status=CommitmentStatus.ACTIVE.value,
         )
         unresolved = self.persistent_state.working_memory_metadata.get(
             "unresolved_items", []
@@ -553,9 +894,14 @@ class KagyaMainLoop:
         *,
         kind: WorkingMemoryKind,
         reason: RetentionReason,
+        required_status: str | None = None,
     ) -> None:
         for entry in entries:
-            entry_id = entry.get("id")
+            if required_status is not None and entry.get("status") != required_status:
+                continue
+            entry_id = entry.get(
+                "id", entry.get("goal_id", entry.get("commitment_id"))
+            )
             content = entry.get("content", entry.get("description", entry.get("text")))
             if not isinstance(entry_id, str) or not isinstance(content, str):
                 continue

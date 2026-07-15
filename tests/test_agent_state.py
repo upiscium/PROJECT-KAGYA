@@ -7,6 +7,7 @@ from kagya.body import EmotionState
 from kagya.config import load_settings
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.motivation import GoalStatus, GoalType
 from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateStore,
@@ -58,8 +59,10 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
 
     assert loaded == saved
     assert restored_loop.emotion_engine.state == EmotionState(0.2, 0.4, 0.8)
-    assert restored_loop.persistent_state.active_goals == [{"id": "goal-1"}]
-    assert restored_loop.persistent_state.commitments == [{"id": "promise-1"}]
+    assert restored_loop.goal_manager.get("goal-1").status.value == "active"
+    assert restored_loop.commitment_store.get("promise-1").status.value == "active"
+    assert restored_loop.persistent_state.active_goals[0]["schema_version"] == 1
+    assert restored_loop.persistent_state.commitments[0]["schema_version"] == 1
     assert restored_loop.persistent_state.values["schema_version"] == 1
     assert restored_loop.value_system.get("care").weight == 0.9
     assert restored_loop.persistent_state.self_model == {"certainty": 0.5}
@@ -83,6 +86,29 @@ def test_corrupt_snapshot_uses_safe_defaults_without_reading_temp(tmp_path: Path
     assert snapshot.last_processed_event_sequence == 0
     assert snapshot.emotion_state.optimal_loss == 0.7
     assert path.read_text(encoding="utf-8") == "private corrupt content"
+
+
+def test_goal_state_and_decisions_resume_after_snapshot_restore(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.propose_goal(
+        goal_id="persistent-goal",
+        goal_type=GoalType.INTRINSIC,
+        description="Continue across events",
+        origin_value_id="care",
+    )
+    loop.adopt_goal("persistent-goal")
+    store = AgentStateStore(tmp_path / "agent_state.json")
+    store.save(store.capture(loop, 7))
+
+    restored = _loop(tmp_path / "restored")
+    store.restore_into(restored, store.load(1.0))
+
+    assert restored.goal_manager.get("persistent-goal").status.value == "active"
+    assert restored.goal_manager.decisions[-1].action.value == "activate"
+    restored.transition_goal(
+        "persistent-goal", GoalStatus.SUSPENDED, reason="pause"
+    )
+    assert restored.adopt_goal("persistent-goal").action.value == "resume"
 
 
 def test_v0_snapshot_migrates_to_current_schema(tmp_path: Path) -> None:
