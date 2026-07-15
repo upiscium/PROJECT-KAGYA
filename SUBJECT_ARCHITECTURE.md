@@ -1,0 +1,67 @@
+# Subject Architecture
+
+PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify situations and information sources; they do not create separate personalities. All authoritative mutations are committed through one ordered `AgentRuntime` event stream and captured in the versioned agent-state snapshot.
+
+## Authority Boundaries
+
+- `AgentRuntime` is the process-local ordering authority. API handlers submit typed events and do not mutate subject state from request threads.
+- `AgentStateStore` is the persistence authority for internal state. It writes atomic, fsynced snapshots after accepted events.
+- `KagyaMainLoop` coordinates subsystem inputs and outputs. It is not an alternative state store.
+- The inference host is the authoritative subject in both standalone and future split deployments. Training workers must consume immutable artifacts and cannot mutate memory, emotion, values, goals, decisions, self-model state, or adapter activation directly.
+- Free-form hidden thoughts are not decision authority, capability evidence, or a training target. Public responses, agent-state snapshots, DecisionRecords, and new training datasets exclude them; legacy/internal episodic metadata remains behind the admin and retrieval privacy boundaries.
+
+## State Layers
+
+| Layer | Responsibility | Persistent location | Accepted update evidence | Main regression tests |
+| --- | --- | --- | --- | --- |
+| Event runtime | Assign one causal processing sequence and serialize mutations | `last_processed_event_sequence` in `.kagya/agent_state.json` | Accepted `AgentEvent` | `tests/test_agent_runtime.py` |
+| Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
+| Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
+| Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
+| Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
+| Value system | Maintain stable, rate-limited value weights and conflicts | `identity.values` | Structured observation/outcome/reflection proposals with event or memory evidence | `tests/test_value_system.py` |
+| Goal manager | Maintain candidates, active/suspended goals, dependencies, deadlines, and transition reasons | `motivation.active_goals`; decisions under motivation extensions | Explicit proposals, value-aware adoption, internal reevaluation events | `tests/test_goal_manager.py` |
+| Commitment store | Distinguish promises from intrinsic and external-request goals | `motivation.commitments` | Explicit commitment lifecycle events | `tests/test_goal_manager.py`, `tests/test_fastapi_backend.py` |
+| Decision store | Track candidates, predictions, contributions, selection, outcome, and prediction error in one record | `extensions.decision_records` | Schema-constrained candidates and later outcome events | `tests/test_decision_records.py` |
+| Self model | Maintain identity, capabilities, limitations, known unknowns, roles, and references | `identity.self_model` | Resolved declared DecisionRecord outcomes or explicit admin correction; self-reports remain proposals | `tests/test_self_model.py` |
+| Adapter lifecycle | Register, evaluate, approve, activate, and roll back local adapters | `.kagya/adapter_registry.json` and immutable evaluation artifacts | Paired baseline/candidate evaluation and explicit approval | `tests/test_adapter_registry.py`, `tests/test_adapter_evaluator.py` |
+
+## Decision Flow
+
+1. An event enters `AgentRuntime` and receives a processing sequence.
+2. Working memory selects relevant context, including active goals, commitments, and candidate-relevant self-model facts.
+3. Appraisal and emotion provide structured current-state signals.
+4. `ValueSystem`, `GoalManager`, and `SelfModel` contribute separate scores to schema-validated `ActionCandidate` records.
+5. `DecisionStore` records all considered candidates, contributions, the selected regular action or no-op/defer/observation choice, and selection confidence.
+6. A later event appends the actual outcome and prediction error to the same `DecisionRecord`.
+7. Only resolved records whose selected action declared the relevant capability can update capability confidence. Identity claims become reviewable proposals rather than immediate state changes.
+8. The completion hook atomically snapshots the resulting subject state.
+
+## Versioning And Migration
+
+- The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
+- Values, goals, commitments, action candidates, decision records, and self-model state carry their own schema versions or revisions.
+- Legacy flat values, goal/commitment dictionaries, DecisionRecord v1 data, and legacy self-model dictionaries are migrated at subsystem restore boundaries.
+- Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
+
+## API And Privacy
+
+- Public `POST /api/chat` exposes only the response, context ID, emotion, and model metadata.
+- Debug, state, memory, value, goal, commitment, decision, and self-model inspection require `X-KAGYA-Admin-Token`.
+- Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
+- Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
+- Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.
+
+## Verification
+
+Run the complete regression boundary before merging architecture changes:
+
+```bash
+uv run pytest
+just lint
+just config-check
+just schema-check
+cd frontend && npm test -- --run && npm run build
+```
+
+The private deployment still requires one Uvicorn worker. Multiple workers create multiple process-local runtimes and therefore violate the single-subject authority boundary.
