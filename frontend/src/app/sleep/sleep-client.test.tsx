@@ -19,23 +19,30 @@ function renderWithQuery() {
 
 describe("SleepClient", () => {
   it("shows empty sleep cycle states", async () => {
-    fetchMock.mockResolvedValue({
+    const job = {
+      job_id: "job-1", attempt_id: "attempt-1", idempotency_key: "request-1", status: "completed",
+      bundle_path: null, bundle_hash: null, base_model_id: "model", base_model_revision: "revision",
+      parent_adapter_id: null, source_event_sequence_start: 0, source_event_sequence_end: 0,
+      backend: "local", remote_job_id: null, candidate_adapter_id: null,
+      selected_episode_ids: [], semantic_memory_ids: [], created_at: "now", updated_at: "now", error: null, retry_count: 0,
+    };
+    fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({
-        selected_episode_ids: [],
-        semantic_memory_ids: [],
-        dream_dataset_path: null,
-        adapter_id: null,
-        adapter_status: null,
-        dry_run: null,
-      }),
+      json: async () => ({ jobs: [] }),
+    }).mockResolvedValueOnce({
+      ok: true,
+      json: async () => job,
+    }).mockResolvedValue({
+      ok: true,
+      json: async () => ({ jobs: [job] }),
     });
     renderWithQuery();
 
-    await userEvent.click(screen.getByRole("button", { name: "Run Sleep Cycle" }));
+    await userEvent.click(screen.getByRole("button", { name: "Create Sleep Job" }));
 
     expect(await screen.findByText("No high-emotion DB1 episodes met the sleep threshold.")).toBeInTheDocument();
     expect(screen.getByText("No semantic memories were created in this cycle.")).toBeInTheDocument();
-    expect(screen.getByText("No adapter created")).toBeInTheDocument();
+    expect(await screen.findByText("job-1")).toBeInTheDocument();
+    expect(screen.getByText("completed")).toBeInTheDocument();
   });
 });

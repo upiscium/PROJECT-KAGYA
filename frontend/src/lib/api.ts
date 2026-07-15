@@ -125,14 +125,29 @@ export type EvaluationResultSummary = {
 export type EvaluationResultListResponse = { results: EvaluationResultSummary[] };
 export type AdapterEvaluationHistoryResponse = { adapter_id: string; results: EvaluationResultSummary[] };
 export type EvaluationResultDetail = { filename: string; payload: Record<string, unknown> };
-export type SleepRunResponse = {
+export type TrainingJob = {
+  job_id: string;
+  attempt_id: string;
+  idempotency_key: string;
+  status: string;
+  bundle_path: string | null;
+  bundle_hash: string | null;
+  base_model_id: string;
+  base_model_revision: string;
+  parent_adapter_id: string | null;
+  source_event_sequence_start: number;
+  source_event_sequence_end: number;
+  backend: string;
+  remote_job_id: string | null;
+  candidate_adapter_id: string | null;
   selected_episode_ids: string[];
   semantic_memory_ids: string[];
-  dream_dataset_path: string | null;
-  adapter_id: string | null;
-  adapter_status: string | null;
-  dry_run: boolean | null;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+  retry_count: number;
 };
+export type TrainingJobListResponse = { jobs: TrainingJob[] };
 export type BuildInfo = { version: string; commit: string | null };
 export type RuntimeInfo = {
   environment: string;
@@ -231,7 +246,10 @@ export const api = {
   reviewEpisodeMemory: (episodeId: string, body: MemoryReviewUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/review`, { method: "POST", body: JSON.stringify(body) }),
   archiveSemanticMemory: (memoryId: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
   updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
-  sleepRun: () => adminRequest<SleepRunResponse>("/sleep/run", { method: "POST" }),
+  createSleepJob: (idempotency_key?: string) => adminRequest<TrainingJob>("/sleep/jobs", { method: "POST", body: JSON.stringify({ idempotency_key }) }),
+  sleepJobs: () => adminRequest<TrainingJobListResponse>("/sleep/jobs"),
+  cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
+  retrySleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
   evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),
   trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),

@@ -92,6 +92,10 @@ def _lifespan(settings: Settings):
         try:
             yield
         finally:
+            coordinator = getattr(app.state, "sleep_coordinator", None)
+            if coordinator is not None:
+                coordinator.shutdown()
+                app.state.sleep_coordinator = None
             timer = getattr(app.state, "emotion_timer", None)
             if timer is not None:
                 timer.stop()

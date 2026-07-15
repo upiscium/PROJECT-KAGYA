@@ -27,7 +27,7 @@ def test_inference_role_builds_subject_without_local_sleep(tmp_path: Path) -> No
         assert client.post(
             "/api/chat", json={"text": "hello", "attachments": []}
         ).status_code == 200
-        assert client.post("/api/sleep/run").status_code == 404
+        assert client.post("/api/sleep/jobs", json={}).status_code == 404
         assert app.state.main_loop is not None
         assert app.state.memory_system is not None
         assert app.state.agent_state_store is not None
@@ -48,7 +48,7 @@ def test_training_worker_exposes_health_without_subject_runtime(tmp_path: Path) 
         }
         assert client.post("/api/chat", json={"text": "hello"}).status_code == 404
         assert client.get("/api/memory/search", params={"query": "x"}).status_code == 404
-        assert client.post("/api/sleep/run").status_code == 404
+        assert client.post("/api/sleep/jobs", json={}).status_code == 404
         assert app.state.worker_runtime.node_id == "training-01"
         assert app.state.worker_runtime.max_concurrent_jobs == 1
         for forbidden in (

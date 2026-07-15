@@ -356,7 +356,11 @@ def _settings_for_sleep(tmp_path: Path) -> Settings:
                 }
             ),
             "sleep": settings.sleep.model_copy(
-                update={"dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl"}
+                update={
+                    "dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl",
+                    "job_registry_path": tmp_path / "training_jobs.json",
+                    "training_artifact_directory": tmp_path / "training_artifacts",
+                }
             ),
             "qlora": settings.qlora.model_copy(
                 update={"output_dir": tmp_path / "adapters", "dry_run": True}

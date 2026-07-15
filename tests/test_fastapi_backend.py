@@ -2,6 +2,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import time
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -389,7 +390,9 @@ def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> No
         dataset_hash="hash",
     )
 
-    sleep = client.post("/api/sleep/run", headers=admin_headers())
+    sleep = client.post(
+        "/api/sleep/jobs", headers=admin_headers(), json={"idempotency_key": "events"}
+    )
     evaluated = client.post(
         "/api/adapters/adapter-observed/evaluate",
         headers=admin_headers(),
@@ -406,7 +409,7 @@ def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> No
     event_pairs = {
         (event["category"], event["event_type"]) for event in events.json()["events"]
     }
-    assert ("sleep", "run_completed") in event_pairs
+    assert ("sleep", "job_created") in event_pairs
     assert ("adapter", "evaluated") in event_pairs
     assert ("adapter", "approved") in event_pairs
 
@@ -639,7 +642,7 @@ def test_evaluation_result_endpoints_reject_unsafe_paths(tmp_path: Path) -> None
     assert response.status_code == 404
 
 
-def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
+def test_sleep_endpoint_returns_persistent_async_job(tmp_path: Path) -> None:
     client = _client(tmp_path)
     memory = client.app.state.memory_system
     memory.save_episodic(
@@ -649,15 +652,28 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
         emotion_arousal=0.9,
     )
 
-    response = client.post("/api/sleep/run", headers=admin_headers())
+    started = time.monotonic()
+    response = client.post(
+        "/api/sleep/jobs",
+        headers=admin_headers(),
+        json={"idempotency_key": "sleep-api-test"},
+    )
 
     assert response.status_code == 200
-    data = response.json()
+    assert time.monotonic() - started < 1.0
+    job_id = response.json()["job_id"]
+    data = _wait_for_sleep_job(client, job_id)
+    assert data["status"] == "completed"
     assert data["selected_episode_ids"]
     assert data["semantic_memory_ids"]
-    assert data["adapter_id"] is not None
-    assert data["adapter_status"] == "candidate"
-    assert data["dry_run"] is True
+    assert data["candidate_adapter_id"] is not None
+    assert data["bundle_path"] is not None
+    duplicate = client.post(
+        "/api/sleep/jobs",
+        headers=admin_headers(),
+        json={"idempotency_key": "sleep-api-test"},
+    )
+    assert duplicate.json()["job_id"] == job_id
 
 
 def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
@@ -764,7 +780,7 @@ def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     assert (
         client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
     )
-    assert client.post("/api/sleep/run").status_code == 401
+    assert client.post("/api/sleep/jobs", json={}).status_code == 401
     assert client.get("/api/adapters").status_code == 401
 
 
@@ -1295,7 +1311,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "sleep": settings.sleep.model_copy(
                 update={
-                    "dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl"
+                    "dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl",
+                    "job_registry_path": tmp_path / "training_jobs.json",
+                    "training_artifact_directory": tmp_path / "training_artifacts",
                 }
             ),
             "qlora": settings.qlora.model_copy(
@@ -1326,3 +1344,15 @@ def _settings(tmp_path: Path) -> Settings:
 
 def admin_headers() -> dict[str, str]:
     return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
+
+
+def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:
+    for _ in range(100):
+        response = client.get(
+            f"/api/sleep/jobs/{job_id}", headers=admin_headers()
+        )
+        data = response.json()
+        if data["status"] in {"completed", "failed", "cancelled"}:
+            return data
+        time.sleep(0.01)
+    raise AssertionError("sleep job did not finish")
