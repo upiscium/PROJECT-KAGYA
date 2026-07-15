@@ -7,6 +7,8 @@
 - Run frontend tests from `frontend/` with `nix develop --command npm test`.
 - Build the frontend from `frontend/` with `nix develop --command npm run build`.
 
+The single-subject state layers, authority boundaries, persistent schemas, decision flow, and regression-test mapping are documented in [SUBJECT_ARCHITECTURE.md](SUBJECT_ARCHITECTURE.md).
+
 ## Private First Run
 
 Use this path when bringing up PROJECT-KAGYA for yourself on localhost, LAN, VPN, or an SSH tunnel.
