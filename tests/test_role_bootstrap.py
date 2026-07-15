@@ -13,7 +13,7 @@ from kagya.models import DummyProvider
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
-def test_inference_role_builds_subject_without_local_sleep(tmp_path: Path) -> None:
+def test_inference_role_builds_subject_with_admin_remote_sleep(tmp_path: Path) -> None:
     settings = _inference_settings(tmp_path)
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
@@ -27,7 +27,7 @@ def test_inference_role_builds_subject_without_local_sleep(tmp_path: Path) -> No
         assert client.post(
             "/api/chat", json={"text": "hello", "attachments": []}
         ).status_code == 200
-        assert client.post("/api/sleep/jobs", json={}).status_code == 404
+        assert client.post("/api/sleep/jobs", json={}).status_code == 401
         assert app.state.main_loop is not None
         assert app.state.memory_system is not None
         assert app.state.agent_state_store is not None

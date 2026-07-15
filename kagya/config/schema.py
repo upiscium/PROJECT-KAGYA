@@ -87,9 +87,23 @@ class RemoteWorkerSettings(StrictBaseModel):
     worker_token_env: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
-    def validate_node_id(self) -> "RemoteWorkerSettings":
+    def validate_transport(self) -> "RemoteWorkerSettings":
         if re.fullmatch(r"[A-Za-z0-9._-]+", self.node_id) is None:
             raise ValueError("remote worker node_id contains unsafe characters")
+        if re.fullmatch(r"[A-Za-z0-9._-]+", self.host) is None:
+            raise ValueError("remote worker host contains unsafe characters")
+        if re.fullmatch(r"[A-Za-z0-9._-]+", self.user) is None:
+            raise ValueError("remote worker user contains unsafe characters")
+        for label, path in (
+            ("remote_inbox", self.remote_inbox),
+            ("remote_results", self.remote_results),
+            ("command", self.command),
+        ):
+            if (
+                not path.is_absolute()
+                or re.fullmatch(r"/[A-Za-z0-9._/-]+", str(path)) is None
+            ):
+                raise ValueError(f"remote worker {label} must be a safe absolute path")
         return self
 
 
@@ -111,6 +125,15 @@ class WorkerSettings(StrictBaseModel):
             for item in self.allowed_submitters
         ):
             raise ValueError("allowed submitter node ID contains unsafe characters")
+        directories = {
+            self.inbox_directory.resolve(),
+            self.work_directory.resolve(),
+            self.result_directory.resolve(),
+        }
+        if len(directories) != 3:
+            raise ValueError(
+                "worker inbox, work, and result directories must be distinct"
+            )
         return self
 
 

@@ -18,6 +18,13 @@ from kagya.training.jobs import (
     TrainingJobRegistry,
     TrainingJobStatus,
 )
+from kagya.training.remote import SSHTrainingBackend
+from kagya.training.worker import (
+    TrainingWorkerService,
+    WorkerJob,
+    WorkerJobStatus,
+    WorkerJobStore,
+)
 
 __all__ = [
     "TrainingArtifactContract",
@@ -34,4 +41,9 @@ __all__ = [
     "TrainingJob",
     "TrainingJobRegistry",
     "TrainingJobStatus",
+    "SSHTrainingBackend",
+    "TrainingWorkerService",
+    "WorkerJob",
+    "WorkerJobStatus",
+    "WorkerJobStore",
 ]

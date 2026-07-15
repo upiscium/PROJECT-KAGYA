@@ -8,7 +8,7 @@ from typing import Callable, TypeVar
 from fastapi import Header, HTTPException, Request, status
 
 from kagya.api.observability import RuntimeEventLog
-from kagya.config import Settings, get_settings
+from kagya.config import Settings, TrainingBackendType, get_settings
 from kagya.learning import (
     AdapterEntry,
     AdapterRegistry,
@@ -32,6 +32,7 @@ from kagya.training import (
     LocalTrainingBackend,
     MemoryConsolidator,
     SleepCoordinator,
+    SSHTrainingBackend,
     TrainingBundleBuilder,
     TrainingJobRegistry,
 )
@@ -255,6 +256,17 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
         if coordinator is None:
             settings = get_api_settings(request)
             runtime = get_agent_runtime(request)
+            if settings.deployment.training.backend == TrainingBackendType.SSH:
+                remote = settings.deployment.training.remote_worker
+                if remote is None:
+                    raise RuntimeError(
+                        "SSH training backend requires remote worker settings"
+                    )
+                backend = SSHTrainingBackend(
+                    remote, settings.sleep.training_artifact_directory
+                )
+            else:
+                backend = LocalTrainingBackend(QloraTrainer(settings))
             coordinator = SleepCoordinator(
                 settings,
                 MemoryConsolidator(
@@ -262,7 +274,7 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
                 ),
                 TrainingBundleBuilder(settings),
                 TrainingJobRegistry(settings.sleep.job_registry_path),
-                LocalTrainingBackend(QloraTrainer(settings)),
+                backend,
                 get_adapter_registry(request),
                 subject_executor=lambda source, handler: runtime.execute(
                     AgentEventType.SLEEP,
