@@ -23,11 +23,18 @@ from kagya.api.routes import (
     values,
 )
 from kagya.api.observability import RuntimeEventLog
-from kagya.config import Settings, get_settings
+from kagya.config import NodeRole, Settings, get_settings, validate_deployment_hostname
 from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
-from kagya.runtime import AgentRuntime, AgentStateStore, EmotionTimer, KagyaMainLoop
+from kagya.runtime import (
+    AgentRuntime,
+    AgentStateStore,
+    EmotionTimer,
+    KagyaMainLoop,
+    RemoteTrainingDispatcher,
+    TrainingWorkerRuntime,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -36,6 +43,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
     app = FastAPI(title=app_settings.project.name, lifespan=_lifespan(app_settings))
     app.state.settings = app_settings
+    app.state.node_role = app_settings.deployment.node.role
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.api.cors_origins,
@@ -46,22 +54,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "project": app_settings.project.name}
+        return {
+            "status": "ok",
+            "project": app_settings.project.name,
+            "role": app_settings.deployment.node.role.value,
+        }
 
-    app.include_router(chat.router)
-    app.include_router(debug.router)
-    app.include_router(memory.router)
-    app.include_router(sleep.router)
-    app.include_router(adapters.router)
-    app.include_router(evaluations.router)
-    app.include_router(system.router)
-    app.include_router(state.router)
-    app.include_router(contexts.router)
-    app.include_router(values.router)
-    app.include_router(goals.router)
-    app.include_router(goals.commitment_router)
-    app.include_router(decisions.router)
-    app.include_router(self_model.router)
+    role = app_settings.deployment.node.role
+    if role in {NodeRole.ALL, NodeRole.INFERENCE}:
+        app.include_router(chat.router)
+        app.include_router(debug.router)
+        app.include_router(memory.router)
+        if role == NodeRole.ALL:
+            app.include_router(sleep.router)
+        app.include_router(adapters.router)
+        app.include_router(evaluations.router)
+        app.include_router(system.router)
+        app.include_router(state.router)
+        app.include_router(contexts.router)
+        app.include_router(values.router)
+        app.include_router(goals.router)
+        app.include_router(goals.commitment_router)
+        app.include_router(decisions.router)
+        app.include_router(self_model.router)
 
     return app
 
@@ -69,7 +84,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _lifespan(settings: Settings):
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        _preload_runtime(app, settings)
+        validate_deployment_hostname(settings)
+        if settings.deployment.node.role == NodeRole.TRAINING_WORKER:
+            _preload_worker_runtime(app, settings)
+        else:
+            _preload_subject_runtime(app, settings)
         try:
             yield
         finally:
@@ -77,13 +96,15 @@ def _lifespan(settings: Settings):
             if timer is not None:
                 timer.stop()
                 app.state.emotion_timer = None
-            app.state.agent_runtime.shutdown()
-            app.state.agent_runtime = None
+            runtime = getattr(app.state, "agent_runtime", None)
+            if runtime is not None:
+                runtime.shutdown()
+                app.state.agent_runtime = None
 
     return lifespan
 
 
-def _preload_runtime(app: FastAPI, settings: Settings) -> None:
+def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     if getattr(app.state, "runtime_event_log", None) is None:
         app.state.runtime_event_log = RuntimeEventLog()
     if getattr(app.state, "agent_state_store", None) is None:
@@ -164,6 +185,20 @@ def _preload_runtime(app: FastAPI, settings: Settings) -> None:
             interval_seconds=settings.appraisal.timer_interval_seconds,
         )
         app.state.emotion_timer.start()
+    if settings.deployment.node.role == NodeRole.INFERENCE:
+        remote = settings.deployment.training.remote_worker
+        if remote is None:
+            raise RuntimeError("Inference role requires remote worker settings")
+        app.state.training_dispatcher = RemoteTrainingDispatcher.from_settings(remote)
+
+
+def _preload_worker_runtime(app: FastAPI, settings: Settings) -> None:
+    worker = settings.deployment.training.worker
+    if worker is None:
+        raise RuntimeError("Training worker role requires worker settings")
+    app.state.worker_runtime = TrainingWorkerRuntime.from_settings(
+        settings.deployment.node.id, worker
+    )
 
 
 def _event_sequence(sequence: int | None) -> int:
