@@ -5,6 +5,7 @@ import os
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+import pytest
 
 from kagya.api.server import create_app
 from kagya.config import Settings, load_settings
@@ -983,6 +984,126 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     assert client.app.state.main_loop.goal_manager.get(
         "commitment:expired-promise"
     ).status.value == "failed"
+
+
+def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+
+    assert client.get("/api/decisions").status_code == 401
+    context_id = client.post(
+        "/api/chat", json={"text": "decision context", "attachments": []}
+    ).json()["context_id"]
+    goal = client.post(
+        "/api/goals",
+        headers=headers,
+        json={
+            "goal_id": "decision-goal",
+            "goal_type": "intrinsic",
+            "description": "Make a traceable decision",
+        },
+    )
+    assert goal.status_code == 200
+    assert client.post(
+        "/api/goals/decision-goal/adopt", headers=headers
+    ).status_code == 200
+
+    candidates = [
+        {
+            "candidate_id": "respond",
+            "candidate_type": "respond",
+            "proposed_action": "Provide an answer",
+            "parameters": {"format": "text"},
+            "prerequisites": [],
+            "predicted_outcomes": [
+                {
+                    "outcome_id": "helpful",
+                    "description": "The answer helps",
+                    "probability": 1.0,
+                    "utility": 0.8,
+                }
+            ],
+            "uncertainty": 0.1,
+            "estimated_cost": 0.1,
+            "estimated_risk": 0.1,
+            "value_effects": {"honesty": 0.5},
+            "appraisal_contributions": {"goal_progress": 0.2},
+        },
+        {
+            "candidate_id": "defer",
+            "candidate_type": "defer",
+            "proposed_action": "Wait for more evidence",
+            "parameters": {},
+            "prerequisites": [],
+            "predicted_outcomes": [],
+            "uncertainty": 0.2,
+            "estimated_cost": 0.0,
+            "estimated_risk": 0.0,
+            "value_effects": {},
+            "appraisal_contributions": {},
+        },
+    ]
+    created = client.post(
+        "/api/decisions",
+        headers=headers,
+        json={
+            "decision_id": "decision-api-1",
+            "context_id": context_id,
+            "candidates": candidates,
+        },
+    )
+    assert created.status_code == 200
+    record = created.json()
+    assert record["selected_candidate_id"] == "respond"
+    assert record["status"] == "awaiting_outcome"
+    assert record["actual_outcome"] is None
+    assert record["triggering_event_id"]
+    assert record["triggering_event_sequence"] > 0
+    assert record["active_goal_ids"] == ["decision-goal"]
+    assert set(record["value_revision_refs"]) == {"care", "honesty"}
+    assert set(record["emotion_snapshot"]) == {
+        "valence",
+        "arousal",
+        "optimal_loss",
+    }
+    assert record["considered_candidates"][0]["value_contributions"][
+        "honesty"
+    ] > 0
+
+    awaiting = client.get(
+        "/api/decisions", headers=headers, params={"status": "awaiting_outcome"}
+    )
+    assert len(awaiting.json()["decisions"]) == 1
+    resolved = client.post(
+        "/api/decisions/decision-api-1/outcome",
+        headers=headers,
+        json={
+            "description": "The answer was partially useful",
+            "utility": 0.2,
+            "success": True,
+        },
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["status"] == "resolved"
+    assert resolved.json()["prediction_error"] == pytest.approx(-0.6)
+    assert resolved.json()["actual_outcome"]["observed_event_id"]
+
+    dataset = client.get("/api/decisions/dataset", headers=headers)
+    assert dataset.status_code == 200
+    assert dataset.json()["records"][0]["source_id"] == "decision-api-1"
+    assert "hidden_thought" not in json.dumps(dataset.json())
+
+    client.app.state.model_provider.response_text = json.dumps(
+        {"candidates": [candidates[1]]}
+    )
+    generated = client.post(
+        "/api/decisions/generate",
+        headers=headers,
+        json={"situation": "Insufficient evidence"},
+    )
+    assert generated.status_code == 200
+    assert generated.json()["candidates"][0]["candidate_type"] == "defer"
+    assert "hidden_thought" not in json.dumps(generated.json())
 
 
 def _client(

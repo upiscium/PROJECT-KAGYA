@@ -242,6 +242,7 @@ class AgentStateStore:
         main_loop.restore_appraisal_state()
         main_loop.restore_value_state()
         main_loop.restore_motivation_state()
+        main_loop.restore_decision_state()
         main_loop.working_memory.restore(
             [_working_memory_item_from_snapshot(item) for item in snapshot.working_memory.items]
         )

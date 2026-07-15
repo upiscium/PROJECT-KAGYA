@@ -21,6 +21,16 @@ from kagya.cognition import (
     ValueUpdateRecord,
 )
 from kagya.config import Settings
+from kagya.decision import (
+    ActionCandidate,
+    DecisionDatasetGenerator,
+    DecisionDatasetRecord,
+    DecisionRecord,
+    DecisionStatus,
+    DecisionStore,
+    parse_candidate_output,
+    schema_candidate_prompt,
+)
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.memory.quality import assess_generation_health
@@ -150,10 +160,12 @@ class KagyaMainLoop:
         )
         self.goal_manager = GoalManager()
         self.commitment_store = CommitmentStore()
+        self.decision_store = DecisionStore()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
         self.restore_motivation_state()
+        self.restore_decision_state()
 
     def chat(
         self,
@@ -769,6 +781,105 @@ class KagyaMainLoop:
                 )
             else:
                 self.working_memory.forget(item_id)
+
+    def restore_decision_state(self) -> None:
+        payload = self.persistent_state.extensions.get("decision_records", [])
+        self.decision_store.restore(payload if isinstance(payload, list) else [])
+        self._persist_decision_state()
+
+    def _persist_decision_state(self) -> None:
+        self.persistent_state.extensions["decision_records"] = (
+            self.decision_store.to_json()
+        )
+
+    def create_decision(
+        self,
+        candidates: list[ActionCandidate],
+        *,
+        context_id: str | None = None,
+        satisfied_prerequisites: set[str] | None = None,
+        decision_id: str | None = None,
+    ) -> DecisionRecord:
+        event = current_agent_event()
+        if context_id is not None and self.context_registry.get(context_id) is None:
+            raise ValueError(f"Unknown context: {context_id}")
+        completed_goals = {
+            goal.goal_id
+            for goal in self.goal_manager.goals.values()
+            if goal.status == GoalStatus.COMPLETED
+        }
+        emotion = self.emotion_engine.state
+        record = self.decision_store.create(
+            candidates,
+            triggering_event_id=None if event is None else event.event_id,
+            triggering_event_sequence=None
+            if event is None
+            else event.processing_sequence,
+            context_id=context_id,
+            active_goal_ids=tuple(
+                goal.goal_id
+                for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+            ),
+            value_revision_refs={
+                value.value_id: value.revision
+                for value in self.value_system.list_values()
+            },
+            emotion_snapshot={
+                "valence": emotion.valence,
+                "arousal": emotion.arousal,
+                "optimal_loss": emotion.optimal_loss,
+            },
+            satisfied_prerequisites=completed_goals
+            | (satisfied_prerequisites or set()),
+            value_evaluator=self._decision_value_evaluator,
+            decision_id=decision_id,
+        )
+        self._persist_decision_state()
+        return record
+
+    def generate_decision_candidates(self, situation: str) -> list[ActionCandidate]:
+        raw = self.provider.generate(schema_candidate_prompt(situation))
+        return parse_candidate_output(raw)
+
+    def record_decision_outcome(
+        self,
+        decision_id: str,
+        *,
+        description: str,
+        utility: float,
+        success: bool,
+    ) -> DecisionRecord:
+        event = current_agent_event()
+        record = self.decision_store.record_outcome(
+            decision_id,
+            description=description,
+            utility=utility,
+            success=success,
+            observed_event_id=None if event is None else event.event_id,
+            observed_event_sequence=None
+            if event is None
+            else event.processing_sequence,
+        )
+        self._persist_decision_state()
+        return record
+
+    def decision_dataset(self) -> list[DecisionDatasetRecord]:
+        return DecisionDatasetGenerator().generate(
+            self.decision_store.list_records(DecisionStatus.RESOLVED)
+        )
+
+    def _decision_value_evaluator(
+        self, options: dict[str, dict[str, float]]
+    ) -> dict[str, dict[str, float]]:
+        if not options:
+            return {}
+        return {
+            score.option_id: {
+                contribution.value_id: contribution.contribution
+                for contribution in score.contributions
+            }
+            for score in self.value_system.evaluate(options)
+        }
 
     def _resolve_context(
         self,
