@@ -83,6 +83,7 @@ class CandidateEvaluation:
     predicted_utility: float
     value_contributions: dict[str, float]
     appraisal_contributions: dict[str, float]
+    self_model_contributions: dict[str, float]
     total_score: float | None
     reasons: tuple[str, ...]
 
@@ -122,12 +123,12 @@ class DecisionRecord:
     prediction_error: float | None
     created_at: str
     updated_at: str
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -152,6 +153,9 @@ class DecisionRecord:
 
 
 ValueEvaluator = Callable[[dict[str, dict[str, float]]], dict[str, dict[str, float]]]
+SelfModelEvaluator = Callable[
+    [tuple[ActionCandidate, ...]], dict[str, dict[str, float]]
+]
 
 
 class DecisionStore:
@@ -170,6 +174,7 @@ class DecisionStore:
         emotion_snapshot: dict[str, float],
         satisfied_prerequisites: set[str] | None = None,
         value_evaluator: ValueEvaluator | None = None,
+        self_model_evaluator: SelfModelEvaluator | None = None,
         decision_id: str | None = None,
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
@@ -204,11 +209,17 @@ class DecisionStore:
             if value_evaluator is not None
             else {}
         )
+        self_model_contributions = (
+            self_model_evaluator(candidate_values)
+            if self_model_evaluator is not None
+            else {}
+        )
         evaluations = tuple(
             _evaluate_candidate(
                 candidate,
                 satisfied_prerequisites or set(),
                 value_contributions.get(candidate.candidate_id, {}),
+                self_model_contributions.get(candidate.candidate_id, {}),
             )
             for candidate in candidate_values
         )
@@ -410,6 +421,7 @@ def _evaluate_candidate(
     candidate: ActionCandidate,
     satisfied_prerequisites: set[str],
     value_contributions: dict[str, float],
+    self_model_contributions: dict[str, float],
 ) -> CandidateEvaluation:
     missing = tuple(
         item for item in candidate.prerequisites if item not in satisfied_prerequisites
@@ -424,6 +436,7 @@ def _evaluate_candidate(
             predicted_utility=predicted_utility,
             value_contributions=dict(value_contributions),
             appraisal_contributions=dict(candidate.appraisal_contributions),
+            self_model_contributions=dict(self_model_contributions),
             total_score=None,
             reasons=("prerequisites_missing", *missing),
         )
@@ -431,6 +444,7 @@ def _evaluate_candidate(
         predicted_utility
         + sum(value_contributions.values())
         + 0.25 * sum(candidate.appraisal_contributions.values())
+        + sum(self_model_contributions.values())
         - 0.25 * candidate.uncertainty
         - 0.25 * candidate.estimated_cost
         - 0.5 * candidate.estimated_risk
@@ -441,12 +455,14 @@ def _evaluate_candidate(
         predicted_utility=predicted_utility,
         value_contributions=dict(value_contributions),
         appraisal_contributions=dict(candidate.appraisal_contributions),
+        self_model_contributions=dict(self_model_contributions),
         total_score=total,
         reasons=(
             "prerequisites_satisfied",
             "predicted_outcomes_scored",
             "value_contributions_scored",
             "appraisal_contributions_scored",
+            "self_model_contributions_scored",
             "cost_risk_uncertainty_applied",
         ),
     )
@@ -508,6 +524,9 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
         item = dict(raw)
         item["candidate"] = _candidate_from_json(item["candidate"])
         item["reasons"] = tuple(item.get("reasons", ()))
+        item["self_model_contributions"] = dict(
+            item.get("self_model_contributions", {})
+        )
         evaluations.append(CandidateEvaluation(**item))
     data["considered_candidates"] = tuple(evaluations)
     data["active_goal_ids"] = tuple(data.get("active_goal_ids", ()))

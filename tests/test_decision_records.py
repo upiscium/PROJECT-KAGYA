@@ -149,6 +149,31 @@ def test_records_round_trip_through_json() -> None:
     assert restored.get("decision-1") == store.get("decision-1")
 
 
+def test_v1_record_migrates_without_self_model_contributions() -> None:
+    store = DecisionStore()
+    store.create(
+        [_fallback_candidate()],
+        triggering_event_id=None,
+        triggering_event_sequence=None,
+        context_id=None,
+        active_goal_ids=(),
+        value_revision_refs={},
+        emotion_snapshot={},
+        decision_id="legacy",
+    )
+    payload = json.loads(json.dumps(store.to_json()))
+    payload[0]["schema_version"] = 1
+    del payload[0]["considered_candidates"][0]["self_model_contributions"]
+
+    restored = DecisionStore()
+    restored.restore(payload)
+
+    assert (
+        restored.get("legacy").considered_candidates[0].self_model_contributions
+        == {}
+    )
+
+
 def test_schema_parser_rejects_free_form_reasoning_and_unknown_fields() -> None:
     payload = {"candidates": [_candidate_payload(_fallback_candidate())]}
 

@@ -14,6 +14,7 @@ class WorkingMemoryKind(StrEnum):
     UNRESOLVED = "unresolved"
     COMMITMENT = "commitment"
     EMOTION = "emotion"
+    SELF_MODEL = "self_model"
 
 
 class RetentionReason(StrEnum):
@@ -23,6 +24,7 @@ class RetentionReason(StrEnum):
     ACTIVE_COMMITMENT = "active_commitment"
     CURRENT_EMOTION = "current_emotion"
     REACTIVATED = "reactivated"
+    RELEVANT_SELF_MODEL = "relevant_self_model"
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,7 @@ class WorkingMemory:
             RetentionReason.UNRESOLVED,
             RetentionReason.ACTIVE_COMMITMENT,
             RetentionReason.CURRENT_EMOTION,
+            RetentionReason.RELEVANT_SELF_MODEL,
         }
         if self._score(item) < 0.15 and item.retention_reason not in protected:
             return
@@ -160,6 +163,7 @@ class WorkingMemory:
             RetentionReason.UNRESOLVED,
             RetentionReason.ACTIVE_COMMITMENT,
             RetentionReason.CURRENT_EMOTION,
+            RetentionReason.RELEVANT_SELF_MODEL,
         }
         updated: dict[str, WorkingMemoryItem] = {}
         for item in self._items.values():
@@ -286,6 +290,7 @@ class WorkingMemory:
             RetentionReason.ACTIVE_COMMITMENT: 0.35,
             RetentionReason.CURRENT_EMOTION: 0.25,
             RetentionReason.REACTIVATED: 0.1,
+            RetentionReason.RELEVANT_SELF_MODEL: 0.3,
         }.get(item.retention_reason, 0.0)
         return 0.6 * item.activation + 0.4 * item.salience + bonus
 

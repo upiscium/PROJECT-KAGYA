@@ -31,6 +31,13 @@ from kagya.decision import (
     parse_candidate_output,
     schema_candidate_prompt,
 )
+from kagya.identity import (
+    EpistemicUncertainty,
+    IdentityRevisionProposal,
+    KnownLimitation,
+    SelfModel,
+    SelfModelState,
+)
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.memory.quality import assess_generation_health
@@ -161,11 +168,13 @@ class KagyaMainLoop:
         self.goal_manager = GoalManager()
         self.commitment_store = CommitmentStore()
         self.decision_store = DecisionStore()
+        self.self_model = SelfModel()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
         self.restore_motivation_state()
         self.restore_decision_state()
+        self.restore_self_model_state()
 
     def chat(
         self,
@@ -632,6 +641,8 @@ class KagyaMainLoop:
             commitment_id=identifier,
         )
         self.adopt_goal(goal.goal_id)
+        self._sync_self_references()
+        self._persist_self_model_state()
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
         return self.commitment_store.get(commitment.commitment_id)
@@ -830,10 +841,17 @@ class KagyaMainLoop:
                 "optimal_loss": emotion.optimal_loss,
             },
             satisfied_prerequisites=completed_goals
+            | {
+                f"capability:{capability.capability_id}"
+                for capability in self.self_model.state.capabilities.values()
+                if capability.confidence >= 0.5
+            }
             | (satisfied_prerequisites or set()),
             value_evaluator=self._decision_value_evaluator,
+            self_model_evaluator=self.self_model.evaluate_candidates,
             decision_id=decision_id,
         )
+        self._sync_self_model_working_memory(candidates)
         self._persist_decision_state()
         return record
 
@@ -880,6 +898,155 @@ class KagyaMainLoop:
             }
             for score in self.value_system.evaluate(options)
         }
+
+    def restore_self_model_state(self) -> None:
+        self.self_model.restore(self.persistent_state.self_model)
+        self._sync_self_references()
+        self._persist_self_model_state()
+
+    def _persist_self_model_state(self) -> None:
+        self.persistent_state.self_model = self.self_model.to_json()
+
+    def update_capability_from_decision(
+        self,
+        capability_id: str,
+        description: str,
+        decision_id: str,
+        *,
+        tags: tuple[str, ...] = (),
+    ) -> SelfModelState:
+        event = current_agent_event()
+        self.self_model.update_capability_from_decision(
+            capability_id,
+            description,
+            self.decision_store.get(decision_id),
+            tags=tags,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return self.self_model.state
+
+    def manual_correct_capability(
+        self,
+        capability_id: str,
+        description: str,
+        confidence: float,
+        *,
+        reason: str,
+        tags: tuple[str, ...] = (),
+    ) -> SelfModelState:
+        event = current_agent_event()
+        self.self_model.manual_correct_capability(
+            capability_id,
+            description,
+            confidence,
+            reason=reason,
+            tags=tags,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return self.self_model.state
+
+    def add_self_limitation(
+        self, limitation: KnownLimitation, *, reason: str
+    ) -> SelfModelState:
+        event = current_agent_event()
+        self.self_model.add_limitation(
+            limitation,
+            reason=reason,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return self.self_model.state
+
+    def add_self_uncertainty(
+        self, uncertainty: EpistemicUncertainty, *, reason: str
+    ) -> SelfModelState:
+        event = current_agent_event()
+        self.self_model.add_uncertainty(
+            uncertainty,
+            reason=reason,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return self.self_model.state
+
+    def propose_identity_revision(
+        self,
+        *,
+        proposed_summary: str | None,
+        proposed_traits: dict[str, float],
+        evidence_refs: tuple[str, ...],
+        source: str,
+        proposal_id: str | None = None,
+    ) -> IdentityRevisionProposal:
+        proposal = self.self_model.propose_identity_revision(
+            proposed_summary=proposed_summary,
+            proposed_traits=proposed_traits,
+            evidence_refs=evidence_refs,
+            source=source,
+            proposal_id=proposal_id,
+        )
+        self._persist_self_model_state()
+        return proposal
+
+    def resolve_identity_revision(
+        self, proposal_id: str, *, apply: bool, reason: str
+    ) -> IdentityRevisionProposal:
+        event = current_agent_event()
+        proposal = self.self_model.resolve_identity_revision(
+            proposal_id,
+            apply=apply,
+            reason=reason,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return proposal
+
+    def rollback_self_model(self, target_revision: int, *, reason: str) -> SelfModelState:
+        event = current_agent_event()
+        state = self.self_model.rollback(
+            target_revision,
+            reason=reason,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_self_model_state()
+        return state
+
+    def _sync_self_references(self) -> None:
+        self.self_model.sync_references(
+            commitment_refs=(
+                commitment.commitment_id
+                for commitment in self.commitment_store.commitments.values()
+            )
+        )
+
+    def _sync_self_model_working_memory(
+        self, candidates: list[ActionCandidate]
+    ) -> None:
+        for item in tuple(self.working_memory.items):
+            if item.kind == WorkingMemoryKind.SELF_MODEL:
+                self.working_memory.forget(item.item_id)
+        for candidate in candidates:
+            selection = self.self_model.select_relevant(candidate)
+            for index, rendered in enumerate(selection.rendered_items):
+                self.working_memory.admit(
+                    working_memory_item(
+                        item_id=f"self:{candidate.candidate_id}:{index}",
+                        kind=WorkingMemoryKind.SELF_MODEL,
+                        content=rendered,
+                        activation=0.85,
+                        salience=0.8,
+                        retention_reason=RetentionReason.RELEVANT_SELF_MODEL,
+                        source="runtime.self_model",
+                    )
+                )
 
     def _resolve_context(
         self,

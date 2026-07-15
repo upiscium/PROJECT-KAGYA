@@ -66,7 +66,8 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.persistent_state.commitments[0]["schema_version"] == 1
     assert restored_loop.persistent_state.values["schema_version"] == 1
     assert restored_loop.value_system.get("care").weight == 0.9
-    assert restored_loop.persistent_state.self_model == {"certainty": 0.5}
+    assert restored_loop.self_model.state.traits == {"certainty": 0.5}
+    assert restored_loop.persistent_state.self_model["schema_version"] == 1
     assert restored_loop.working_memory.items[0].reference == "episode:one"
     assert loaded.working_memory.items[0].content is None
     assert restored_loop.context_registry.get("ctx-one") is not None
@@ -141,6 +142,27 @@ def test_decision_records_restore_from_agent_snapshot(tmp_path: Path) -> None:
     record = restored.decision_store.get("persistent-decision")
     assert record.status.value == "awaiting_outcome"
     assert record.selected_candidate_id == "no-op"
+
+
+def test_self_model_restores_from_agent_snapshot(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.manual_correct_capability(
+        "writing",
+        "Write useful text",
+        0.8,
+        reason="verified by administrator",
+        tags=("text",),
+    )
+    store = AgentStateStore(tmp_path / "agent_state.json")
+    store.save(store.capture(loop, 10))
+
+    restored = _loop(tmp_path / "restored")
+    store.restore_into(restored, store.load(1.0))
+
+    capability = restored.self_model.state.capabilities["writing"]
+    assert capability.confidence == 0.8
+    assert capability.evidence[0].evidence_type == "manual_correction"
+    assert restored.self_model.history[-1].event_sequence is None
 
 
 def test_v0_snapshot_migrates_to_current_schema(tmp_path: Path) -> None:

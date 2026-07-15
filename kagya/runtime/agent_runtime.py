@@ -40,6 +40,8 @@ class AgentEventType(StrEnum):
     DECISION_READ = "decision_read"
     DECISION_UPDATE = "decision_update"
     DECISION_GENERATE = "decision_generate"
+    SELF_MODEL_READ = "self_model_read"
+    SELF_MODEL_UPDATE = "self_model_update"
 
 
 @dataclass(frozen=True)
