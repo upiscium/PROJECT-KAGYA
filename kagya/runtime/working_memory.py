@@ -34,6 +34,9 @@ class WorkingMemoryItem:
     source_event_id: str | None = None
     source_event_sequence: int | None = None
     context_id: str | None = None
+    source: str = "unknown"
+    source_channel: str = "unknown"
+    source_session_id: str | None = None
     activation: float = 0.5
     salience: float = 0.5
     created_at: datetime = datetime.min.replace(tzinfo=UTC)
@@ -62,6 +65,10 @@ class WorkingMemoryDecision:
     salience: float
     retention_reason: RetentionReason
     reference: str | None
+    context_id: str | None
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,9 @@ class WorkingMemorySelection:
     rendered_content: str
     score: float
     reasons: tuple[str, ...]
+    context_compatibility: float
+    context_relation: str
+    cross_context: bool
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,7 @@ class WorkingMemoryView:
 
 Resolver = Callable[[WorkingMemoryItem], str | None]
 TokenCounter = Callable[[str], int]
+ContextCompatibility = Callable[[str | None], tuple[float, str]]
 
 
 class WorkingMemory:
@@ -154,15 +165,36 @@ class WorkingMemory:
             updated[item.item_id] = replace(item, activation=activation)
         self._items = updated
 
-    def select(self, *, resolver: Resolver | None = None) -> WorkingMemoryView:
-        ranked = sorted(self._items.values(), key=self._rank_key, reverse=True)
+    def select(
+        self,
+        *,
+        resolver: Resolver | None = None,
+        context_compatibility: ContextCompatibility | None = None,
+    ) -> WorkingMemoryView:
+        def context_score(item: WorkingMemoryItem) -> tuple[float, str]:
+            if context_compatibility is None:
+                return 1.0, "global"
+            return context_compatibility(item.context_id)
+
+        ranked = sorted(
+            self._items.values(),
+            key=lambda item: (
+                self._score(item) + 0.3 * context_score(item)[0],
+                item.last_accessed_at,
+                item.created_at,
+                item.item_id,
+            ),
+            reverse=True,
+        )
         selected: list[WorkingMemorySelection] = []
         decisions: list[WorkingMemoryDecision] = []
         token_count = 0
         for item in ranked:
             rendered = item.content or (resolver(item) if resolver is not None else None)
-            score = self._score(item)
-            reasons = [item.retention_reason.value]
+            compatibility, relation = context_score(item)
+            score = self._score(item) + 0.3 * compatibility
+            cross_context = item.context_id is not None and relation != "same_context"
+            reasons = [item.retention_reason.value, relation]
             selected_item = False
             if not rendered:
                 reasons.append("unresolved_reference")
@@ -177,6 +209,9 @@ class WorkingMemory:
                             rendered_content=rendered,
                             score=score,
                             reasons=tuple(reasons),
+                            context_compatibility=compatibility,
+                            context_relation=relation,
+                            cross_context=cross_context,
                         )
                     )
                     self._items[item.item_id] = replace(
@@ -195,6 +230,10 @@ class WorkingMemory:
                     salience=item.salience,
                     retention_reason=item.retention_reason,
                     reference=item.reference,
+                    context_id=item.context_id,
+                    context_compatibility=compatibility,
+                    context_relation=relation,
+                    cross_context=cross_context,
                 )
             )
         return WorkingMemoryView(
@@ -256,6 +295,9 @@ def working_memory_item(
     source_event_id: str | None = None,
     source_event_sequence: int | None = None,
     context_id: str | None = None,
+    source: str = "unknown",
+    source_channel: str = "unknown",
+    source_session_id: str | None = None,
     activation: float = 0.5,
     salience: float = 0.5,
     retention_reason: RetentionReason = RetentionReason.RECENT_CONTEXT,
@@ -269,6 +311,9 @@ def working_memory_item(
         source_event_id=source_event_id,
         source_event_sequence=source_event_sequence,
         context_id=context_id,
+        source=source,
+        source_channel=source_channel,
+        source_session_id=source_session_id,
         activation=activation,
         salience=salience,
         created_at=now,

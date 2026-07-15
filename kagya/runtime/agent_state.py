@@ -16,9 +16,15 @@ from kagya.runtime.working_memory import (
     WorkingMemoryItem,
     WorkingMemoryKind,
 )
+from kagya.runtime.context import (
+    ContextFrame,
+    ContextStatus,
+    InferredAttribute,
+    InterlocutorModel,
+)
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION = 2
+CURRENT_AGENT_STATE_SCHEMA_VERSION = 3
 
 
 class _StateModel(BaseModel):
@@ -39,6 +45,9 @@ class WorkingMemoryItemSnapshot(_StateModel):
     source_event_id: str | None = None
     source_event_sequence: int | None = None
     context_id: str | None = None
+    source: str = "unknown"
+    source_channel: str = "unknown"
+    source_session_id: str | None = None
     activation: float = Field(ge=0.0, le=1.0)
     salience: float = Field(ge=0.0, le=1.0)
     created_at: datetime
@@ -64,8 +73,36 @@ class IdentityStateSnapshot(_StateModel):
     extensions: dict[str, Any] = Field(default_factory=dict)
 
 
+class ContextFrameSnapshot(_StateModel):
+    context_id: str
+    context_type: str
+    source_channel: str
+    source_session_id: str | None = None
+    participant_ids: list[str] = Field(default_factory=list)
+    active_topic: str | None = None
+    active_task: str | None = None
+    started_at: datetime
+    last_active_at: datetime
+    parent_context_id: str | None = None
+    related_context_ids: list[str] = Field(default_factory=list)
+    status: str
+
+
+class InterlocutorSnapshot(_StateModel):
+    identity_key: str
+    relationship_metadata: dict[str, Any] = Field(default_factory=dict)
+    shared_history_references: list[str] = Field(default_factory=list)
+    inferred_preferences: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    uncertainties: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class ContextStateSnapshot(_StateModel):
+    frames: list[ContextFrameSnapshot] = Field(default_factory=list)
+    interlocutors: list[InterlocutorSnapshot] = Field(default_factory=list)
+
+
 class AgentStateSnapshot(_StateModel):
-    schema_version: Literal[2] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[3] = CURRENT_AGENT_STATE_SCHEMA_VERSION
     saved_at: datetime
     last_processed_event_sequence: int = Field(ge=0)
     emotion_state: EmotionStateSnapshot
@@ -74,6 +111,7 @@ class AgentStateSnapshot(_StateModel):
     )
     motivation: MotivationStateSnapshot = Field(default_factory=MotivationStateSnapshot)
     identity: IdentityStateSnapshot = Field(default_factory=IdentityStateSnapshot)
+    context_state: ContextStateSnapshot = Field(default_factory=ContextStateSnapshot)
     extensions: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -117,10 +155,13 @@ class AgentStateStore:
             version = raw.get("schema_version")
             if version == 0:
                 raw = _migrate_v0(raw)
-                self._record("migrated", {"from_version": 0, "to_version": 2})
+                self._record("migrated", {"from_version": 0, "to_version": 3})
             elif version == 1:
                 raw = _migrate_v1(raw)
-                self._record("migrated", {"from_version": 1, "to_version": 2})
+                self._record("migrated", {"from_version": 1, "to_version": 3})
+            elif version == 2:
+                raw = _migrate_v2(raw)
+                self._record("migrated", {"from_version": 2, "to_version": 3})
             elif version != CURRENT_AGENT_STATE_SCHEMA_VERSION:
                 raise UnsupportedStateVersion(version)
             snapshot = AgentStateSnapshot.model_validate(raw)
@@ -185,6 +226,13 @@ class AgentStateStore:
                 self_model=state.self_model,
                 extensions=state.identity_extensions,
             ),
+            context_state=ContextStateSnapshot(
+                frames=[_context_frame_snapshot(frame) for frame in main_loop.context_registry.frames],
+                interlocutors=[
+                    _interlocutor_snapshot(model)
+                    for model in main_loop.context_registry.interlocutors
+                ],
+            ),
             extensions=state.extensions,
         )
 
@@ -193,6 +241,13 @@ class AgentStateStore:
         main_loop.persistent_state = persistent_state_from_snapshot(snapshot)
         main_loop.working_memory.restore(
             [_working_memory_item_from_snapshot(item) for item in snapshot.working_memory.items]
+        )
+        main_loop.context_registry.restore(
+            tuple(_context_frame_from_snapshot(item) for item in snapshot.context_state.frames),
+            tuple(
+                _interlocutor_from_snapshot(item)
+                for item in snapshot.context_state.interlocutors
+            ),
         )
 
     def save_failed_sequence(self, sequence: int) -> None:
@@ -249,23 +304,32 @@ def persistent_state_from_snapshot(snapshot: AgentStateSnapshot) -> PersistentAg
 
 def _migrate_v0(raw: dict[str, Any]) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "saved_at": datetime.now(UTC).isoformat(),
         "last_processed_event_sequence": raw.get("last_event_sequence", 0),
         "emotion_state": raw.get("emotion", {}),
         "working_memory": {},
         "motivation": {},
         "identity": {},
+        "context_state": {},
         "extensions": {},
     }
 
 
 def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
     migrated = dict(raw)
-    migrated["schema_version"] = 2
+    migrated["schema_version"] = 3
     working_memory = dict(migrated.get("working_memory") or {})
     working_memory["items"] = []
     migrated["working_memory"] = working_memory
+    migrated["context_state"] = {}
+    return migrated
+
+
+def _migrate_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(raw)
+    migrated["schema_version"] = 3
+    migrated["context_state"] = {}
     return migrated
 
 
@@ -278,6 +342,9 @@ def _working_memory_item_snapshot(item: WorkingMemoryItem) -> WorkingMemoryItemS
         source_event_id=item.source_event_id,
         source_event_sequence=item.source_event_sequence,
         context_id=item.context_id,
+        source=item.source,
+        source_channel=item.source_channel,
+        source_session_id=item.source_session_id,
         activation=item.activation,
         salience=item.salience,
         created_at=item.created_at,
@@ -297,11 +364,97 @@ def _working_memory_item_from_snapshot(
         source_event_id=item.source_event_id,
         source_event_sequence=item.source_event_sequence,
         context_id=item.context_id,
+        source=item.source,
+        source_channel=item.source_channel,
+        source_session_id=item.source_session_id,
         activation=item.activation,
         salience=item.salience,
         created_at=item.created_at,
         last_accessed_at=item.last_accessed_at,
         retention_reason=RetentionReason(item.retention_reason),
+    )
+
+
+def _context_frame_snapshot(frame: ContextFrame) -> ContextFrameSnapshot:
+    return ContextFrameSnapshot(
+        context_id=frame.context_id,
+        context_type=frame.context_type,
+        source_channel=frame.source_channel,
+        source_session_id=frame.source_session_id,
+        participant_ids=list(frame.participant_ids),
+        active_topic=frame.active_topic,
+        active_task=frame.active_task,
+        started_at=frame.started_at,
+        last_active_at=frame.last_active_at,
+        parent_context_id=frame.parent_context_id,
+        related_context_ids=list(frame.related_context_ids),
+        status=frame.status.value,
+    )
+
+
+def _context_frame_from_snapshot(item: ContextFrameSnapshot) -> ContextFrame:
+    return ContextFrame(
+        context_id=item.context_id,
+        context_type=item.context_type,
+        source_channel=item.source_channel,
+        source_session_id=item.source_session_id,
+        participant_ids=tuple(item.participant_ids),
+        active_topic=item.active_topic,
+        active_task=item.active_task,
+        started_at=item.started_at,
+        last_active_at=item.last_active_at,
+        parent_context_id=item.parent_context_id,
+        related_context_ids=tuple(item.related_context_ids),
+        status=ContextStatus(item.status),
+    )
+
+
+def _interlocutor_snapshot(model: InterlocutorModel) -> InterlocutorSnapshot:
+    return InterlocutorSnapshot(
+        identity_key=model.identity_key,
+        relationship_metadata=model.relationship_metadata,
+        shared_history_references=list(model.shared_history_references),
+        inferred_preferences={
+            key: _attribute_json(value)
+            for key, value in model.inferred_preferences.items()
+        },
+        uncertainties={
+            key: _attribute_json(value) for key, value in model.uncertainties.items()
+        },
+    )
+
+
+def _interlocutor_from_snapshot(item: InterlocutorSnapshot) -> InterlocutorModel:
+    return InterlocutorModel(
+        identity_key=item.identity_key,
+        relationship_metadata=item.relationship_metadata,
+        shared_history_references=tuple(item.shared_history_references),
+        inferred_preferences={
+            key: _attribute_from_json(value)
+            for key, value in item.inferred_preferences.items()
+        },
+        uncertainties={
+            key: _attribute_from_json(value)
+            for key, value in item.uncertainties.items()
+        },
+    )
+
+
+def _attribute_json(attribute: InferredAttribute) -> dict[str, Any]:
+    return {
+        "value": attribute.value,
+        "confidence": attribute.confidence,
+        "evidence_references": list(attribute.evidence_references),
+    }
+
+
+def _attribute_from_json(value: dict[str, Any]) -> InferredAttribute:
+    return InferredAttribute(
+        value=value.get("value"),
+        confidence=float(value.get("confidence", 0.0)),
+        evidence_references=tuple(
+            str(item) for item in value.get("evidence_references", [])
+        ),
     )
 
 

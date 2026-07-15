@@ -30,6 +30,7 @@ class AgentEventType(StrEnum):
     STATE_EXPORT = "state_export"
     STATE_RESTORE = "state_restore"
     STATE_RESET = "state_reset"
+    CONTEXT_UPDATE = "context_update"
 
 
 @dataclass(frozen=True)

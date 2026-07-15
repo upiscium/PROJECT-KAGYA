@@ -1,6 +1,7 @@
 """ChromaDB-backed dual memory implementation."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -139,6 +140,8 @@ class DualMemorySystem:
         generation_health: GenerationHealth | None = None,
         source_event_id: str | None = None,
         source: str = "unknown",
+        source_channel: str = "unknown",
+        source_session_id: str | None = None,
         processing_sequence: int | None = None,
         causation_id: str | None = None,
         correlation_id: str | None = None,
@@ -184,6 +187,8 @@ class DualMemorySystem:
                 "provenance": {
                     "source_event_id": source_event_id,
                     "source": source,
+                    "source_channel": source_channel,
+                    "source_session_id": source_session_id,
                     "processing_sequence": processing_sequence,
                     "causation_id": causation_id,
                     "correlation_id": correlation_id,
@@ -221,24 +226,49 @@ class DualMemorySystem:
         self.db2.add(ids=[semantic_id], documents=[text], metadatas=[record_metadata])
         return semantic_id
 
-    def retrieve_context(self, query: str) -> MemoryContext:
+    def retrieve_context(
+        self,
+        query: str,
+        *,
+        current_context_id: str | None = None,
+        context_compatibility: Callable[[str | None], tuple[float, str]] | None = None,
+    ) -> MemoryContext:
         db1_results = self.db1.query(
             query_texts=[query],
-            n_results=self.settings.memory.db1_top_k,
+            n_results=self.settings.memory.db1_top_k * 3,
             where={"archived": False},
         )
         db2_results = self.db2.query(
             query_texts=[query],
-            n_results=self.settings.memory.db2_top_k,
+            n_results=self.settings.memory.db2_top_k * 3,
+        )
+        compatibility = context_compatibility or (
+            lambda source_id: _default_context_compatibility(
+                source_id, current_context_id
+            )
+        )
+        episodic = _annotate_retrieval(
+            _episodic_records_from_query(db1_results),
+            _first_result_list(db1_results.get("distances")),
+            compatibility,
+        )
+        semantic = _annotate_retrieval(
+            _semantic_records_from_query(db2_results),
+            _first_result_list(db2_results.get("distances")),
+            compatibility,
         )
         return MemoryContext(
-            db1_results=[record for record in _episodic_records_from_query(db1_results) if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE],
+            db1_results=[
+                record
+                for record in episodic
+                if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+            ][: self.settings.memory.db1_top_k],
             db2_results=[
                 record
-                for record in _semantic_records_from_query(db2_results)
+                for record in semantic
                 if not record.archived
                 and record.metadata.get("publication_status", "published") == "published"
-            ],
+            ][: self.settings.memory.db2_top_k],
         )
 
     def consolidate_to_semantic(self, model_provider: ModelProvider) -> list[str]:
@@ -493,6 +523,8 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         dedup_key=str(metadata.get("dedup_key", "")),
         source_event_id=_optional_str(provenance.get("source_event_id")),
         source=str(provenance.get("source", "unknown")),
+        source_channel=str(provenance.get("source_channel", "unknown")),
+        source_session_id=_optional_str(provenance.get("source_session_id")),
         processing_sequence=_optional_int(provenance.get("processing_sequence")),
         causation_id=_optional_str(provenance.get("causation_id")),
         correlation_id=_optional_str(provenance.get("correlation_id")),
@@ -519,6 +551,10 @@ def _semantic_record_from_metadata(record_id: str, document: str, metadata: dict
         metadata=extra,
         tags=_operator_tags(extra),
         operator_metadata=_operator_metadata(extra),
+        context_id=_optional_str(extra.get("context_id")),
+        source=str(extra.get("source", "unknown")),
+        source_channel=str(extra.get("source_channel", "unknown")),
+        source_session_id=_optional_str(extra.get("source_session_id")),
     )
 
 
@@ -604,3 +640,42 @@ def _optional_str(value: Any) -> str | None:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _default_context_compatibility(
+    source_context_id: str | None, current_context_id: str | None
+) -> tuple[float, str]:
+    if source_context_id is None:
+        return 0.45, "legacy_unknown"
+    if source_context_id == current_context_id:
+        return 1.0, "same_context"
+    return 0.2, "cross_context"
+
+
+def _annotate_retrieval(
+    records: list[Any],
+    distances: list[Any],
+    compatibility: Callable[[str | None], tuple[float, str]],
+) -> list[Any]:
+    annotated: list[Any] = []
+    for index, record in enumerate(records):
+        distance = float(distances[index]) if index < len(distances) else 1.0
+        relevance = 1.0 / (1.0 + max(0.0, distance))
+        context_score, relation = compatibility(record.context_id)
+        annotated.append(
+            replace(
+                record,
+                semantic_relevance=relevance,
+                context_compatibility=context_score,
+                context_relation=relation,
+                cross_context=record.context_id is not None
+                and relation != "same_context",
+            )
+        )
+    return sorted(
+        annotated,
+        key=lambda item: (
+            0.7 * item.semantic_relevance + 0.3 * item.context_compatibility
+        ),
+        reverse=True,
+    )

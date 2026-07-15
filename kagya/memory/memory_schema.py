@@ -82,6 +82,8 @@ class EpisodicMemoryRecord:
     dedup_key: str = ""
     source_event_id: str | None = None
     source: str = "unknown"
+    source_channel: str = "unknown"
+    source_session_id: str | None = None
     processing_sequence: int | None = None
     causation_id: str | None = None
     correlation_id: str | None = None
@@ -96,6 +98,10 @@ class EpisodicMemoryRecord:
     consolidation_status: ConsolidationStatus = ConsolidationStatus.PENDING
     consolidation_version: str = ""
     consolidation_attempt_id: str | None = None
+    semantic_relevance: float = 0.0
+    context_compatibility: float = 0.0
+    context_relation: str = "legacy_unknown"
+    cross_context: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,14 @@ class SemanticMemoryRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     operator_metadata: dict[str, Any] = field(default_factory=dict)
+    context_id: str | None = None
+    source: str = "unknown"
+    source_channel: str = "unknown"
+    source_session_id: str | None = None
+    semantic_relevance: float = 0.0
+    context_compatibility: float = 0.0
+    context_relation: str = "legacy_unknown"
+    cross_context: bool = False
 
 
 @dataclass(frozen=True)

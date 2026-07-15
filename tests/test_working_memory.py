@@ -120,6 +120,39 @@ def test_restore_trims_deterministically_to_current_capacity() -> None:
     assert [item.item_id for item in memory.items] == ["high"]
 
 
+def test_context_compatibility_prioritizes_local_but_keeps_cross_context() -> None:
+    memory = WorkingMemory(item_capacity=3, token_capacity=100)
+    memory.admit(
+        WorkingMemoryItem(
+            **{
+                **_item("same", activation=0.5).__dict__,
+                "context_id": "ctx-current",
+            }
+        )
+    )
+    memory.admit(
+        WorkingMemoryItem(
+            **{
+                **_item("other", activation=0.5).__dict__,
+                "context_id": "ctx-other",
+            }
+        )
+    )
+
+    view = memory.select(
+        context_compatibility=lambda context_id: (
+            (1.0, "same_context")
+            if context_id == "ctx-current"
+            else (0.2, "unrelated")
+        )
+    )
+
+    assert [selection.item.item_id for selection in view.selected] == ["same", "other"]
+    assert view.selected[0].cross_context is False
+    assert view.selected[1].cross_context is True
+    assert view.selected[1].context_relation == "unrelated"
+
+
 def _item(
     item_id: str,
     *,

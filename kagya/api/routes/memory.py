@@ -202,6 +202,13 @@ def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
         model_revision=record.model_revision,
         adapter_id=record.adapter_id,
         consolidation_status=record.consolidation_status.value,
+        context_id=record.context_id,
+        source_channel=record.source_channel,
+        source_session_id=record.source_session_id,
+        semantic_relevance=record.semantic_relevance,
+        context_compatibility=record.context_compatibility,
+        context_relation=record.context_relation,
+        cross_context=record.cross_context,
     )
 
 
@@ -215,4 +222,11 @@ def semantic_response(record: SemanticMemoryRecord) -> SemanticMemoryResponse:
         created_at=record.created_at,
         tags=record.tags,
         operator_metadata=record.operator_metadata,
+        context_id=record.context_id,
+        source_channel=record.source_channel,
+        source_session_id=record.source_session_id,
+        semantic_relevance=record.semantic_relevance,
+        context_compatibility=record.context_compatibility,
+        context_relation=record.context_relation,
+        cross_context=record.cross_context,
     )

@@ -5,8 +5,9 @@ export type Emotion = { valence: number; arousal: number; optimal_loss: number }
 export type ModelInfo = { model_id: string; adapter_id: string | null; fallback_used: boolean };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
-export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: boolean };
+export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: boolean; context_id?: string; client_session_id?: string; interlocutor_key?: string };
 export type ChatResponse = {
+  context_id: string;
   episode_id: string;
   response: string;
   emotion: Emotion;
@@ -14,8 +15,8 @@ export type ChatResponse = {
 };
 
 export type RetrievedMemory = {
-  db1_results: Array<{ id: string; user_input: string; response: string; record_type: string }>;
-  db2_results: Array<{ id: string; text: string; record_type: string }>;
+  db1_results: Array<{ id: string; user_input: string; response: string; record_type: string; context_id: string | null; semantic_relevance: number; context_compatibility: number; context_relation: string; cross_context: boolean }>;
+  db2_results: Array<{ id: string; text: string; record_type: string; context_id: string | null; semantic_relevance: number; context_compatibility: number; context_relation: string; cross_context: boolean }>;
 };
 
 export type DebugChatResponse = ChatResponse & {
@@ -26,7 +27,7 @@ export type DebugChatResponse = ChatResponse & {
   retrieved_memory: RetrievedMemory;
   generation_params: { max_new_tokens: number; temperature: number; top_p: number; do_sample: boolean; repetition_penalty: number; no_repeat_ngram_size: number };
   working_memory: {
-    items: Array<{ item_id: string; kind: string; selected: boolean; score: number; reasons: string[]; activation: number; salience: number; retention_reason: string; reference: string | null }>;
+    items: Array<{ item_id: string; kind: string; selected: boolean; score: number; reasons: string[]; activation: number; salience: number; retention_reason: string; reference: string | null; context_id: string | null; context_compatibility: number; context_relation: string; cross_context: boolean }>;
     token_count: number;
     item_capacity: number;
     token_capacity: number;
@@ -58,6 +59,13 @@ export type EpisodeMemory = {
   model_revision: string;
   adapter_id: string | null;
   consolidation_status: string;
+  context_id: string | null;
+  source_channel: string;
+  source_session_id: string | null;
+  semantic_relevance: number;
+  context_compatibility: number;
+  context_relation: string;
+  cross_context: boolean;
 };
 
 export type SemanticMemory = {
@@ -69,6 +77,13 @@ export type SemanticMemory = {
   created_at: string;
   tags: string[];
   operator_metadata: Record<string, unknown>;
+  context_id: string | null;
+  source_channel: string;
+  source_session_id: string | null;
+  semantic_relevance: number;
+  context_compatibility: number;
+  context_relation: string;
+  cross_context: boolean;
 };
 
 export type MemorySearchResponse = { db1_results: EpisodeMemory[]; db2_results: SemanticMemory[] };

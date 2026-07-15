@@ -11,10 +11,11 @@ from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateStore,
     KagyaMainLoop,
+    InterlocutorModel,
     WorkingMemoryKind,
     working_memory_item,
 )
-from kagya.runtime.agent_state import EmotionStateSnapshot
+from kagya.runtime.agent_state import EmotionStateSnapshot, default_agent_state_snapshot
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -37,6 +38,15 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
             source_event_sequence=4,
         )
     )
+    frame = loop.context_registry.create(
+        context_id="ctx-one",
+        source_channel="api.chat",
+        participant_ids=("person-1",),
+    )
+    loop.context_registry.suspend(frame.context_id)
+    loop.context_registry.register_interlocutor(
+        InterlocutorModel(identity_key="person-1")
+    )
     store = AgentStateStore(tmp_path / "agent_state.json")
 
     saved = store.save(store.capture(loop, 12))
@@ -52,6 +62,9 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.persistent_state.self_model == {"certainty": 0.5}
     assert restored_loop.working_memory.items[0].reference == "episode:one"
     assert loaded.working_memory.items[0].content is None
+    assert restored_loop.context_registry.get("ctx-one") is not None
+    assert restored_loop.context_registry.get("ctx-one").status.value == "suspended"
+    assert restored_loop.context_registry.interlocutors[0].identity_key == "person-1"
 
 
 def test_corrupt_snapshot_uses_safe_defaults_without_reading_temp(tmp_path: Path) -> None:
@@ -83,7 +96,7 @@ def test_v0_snapshot_migrates_to_current_schema(tmp_path: Path) -> None:
 
     snapshot = AgentStateStore(path).load(1.0)
 
-    assert snapshot.schema_version == 2
+    assert snapshot.schema_version == 3
     assert snapshot.last_processed_event_sequence == 7
     assert snapshot.emotion_state.valence == 0.1
 
@@ -112,19 +125,33 @@ def test_v1_snapshot_migrates_with_empty_working_memory_items(tmp_path: Path) ->
 
     snapshot = AgentStateStore(path).load(1.0)
 
-    assert snapshot.schema_version == 2
+    assert snapshot.schema_version == 3
     assert snapshot.last_processed_event_sequence == 5
     assert snapshot.working_memory.items == []
 
 
 def test_future_snapshot_version_is_rejected_with_fallback(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
-    path.write_text(json.dumps({"schema_version": 3}), encoding="utf-8")
+    path.write_text(json.dumps({"schema_version": 4}), encoding="utf-8")
 
     snapshot = AgentStateStore(path).load(0.6)
 
-    assert snapshot.schema_version == 2
+    assert snapshot.schema_version == 3
     assert snapshot.emotion_state.optimal_loss == 0.6
+
+
+def test_v2_snapshot_migrates_with_empty_context_state(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    payload = default_agent_state_snapshot(1.0).model_dump(mode="json")
+    payload["schema_version"] = 2
+    payload.pop("context_state")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    snapshot = AgentStateStore(path).load(1.0)
+
+    assert snapshot.schema_version == 3
+    assert snapshot.context_state.frames == []
+    assert snapshot.context_state.interlocutors == []
 
 
 def test_snapshot_contains_no_session_or_generation_private_data(tmp_path: Path) -> None:

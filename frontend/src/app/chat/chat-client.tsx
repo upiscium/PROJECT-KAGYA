@@ -19,6 +19,7 @@ export function ChatClient() {
   const [attachmentName, setAttachmentName] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [history, setHistory] = useState<ChatTurn[]>([]);
+  const [contextId, setContextId] = useState<string | undefined>();
   const mutation = useMutation({
     mutationFn: api.chat,
     onSuccess: (result, variables) => {
@@ -29,6 +30,7 @@ export function ChatClient() {
       ]);
       setMessage("");
       setAttachments([]);
+      setContextId(result.context_id);
     },
   });
 
@@ -57,7 +59,7 @@ export function ChatClient() {
           <h1 className="page-title">Chat</h1>
           <p className="page-subtitle">Normal chat shows only user-facing answers and emotion state.</p>
         </div>
-        {latest ? <div className="metadata-row"><Badge>{latest.model.model_id}</Badge>{latest.model.fallback_used ? <Badge data-tone="warning">Fallback model</Badge> : null}</div> : null}
+        {latest ? <div className="metadata-row"><Badge>{latest.model.model_id}</Badge>{latest.model.fallback_used ? <Badge data-tone="warning">Fallback model</Badge> : null}<Button type="button" onClick={() => { setContextId(undefined); setHistory([]); }}>New context</Button></div> : null}
       </header>
 
       {latest ? (
@@ -90,7 +92,7 @@ export function ChatClient() {
         className="composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (message.trim()) mutation.mutate({ text: message, attachments, debug: false });
+          if (message.trim()) mutation.mutate({ text: message, attachments, debug: false, context_id: contextId });
         }}
       >
         <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Send a message to PROJECT-KAGYA" />

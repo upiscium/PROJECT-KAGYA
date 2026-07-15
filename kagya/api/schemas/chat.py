@@ -18,6 +18,9 @@ class ChatRequest(BaseModel):
     text: str = Field(min_length=1, validation_alias=AliasChoices("text", "message"))
     attachments: list[AttachmentSchema] = Field(default_factory=list)
     debug: bool = False
+    context_id: str | None = None
+    client_session_id: str | None = None
+    interlocutor_key: str | None = None
 
 
 class EmotionSchema(BaseModel):
@@ -33,6 +36,7 @@ class ModelSchema(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    context_id: str
     episode_id: str
     response: str
     emotion: EmotionSchema
