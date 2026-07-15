@@ -22,6 +22,19 @@ emotion:
   baseline_surprisal: 1.0
   high_emotion_threshold: 0.75
   decay_rate: 0.05
+  appraisal_response_rate: 0.4
+  resting_valence: 0.0
+  resting_arousal: 0.0
+  valence_recovery_rate: 0.01
+  arousal_recovery_rate: 0.02
+
+appraisal:
+  initial_loss_scale: 0.5
+  minimum_loss_scale: 0.1
+  default_controllability: 0.6
+  default_certainty: 0.7
+  timer_enabled: false
+  timer_interval_seconds: 60.0
 
 memory:
   persist_directory: .kagya/chroma

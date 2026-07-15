@@ -22,6 +22,7 @@ from kagya.runtime.context import (
     InferredAttribute,
     InterlocutorModel,
 )
+from kagya.runtime.emotion_timer import EmotionTimer
 from kagya.runtime.session_state import SessionTurn, SessionState
 from kagya.runtime.working_memory import (
     RetentionReason,
@@ -50,6 +51,7 @@ __all__ = [
     "ContextStatus",
     "InferredAttribute",
     "InterlocutorModel",
+    "EmotionTimer",
     "KagyaMainLoop",
     "PersistentAgentState",
     "SessionState",

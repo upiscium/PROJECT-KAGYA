@@ -65,6 +65,20 @@ def test_working_memory_capacities_must_be_positive() -> None:
         )
 
 
+def test_appraisal_and_recovery_settings_load_from_config() -> None:
+    raw_config = read_raw_config()
+    settings = load_settings(CONFIG_PATH)
+
+    assert (
+        settings.appraisal.timer_interval_seconds
+        == raw_config["appraisal"]["timer_interval_seconds"]
+    )
+    assert (
+        settings.emotion.appraisal_response_rate
+        == raw_config["emotion"]["appraisal_response_rate"]
+    )
+
+
 def test_reserved_config_fields_are_documented() -> None:
     readme = (CONFIG_PATH.parent / "README.md").read_text(encoding="utf-8")
 

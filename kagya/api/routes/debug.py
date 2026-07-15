@@ -12,7 +12,11 @@ from kagya.api.dependencies import (
     require_admin,
 )
 from kagya.api.observability import RuntimeEventLog
-from kagya.api.routes.chat import attachment_metadata, chat_response_from_result
+from kagya.api.routes.chat import (
+    attachment_metadata,
+    chat_response_from_result,
+    record_appraisal,
+)
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
     DebugChatResponse,
@@ -23,6 +27,9 @@ from kagya.api.schemas.debug import (
     RetrievedSemanticSchema,
     WorkingMemoryDecisionSchema,
     WorkingMemoryViewSchema,
+    AppraisalSchema,
+    EmotionUpdateSchema,
+    LossMeasurementSchema,
 )
 from kagya.config import Settings
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -69,6 +76,7 @@ def debug_chat(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    record_appraisal(event_log, result, debug=True)
     if result.fallback_used:
         event_log.record(
             category="model",
@@ -146,6 +154,31 @@ def debug_chat(
             token_count=result.working_memory_view.token_count,
             item_capacity=result.working_memory_view.item_capacity,
             token_capacity=result.working_memory_view.token_capacity,
+        ),
+        loss_measurement=LossMeasurementSchema(
+            raw_loss=result.loss_measurement.raw_loss,
+            mean_token_loss=result.loss_measurement.mean_token_loss,
+            target_token_count=result.loss_measurement.target_token_count,
+            model_key=result.loss_measurement.model_key,
+            valid=result.loss_measurement.valid,
+            invalid_reason=result.loss_measurement.invalid_reason,
+            calibrated_novelty=result.loss_measurement.calibrated_novelty,
+        ),
+        appraisal=AppraisalSchema(
+            novelty=result.appraisal.novelty,
+            goal_progress=result.appraisal.goal_progress,
+            threat=result.appraisal.threat,
+            controllability=result.appraisal.controllability,
+            certainty=result.appraisal.certainty,
+            social_relevance=result.appraisal.social_relevance,
+            effort_cost=result.appraisal.effort_cost,
+            novelty_valid=result.appraisal.novelty_valid,
+            reasons=list(result.appraisal.reasons),
+        ),
+        emotion_update=EmotionUpdateSchema(
+            valence_contributions=result.emotion_update.valence_contributions,
+            arousal_contributions=result.emotion_update.arousal_contributions,
+            reasons=list(result.emotion_update.reasons),
         ),
     )
 

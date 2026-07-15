@@ -65,14 +65,45 @@ class WorkingMemoryViewSchema(BaseModel):
     token_capacity: int
 
 
+class LossMeasurementSchema(BaseModel):
+    raw_loss: float | None
+    mean_token_loss: float | None
+    target_token_count: int | None
+    model_key: str
+    valid: bool
+    invalid_reason: str | None
+    calibrated_novelty: float | None
+
+
+class AppraisalSchema(BaseModel):
+    novelty: float | None
+    goal_progress: float
+    threat: float
+    controllability: float
+    certainty: float
+    social_relevance: float
+    effort_cost: float
+    novelty_valid: bool
+    reasons: list[str]
+
+
+class EmotionUpdateSchema(BaseModel):
+    valence_contributions: dict[str, float]
+    arousal_contributions: dict[str, float]
+    reasons: list[str]
+
+
 class DebugChatResponse(ChatResponse):
     hidden_thought: str
-    loss: float
+    loss: float | None
     prompt: str
     attachments: list[AttachmentSchema]
     retrieved_memory: RetrievedMemorySchema
     generation_params: GenerationParamsSchema
     working_memory: WorkingMemoryViewSchema
+    loss_measurement: LossMeasurementSchema
+    appraisal: AppraisalSchema
+    emotion_update: EmotionUpdateSchema
 
 
 class EmotionStateResponse(EmotionSchema):

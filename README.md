@@ -190,6 +190,10 @@ The active subject uses finite attention-based working memory instead of an unbo
 
 Chat responses return an opaque `context_id`; clients resend it to resume the same situation. Context frames distinguish channel, client session, participants, topic/task, parent/related contexts, and active/suspended/closed lifecycle state without splitting the subject's global emotion or identity. Retrieval keeps semantic relevance and context compatibility as separate scores. Cross-context memories remain available but are explicitly marked with their source context and relationship. Interlocutor keys are unverified correlation hints, not authenticated identity claims. Context lifecycle administration is available under `/api/contexts/*` with the admin token.
 
+## Appraisal And Emotion
+
+Model loss is treated as a calibrated, model-specific novelty measurement rather than a direct emotion value. Invalid, non-finite, or unavailable loss becomes an explicit invalid measurement and contributes no novelty; it is never converted to zero-loss wellbeing. Structured appraisal separates novelty, goal progress, threat, controllability, certainty, social relevance, and effort cost before updating valence/arousal. Admin debug responses and runtime events expose numeric contributions and safe reason codes. Optional `appraisal.timer_enabled` recovery submits serialized `emotion_tick` events; the timer never mutates subject state outside the agent queue.
+
 ## Private Deployment
 
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.

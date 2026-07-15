@@ -1,4 +1,4 @@
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from time import monotonic, sleep
 
 import pytest
@@ -8,6 +8,7 @@ from kagya.runtime import (
     AgentRuntime,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
+    EmotionTimer,
     current_agent_event,
 )
 
@@ -282,6 +283,26 @@ def test_current_event_is_available_only_inside_handler() -> None:
     assert outcome.value.processing_sequence == 1
     assert current_agent_event() is None
     runtime.shutdown()
+
+
+def test_emotion_timer_mutation_runs_on_agent_consumer() -> None:
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    completed = Event()
+    threads: list[str] = []
+    timer = EmotionTimer(
+        runtime,
+        lambda elapsed: threads.append(current_thread().name) or completed.set(),
+        interval_seconds=0.01,
+    )
+
+    timer.start()
+    assert completed.wait(timeout=1)
+    timer.stop()
+    runtime.shutdown()
+
+    assert threads
+    assert set(threads) == {"kagya-agent-runtime"}
 
 
 def _block(entered: Event, release: Event, result: object) -> object:

@@ -3,8 +3,14 @@
 from dataclasses import dataclass
 from typing import Any
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.cognition import SurprisalCalculator
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from kagya.cognition import (
+    AppraisalResult,
+    AppraisalSignals,
+    CognitiveAppraiser,
+    LossMeasurement,
+    SurprisalCalculator,
+)
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
@@ -30,7 +36,7 @@ class ChatResult:
     episode_id: str
     response: str
     hidden_thought: str
-    loss: float
+    loss: float | None
     valence: float
     arousal: float
     optimal_loss: float
@@ -41,6 +47,9 @@ class ChatResult:
     memory_context: MemoryContext
     working_memory_view: WorkingMemoryView
     context_id: str
+    loss_measurement: LossMeasurement
+    appraisal: AppraisalResult
+    emotion_update: EmotionUpdate
 
 
 class KagyaMainLoop:
@@ -61,15 +70,26 @@ class KagyaMainLoop:
         persistent_state: PersistentAgentState | None = None,
         working_memory: WorkingMemory | None = None,
         context_registry: ContextRegistry | None = None,
+        appraiser: CognitiveAppraiser | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system
         self.session_state = session_state or SessionState()
-        self.surprisal_calculator = SurprisalCalculator(provider)
+        self.surprisal_calculator = SurprisalCalculator(
+            provider,
+            initial_baseline=settings.emotion.baseline_surprisal,
+            initial_scale=settings.appraisal.initial_loss_scale,
+            minimum_scale=settings.appraisal.minimum_loss_scale,
+        )
         self.emotion_engine = emotion_engine or EmotionEngineAllostasis(
             EmotionState(optimal_loss=settings.emotion.baseline_surprisal),
             adaptation_rate=settings.emotion.decay_rate,
+            response_rate=settings.emotion.appraisal_response_rate,
+            resting_valence=settings.emotion.resting_valence,
+            resting_arousal=settings.emotion.resting_arousal,
+            valence_recovery_rate=settings.emotion.valence_recovery_rate,
+            arousal_recovery_rate=settings.emotion.arousal_recovery_rate,
         )
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.agent = agent or ConsciousAgent(provider)
@@ -81,7 +101,9 @@ class KagyaMainLoop:
             token_capacity=settings.working_memory.token_capacity,
         )
         self.context_registry = context_registry or ContextRegistry()
+        self.appraiser = appraiser or CognitiveAppraiser()
         self.default_context_id: str | None = None
+        self.restore_appraisal_state()
 
     def chat(
         self,
@@ -98,6 +120,7 @@ class KagyaMainLoop:
         previous_context_frames = self.context_registry.frames
         previous_interlocutors = self.context_registry.interlocutors
         previous_default_context_id = self.default_context_id
+        previous_calibration = self.surprisal_calculator.export_history()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -118,16 +141,43 @@ class KagyaMainLoop:
                 context_compatibility=compatibility,
             )
             context_text = context_view.context_text()
-            loss = self.surprisal_calculator.calculate(context_text, user_input)
+            model_key = (
+                f"{self.settings.model.provider}:{self.settings.model.primary_id}:"
+                f"{self.adapter_id or 'base'}"
+            )
+            loss_measurement = self.surprisal_calculator.measure(
+                context_text, user_input, model_key=model_key
+            )
         except Exception:
             self.working_memory.restore(previous_working_memory)
             self.context_registry.restore(
                 previous_context_frames, previous_interlocutors
             )
             self.default_context_id = previous_default_context_id
+            self.surprisal_calculator.restore_history(previous_calibration)
             raise
         try:
-            emotion_state = self.emotion_engine.update(loss)
+            appraisal = self.appraiser.assess(
+                loss_measurement,
+                AppraisalSignals(
+                    controllability=self.settings.appraisal.default_controllability
+                    if loss_measurement.valid
+                    else 0.5,
+                    certainty=self.settings.appraisal.default_certainty
+                    if loss_measurement.valid
+                    else 0.2,
+                    social_relevance=0.5
+                    if current_context.participant_ids
+                    else 0.0,
+                    effort_cost=min(
+                        1.0,
+                        len(user_input.encode("utf-8"))
+                        / self.settings.working_memory.token_capacity,
+                    ),
+                ),
+            )
+            emotion_update = self.emotion_engine.update_from_appraisal(appraisal)
+            emotion_state = emotion_update.state
             memory_context = self.memory_system.retrieve_context(
                 user_input,
                 current_context_id=current_context.context_id,
@@ -176,14 +226,18 @@ class KagyaMainLoop:
             )
             generation_health = assess_generation_health(
                 processed_response.visible_response,
-                loss=loss,
+                loss=loss_measurement.raw_loss
+                if loss_measurement.raw_loss is not None
+                else float("nan"),
                 fallback_used=fallback_used,
             )
             episode_id = self.memory_system.save_episodic(
                 user_input,
                 processed_response.visible_response,
                 hidden_thought=processed_response.hidden_thought,
-                loss=loss,
+                loss=loss_measurement.raw_loss
+                if loss_measurement.raw_loss is not None
+                else 0.0,
                 emotion_valence=emotion_state.valence,
                 emotion_arousal=emotion_state.arousal,
                 generation_health=generation_health,
@@ -208,6 +262,7 @@ class KagyaMainLoop:
             self.context_registry.record_shared_history(
                 current_context.participant_ids, f"episode:{episode_id}"
             )
+            self._persist_appraisal_state()
             self.working_memory.admit(
                 working_memory_item(
                     item_id=f"episode:{episode_id}",
@@ -233,6 +288,8 @@ class KagyaMainLoop:
                 previous_context_frames, previous_interlocutors
             )
             self.default_context_id = previous_default_context_id
+            self.surprisal_calculator.restore_history(previous_calibration)
+            self._persist_appraisal_state()
             raise
         return ChatResult(
             episode_id=episode_id,
@@ -240,7 +297,7 @@ class KagyaMainLoop:
             hidden_thought=processed_response.hidden_thought
             if debug
             else processed_response.hidden_thought,
-            loss=loss,
+            loss=loss_measurement.raw_loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,
             optimal_loss=emotion_state.optimal_loss,
@@ -251,6 +308,37 @@ class KagyaMainLoop:
             memory_context=memory_context,
             working_memory_view=working_memory_view,
             context_id=current_context.context_id,
+            loss_measurement=loss_measurement,
+            appraisal=appraisal,
+            emotion_update=emotion_update,
+        )
+
+    def advance_time(self, elapsed_seconds: float) -> EmotionUpdate:
+        update = self.emotion_engine.advance_time(elapsed_seconds)
+        self.working_memory.admit(
+            working_memory_item(
+                item_id="emotion:current",
+                kind=WorkingMemoryKind.EMOTION,
+                content=(
+                    f"Current valence={update.state.valence:.3f}, "
+                    f"arousal={update.state.arousal:.3f}"
+                ),
+                activation=1.0,
+                salience=max(0.5, update.state.arousal),
+                retention_reason=RetentionReason.CURRENT_EMOTION,
+                source="runtime.emotion_tick",
+            )
+        )
+        return update
+
+    def restore_appraisal_state(self) -> None:
+        self.surprisal_calculator.restore_history(
+            self.persistent_state.extensions.get("appraisal_calibration")
+        )
+
+    def _persist_appraisal_state(self) -> None:
+        self.persistent_state.extensions["appraisal_calibration"] = (
+            self.surprisal_calculator.export_history()
         )
 
     def _resolve_context(
