@@ -5,6 +5,7 @@ import os
 
 from kagya.body import EmotionState
 from kagya.config import load_settings
+from kagya.decision import ActionCandidate, ActionType
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.motivation import GoalStatus, GoalType
@@ -109,6 +110,37 @@ def test_goal_state_and_decisions_resume_after_snapshot_restore(tmp_path: Path) 
         "persistent-goal", GoalStatus.SUSPENDED, reason="pause"
     )
     assert restored.adopt_goal("persistent-goal").action.value == "resume"
+
+
+def test_decision_records_restore_from_agent_snapshot(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.create_decision(
+        [
+            ActionCandidate(
+                candidate_id="no-op",
+                candidate_type=ActionType.NO_OP,
+                proposed_action="Wait",
+                parameters={},
+                prerequisites=(),
+                predicted_outcomes=(),
+                uncertainty=0.2,
+                estimated_cost=0.0,
+                estimated_risk=0.0,
+                value_effects={},
+                appraisal_contributions={},
+            )
+        ],
+        decision_id="persistent-decision",
+    )
+    store = AgentStateStore(tmp_path / "agent_state.json")
+    store.save(store.capture(loop, 9))
+
+    restored = _loop(tmp_path / "restored")
+    store.restore_into(restored, store.load(1.0))
+
+    record = restored.decision_store.get("persistent-decision")
+    assert record.status.value == "awaiting_outcome"
+    assert record.selected_candidate_id == "no-op"
 
 
 def test_v0_snapshot_migrates_to_current_schema(tmp_path: Path) -> None:

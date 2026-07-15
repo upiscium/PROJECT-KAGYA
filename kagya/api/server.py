@@ -12,6 +12,7 @@ from kagya.api.routes import (
     chat,
     contexts,
     debug,
+    decisions,
     evaluations,
     goals,
     memory,
@@ -58,6 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(values.router)
     app.include_router(goals.router)
     app.include_router(goals.commitment_router)
+    app.include_router(decisions.router)
 
     return app
 

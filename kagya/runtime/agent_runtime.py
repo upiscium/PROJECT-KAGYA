@@ -37,6 +37,9 @@ class AgentEventType(StrEnum):
     GOAL_READ = "goal_read"
     GOAL_UPDATE = "goal_update"
     GOAL_REEVALUATE = "goal_reevaluate"
+    DECISION_READ = "decision_read"
+    DECISION_UPDATE = "decision_update"
+    DECISION_GENERATE = "decision_generate"
 
 
 @dataclass(frozen=True)
