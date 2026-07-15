@@ -3,12 +3,15 @@ project:
   environment: development
 
 model:
-  primary_id: google/gemma-4-E4B-it
+  primary_id: google/gemma-4-12B-it
   fallback_id: google/gemma-4-E2B-it
   provider: dummy
   device: auto
   dtype: auto
   load_in_4bit: true
+  revision: main
+  processor_revision: main
+  fallback_revision: main
 
 generation:
   max_new_tokens: 128
@@ -123,3 +126,13 @@ api:
 frontend:
   base_url: http://localhost:3000
   api_base_url: http://127.0.0.1:8000
+
+deployment:
+  mode: standalone
+  node:
+    id: kagya-standalone-01
+    role: all
+    expected_hostname: null
+    enforce_hostname_match: false
+  training:
+    backend: local
