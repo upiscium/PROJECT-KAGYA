@@ -34,6 +34,9 @@ class AgentEventType(StrEnum):
     EMOTION_TICK = "emotion_tick"
     VALUE_READ = "value_read"
     VALUE_UPDATE = "value_update"
+    GOAL_READ = "goal_read"
+    GOAL_UPDATE = "goal_update"
+    GOAL_REEVALUATE = "goal_reevaluate"
 
 
 @dataclass(frozen=True)

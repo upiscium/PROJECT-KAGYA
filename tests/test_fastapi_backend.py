@@ -851,6 +851,140 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     assert reset.json()["values"][0]["weight"] == 0.8
 
 
+def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+
+    assert client.get("/api/goals").status_code == 401
+    intrinsic = client.post(
+        "/api/goals",
+        headers=headers,
+        json={
+            "goal_id": "intrinsic-goal",
+            "goal_type": "intrinsic",
+            "description": "Maintain internal coherence",
+            "origin_value_id": "honesty",
+            "priority": 0.3,
+            "urgency": 0.3,
+            "expected_utility": 0.5,
+            "confidence": 0.8,
+            "value_effects": {"honesty": 1.0},
+        },
+    )
+    assert intrinsic.status_code == 200
+    assert intrinsic.json()["goal_type"] == "intrinsic"
+    adopted = client.post(
+        "/api/goals/intrinsic-goal/adopt", headers=headers
+    )
+    assert adopted.status_code == 200
+    assert adopted.json()["action"] == "activate"
+
+    external = client.post(
+        "/api/goals",
+        headers=headers,
+        json={
+            "goal_id": "external-goal",
+            "goal_type": "external_request",
+            "description": "Handle an urgent external request",
+            "priority": 1.0,
+            "urgency": 1.0,
+            "expected_utility": 1.0,
+            "confidence": 1.0,
+            "conflict_ids": ["intrinsic-goal"],
+        },
+    )
+    assert external.status_code == 200
+    selected = client.post(
+        "/api/goals/external-goal/adopt", headers=headers
+    )
+    assert selected.status_code == 200
+    assert selected.json()["conflicting_goal_ids"] == ["intrinsic-goal"]
+
+    inspected = client.get("/api/goals", headers=headers).json()
+    statuses = {goal["goal_id"]: goal["status"] for goal in inspected["goals"]}
+    assert statuses == {
+        "external-goal": "active",
+        "intrinsic-goal": "suspended",
+    }
+    assert any(
+        decision["action"] == "suspend" for decision in inspected["decisions"]
+    )
+    decision_input = client.get(
+        "/api/goals/decision-input", headers=headers
+    ).json()
+    assert decision_input["active_goals"][0]["goal_id"] == "external-goal"
+    assert "no_action" in decision_input["allowed_actions"]
+
+    valence_before = client.app.state.main_loop.emotion_engine.state.valence
+    completed = client.post(
+        "/api/goals/external-goal/transition",
+        headers=headers,
+        json={
+            "status": "completed",
+            "reason": "request_satisfied",
+            "outcome": "response delivered",
+        },
+    )
+    assert completed.status_code == 200
+    assert completed.json()["transitions"][-1]["outcome"] == "response delivered"
+    assert client.app.state.main_loop.emotion_engine.state.valence > valence_before
+
+    reevaluated = client.post("/api/goals/reevaluate", headers=headers)
+    assert reevaluated.status_code == 200
+    assert any(
+        decision["action"] == "resume"
+        and decision["goal_id"] == "intrinsic-goal"
+        for decision in reevaluated.json()["decisions"]
+    )
+    assert any(
+        item.item_id == "goal:intrinsic-goal"
+        for item in client.app.state.main_loop.working_memory.items
+    )
+
+    commitment = client.post(
+        "/api/commitments",
+        headers=headers,
+        json={
+            "commitment_id": "promise-1",
+            "description": "Provide a follow-up",
+            "value_effects": {"care": 0.5},
+        },
+    )
+    assert commitment.status_code == 200
+    assert commitment.json()["status"] == "active"
+    fulfilled = client.post(
+        "/api/commitments/promise-1/transition",
+        headers=headers,
+        json={
+            "status": "fulfilled",
+            "reason": "follow_up_provided",
+            "outcome": "delivered",
+        },
+    )
+    assert fulfilled.status_code == 200
+    assert fulfilled.json()["status"] == "fulfilled"
+    related_goal = client.app.state.main_loop.goal_manager.get(
+        "commitment:promise-1"
+    )
+    assert related_goal.goal_type.value == "commitment"
+    assert related_goal.status.value == "completed"
+
+    expired_commitment = client.post(
+        "/api/commitments",
+        headers=headers,
+        json={
+            "commitment_id": "expired-promise",
+            "description": "Already expired promise",
+            "deadline": "2000-01-01T00:00:00Z",
+        },
+    )
+    assert expired_commitment.status_code == 200
+    assert expired_commitment.json()["status"] == "breached"
+    assert client.app.state.main_loop.goal_manager.get(
+        "commitment:expired-promise"
+    ).status.value == "failed"
+
+
 def _client(
     tmp_path: Path,
     *,

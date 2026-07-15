@@ -79,6 +79,21 @@ def test_duplicate_reference_reactivates_existing_item() -> None:
     assert restored.retention_reason == RetentionReason.REACTIVATED
 
 
+def test_readmitting_active_goal_preserves_protected_retention() -> None:
+    memory = WorkingMemory(item_capacity=2, token_capacity=100)
+    goal = _item(
+        "goal",
+        activation=0.3,
+        reason=RetentionReason.ONGOING_GOAL,
+        kind=WorkingMemoryKind.GOAL,
+    )
+    memory.admit(goal)
+
+    memory.admit(goal)
+
+    assert memory.items[0].retention_reason == RetentionReason.ONGOING_GOAL
+
+
 def test_decay_forgets_unprotected_but_retains_commitment() -> None:
     memory = WorkingMemory(item_capacity=2, token_capacity=100)
     memory.admit(_item("ordinary", activation=0.1))

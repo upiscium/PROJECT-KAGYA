@@ -145,7 +145,11 @@ class WorkingMemory:
                 last_accessed_at=now,
                 activation=min(1.0, max(existing.activation, item.activation) + 0.2),
                 salience=max(existing.salience, item.salience),
-                retention_reason=RetentionReason.REACTIVATED,
+                retention_reason=(
+                    item.retention_reason
+                    if item.retention_reason in protected
+                    else RetentionReason.REACTIVATED
+                ),
             )
         self._items[item.item_id] = item
         self._trim_items()
