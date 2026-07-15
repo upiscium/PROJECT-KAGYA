@@ -28,6 +28,14 @@ from kagya.runtime import (
     EmotionTimer,
 )
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
+from kagya.training import (
+    LocalTrainingBackend,
+    MemoryConsolidator,
+    SleepCoordinator,
+    TrainingBundleBuilder,
+    TrainingJobRegistry,
+)
+from kagya.learning import QloraTrainer
 
 
 T = TypeVar("T")
@@ -236,6 +244,34 @@ def get_sleep_cycle_manager(request: Request) -> SleepCycleManager:
         get_model_provider(request),
         get_adapter_registry(request),
     )
+
+
+def get_sleep_coordinator(request: Request) -> SleepCoordinator:
+    coordinator = getattr(request.app.state, "sleep_coordinator", None)
+    if coordinator is not None:
+        return coordinator
+    with _dependency_lock:
+        coordinator = getattr(request.app.state, "sleep_coordinator", None)
+        if coordinator is None:
+            settings = get_api_settings(request)
+            runtime = get_agent_runtime(request)
+            coordinator = SleepCoordinator(
+                settings,
+                MemoryConsolidator(
+                    settings, get_memory_system(request), get_model_provider(request)
+                ),
+                TrainingBundleBuilder(settings),
+                TrainingJobRegistry(settings.sleep.job_registry_path),
+                LocalTrainingBackend(QloraTrainer(settings)),
+                get_adapter_registry(request),
+                subject_executor=lambda source, handler: runtime.execute(
+                    AgentEventType.SLEEP,
+                    source=source,
+                    handler=handler,
+                ).value,
+            )
+            request.app.state.sleep_coordinator = coordinator
+    return coordinator
 
 
 def _get_active_adapter(request: Request) -> AdapterEntry | None:

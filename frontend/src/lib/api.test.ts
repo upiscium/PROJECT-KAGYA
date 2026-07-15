@@ -56,12 +56,16 @@ describe("api client", () => {
     ]);
   });
 
-  it("sleep page action calls /api/sleep/run", async () => {
+  it("sleep page uses asynchronous job endpoints", async () => {
     fetchMock.mockReturnValue(jsonResponse({}));
 
-    await api.sleepRun();
+    await api.createSleepJob("request-1");
+    await api.sleepJobs();
 
-    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/sleep/run", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/admin-proxy/sleep/jobs",
+      "/admin-proxy/sleep/jobs",
+    ]);
   });
 
   it("system metadata calls public and admin system endpoints", async () => {

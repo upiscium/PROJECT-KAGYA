@@ -170,6 +170,8 @@ class SleepSettings(StrictBaseModel):
     dream_dataset_path: Path
     min_emotion_score: float = Field(ge=0.0, le=1.0)
     max_episodes_per_cycle: int = Field(gt=0)
+    job_registry_path: Path = Path(".kagya/training_jobs.json")
+    training_artifact_directory: Path = Path(".kagya/training_artifacts")
 
 
 class QloraSettings(StrictBaseModel):

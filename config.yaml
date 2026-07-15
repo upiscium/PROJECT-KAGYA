@@ -82,6 +82,8 @@ sleep:
   dream_dataset_path: .kagya/dreams/dream_dataset.jsonl
   min_emotion_score: 0.75
   max_episodes_per_cycle: 100
+  job_registry_path: .kagya/training_jobs.json
+  training_artifact_directory: .kagya/training_artifacts
 
 qlora:
   output_dir: .kagya/adapters
