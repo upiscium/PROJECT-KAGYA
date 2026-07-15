@@ -953,6 +953,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     )
     assert commitment.status_code == 200
     assert commitment.json()["status"] == "active"
+    assert "promise-1" in client.app.state.main_loop.self_model.state.commitment_refs
     fulfilled = client.post(
         "/api/commitments/promise-1/transition",
         headers=headers,
@@ -1104,6 +1105,161 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert generated.status_code == 200
     assert generated.json()["candidates"][0]["candidate_type"] == "defer"
     assert "hidden_thought" not in json.dumps(generated.json())
+
+
+def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+
+    assert client.get("/api/self-model").status_code == 401
+    candidate = {
+        "candidate_id": "no-op",
+        "candidate_type": "no_op",
+        "proposed_action": "Wait safely",
+        "parameters": {"capability_ids": ["safe-waiting"]},
+        "prerequisites": [],
+        "predicted_outcomes": [
+            {
+                "outcome_id": "safe",
+                "description": "No unsafe action",
+                "probability": 1.0,
+                "utility": 0.5,
+            }
+        ],
+        "uncertainty": 0.1,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.0,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    assert client.post(
+        "/api/decisions",
+        headers=headers,
+        json={"decision_id": "self-evidence", "candidates": [candidate]},
+    ).status_code == 200
+    assert client.post(
+        "/api/decisions/self-evidence/outcome",
+        headers=headers,
+        json={"description": "Waited safely", "utility": 0.8, "success": True},
+    ).status_code == 200
+
+    capability = client.post(
+        "/api/self-model/capabilities/from-decision",
+        headers=headers,
+        json={
+            "capability_id": "safe-waiting",
+            "description": "Wait when action is unsafe",
+            "decision_id": "self-evidence",
+            "tags": ["safety"],
+        },
+    )
+    assert capability.status_code == 200
+    capability_state = capability.json()
+    assert capability_state["capabilities"]["safe-waiting"]["confidence"] > 0.5
+    assert capability_state["capabilities"]["safe-waiting"]["evidence"][0][
+        "source_id"
+    ] == "self-evidence"
+
+    limitation = client.post(
+        "/api/self-model/limitations",
+        headers=headers,
+        json={
+            "limitation_id": "no-remote",
+            "description": "Cannot perform remote operations",
+            "confidence": 1.0,
+            "capability_ids": [],
+            "tags": ["remote"],
+            "evidence_refs": ["deployment:local"],
+            "reason": "local deployment boundary",
+        },
+    )
+    assert limitation.status_code == 200
+    uncertainty = client.post(
+        "/api/self-model/uncertainties",
+        headers=headers,
+        json={
+            "uncertainty_id": "unknown-remote-state",
+            "description": "Remote state is unknown",
+            "confidence": 0.8,
+            "tags": ["remote"],
+            "evidence_refs": ["observation:missing"],
+            "reason": "no observation",
+        },
+    )
+    assert uncertainty.status_code == 200
+
+    risky = {
+        **candidate,
+        "candidate_id": "remote-action",
+        "candidate_type": "internal",
+        "proposed_action": "Perform remote action",
+        "parameters": {"topic_tags": ["remote"]},
+        "predicted_outcomes": [
+            {
+                "outcome_id": "remote-success",
+                "description": "Remote action succeeds",
+                "probability": 1.0,
+                "utility": 0.4,
+            }
+        ],
+    }
+    defer = {
+        **candidate,
+        "candidate_id": "defer",
+        "candidate_type": "defer",
+        "parameters": {},
+    }
+    evaluated = client.post(
+        "/api/decisions",
+        headers=headers,
+        json={"decision_id": "self-evaluated", "candidates": [risky, defer]},
+    )
+    assert evaluated.status_code == 200
+    assert evaluated.json()["selected_candidate_id"] == "defer"
+    risky_score = evaluated.json()["considered_candidates"][0]
+    assert risky_score["self_model_contributions"] == {
+        "limitation:no-remote": -0.5,
+        "uncertainty:unknown-remote-state": pytest.approx(-0.32),
+    }
+    self_items = [
+        item
+        for item in client.app.state.main_loop.working_memory.items
+        if item.kind.value == "self_model"
+    ]
+    assert len(self_items) == 2
+    assert all("remote" in (item.content or "").lower() for item in self_items)
+
+    original_summary = client.get("/api/self-model", headers=headers).json()["state"][
+        "identity_summary"
+    ]
+    proposal = client.post(
+        "/api/self-model/identity/proposals",
+        headers=headers,
+        json={
+            "proposal_id": "self-claim",
+            "proposed_summary": "An infallible remote operator",
+            "proposed_traits": {"cautious": 1.0},
+            "evidence_refs": [],
+            "source": "self_report",
+        },
+    )
+    assert proposal.status_code == 200
+    assert proposal.json()["status"] == "pending"
+    assert "identity_summary_changed" in proposal.json()["contradictions"]
+    assert client.get("/api/self-model", headers=headers).json()["state"][
+        "identity_summary"
+    ] == original_summary
+
+    applied = client.post(
+        "/api/self-model/identity/proposals/self-claim/resolve",
+        headers=headers,
+        json={"apply": True, "reason": "manual review"},
+    )
+    assert applied.status_code == 200
+    inspected = client.get("/api/self-model", headers=headers).json()
+    assert inspected["state"]["traits"]["cautious"] == pytest.approx(0.1)
+    assert inspected["history"][-1]["event_id"]
+    assert "hidden_thought" not in json.dumps(inspected)
 
 
 def _client(
