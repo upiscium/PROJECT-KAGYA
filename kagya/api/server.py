@@ -65,8 +65,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(chat.router)
         app.include_router(debug.router)
         app.include_router(memory.router)
-        if role == NodeRole.ALL:
-            app.include_router(sleep.router)
+        app.include_router(sleep.router)
         app.include_router(adapters.router)
         app.include_router(evaluations.router)
         app.include_router(system.router)

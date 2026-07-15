@@ -3,6 +3,7 @@ from pathlib import Path
 from threading import Event
 
 from kagya.config import load_settings
+from kagya.learning import QloraTrainingResult
 from kagya.training import (
     ConsolidationPreparation,
     SleepCoordinator,
@@ -110,6 +111,43 @@ def test_coordinator_marks_interrupted_local_job_failed_on_restart(
     assert "restarted" in (recovered.error or "")
 
 
+def test_coordinator_resumes_persisted_remote_job(tmp_path: Path) -> None:
+    registry = TrainingJobRegistry(tmp_path / "jobs.json")
+    job, _ = registry.create(
+        idempotency_key="remote-request",
+        base_model_id="model",
+        base_model_revision="revision",
+        parent_adapter_id=None,
+        backend="ssh",
+    )
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    registry.update(
+        job.job_id,
+        status=TrainingJobStatus.RUNNING,
+        bundle_path=str(bundle),
+        remote_job_id=job.job_id,
+    )
+    consolidator = _RecoveringConsolidator()
+    backend = _RecoveringBackend(tmp_path)
+    coordinator = SleepCoordinator(
+        load_settings(CONFIG_PATH),
+        consolidator,
+        _ImmediateBuilder(tmp_path),
+        TrainingJobRegistry(tmp_path / "jobs.json"),
+        backend,
+        _RegisteringAdapterRegistry(),
+    )
+
+    coordinator.shutdown()
+
+    restored = TrainingJobRegistry(tmp_path / "jobs.json").get(job.job_id)
+    assert backend.attached == job.job_id
+    assert restored.status == TrainingJobStatus.COMPLETED
+    assert restored.candidate_adapter_id == "adapter-remote"
+    assert consolidator.completed is True
+
+
 @dataclass(frozen=True)
 class _Episode:
     id: str = "episode-1"
@@ -129,6 +167,17 @@ class _FakeConsolidator:
 
     def fail(self, preparation, attempt_id: str) -> None:
         self.failed = True
+
+
+class _Memory:
+    def get_episodic(self, episode_id: str):
+        return None
+
+
+class _RecoveringConsolidator(_FakeConsolidator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.memory = _Memory()
 
 
 class _BlockingBuilder:
@@ -176,9 +225,48 @@ class _FailingBackend(_FakeBackend):
         raise RuntimeError("backend failed")
 
 
+class _RecoveringBackend(_FakeBackend):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.attached = None
+
+    def attach(self, job) -> None:
+        self.attached = job.job_id
+
+    def fetch_result(self, job_id: str):
+        adapter = self.root / "adapter-remote"
+        adapter.mkdir(exist_ok=True)
+        dataset = self.root / "dataset.jsonl"
+        dataset.write_text("{}\n")
+        return QloraTrainingResult(
+            adapter_id="adapter-remote",
+            adapter_path=adapter,
+            dataset_path=dataset,
+            dataset_hash="hash",
+            dry_run=True,
+            training_records=1,
+        )
+
+
 class _AdapterRegistry:
+    def lookup(self, adapter_id: str):
+        return None
+
     def register_candidate(self, **kwargs):
         raise AssertionError("candidate must not be registered")
+
+
+@dataclass(frozen=True)
+class _AdapterEntry:
+    adapter_id: str
+
+
+class _RegisteringAdapterRegistry:
+    def lookup(self, adapter_id: str):
+        return None
+
+    def register_candidate(self, **kwargs):
+        return _AdapterEntry(kwargs["adapter_id"])
 
 
 def _coordinator(tmp_path, consolidator, builder, backend) -> SleepCoordinator:

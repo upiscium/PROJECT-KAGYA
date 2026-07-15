@@ -187,6 +187,8 @@ class TrainingBackend(Protocol):
     def inspect(self, job_id: str) -> TrainingJobStatus: ...
     def cancel(self, job_id: str) -> bool: ...
     def fetch_result(self, job_id: str) -> QloraTrainingResult | None: ...
+    def attach(self, job: TrainingJob) -> None: ...
+    def shutdown(self) -> None: ...
 
 
 class LocalTrainingBackend:
@@ -220,6 +222,12 @@ class LocalTrainingBackend:
 
     def fetch_result(self, job_id: str) -> QloraTrainingResult | None:
         return self._results.get(job_id)
+
+    def attach(self, job: TrainingJob) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -393,12 +401,15 @@ class SleepCoordinator:
         self._threads: dict[str, Thread] = {}
         self._cancel: dict[str, Event] = {}
         for job in self.registry.list():
-            if job.status not in TERMINAL_JOB_STATUSES:
+            if job.backend == "local" and job.status not in TERMINAL_JOB_STATUSES:
                 self.registry.update(
                     job.job_id,
                     status=TrainingJobStatus.FAILED,
                     error="local runtime restarted before job completion",
                 )
+            elif job.backend != "local" and job.status not in TERMINAL_JOB_STATUSES:
+                self.backend.attach(job)
+                self._start_resume(job)
 
     def create_job(self, idempotency_key: str) -> TrainingJob:
         job, created = self.registry.create(
@@ -443,6 +454,16 @@ class SleepCoordinator:
         self._threads[job.job_id] = thread
         thread.start()
 
+    def _start_resume(self, job: TrainingJob) -> None:
+        thread = Thread(
+            target=self._resume,
+            args=(job.job_id,),
+            name=f"kagya-sleep-resume-{job.job_id}",
+            daemon=True,
+        )
+        self._threads[job.job_id] = thread
+        thread.start()
+
     def inspect(self, job_id: str) -> TrainingJob:
         return self.registry.get(job_id)
 
@@ -458,8 +479,52 @@ class SleepCoordinator:
         return self.registry.update(job_id, status=TrainingJobStatus.CANCELLED)
 
     def shutdown(self) -> None:
+        shutdown = getattr(self.backend, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
         for thread in tuple(self._threads.values()):
             thread.join()
+
+    def _resume(self, job_id: str) -> None:
+        job = self.registry.get(job_id)
+        episodes = tuple(
+            episode
+            for episode_id in job.selected_episode_ids
+            if (episode := self.consolidator.memory.get_episodic(episode_id))
+            is not None
+        )
+        preparation = ConsolidationPreparation(episodes, job.semantic_memory_ids)
+        try:
+            if job.bundle_path is None:
+                raise RuntimeError("remote training job has no persisted bundle")
+            remote_id = self.backend.submit(job, Path(job.bundle_path))
+            self.registry.update(job_id, remote_job_id=remote_id)
+            result = self.backend.fetch_result(job_id)
+            if result is None:
+                raise RuntimeError("Training backend returned no result")
+            self.registry.update(job_id, status=TrainingJobStatus.IMPORTING)
+            entry = self.subject_executor(
+                "runtime.sleep.resume_finalize",
+                lambda: self._finalize_subject_state(
+                    preparation, job.attempt_id, result
+                ),
+            )
+            self.registry.update(
+                job_id,
+                status=TrainingJobStatus.COMPLETED,
+                candidate_adapter_id=entry.adapter_id,
+                error=None,
+            )
+        except InterruptedError:
+            return
+        except Exception as exc:
+            self.subject_executor(
+                "runtime.sleep.resume_fail",
+                lambda: self.consolidator.fail(preparation, job.attempt_id),
+            )
+            self.registry.update(
+                job_id, status=TrainingJobStatus.FAILED, error=str(exc)
+            )
 
     def _run(self, job_id: str, cancel: Event) -> None:
         preparation = ConsolidationPreparation((), ())
@@ -496,6 +561,7 @@ class SleepCoordinator:
             self.registry.update(job_id, status=TrainingJobStatus.DISPATCHED)
             self.registry.update(job_id, status=TrainingJobStatus.RUNNING)
             remote_id = self.backend.submit(job, bundle)
+            self.registry.update(job_id, remote_job_id=remote_id)
             if cancel.is_set():
                 raise _Cancelled
             result = self.backend.fetch_result(job_id)
@@ -504,7 +570,6 @@ class SleepCoordinator:
             self.registry.update(
                 job_id,
                 status=TrainingJobStatus.SUCCEEDED,
-                remote_job_id=remote_id,
             )
             self.registry.update(job_id, status=TrainingJobStatus.IMPORTING)
             entry = self.subject_executor(
@@ -539,14 +604,16 @@ class SleepCoordinator:
         attempt_id: str,
         result: QloraTrainingResult,
     ):
-        entry = self.adapter_registry.register_candidate(
-            adapter_id=result.adapter_id,
-            adapter_path=result.adapter_path,
-            dataset_path=result.dataset_path,
-            dataset_hash=result.dataset_hash,
-            base_model=self.settings.model.primary_id,
-            notes="registered by local sleep job",
-        )
+        entry = self.adapter_registry.lookup(result.adapter_id)
+        if entry is None:
+            entry = self.adapter_registry.register_candidate(
+                adapter_id=result.adapter_id,
+                adapter_path=result.adapter_path,
+                dataset_path=result.dataset_path,
+                dataset_hash=result.dataset_hash,
+                base_model=self.settings.model.primary_id,
+                notes=f"registered by {self.settings.deployment.training.backend.value} sleep job",
+            )
         self.consolidator.complete(preparation, attempt_id)
         return entry
 
