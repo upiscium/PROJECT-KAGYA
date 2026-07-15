@@ -27,7 +27,7 @@ uv run pytest
 just config-check
 ```
 
-3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers`. Use instruction-tuned model IDs for chat; the defaults are `google/gemma-4-E4B-it` and `google/gemma-4-E2B-it`. Base variants can treat the prompt as document continuation and produce repetitive or unrelated text. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
+3. Create a private real-model config by copying `config.yaml`, then set `model.provider: transformers`. The primary training-compatible default is `google/gemma-4-12B-it`; the fallback remains `google/gemma-4-E2B-it`. Pin `model.revision` and `model.processor_revision` to immutable commits before using split deployment. Base variants can treat the prompt as document continuation and produce repetitive or unrelated text. Keep the committed `config.yaml` on `dummy` unless you want every local run to load real models.
 
 If you previously used `.kagya/chroma` with another embedding backend, PROJECT-KAGYA creates embedding-versioned Chroma collections for non-legacy embeddings. Old collections are kept on disk but are not mixed with new embedding dimensions.
 
@@ -91,6 +91,16 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Chat responses include `model.fallback_used`; fallback responses report the fallback model ID and no active adapter.
 - External LLM providers such as Ollama, OpenAI, Gemini API, and Claude API are intentionally unsupported.
 
+## Deployment Topology
+
+- `standalone + all + local` is the normal single-host configuration.
+- `split + inference + ssh` requires `training.remote_worker`, an SSH identity path, a known-hosts path, and an expected worker model whose ID and exact revisions match the inference model.
+- `split + training_worker + worker` requires isolated inbox, work, and result directories plus explicit allowed submitter node IDs.
+- Other mode, role, and backend combinations are rejected during config validation.
+- `node.id` is a stable application identifier and is distinct from the OS hostname. Set `enforce_hostname_match: true` only with an explicit `expected_hostname`.
+- Passwords, private key contents, Hugging Face tokens, and worker token values do not belong in YAML. Configuration stores credential file paths or environment-variable names only.
+- Legacy configs without `deployment` are explicitly migrated to `standalone/all/local`; `just config-check` reports the migration note. Split configs never use that migration as an implicit topology fallback.
+
 ## Multimodal Attachments
 
 The first real multimodal milestone supports one local image attachment for capable Transformers image-text models.
@@ -148,6 +158,8 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 | Field | Status |
 | --- | --- |
 | `model.fallback_id` | Active for Transformers per-request fallback generation. Dummy provider ignores it. |
+| `model.revision` / `model.processor_revision` | Passed to Transformers model and processor loading. Split inference requires immutable exact revisions that match the worker expectation. |
+| `model.fallback_revision` | Passed to fallback model and processor loading. |
 | `memory.embedding_model_id` | Active for the default sentence-transformers memory embedding backend. Tests and bootstrap flows can still inject deterministic embeddings explicitly. |
 | `adapter_registry.allowed_states` | Reserved as an operator-visible lifecycle contract. Runtime transitions are enforced by `AdapterStatus`. |
 | `adapter_registry.manual_approval_required` | Reserved for future automatic approval policy. Current lifecycle always requires explicit approval before activation. |

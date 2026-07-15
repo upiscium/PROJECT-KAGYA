@@ -311,7 +311,7 @@ def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:
     assert data["runtime"] == {
         "environment": "development",
         "provider": "dummy",
-        "primary_model_id": "google/gemma-4-E4B-it",
+        "primary_model_id": load_settings(CONFIG_PATH).model.primary_id,
         "fallback_configured": True,
         "transformers_4bit": True,
         "qlora_dry_run": True,

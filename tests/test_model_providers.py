@@ -254,8 +254,9 @@ def test_transformers_provider_loads_configured_model_id(
 ) -> None:
     loaded: dict[str, object] = {}
 
-    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+    def fake_processor_from_pretrained(model_id: str, **kwargs) -> FakeProcessor:
         loaded["processor_model_id"] = model_id
+        loaded["processor_kwargs"] = kwargs
         return FakeProcessor()
 
     def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
@@ -276,8 +277,12 @@ def test_transformers_provider_loads_configured_model_id(
     TransformersProvider(settings).generate("hello")
 
     assert loaded["processor_model_id"] == settings.model.primary_id
+    assert loaded["processor_kwargs"] == {
+        "revision": settings.model.processor_revision
+    }
     assert loaded["model_model_id"] == settings.model.primary_id
     assert "quantization_config" in loaded["model_kwargs"]
+    assert loaded["model_kwargs"]["revision"] == settings.model.revision
 
 
 def test_transformers_provider_uses_fallback_when_primary_load_fails(
@@ -285,7 +290,7 @@ def test_transformers_provider_uses_fallback_when_primary_load_fails(
 ) -> None:
     loaded_model_ids: list[str] = []
 
-    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+    def fake_processor_from_pretrained(model_id: str, **kwargs) -> FakeProcessor:
         return FakeProcessor()
 
     def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
@@ -320,7 +325,7 @@ def test_transformers_provider_uses_fallback_when_primary_generation_fails(
 ) -> None:
     loaded_model_ids: list[str] = []
 
-    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+    def fake_processor_from_pretrained(model_id: str, **kwargs) -> FakeProcessor:
         return FakeProcessor()
 
     def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
@@ -355,7 +360,7 @@ def test_transformers_provider_retries_primary_on_each_request_after_load_failur
     settings = load_settings(CONFIG_PATH)
     primary_attempts = 0
 
-    def fake_processor_from_pretrained(model_id: str) -> FakeProcessor:
+    def fake_processor_from_pretrained(model_id: str, **kwargs) -> FakeProcessor:
         return FakeProcessor()
 
     def fake_model_from_pretrained(model_id: str, **kwargs) -> FakeModel:
