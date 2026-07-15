@@ -780,6 +780,77 @@ def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> Non
     assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
 
+def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+
+    assert client.get("/api/values").status_code == 401
+    inspected = client.get("/api/values", headers=headers)
+    assert inspected.status_code == 200
+    assert {value["value_id"] for value in inspected.json()["values"]} == {
+        "care",
+        "honesty",
+    }
+
+    evaluated = client.post(
+        "/api/values/evaluate",
+        headers=headers,
+        json={
+            "options": {
+                "gentle": {"care": 1.0, "honesty": 0.5},
+                "blunt": {"care": -1.0, "honesty": 1.0},
+            }
+        },
+    )
+    assert evaluated.status_code == 200
+    assert evaluated.json()["options"][1]["conflicts"] == [
+        "compassionate-honesty"
+    ]
+    assert evaluated.json()["options"][0]["contributions"][0]["value_id"] == "care"
+
+    update = {
+        "proposal_id": "api-outcome-1",
+        "kind": "outcome",
+        "impacts": {"care": 1.0},
+        "certainty": 1.0,
+        "memory_ids": ["memory-api-1"],
+    }
+    updated = client.post("/api/values/updates", headers=headers, json=update)
+    assert updated.status_code == 200
+    record = updated.json()["updates"][0]
+    assert record["event_id"]
+    assert record["event_sequence"] > 0
+    assert record["memory_ids"] == ["memory-api-1"]
+    assert client.post(
+        "/api/values/updates", headers=headers, json=update
+    ).json() == {"updates": []}
+
+    frozen = client.post(
+        "/api/values/care/freeze", headers=headers, json={"frozen": True}
+    )
+    assert frozen.status_code == 200
+    assert frozen.json()["frozen"] is True
+    rejected = client.post(
+        "/api/values/updates",
+        headers=headers,
+        json={**update, "proposal_id": "api-outcome-2"},
+    )
+    assert rejected.json()["updates"][0]["operation"] == "rejected"
+
+    rolled_back = client.post(
+        "/api/values/care/rollback",
+        headers=headers,
+        json={"target_revision": 1},
+    )
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["frozen"] is False
+    reset = client.post(
+        "/api/values/reset", headers=headers, json={"value_ids": ["care"]}
+    )
+    assert reset.status_code == 200
+    assert reset.json()["values"][0]["weight"] == 0.8
+
+
 def _client(
     tmp_path: Path,
     *,

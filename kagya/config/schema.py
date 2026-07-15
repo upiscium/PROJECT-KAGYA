@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictBaseModel(BaseModel):
@@ -108,6 +108,43 @@ class WorkingMemorySettings(StrictBaseModel):
     token_capacity: int = Field(default=2048, gt=0)
 
 
+class ValueSeedSettings(StrictBaseModel):
+    value_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    weight: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    stability: float = Field(ge=0.0, le=1.0)
+    source: str = Field(default="config", min_length=1)
+    origin: str = Field(default="persona:default", min_length=1)
+    allowed_update_rate: float = Field(default=0.05, gt=0.0, le=1.0)
+
+
+class ValueConflictSettings(StrictBaseModel):
+    left_value_id: str = Field(min_length=1)
+    right_value_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
+class ValueSystemSettings(StrictBaseModel):
+    max_update_per_event: float = Field(default=0.05, gt=0.0, le=1.0)
+    max_total_update_per_event: float = Field(default=0.1, gt=0.0, le=1.0)
+    seeds: list[ValueSeedSettings] = Field(default_factory=list)
+    conflicts: list[ValueConflictSettings] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "ValueSystemSettings":
+        value_ids = [seed.value_id for seed in self.seeds]
+        if len(value_ids) != len(set(value_ids)):
+            raise ValueError("value seed IDs must be unique")
+        known = set(value_ids)
+        for conflict in self.conflicts:
+            if conflict.left_value_id not in known or conflict.right_value_id not in known:
+                raise ValueError("value conflict references unknown seed")
+            if conflict.left_value_id == conflict.right_value_id:
+                raise ValueError("value conflict must reference two values")
+        return self
+
+
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
@@ -134,5 +171,6 @@ class Settings(StrictBaseModel):
     tools: ToolRegistrySettings
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
+    values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
     api: ApiSettings
     frontend: FrontendSettings

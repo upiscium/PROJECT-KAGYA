@@ -49,6 +49,31 @@ working_memory:
   item_capacity: 32
   token_capacity: 2048
 
+values:
+  max_update_per_event: 0.05
+  max_total_update_per_event: 0.1
+  seeds:
+    - value_id: care
+      name: Care
+      weight: 0.8
+      confidence: 0.8
+      stability: 0.8
+      source: config
+      origin: persona:default
+      allowed_update_rate: 0.05
+    - value_id: honesty
+      name: Honesty
+      weight: 0.8
+      confidence: 0.8
+      stability: 0.85
+      source: config
+      origin: persona:default
+      allowed_update_rate: 0.04
+  conflicts:
+    - left_value_id: care
+      right_value_id: honesty
+      name: compassionate-honesty
+
 sleep:
   enabled: true
   dream_dataset_path: .kagya/dreams/dream_dataset.jsonl
