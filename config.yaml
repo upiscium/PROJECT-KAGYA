@@ -132,6 +132,11 @@ tools:
   path: .kagya/tool_registry.json
   audit_path: .kagya/tool_audit.jsonl
 
+agent_journal:
+  path: .kagya/agent_journal.jsonl
+  max_bytes: 10485760
+  retained_files: 3
+
 api:
   host: 127.0.0.1
   port: 8000

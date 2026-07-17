@@ -19,6 +19,7 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^evaluations$/ },
   { method: "GET", pattern: /^evaluations\/adapters\/[^/]+\/history$/ },
   { method: "GET", pattern: /^evaluations\/[^/]+\.json$/ },
+  { method: "GET", pattern: /^system\/(events|journal)$/ },
 ];
 
 export async function GET(request: NextRequest, context: RouteContext) {

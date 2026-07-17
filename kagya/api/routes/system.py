@@ -14,12 +14,15 @@ from kagya.api.dependencies import (
 from kagya.api.observability import RuntimeEvent, RuntimeEventLog
 from kagya.api.schemas.system import (
     BuildInfoSchema,
+    JournalRecordListResponse,
+    JournalRecordSchema,
     RuntimeEventListResponse,
     RuntimeEventSchema,
     RuntimeInfoSchema,
     SystemInfoResponse,
 )
 from kagya.config import Settings
+from kagya.runtime import EventJournal, JournalRecord
 from kagya.tools import ToolAuditEvent, ToolAuditLog
 
 
@@ -67,6 +70,23 @@ def runtime_events(
     return RuntimeEventListResponse(events=events[-limit:])
 
 
+@router.get(
+    "/journal",
+    response_model=JournalRecordListResponse,
+    dependencies=[Depends(require_admin)],
+)
+def event_journal(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=500),
+) -> JournalRecordListResponse:
+    """Return durable operator-safe event lifecycle records."""
+
+    journal: EventJournal = request.app.state.event_journal
+    return JournalRecordListResponse(
+        records=[journal_record_schema(record) for record in journal.recent(limit)]
+    )
+
+
 def _package_version() -> str:
     try:
         return version("project-kagya")
@@ -101,6 +121,27 @@ def event_schema(event: RuntimeEvent) -> RuntimeEventSchema:
         event_type=event.event_type,
         message=event.message,
         metadata=event.metadata,
+    )
+
+
+def journal_record_schema(record: JournalRecord) -> JournalRecordSchema:
+    return JournalRecordSchema(
+        record_id=record.record_id,
+        timestamp=record.timestamp.isoformat(),
+        lifecycle=record.lifecycle.value,
+        event_id=record.event_id,
+        event_type=record.event_type,
+        source=record.source,
+        processing_sequence=record.processing_sequence,
+        snapshot_sequence=record.snapshot_sequence,
+        causation_id=record.causation_id,
+        correlation_id=record.correlation_id,
+        state_hash_before=record.state_hash_before,
+        state_hash_after=record.state_hash_after,
+        snapshot_hash=record.snapshot_hash,
+        failure_category=record.failure_category,
+        previous_record_hash=record.previous_record_hash,
+        record_hash=record.record_hash,
     )
 
 

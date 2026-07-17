@@ -13,6 +13,13 @@ from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.runtime import (
+    AgentEventType,
+    AgentStateStore,
+    EventJournal,
+    JournalLifecycle,
+    hash_snapshot,
+)
 from kagya.tools import (
     ToolAuditEvent,
     ToolDefinition,
@@ -1306,6 +1313,84 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     assert "hidden_thought" not in json.dumps(inspected)
 
 
+def test_agent_event_journal_commits_snapshot_without_private_chat_data(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        denied = client.get("/api/system/journal")
+        assert denied.status_code == 401
+        response = client.post(
+            "/api/chat", json={"text": "private journal input", "attachments": []}
+        )
+        assert response.status_code == 200
+        inspected = client.get(
+            "/api/system/journal", headers=admin_headers()
+        )
+        assert inspected.status_code == 200
+        assert "private journal input" not in inspected.text
+        assert "debug thought" not in inspected.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    snapshot = AgentStateStore(settings.agent_state.path).load(1.0)
+    event_records = [
+        record for record in records if record.event_type == AgentEventType.CHAT.value
+    ]
+
+    assert [record.lifecycle for record in event_records] == [
+        JournalLifecycle.ACCEPTED,
+        JournalLifecycle.STARTED,
+        JournalLifecycle.PREPARED,
+        JournalLifecycle.COMPLETED,
+    ]
+    assert event_records[-1].snapshot_hash == hash_snapshot(snapshot)
+    serialized = settings.agent_journal.path.read_text(encoding="utf-8")
+    assert "private journal input" not in serialized
+    assert "debug thought" not in serialized
+
+
+def test_agent_event_journal_continues_sequence_across_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.post(
+            "/api/chat", json={"text": "first", "attachments": []}
+        ).status_code == 200
+    with _client(tmp_path, settings=settings) as restarted:
+        assert restarted.post(
+            "/api/chat", json={"text": "second", "attachments": []}
+        ).status_code == 200
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert [
+        record.processing_sequence
+        for record in records
+        if record.lifecycle == JournalLifecycle.STARTED
+    ] == [1, 2]
+
+
+def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.post(
+            "/api/chat", json={"text": "commit", "attachments": []}
+        ).status_code == 200
+    store = AgentStateStore(settings.agent_state.path)
+    snapshot = store.load(1.0)
+    store.save(
+        snapshot.model_copy(
+            update={
+                "emotion_state": snapshot.emotion_state.model_copy(
+                    update={"valence": 0.75}
+                )
+            }
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="hashes disagree"):
+        with _client(tmp_path, settings=settings):
+            pass
+
+
 def _client(
     tmp_path: Path,
     *,
@@ -1362,6 +1447,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
+            ),
+            "agent_journal": settings.agent_journal.model_copy(
+                update={"path": tmp_path / "agent_journal.jsonl"}
             ),
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}

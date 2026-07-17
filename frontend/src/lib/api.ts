@@ -57,6 +57,7 @@ export type EpisodeMemory = {
   source_event_id: string | null;
   source: string;
   processing_sequence: number | null;
+  snapshot_sequence: number | null;
   provider: string;
   model_id: string;
   model_revision: string;
@@ -187,6 +188,24 @@ export type RuntimeEvent = {
   metadata: Record<string, unknown>;
 };
 export type RuntimeEventListResponse = { events: RuntimeEvent[] };
+export type JournalRecord = {
+  record_id: string;
+  timestamp: string;
+  lifecycle: string;
+  event_id: string;
+  event_type: string;
+  source: string;
+  processing_sequence: number | null;
+  causation_id: string | null;
+  correlation_id: string | null;
+  state_hash_before: string | null;
+  state_hash_after: string | null;
+  snapshot_hash: string | null;
+  failure_category: string | null;
+  previous_record_hash: string | null;
+  record_hash: string;
+};
+export type JournalRecordListResponse = { records: JournalRecord[] };
 
 export class ApiError extends Error {
   constructor(
@@ -285,4 +304,5 @@ export const api = {
   evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
   systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
   runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),
+  eventJournal: () => adminRequest<JournalRecordListResponse>("/system/journal"),
 };

@@ -257,6 +257,12 @@ class AgentStateSettings(StrictBaseModel):
     path: Path = Path(".kagya/agent_state.json")
 
 
+class AgentJournalSettings(StrictBaseModel):
+    path: Path = Path(".kagya/agent_journal.jsonl")
+    max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    retained_files: int = Field(default=3, ge=1, le=100)
+
+
 class WorkingMemorySettings(StrictBaseModel):
     item_capacity: int = Field(default=32, gt=0)
     token_capacity: int = Field(default=2048, gt=0)
@@ -324,6 +330,7 @@ class Settings(StrictBaseModel):
     adapter_registry: AdapterRegistrySettings
     tools: ToolRegistrySettings
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
+    agent_journal: AgentJournalSettings = Field(default_factory=AgentJournalSettings)
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
     api: ApiSettings
@@ -381,4 +388,6 @@ class Settings(StrictBaseModel):
             raise ValueError(
                 "standalone deployment forbids remote worker and worker settings"
             )
+        if self.agent_state.path.resolve() == self.agent_journal.path.resolve():
+            raise ValueError("agent state and journal paths must be distinct")
         return self

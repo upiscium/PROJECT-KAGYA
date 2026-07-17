@@ -102,7 +102,7 @@ class ContextStateSnapshot(_StateModel):
 
 
 class AgentStateSnapshot(_StateModel):
-    schema_version: Literal[3] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[3] = 3
     saved_at: datetime
     last_processed_event_sequence: int = Field(ge=0)
     emotion_state: EmotionStateSnapshot
@@ -255,10 +255,10 @@ class AgentStateStore:
             ),
         )
 
-    def save_failed_sequence(self, sequence: int) -> None:
+    def save_failed_sequence(self, sequence: int) -> AgentStateSnapshot | None:
         if self.last_snapshot is None:
-            return
-        self.save(
+            return None
+        return self.save(
             self.last_snapshot.model_copy(
                 update={
                     "saved_at": datetime.now(UTC),

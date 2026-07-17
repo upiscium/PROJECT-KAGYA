@@ -7,9 +7,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 from threading import Lock, Thread
-from typing import Any, Callable, Generic, Protocol, TypeVar
+from typing import Any, Callable, cast, Generic, Protocol, TypeVar
 from uuid import uuid4
 
 
@@ -82,11 +82,26 @@ class EventRecorder(Protocol):
 
 
 class EventCompletionHook(Protocol):
-    def __call__(self, event: AgentEvent) -> None: ...
+    def __call__(self, event: AgentEvent) -> str | None: ...
 
 
 class EventFailureHook(Protocol):
-    def __call__(self, event: AgentEvent, exception: Exception) -> None: ...
+    def __call__(self, event: AgentEvent, exception: Exception) -> str | None: ...
+
+
+class DurableEventJournal(Protocol):
+    def accepted(self, event: AgentEvent) -> object: ...
+
+    def started(self, event: AgentEvent) -> object: ...
+
+    def completed(self, event: AgentEvent, snapshot_hash: str) -> object: ...
+
+    def failed(
+        self,
+        event: AgentEvent,
+        failure_category: str,
+        snapshot_hash: str | None,
+    ) -> object: ...
 
 
 class AgentRuntimeQueueFull(RuntimeError):
@@ -95,6 +110,10 @@ class AgentRuntimeQueueFull(RuntimeError):
 
 class AgentRuntimeStopped(RuntimeError):
     """Raised when an event is submitted after draining starts."""
+
+
+class AgentRuntimeJournalError(RuntimeError):
+    """Raised when durable event lifecycle persistence fails."""
 
 
 class AgentRuntime:
@@ -108,6 +127,7 @@ class AgentRuntime:
         initial_sequence: int = 0,
         completion_hook: EventCompletionHook | None = None,
         failure_hook: EventFailureHook | None = None,
+        event_journal: DurableEventJournal | None = None,
     ) -> None:
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be greater than zero")
@@ -117,6 +137,7 @@ class AgentRuntime:
         self._event_recorder = event_recorder
         self._completion_hook = completion_hook
         self._failure_hook = failure_hook
+        self._event_journal = event_journal
         self._state_lock = Lock()
         self._state = "created"
         self._sequence = initial_sequence
@@ -163,6 +184,17 @@ class AgentRuntime:
         with self._state_lock:
             if self._state != "accepting":
                 raise AgentRuntimeStopped("Agent runtime is draining or stopped")
+            if self._queue.full():
+                raise AgentRuntimeQueueFull("Agent event queue is full")
+            if self._event_journal is not None:
+                try:
+                    self._event_journal.accepted(event)
+                except Exception as exc:
+                    self._state = "failed"
+                    self._queue.put_nowait(_STOP)
+                    raise AgentRuntimeJournalError(
+                        "Agent event could not be durably accepted"
+                    ) from exc
             try:
                 self._queue.put_nowait(envelope)
             except Full as exc:
@@ -224,35 +256,80 @@ class AgentRuntime:
             try:
                 if item is _STOP:
                     return
-                envelope = item
+                envelope = cast(_Envelope[Any], item)
                 self._sequence += 1
                 event = replace(
                     envelope.event, processing_sequence=self._sequence
                 )
                 can_deliver = envelope.future.set_running_or_notify_cancel()
+                if self._event_journal is not None:
+                    try:
+                        self._event_journal.started(event)
+                    except Exception:
+                        self._fail_stop(
+                            envelope,
+                            AgentRuntimeJournalError(
+                                "Agent event start could not be journaled"
+                            ),
+                            can_deliver=can_deliver,
+                        )
+                        return
                 self._record(event, "started")
                 event_token = _current_event.set(event)
                 try:
                     value = envelope.handler()
                 except Exception as exc:
-                    if self._failure_hook is not None:
-                        try:
-                            self._failure_hook(event, exc)
-                        except Exception:
-                            pass
+                    try:
+                        snapshot_hash = (
+                            None
+                            if self._failure_hook is None
+                            else self._failure_hook(event, exc)
+                        )
+                        if self._event_journal is not None:
+                            self._event_journal.failed(
+                                event, type(exc).__name__, snapshot_hash
+                            )
+                    except Exception:
+                        self._fail_stop(
+                            envelope,
+                            AgentRuntimeJournalError(
+                                "Agent event failure could not be committed"
+                            ),
+                            can_deliver=can_deliver,
+                        )
+                        return
                     self._record(event, "failed", exception_type=type(exc).__name__)
                     if can_deliver:
                         envelope.future.set_exception(exc)
                 else:
                     try:
-                        if self._completion_hook is not None:
-                            self._completion_hook(event)
+                        snapshot_hash = (
+                            None
+                            if self._completion_hook is None
+                            else self._completion_hook(event)
+                        )
+                        if self._event_journal is not None:
+                            if snapshot_hash is None:
+                                raise RuntimeError(
+                                    "durable journal requires a committed snapshot hash"
+                                )
+                            self._event_journal.completed(event, snapshot_hash)
                     except Exception as exc:
                         self._record(
                             event, "failed", exception_type=type(exc).__name__
                         )
-                        if can_deliver:
-                            envelope.future.set_exception(exc)
+                        if self._event_journal is None:
+                            if can_deliver:
+                                envelope.future.set_exception(exc)
+                        else:
+                            self._fail_stop(
+                                envelope,
+                                AgentRuntimeJournalError(
+                                    "Agent event completion could not be committed"
+                                ),
+                                can_deliver=can_deliver,
+                            )
+                            return
                     else:
                         self._record(event, "completed")
                         if can_deliver:
@@ -261,6 +338,35 @@ class AgentRuntime:
                             )
                 finally:
                     _current_event.reset(event_token)
+            finally:
+                self._queue.task_done()
+
+    def _fail_stop(
+        self,
+        envelope: _Envelope[Any],
+        error: AgentRuntimeJournalError,
+        *,
+        can_deliver: bool,
+    ) -> None:
+        with self._state_lock:
+            self._state = "failed"
+        if can_deliver and not envelope.future.done():
+            envelope.future.set_exception(error)
+        while True:
+            try:
+                pending = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if pending is not _STOP:
+                    pending_envelope = cast(_Envelope[Any], pending)
+                    if pending_envelope.future.done():
+                        continue
+                    pending_envelope.future.set_exception(
+                        AgentRuntimeJournalError(
+                            "Agent runtime stopped after journal failure"
+                        )
+                    )
             finally:
                 self._queue.task_done()
 

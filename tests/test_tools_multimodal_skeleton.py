@@ -504,6 +504,9 @@ def _settings(tmp_path: Path) -> Settings:
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
             ),
+            "agent_journal": settings.agent_journal.model_copy(
+                update={"path": tmp_path / "agent_journal.jsonl"}
+            ),
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
             ),

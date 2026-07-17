@@ -30,11 +30,14 @@ from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentRuntime,
+    AgentEvent,
     AgentStateStore,
     EmotionTimer,
+    EventJournal,
     KagyaMainLoop,
     RemoteTrainingDispatcher,
     TrainingWorkerRuntime,
+    hash_snapshot,
 )
 
 
@@ -119,6 +122,13 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     snapshot = app.state.agent_state_store.load(
         settings.emotion.baseline_surprisal
     )
+    if getattr(app.state, "event_journal", None) is None:
+        app.state.event_journal = EventJournal(
+            settings.agent_journal.path,
+            max_bytes=settings.agent_journal.max_bytes,
+            retained_files=settings.agent_journal.retained_files,
+        )
+    app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
     embedding_model = getattr(app.state.memory_system.embedding_function, "_get_model", None)
@@ -175,16 +185,10 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
         app.state.agent_runtime = AgentRuntime(
             queue_capacity=settings.api.agent_queue_capacity,
             event_recorder=app.state.runtime_event_log,
+            event_journal=app.state.event_journal,
             initial_sequence=snapshot.last_processed_event_sequence,
-            completion_hook=lambda event: app.state.agent_state_store.save(
-                app.state.agent_state_store.capture(
-                    app.state.main_loop,
-                    _event_sequence(event.processing_sequence),
-                )
-            ),
-            failure_hook=lambda event, exc: app.state.agent_state_store.save_failed_sequence(
-                _event_sequence(event.processing_sequence)
-            ),
+            completion_hook=lambda event: _commit_subject_event(app, event),
+            failure_hook=lambda event, exc: _fail_subject_event(app, event),
         )
         app.state.agent_runtime.start()
     if settings.appraisal.timer_enabled and getattr(app.state, "emotion_timer", None) is None:
@@ -214,6 +218,37 @@ def _event_sequence(sequence: int | None) -> int:
     if sequence is None:
         raise RuntimeError("Agent event has no processing sequence")
     return sequence
+
+
+def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    store = app.state.agent_state_store
+    previous = store.last_snapshot
+    if previous is None:
+        raise RuntimeError("Agent state store has no previous snapshot")
+    candidate = store.capture(
+        app.state.main_loop, _event_sequence(event.processing_sequence)
+    )
+    before_hash = hash_snapshot(previous)
+    after_hash = hash_snapshot(candidate)
+    app.state.event_journal.prepared(
+        event,
+        state_hash_before=before_hash,
+        state_hash_after=after_hash,
+    )
+    saved = store.save(candidate)
+    return hash_snapshot(saved)
+
+
+def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    store = app.state.agent_state_store
+    previous = store.last_snapshot
+    if previous is None:
+        raise RuntimeError("Agent state store has no previous snapshot")
+    store.restore_into(app.state.main_loop, previous)
+    saved = store.save_failed_sequence(_event_sequence(event.processing_sequence))
+    if saved is None:
+        raise RuntimeError("Agent failure snapshot was not saved")
+    return hash_snapshot(saved)
 
 
 app = create_app()

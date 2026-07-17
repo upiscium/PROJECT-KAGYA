@@ -166,6 +166,7 @@ Distributed training operations are available through admin-token-protected endp
 - `POST /api/sleep/jobs/{job_id}/reconcile` and `POST /api/sleep/reconcile` rediscover remote state and report orphan jobs/results without duplicating submissions.
 - `POST /api/sleep/cleanup` applies `sleep.artifact_retention_days` to terminal bundle/result/work artifacts. Imported ACTIVE and rollback adapter directories are outside this cleanup boundary.
 - `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
+- `GET /api/system/journal` returns admin-only, operator-safe durable event lifecycle records and hash continuity metadata. It never returns event payloads, prompts, generated text, attachments, credentials, or hidden thoughts.
 
 ### Split Training Worker Runbook
 
@@ -394,6 +395,7 @@ Backups must include both runtime data and private environment files:
 - `.kagya/eval_results`: adapter evaluation outputs.
 - `.kagya/adapter_registry.json`: adapter lifecycle state.
 - `.kagya/agent_state.json`: versioned subject state and last processed event sequence.
+- `.kagya/agent_journal.jsonl*`: fsynced event lifecycle journal and retained hash-chain rotation files.
 - `/etc/project-kagya/*.env`: backend/frontend env files, including `KAGYA_ADMIN_TOKEN`.
 
 Create a restricted archive on the deployment host:
@@ -447,6 +449,7 @@ Use backups before pruning. `.kagya/` contains private memories, training data, 
 
 - Never prune `.kagya/chroma` with filesystem commands. Use future memory archive/tag tooling instead so DB1/DB2 invariants are preserved.
 - Never prune `.kagya/adapter_registry.json`; it is the source of adapter lifecycle truth.
+- Never prune `.kagya/agent_journal.jsonl*` with generic filesystem-age rules. Journal rotation and retention are controlled by `agent_journal.max_bytes` and `agent_journal.retained_files`.
 - Do not prune active, approved, trial, candidate, or rejected adapter directories. Only archived adapter artifact directories are eligible for manual pruning.
 - Preserve the immediate rollback target recorded for the ACTIVE adapter. If activation history is missing or unreadable, `private-prune.sh` protects every archived adapter rather than guessing.
 - Evaluation results under `.kagya/eval_results` and dream datasets under `.kagya/dreams` may be pruned after they are older than the operator-selected retention window and a backup exists.
