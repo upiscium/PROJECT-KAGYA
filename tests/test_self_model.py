@@ -177,6 +177,7 @@ def test_identity_conflict_stays_pending_then_applies_with_inertia() -> None:
     )
 
     assert resolved.status == ProposalStatus.APPLIED
+    assert resolved.identity_origin.endorsement.value == "endorsed"
     assert model.state.identity_summary == "A different identity"
     assert model.state.traits["cautious"] == pytest.approx(0.1)
     assert model.history[-1].evidence_refs == ("decision:one",)
@@ -222,6 +223,26 @@ def test_empty_snapshot_resets_self_model_state_and_history() -> None:
     assert model.state.capabilities == {}
     assert model.state.revision == 0
     assert model.history == []
+
+
+def test_legacy_identity_proposal_migrates_as_inherited_and_uncertain() -> None:
+    model = SelfModel()
+    model.propose_identity_revision(
+        proposed_summary=None,
+        proposed_traits={"careful": 0.5},
+        evidence_refs=(),
+        source="legacy",
+        proposal_id="legacy-proposal",
+    )
+    payload = model.to_json()
+    del payload["proposals"][0]["identity_origin"]
+
+    restored = SelfModel()
+    restored.restore(payload)
+
+    origin = restored.proposals["legacy-proposal"].identity_origin
+    assert origin.actor.value == "inherited"
+    assert origin.endorsement.value == "uncertain"
 
 
 def _resolved_decision(

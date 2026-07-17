@@ -1,6 +1,6 @@
 """Versioned decision records independent of free-form model reasoning."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
@@ -126,12 +126,13 @@ class DecisionRecord:
     adapter_id: str | None = None
     adapter_hash: str | None = None
     activation_sequence: int | None = None
-    schema_version: int = 3
+    identity_origin_refs: dict[str, str] = field(default_factory=dict)
+    schema_version: int = 4
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3}:
+        if self.schema_version not in {1, 2, 3, 4}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -182,6 +183,7 @@ class DecisionStore:
         adapter_id: str | None = None,
         adapter_hash: str | None = None,
         activation_sequence: int | None = None,
+        identity_origin_refs: dict[str, str] | None = None,
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -261,6 +263,7 @@ class DecisionStore:
             adapter_id=adapter_id,
             adapter_hash=adapter_hash,
             activation_sequence=activation_sequence,
+            identity_origin_refs=dict(identity_origin_refs or {}),
         )
         self.records[identifier] = record
         return record
@@ -534,6 +537,7 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data.setdefault("adapter_id", None)
     data.setdefault("adapter_hash", None)
     data.setdefault("activation_sequence", None)
+    data.setdefault("identity_origin_refs", {})
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)

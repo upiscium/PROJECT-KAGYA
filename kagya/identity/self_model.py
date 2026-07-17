@@ -8,6 +8,13 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from kagya.decision import ActionCandidate, DecisionRecord, DecisionStatus
+from kagya.identity.origin import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    identity_origin_from_json,
+    new_identity_origin,
+)
 
 
 class ProposalStatus(StrEnum):
@@ -85,6 +92,7 @@ class IdentityRevisionProposal:
     proposed_traits: dict[str, float]
     evidence_refs: tuple[str, ...]
     source: str
+    identity_origin: IdentityOrigin
     contradictions: tuple[str, ...]
     status: ProposalStatus
     created_at: str
@@ -351,6 +359,7 @@ class SelfModel:
         proposed_traits: dict[str, float],
         evidence_refs: tuple[str, ...],
         source: str,
+        identity_origin: IdentityOrigin | None = None,
         proposal_id: str | None = None,
     ) -> IdentityRevisionProposal:
         if proposed_summary is None and not proposed_traits:
@@ -382,6 +391,13 @@ class SelfModel:
             proposed_traits=dict(proposed_traits),
             evidence_refs=evidence_refs,
             source=source,
+            identity_origin=identity_origin
+            or new_identity_origin(
+                OriginActor.MODEL_INFERENCE,
+                OriginInputKind.SUGGESTION,
+                source_ref="self_model_proposal",
+                confidence=0.5,
+            ),
             contradictions=tuple(contradictions),
             status=ProposalStatus.PENDING,
             created_at=_now(),
@@ -434,6 +450,19 @@ class SelfModel:
         resolved = replace(
             proposal,
             status=ProposalStatus.APPLIED if apply else ProposalStatus.REJECTED,
+            identity_origin=(
+                proposal.identity_origin.endorse(
+                    "identity_revision_approved",
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                )
+                if apply
+                else proposal.identity_origin.reject(
+                    "identity_revision_rejected",
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                )
+            ),
             resolved_at=_now(),
         )
         self.proposals[proposal_id] = resolved
@@ -727,6 +756,9 @@ def _proposal_from_json(payload: dict[str, Any]) -> IdentityRevisionProposal:
     data["evidence_refs"] = tuple(data.get("evidence_refs", ()))
     data["contradictions"] = tuple(data.get("contradictions", ()))
     data["status"] = ProposalStatus(data["status"])
+    data["identity_origin"] = identity_origin_from_json(
+        data.get("identity_origin"), fallback_source="legacy_identity_proposal"
+    )
     return IdentityRevisionProposal(**data)
 
 

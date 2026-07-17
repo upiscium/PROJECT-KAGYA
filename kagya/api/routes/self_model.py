@@ -11,7 +11,12 @@ from kagya.api.dependencies import (
     get_main_loop,
     require_admin,
 )
-from kagya.identity import EpistemicUncertainty, KnownLimitation
+from kagya.identity import (
+    EpistemicUncertainty,
+    KnownLimitation,
+    OriginActor,
+    OriginInputKind,
+)
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -214,10 +219,12 @@ def propose_identity_revision(
                 proposed_summary=body.proposed_summary,
                 proposed_traits=body.proposed_traits,
                 evidence_refs=tuple(body.evidence_refs),
-                source=body.source,
+                source="operator_proposal",
+                origin_actor=OriginActor.OPERATOR,
+                origin_input_kind=OriginInputKind.SUGGESTION,
                 proposal_id=body.proposal_id,
             ),
-            payload={"proposal_id": body.proposal_id, "source": body.source},
+            payload={"proposal_id": body.proposal_id},
             correlation_id=body.proposal_id,
         ).value
     except ValueError as exc:

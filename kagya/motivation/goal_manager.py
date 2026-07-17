@@ -7,6 +7,16 @@ import math
 from typing import Any, Iterable
 from uuid import uuid4
 
+from kagya.identity import (
+    EndorsementStatus,
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    identity_origin_from_json,
+    legacy_identity_origin,
+    new_identity_origin,
+)
+
 
 class GoalType(StrEnum):
     INTRINSIC = "intrinsic"
@@ -66,6 +76,7 @@ class Goal:
     structured_target: dict[str, Any] | None
     origin_event_id: str | None
     origin_value_id: str | None
+    identity_origin: IdentityOrigin
     priority: float
     urgency: float
     expected_utility: float
@@ -79,7 +90,7 @@ class Goal:
     created_at: str
     updated_at: str
     transitions: tuple[GoalTransition, ...] = ()
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.goal_id or not self.description:
@@ -88,7 +99,7 @@ class Goal:
             value = getattr(self, name)
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be finite and between zero and one")
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError(f"Unsupported goal schema version: {self.schema_version}")
         if len(self.dependency_ids) != len(set(self.dependency_ids)):
             raise ValueError("Goal dependencies must be unique")
@@ -143,17 +154,18 @@ class Commitment:
     description: str
     origin_event_id: str | None
     related_goal_id: str
+    identity_origin: IdentityOrigin
     status: CommitmentStatus
     deadline: str | None
     created_at: str
     updated_at: str
     transitions: tuple[CommitmentTransition, ...] = ()
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.commitment_id or not self.description or not self.related_goal_id:
             raise ValueError("commitment identifiers and description must not be empty")
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError(
                 f"Unsupported commitment schema version: {self.schema_version}"
             )
@@ -173,6 +185,7 @@ class GoalManager:
         structured_target: dict[str, Any] | None = None,
         origin_event_id: str | None = None,
         origin_value_id: str | None = None,
+        identity_origin: IdentityOrigin | None = None,
         priority: float = 0.5,
         urgency: float = 0.5,
         expected_utility: float = 0.5,
@@ -203,6 +216,8 @@ class GoalManager:
             structured_target=structured_target,
             origin_event_id=origin_event_id,
             origin_value_id=origin_value_id,
+            identity_origin=identity_origin
+            or _default_goal_origin(goal_type, origin_event_id),
             priority=priority,
             urgency=urgency,
             expected_utility=expected_utility,
@@ -341,6 +356,20 @@ class GoalManager:
             event_id=event_id,
             event_sequence=event_sequence,
         )
+        activated = self.get(goal_id)
+        if activated.identity_origin.endorsement in {
+            EndorsementStatus.PENDING,
+            EndorsementStatus.UNCERTAIN,
+        }:
+            self.goals[goal_id] = replace(
+                activated,
+                identity_origin=activated.identity_origin.endorse(
+                    "goal_adoption",
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                ),
+                updated_at=_now(),
+            )
         return self._decision(
             action,
             self.get(goal_id),
@@ -543,18 +572,30 @@ class CommitmentStore:
         description: str,
         related_goal_id: str,
         origin_event_id: str | None = None,
+        identity_origin: IdentityOrigin | None = None,
         deadline: str | None = None,
         commitment_id: str | None = None,
     ) -> Commitment:
         identifier = commitment_id or str(uuid4())
         if identifier in self.commitments:
             raise ValueError(f"Commitment already exists: {identifier}")
+        resolved_origin = identity_origin or new_identity_origin(
+            OriginActor.SELF,
+            OriginInputKind.INTERNAL_STATE,
+            source_ref="commitment_store",
+        )
+        if resolved_origin.endorsement not in {
+            EndorsementStatus.ENDORSED,
+            EndorsementStatus.IMPOSED,
+        }:
+            raise ValueError("Commitment creation requires endorsed or imposed origin")
         now = _now()
         commitment = Commitment(
             commitment_id=identifier,
             description=description,
             origin_event_id=origin_event_id,
             related_goal_id=related_goal_id,
+            identity_origin=resolved_origin,
             status=CommitmentStatus.ACTIVE,
             deadline=deadline,
             created_at=now,
@@ -666,6 +707,7 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
             structured_target=None,
             origin_event_id=None,
             origin_value_id=None,
+            identity_origin=legacy_identity_origin("legacy_goal"),
             priority=0.5,
             urgency=0.5,
             expected_utility=0.5,
@@ -680,6 +722,10 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
             updated_at=now,
         )
     data = dict(payload)
+    data["schema_version"] = 2
+    data["identity_origin"] = identity_origin_from_json(
+        data.get("identity_origin"), fallback_source="legacy_goal"
+    )
     data["goal_type"] = GoalType(data["goal_type"])
     data["status"] = GoalStatus(data["status"])
     data["dependency_ids"] = tuple(data.get("dependency_ids", ()))
@@ -710,18 +756,42 @@ def _commitment_from_json(payload: dict[str, Any]) -> Commitment:
             description=description,
             origin_event_id=None,
             related_goal_id=f"legacy:{identifier}",
+            identity_origin=legacy_identity_origin("legacy_commitment"),
             status=CommitmentStatus.ACTIVE,
             deadline=None,
             created_at=now,
             updated_at=now,
         )
     data = dict(payload)
+    data["schema_version"] = 2
+    data["identity_origin"] = identity_origin_from_json(
+        data.get("identity_origin"), fallback_source="legacy_commitment"
+    )
     data["status"] = CommitmentStatus(data["status"])
     data["transitions"] = tuple(
         CommitmentTransition(**transition)
         for transition in data.get("transitions", ())
     )
     return Commitment(**data)
+
+
+def _default_goal_origin(
+    goal_type: GoalType, origin_event_id: str | None
+) -> IdentityOrigin:
+    if goal_type == GoalType.INTRINSIC:
+        return new_identity_origin(
+            OriginActor.SELF,
+            OriginInputKind.INTERNAL_STATE,
+            source_ref="goal_manager",
+            event_id=origin_event_id,
+        )
+    return new_identity_origin(
+        OriginActor.UNKNOWN,
+        OriginInputKind.REQUEST,
+        source_ref="goal_manager",
+        event_id=origin_event_id,
+        confidence=0.0,
+    )
 
 
 def _parse_deadline(value: str | None) -> datetime | None:

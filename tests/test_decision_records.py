@@ -47,7 +47,7 @@ def test_candidate_comparison_tracks_contributions_and_selects_best() -> None:
     assert record.adapter_id == "adapter-1"
     assert record.adapter_hash == "hash-1"
     assert record.activation_sequence == 7
-    assert record.schema_version == 3
+    assert record.schema_version == 4
 
 
 def test_no_op_defer_and_observation_are_regular_candidates() -> None:

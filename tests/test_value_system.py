@@ -11,6 +11,7 @@ from kagya.cognition import (
     ValueSystem,
     ValueUpdateKind,
 )
+from kagya.identity import OriginActor, OriginInputKind, new_identity_origin
 
 
 def test_updates_are_bounded_stable_and_idempotent() -> None:
@@ -121,10 +122,11 @@ def test_json_snapshot_preserves_update_evidence_and_history() -> None:
     restored.restore(serialized)
 
     assert restored.history[0].event_id == "event-2"
-    assert restored.history[0].memory_ids == ["memory-2"]
+    assert restored.history[0].memory_ids == ("memory-2",)
     assert restored.history[0].before["weight"] == 0.6
     assert restored.history[0].after["weight"] > 0.6
-    assert restored.get("care").schema_version == 1
+    assert restored.get("care").schema_version == 2
+    assert restored.history[0].identity_origin.actor.value == "inherited"
 
 
 def test_invalid_value_references_are_rejected() -> None:
@@ -132,6 +134,27 @@ def test_invalid_value_references_are_rejected() -> None:
 
     with pytest.raises(ValueError):
         system.evaluate({"option": {"missing": 1.0}})
+
+
+def test_external_request_cannot_directly_update_subject_values() -> None:
+    system = _system()
+    proposal = system.proposals_from_appraisal(
+        _appraisal(),
+        {"care": 1.0},
+        kind=ValueUpdateKind.OBSERVATION,
+        evidence=ValueEvidence(
+            identity_origin=new_identity_origin(
+                OriginActor.USER,
+                OriginInputKind.REQUEST,
+                source_ref="context:request",
+            )
+        ),
+        proposal_id="external-request",
+    )[0]
+
+    with pytest.raises(ValueError, match="cannot directly update"):
+        system.apply([proposal])
+    assert system.get("care").weight == 0.6
 
 
 def _system() -> ValueSystem:
