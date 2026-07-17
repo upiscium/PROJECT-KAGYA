@@ -21,7 +21,14 @@
             gnused
             nodejs_22
             openssl
+            stdenv.cc.cc.lib
+            zlib
           ];
+
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+            pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+          ] + ":/run/opengl-driver/lib";
 
           shellHook = ''
             # uvの仮想環境をプロジェクト直下の .venv に強制
