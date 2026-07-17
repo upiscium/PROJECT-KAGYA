@@ -84,6 +84,7 @@ sleep:
   max_episodes_per_cycle: 100
   job_registry_path: .kagya/training_jobs.json
   training_artifact_directory: .kagya/training_artifacts
+  artifact_retention_days: 30
 
 qlora:
   output_dir: .kagya/adapters

@@ -32,6 +32,7 @@ class SSHTrainingBackend:
         self._monotonic = monotonic
         self._contract = TrainingArtifactContract()
         self._jobs: dict[str, TrainingJob] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
         self._shutdown = Event()
 
     def submit(self, job: TrainingJob, bundle_path: Path) -> str:
@@ -50,6 +51,9 @@ class SSHTrainingBackend:
         self._run_checked(
             self._rsync_base()
             + [f"{bundle_path}/", f"{self._target()}:{remote_staging}/"]
+        )
+        self._metadata.setdefault(job.job_id, {})["transferred_bytes"] = _tree_size(
+            bundle_path
         )
         response = self._run_checked(
             self._ssh_base()
@@ -70,11 +74,18 @@ class SSHTrainingBackend:
         if remote_job_id != job.job_id:
             raise RuntimeError("remote worker returned a mismatched job ID")
         self._jobs[job.job_id] = job
+        self._metadata[job.job_id]["remote_last_contact"] = _now()
         return remote_job_id
 
     def inspect(self, job_id: str) -> TrainingJobStatus:
         payload = self._worker_command("status", job_id)
+        metadata = self._metadata.setdefault(job_id, {})
+        metadata["remote_last_contact"] = _now()
         status = str(payload.get("status", ""))
+        if status == "failed":
+            category, retryable = _remote_failure(str(payload.get("error", "")))
+            metadata["failure_category"] = category
+            metadata["retryable"] = retryable
         mapping = {
             "ready": TrainingJobStatus.DISPATCHED,
             "running": TrainingJobStatus.RUNNING,
@@ -150,11 +161,19 @@ class SSHTrainingBackend:
             expected_model_revision=job.base_model_revision,
             expected_parent_adapter_id=job.parent_adapter_id,
         )
+        metadata = self._metadata.setdefault(job_id, {})
+        metadata["transferred_bytes"] = metadata.get("transferred_bytes", 0) + _tree_size(
+            final_path
+        )
+        metadata["remote_last_contact"] = _now()
+        metadata["worker_node_id"] = manifest.worker_node_id
+        metadata["worker_hostname"] = manifest.worker_hostname
         if manifest.status != "succeeded" or manifest.candidate_adapter_id is None:
             raise RuntimeError("remote worker did not publish a successful result")
         metrics = json.loads(
             (final_path / manifest.training_metrics_path).read_text("utf-8")
         )
+        metadata["training_metrics"] = metrics
         bundle_path = Path(job.bundle_path or "")
         bundle = self._contract.validate_bundle(bundle_path)
         return QloraTrainingResult(
@@ -172,9 +191,48 @@ class SSHTrainingBackend:
     def attach(self, job: TrainingJob) -> None:
         _validate_identifier(job.job_id, "job ID")
         self._jobs[job.job_id] = job
+        self._metadata.setdefault(job.job_id, {})
 
     def shutdown(self) -> None:
         self._shutdown.set()
+
+    def node_status(self) -> dict[str, Any]:
+        try:
+            response = self._run_checked(
+                self._ssh_base() + [str(self.settings.command), "health"],
+                timeout=self.settings.connect_timeout_seconds,
+            )
+            payload = _json_output(response.stdout)
+            return {
+                **payload,
+                "reachable": True,
+                "last_contact": _now(),
+                "backend": "ssh",
+            }
+        except (RuntimeError, TimeoutError) as exc:
+            return {
+                "node_id": self.settings.node_id,
+                "hostname": self.settings.host,
+                "reachable": False,
+                "last_contact": None,
+                "backend": "ssh",
+                "error": str(exc),
+            }
+
+    def job_metadata(self, job_id: str) -> dict[str, Any]:
+        return dict(self._metadata.get(job_id, {}))
+
+    def cleanup(self, retention_days: int) -> dict[str, Any]:
+        response = self._run_checked(
+            self._ssh_base()
+            + [
+                str(self.settings.command),
+                "cleanup",
+                "--retention-days",
+                str(retention_days),
+            ]
+        )
+        return _json_output(response.stdout)
 
     def _worker_command(self, action: str, job_id: str) -> dict[str, Any]:
         _validate_identifier(job_id, "job ID")
@@ -183,7 +241,9 @@ class SSHTrainingBackend:
         )
         return _json_output(response.stdout)
 
-    def _run_checked(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run_checked(
+        self, argv: list[str], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
         last_error: subprocess.CalledProcessError | None = None
         for attempt in range(3):
             try:
@@ -192,7 +252,7 @@ class SSHTrainingBackend:
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=self.settings.job_timeout_seconds,
+                    timeout=timeout or self.settings.job_timeout_seconds,
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 last_error = (
@@ -262,3 +322,30 @@ def _validate_identifier(value: str, label: str) -> None:
         not (character.isalnum() or character in "._-") for character in value
     ):
         raise ValueError(f"{label} contains unsafe characters")
+
+
+def _tree_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
+
+
+def _remote_failure(error: str) -> tuple[str, bool]:
+    if "exited before completion" in error:
+        return "worker_process_lost", True
+    category = error.partition(":")[0]
+    if category in {"cuda_oom", "training_error"}:
+        return category, category == "cuda_oom"
+    if category in {
+        "non_finite_metrics",
+        "target_module_mismatch",
+        "chat_template_mismatch",
+        "dataset_version_mismatch",
+        "parent_adapter_unsupported",
+    }:
+        return category, False
+    return "remote_training_failed", False

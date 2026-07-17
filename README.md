@@ -156,6 +156,14 @@ Training flow for real adapters:
 
 For the manual RTX 3090 integration check, pin `model.revision` and `model.processor_revision` to immutable commits on both nodes, set `model.provider: transformers` and `qlora.dry_run: false`, run the production preflight, then submit a short `dream-v2`/`gemma-v1` bundle through `kagya-worker run`. Preserve the resulting `result.json`, `training_metrics.json`, checksums, GPU name, CUDA/package versions, peak VRAM observation, and a successful adapter-load generation as the execution record. This hardware check is intentionally opt-in and is not run in CI.
 
+Distributed training operations are available through admin-token-protected endpoints:
+
+- `GET /api/training/nodes` reports worker reachability, heartbeat, revisions, capacity, and GPU environment.
+- `GET /api/sleep/jobs/{job_id}` includes phase durations, transfer bytes, last contact, failure category, retryability, metrics, and import status.
+- `POST /api/sleep/jobs/{job_id}/reconcile` and `POST /api/sleep/reconcile` rediscover remote state and report orphan jobs/results without duplicating submissions.
+- `POST /api/sleep/cleanup` applies `sleep.artifact_retention_days` to terminal bundle/result/work artifacts. Imported ACTIVE and rollback adapter directories are outside this cleanup boundary.
+- `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
+
 ## Configuration Field Status
 
 Most `config.yaml` fields are active runtime settings. The fields below are intentionally retained but have limited or future-facing behavior:

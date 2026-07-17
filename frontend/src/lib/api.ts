@@ -151,6 +151,20 @@ export type TrainingJob = {
   updated_at: string;
   error: string | null;
   retry_count: number;
+  phase_started_at: string | null;
+  phase_durations_seconds: Record<string, number>;
+  transferred_bytes: number;
+  remote_last_contact: string | null;
+  worker_node_id: string | null;
+  worker_hostname: string | null;
+  failure_category: string | null;
+  retryable: boolean | null;
+  import_status: string;
+  correlation_id: string | null;
+  processor_revision: string | null;
+  training_metrics: Record<string, unknown>;
+  total_duration_seconds: number;
+  stale: boolean;
 };
 export type TrainingJobListResponse = { jobs: TrainingJob[] };
 export type BuildInfo = { version: string; commit: string | null };
@@ -255,6 +269,9 @@ export const api = {
   sleepJobs: () => adminRequest<TrainingJobListResponse>("/sleep/jobs"),
   cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
   retrySleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
+  reconcileSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/reconcile`, { method: "POST" }),
+  reconcileSleepJobs: () => adminRequest<{ jobs: TrainingJob[]; orphan_result_job_ids: string[]; orphan_remote_job_ids: string[] }>("/sleep/reconcile", { method: "POST" }),
+  cleanupSleepArtifacts: () => adminRequest<{ removed: string[]; remote_removed: string[]; retention_days: number }>("/sleep/cleanup", { method: "POST" }),
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
   adapterRuntime: () => adminRequest<AdapterRuntimeState>("/adapters/runtime"),
   evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),

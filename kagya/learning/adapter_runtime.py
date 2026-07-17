@@ -188,6 +188,15 @@ class AdapterRuntimeManager:
             raise RuntimeError("runtime provider and ACTIVE adapter registry disagree")
         return state
 
+    def history(self, adapter_id: str | None = None) -> list[AdapterActivationRecord]:
+        return [
+            record
+            for record in self._records()
+            if adapter_id is None
+            or record.adapter_id == adapter_id
+            or record.previous_adapter_id == adapter_id
+        ]
+
     def _rollback_target(self, current_adapter_id: str | None) -> str | None:
         records = self._records()
         for record in reversed(records):

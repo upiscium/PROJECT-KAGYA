@@ -25,6 +25,12 @@ describe("SleepClient", () => {
       parent_adapter_id: null, source_event_sequence_start: 0, source_event_sequence_end: 0,
       backend: "local", remote_job_id: null, candidate_adapter_id: null,
       selected_episode_ids: [], semantic_memory_ids: [], created_at: "now", updated_at: "now", error: null, retry_count: 0,
+      phase_started_at: "now", phase_durations_seconds: {}, transferred_bytes: 0,
+      remote_last_contact: null, worker_node_id: null, worker_hostname: null,
+      failure_category: null, retryable: null, import_status: "completed", correlation_id: "request-1",
+      processor_revision: "processor-revision", training_metrics: {},
+      total_duration_seconds: 0,
+      stale: false,
     };
     fetchMock.mockResolvedValueOnce({
       ok: true,

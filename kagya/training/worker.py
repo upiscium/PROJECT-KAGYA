@@ -131,6 +131,10 @@ class WorkerJobStore:
             except KeyError as exc:
                 raise ValueError(f"Unknown worker job: {job_id}") from exc
 
+    def list(self) -> list[WorkerJob]:
+        with self._locked_jobs() as jobs:
+            return sorted(jobs.values(), key=lambda item: item.created_at)
+
     def update(self, job_id: str, **changes: Any) -> WorkerJob:
         _validate_identifier(job_id, "job ID")
         with self._locked_jobs() as jobs:
@@ -397,6 +401,70 @@ class TrainingWorkerService:
                 pass
         return cancelled
 
+    def health(self) -> dict[str, Any]:
+        jobs = self.store.list()
+        gpu: dict[str, Any] = {
+            "available": False,
+            "devices": [],
+            "cuda": None,
+            "torch": None,
+        }
+        try:
+            import torch
+
+            gpu = {
+                "available": bool(torch.cuda.is_available()),
+                "devices": [
+                    torch.cuda.get_device_name(index)
+                    for index in range(torch.cuda.device_count())
+                ],
+                "cuda": torch.version.cuda,
+                "torch": torch.__version__,
+                "driver": (
+                    getattr(torch._C, "_cuda_getDriverVersion", lambda: None)()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+            }
+        except (ImportError, RuntimeError):
+            pass
+        return {
+            "node_id": self.settings.deployment.node.id,
+            "hostname": os.uname().nodename,
+            "heartbeat": _now(),
+            "model_id": self.settings.model.primary_id,
+            "model_revision": self.settings.model.revision,
+            "processor_revision": self.settings.model.processor_revision,
+            "max_concurrent_jobs": self.worker.max_concurrent_jobs,
+            "active_jobs": sum(
+                job.status in {WorkerJobStatus.READY, WorkerJobStatus.RUNNING}
+                for job in jobs
+            ),
+            "jobs": [
+                {"job_id": job.job_id, "status": job.status.value}
+                for job in jobs
+            ],
+            "gpu": gpu,
+        }
+
+    def cleanup(self, retention_days: int) -> dict[str, Any]:
+        if retention_days < 1:
+            raise ValueError("retention_days must be greater than zero")
+        cutoff = datetime.now(UTC).timestamp() - retention_days * 86400
+        removed: list[str] = []
+        for job in self.store.list():
+            if job.status not in WORKER_TERMINAL_STATUSES:
+                continue
+            if job.status == WorkerJobStatus.FAILED and self.worker.retain_failed_jobs:
+                continue
+            if datetime.fromisoformat(job.updated_at).timestamp() >= cutoff:
+                continue
+            for path in (Path(job.bundle_path), Path(job.work_path), Path(job.result_path)):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                    removed.append(str(path))
+        return {"removed": removed, "retention_days": retention_days}
+
     def _finalize_failure(self, job: WorkerJob, manifest, error: str) -> None:
         result_path = Path(job.result_path)
         if result_path.exists():
@@ -413,7 +481,7 @@ class TrainingWorkerService:
                 base_model_id=manifest.base_model_id,
                 base_model_revision=manifest.base_model_revision,
                 parent_adapter_id=manifest.parent_adapter_id,
-                failure_category="training_error",
+                failure_category=_failure_category(error),
                 error=error,
             ),
             training_metrics={},
@@ -440,3 +508,17 @@ def _pid_exists(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _failure_category(error: str) -> str:
+    category = error.partition(":")[0]
+    if category in {
+        "cuda_oom",
+        "non_finite_metrics",
+        "target_module_mismatch",
+        "chat_template_mismatch",
+        "dataset_version_mismatch",
+        "parent_adapter_unsupported",
+    }:
+        return category
+    return "training_error"
