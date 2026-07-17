@@ -6,6 +6,7 @@ import pytest
 from kagya.runtime import (
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeJournalError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     EmotionTimer,
@@ -39,6 +40,35 @@ class RecordingEventLog:
 class FailingEventLog:
     def record(self, **kwargs: object) -> object:
         raise RuntimeError("logger unavailable")
+
+
+class RecordingJournal:
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.fail_on = fail_on
+        self.lifecycle: list[str] = []
+
+    def accepted(self, event: object) -> object:
+        return self._record("accepted")
+
+    def started(self, event: object) -> object:
+        return self._record("started")
+
+    def completed(self, event: object, snapshot_hash: str) -> object:
+        return self._record("completed")
+
+    def failed(
+        self,
+        event: object,
+        failure_category: str,
+        snapshot_hash: str | None,
+    ) -> object:
+        return self._record("failed")
+
+    def _record(self, lifecycle: str) -> object:
+        if lifecycle == self.fail_on:
+            raise OSError(f"{lifecycle} unavailable")
+        self.lifecycle.append(lifecycle)
+        return object()
 
 
 def test_events_run_in_acceptance_order_with_monotonic_sequences() -> None:
@@ -220,6 +250,95 @@ def test_event_log_failure_does_not_stop_processing() -> None:
     assert outcome.value == "completed"
     assert runtime.is_alive is True
     runtime.shutdown()
+
+
+def test_durable_journal_records_acceptance_before_execution() -> None:
+    journal = RecordingJournal()
+    runtime = AgentRuntime(
+        queue_capacity=1,
+        event_journal=journal,
+        completion_hook=lambda event: "a" * 64,
+    )
+    runtime.start()
+
+    outcome = runtime.execute(
+        AgentEventType.CHAT, source="test", handler=lambda: "completed"
+    )
+    runtime.shutdown()
+
+    assert outcome.value == "completed"
+    assert journal.lifecycle == ["accepted", "started", "completed"]
+
+
+def test_durable_accept_failure_rejects_event_without_running_handler() -> None:
+    journal = RecordingJournal(fail_on="accepted")
+    runtime = AgentRuntime(queue_capacity=1, event_journal=journal)
+    runtime.start()
+    ran = Event()
+
+    with pytest.raises(AgentRuntimeJournalError, match="durably accepted"):
+        runtime.submit(
+            AgentEventType.CHAT, source="test", handler=lambda: ran.set()
+        )
+    runtime.shutdown()
+
+    assert ran.is_set() is False
+
+
+def test_durable_completion_failure_fails_stops_runtime() -> None:
+    journal = RecordingJournal(fail_on="completed")
+    runtime = AgentRuntime(
+        queue_capacity=1,
+        event_journal=journal,
+        completion_hook=lambda event: "a" * 64,
+    )
+    runtime.start()
+
+    future = runtime.submit(
+        AgentEventType.CHAT, source="test", handler=lambda: "mutated"
+    )
+
+    with pytest.raises(AgentRuntimeJournalError, match="completion"):
+        future.result(timeout=1)
+    assert runtime.is_accepting is False
+    with pytest.raises(AgentRuntimeStopped):
+        runtime.submit(
+            AgentEventType.CHAT, source="test", handler=lambda: "rejected"
+        )
+    runtime.shutdown()
+
+
+def test_handler_failure_is_durably_recorded_and_runtime_continues() -> None:
+    journal = RecordingJournal()
+    runtime = AgentRuntime(
+        queue_capacity=2,
+        event_journal=journal,
+        completion_hook=lambda event: "a" * 64,
+        failure_hook=lambda event, exc: "b" * 64,
+    )
+    runtime.start()
+
+    failed = runtime.submit(
+        AgentEventType.CHAT,
+        source="test",
+        handler=lambda: _raise(ValueError("expected")),
+    )
+    succeeded = runtime.submit(
+        AgentEventType.CHAT, source="test", handler=lambda: "next"
+    )
+
+    with pytest.raises(ValueError, match="expected"):
+        failed.result(timeout=1)
+    assert succeeded.result(timeout=1).value == "next"
+    runtime.shutdown()
+    assert journal.lifecycle == [
+        "accepted",
+        "accepted",
+        "started",
+        "failed",
+        "started",
+        "completed",
+    ]
 
 
 def test_restored_sequence_and_completion_hook_define_commit_boundary() -> None:

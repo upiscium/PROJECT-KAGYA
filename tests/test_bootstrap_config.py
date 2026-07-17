@@ -42,6 +42,19 @@ def test_model_ids_come_from_config() -> None:
     assert settings.model.revision == raw_config["model"]["revision"]
 
 
+def test_agent_state_and_journal_paths_must_be_distinct() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["agent_state"] = {"path": ".kagya/shared-state"}
+    raw["agent_journal"] = {
+        "path": ".kagya/shared-state",
+        "max_bytes": 1024,
+        "retained_files": 2,
+    }
+
+    with pytest.raises(ValidationError, match="must be distinct"):
+        Settings.model_validate(raw)
+
+
 def test_legacy_config_migrates_explicitly_to_standalone(tmp_path: Path) -> None:
     raw = read_raw_config()
     del raw["deployment"]

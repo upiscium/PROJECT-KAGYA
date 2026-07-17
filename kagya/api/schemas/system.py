@@ -36,3 +36,26 @@ class RuntimeEventSchema(BaseModel):
 
 class RuntimeEventListResponse(BaseModel):
     events: list[RuntimeEventSchema]
+
+
+class JournalRecordSchema(BaseModel):
+    record_id: str
+    timestamp: str
+    lifecycle: str
+    event_id: str
+    event_type: str
+    source: str
+    processing_sequence: int | None
+    snapshot_sequence: int | None
+    causation_id: str | None
+    correlation_id: str | None
+    state_hash_before: str | None
+    state_hash_after: str | None
+    snapshot_hash: str | None
+    failure_category: str | None
+    previous_record_hash: str | None
+    record_hash: str
+
+
+class JournalRecordListResponse(BaseModel):
+    records: list[JournalRecordSchema]

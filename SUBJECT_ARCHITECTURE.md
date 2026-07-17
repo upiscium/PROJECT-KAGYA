@@ -6,6 +6,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 
 - `AgentRuntime` is the process-local ordering authority. API handlers submit typed events and do not mutate subject state from request threads.
 - `AgentStateStore` is the persistence authority for internal state. It writes atomic, fsynced snapshots after accepted events.
+- `EventJournal` is the durable audit and recovery-classification authority for event lifecycles. It records only allowlisted identifiers, sequence, lifecycle, and state hashes; it is not an event-sourced copy of private prompts or arbitrary handler inputs.
 - `KagyaMainLoop` coordinates subsystem inputs and outputs. It is not an alternative state store.
 - The inference host is the authoritative subject in both standalone and future split deployments. Training workers must consume immutable artifacts and cannot mutate memory, emotion, values, goals, decisions, self-model state, or adapter activation directly.
 - Free-form hidden thoughts are not decision authority, capability evidence, or a training target. Public responses, agent-state snapshots, DecisionRecords, and new training datasets exclude them; legacy/internal episodic metadata remains behind the admin and retrieval privacy boundaries.
@@ -15,6 +16,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Layer | Responsibility | Persistent location | Accepted update evidence | Main regression tests |
 | --- | --- | --- | --- | --- |
 | Event runtime | Assign one causal processing sequence and serialize mutations | `last_processed_event_sequence` in `.kagya/agent_state.json` | Accepted `AgentEvent` | `tests/test_agent_runtime.py` |
+| Event journal | Persist accepted/started/prepared/terminal lifecycle and snapshot hash continuity | `.kagya/agent_journal.jsonl*` | Fsynced operator-safe lifecycle records | `tests/test_event_journal.py` |
 | Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
 | Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
 | Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
@@ -36,6 +38,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 6. A later event appends the actual outcome and prediction error to the same `DecisionRecord`.
 7. Only resolved records whose selected action declared the relevant capability can update capability confidence. Identity claims become reviewable proposals rather than immediate state changes.
 8. The completion hook atomically snapshots the resulting subject state.
+9. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
 
 ## Versioning And Migration
 
@@ -51,6 +54,8 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
 - Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.
+- Journal schema has no event payload field. Corrupt records, hash-chain breaks, sequence gaps, and snapshot hash mismatches fail closed at startup.
+- Redacted Journal records support audit and crash classification. Deterministic authoritative state replay requires separately versioned private transition commands or state patches and is not performed by arbitrary handler replay.
 
 ## Verification
 
