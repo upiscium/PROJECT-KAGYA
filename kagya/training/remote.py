@@ -166,6 +166,7 @@ class SSHTrainingBackend:
             training_records=int(
                 metrics.get("training_records", bundle.dataset_record_count)
             ),
+            artifact_path=final_path,
         )
 
     def attach(self, job: TrainingJob) -> None:

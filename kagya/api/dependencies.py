@@ -33,6 +33,7 @@ from kagya.training import (
     MemoryConsolidator,
     SleepCoordinator,
     SSHTrainingBackend,
+    CandidateArtifactImporter,
     TrainingBundleBuilder,
     TrainingJobRegistry,
 )
@@ -281,6 +282,13 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
                     source=source,
                     handler=handler,
                 ).value,
+                candidate_importer=(
+                    CandidateArtifactImporter(
+                        settings, get_adapter_registry(request)
+                    )
+                    if settings.deployment.training.backend == TrainingBackendType.SSH
+                    else None
+                ),
             )
             request.app.state.sleep_coordinator = coordinator
     return coordinator

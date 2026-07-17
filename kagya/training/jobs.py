@@ -390,6 +390,7 @@ class SleepCoordinator:
         backend: TrainingBackend,
         adapter_registry: AdapterRegistry,
         subject_executor: Callable[[str, Callable[[], Any]], Any] | None = None,
+        candidate_importer: Any | None = None,
     ) -> None:
         self.settings = settings
         self.consolidator = consolidator
@@ -398,6 +399,7 @@ class SleepCoordinator:
         self.backend = backend
         self.adapter_registry = adapter_registry
         self.subject_executor = subject_executor or (lambda _source, handler: handler())
+        self.candidate_importer = candidate_importer
         self._threads: dict[str, Thread] = {}
         self._cancel: dict[str, Event] = {}
         for job in self.registry.list():
@@ -604,6 +606,14 @@ class SleepCoordinator:
         attempt_id: str,
         result: QloraTrainingResult,
     ):
+        if result.artifact_path is not None:
+            if self.candidate_importer is None:
+                raise RuntimeError("remote training result requires candidate importer")
+            entry = self.candidate_importer.import_result(
+                result.artifact_path, result.dataset_path.parent
+            )
+            self.consolidator.complete(preparation, attempt_id)
+            return entry
         entry = self.adapter_registry.lookup(result.adapter_id)
         if entry is None:
             entry = self.adapter_registry.register_candidate(

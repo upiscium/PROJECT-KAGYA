@@ -29,6 +29,7 @@ class QloraTrainingResult:
     dataset_hash: str
     dry_run: bool
     training_records: int
+    artifact_path: Path | None = None
 
 
 class QloraTrainer:
