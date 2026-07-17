@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from kagya.api.routes import (
     adapters,
+    beliefs,
     chat,
     contexts,
     debug,
@@ -83,6 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(decisions.router)
         app.include_router(self_model.router)
         app.include_router(experiences.router)
+        app.include_router(beliefs.router)
 
     return app
 

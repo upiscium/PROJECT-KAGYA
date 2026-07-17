@@ -44,6 +44,8 @@ class AgentEventType(StrEnum):
     SELF_MODEL_UPDATE = "self_model_update"
     EXPERIENCE_READ = "experience_read"
     EXPERIENCE_UPDATE = "experience_update"
+    BELIEF_READ = "belief_read"
+    BELIEF_UPDATE = "belief_update"
 
 
 @dataclass(frozen=True)

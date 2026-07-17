@@ -245,9 +245,11 @@ class AgentStateStore:
         main_loop.restore_decision_state()
         main_loop.restore_self_model_state()
         main_loop.restore_experience_state()
+        main_loop.restore_belief_state()
         main_loop.working_memory.restore(
             [_working_memory_item_from_snapshot(item) for item in snapshot.working_memory.items]
         )
+        main_loop._sync_belief_working_memory(None)
         main_loop.context_registry.restore(
             tuple(_context_frame_from_snapshot(item) for item in snapshot.context_state.frames),
             tuple(

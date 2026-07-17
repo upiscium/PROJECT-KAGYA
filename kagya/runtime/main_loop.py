@@ -6,6 +6,13 @@ from typing import Any
 from uuid import uuid4
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from kagya.belief import (
+    BeliefEvidence,
+    BeliefRecord,
+    BeliefStore,
+    EpistemicStatus,
+    Proposition,
+)
 from kagya.cognition import (
     ActionScore,
     AppraisalResult,
@@ -195,6 +202,7 @@ class KagyaMainLoop:
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
+        self.belief_store = BeliefStore()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
@@ -202,6 +210,7 @@ class KagyaMainLoop:
         self.restore_decision_state()
         self.restore_self_model_state()
         self.restore_experience_state()
+        self.restore_belief_state()
 
     def chat(
         self,
@@ -232,6 +241,7 @@ class KagyaMainLoop:
         previous_emotion_state = self.emotion_engine.state
         try:
             self.working_memory.advance()
+            self._sync_belief_working_memory(current_context.context_id)
 
             def compatibility(source_id: str | None) -> tuple[float, str]:
                 return self.context_registry.compatibility(source_id, current_context)
@@ -508,6 +518,144 @@ class KagyaMainLoop:
 
     def list_experiences(self) -> list[ExperienceRecord]:
         return self.experience_store.list_records()
+
+    def restore_belief_state(self) -> None:
+        self.belief_store.restore(self.persistent_state.extensions.get("beliefs"))
+        self._persist_belief_state()
+
+    def _persist_belief_state(self) -> None:
+        self.persistent_state.extensions["beliefs"] = self.belief_store.to_json()
+
+    def propose_belief_from_experience(
+        self,
+        experience_id: str,
+        *,
+        proposition: Proposition,
+        source_trust: float,
+        confidence: float,
+        context_scope: tuple[str, ...] = (),
+        valid_from: str | None = None,
+        valid_until: str | None = None,
+        belief_id: str | None = None,
+    ) -> BeliefRecord:
+        experience = self.experience_store.get(experience_id)
+        record = self.belief_store.propose(
+            proposition,
+            identity_origin=experience.identity_origin,
+            evidence=(
+                BeliefEvidence(
+                    reference=f"experience:{experience_id}",
+                    evidence_type="external_claim",
+                    source_trust=source_trust,
+                    observed_at=experience.created_at,
+                ),
+            ),
+            confidence=confidence,
+            context_scope=context_scope,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            belief_id=belief_id,
+        )
+        self.link_experience_result(
+            experience_id,
+            kind="belief",
+            reference=f"belief:{record.belief_id}",
+            evidence_refs=(f"experience:{experience_id}",),
+        )
+        self._persist_belief_state()
+        self._sync_belief_working_memory(None)
+        return record
+
+    def resolve_belief(
+        self,
+        belief_id: str,
+        *,
+        accept: bool,
+        confidence: float,
+        epistemic_status: EpistemicStatus,
+        reason_code: str,
+        evidence_refs: tuple[str, ...],
+    ) -> BeliefRecord:
+        event = current_agent_event()
+        record = self.belief_store.resolve(
+            belief_id,
+            accept=accept,
+            confidence=confidence,
+            epistemic_status=epistemic_status,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_belief_state()
+        self._sync_belief_working_memory(None)
+        return record
+
+    def retract_belief(
+        self, belief_id: str, *, reason_code: str, evidence_refs: tuple[str, ...]
+    ) -> BeliefRecord:
+        event = current_agent_event()
+        record = self.belief_store.retract(
+            belief_id,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_belief_state()
+        self._sync_belief_working_memory(None)
+        return record
+
+    def supersede_belief(
+        self,
+        old_belief_id: str,
+        new_belief_id: str,
+        *,
+        reason_code: str,
+        evidence_refs: tuple[str, ...],
+    ) -> tuple[BeliefRecord, BeliefRecord]:
+        event = current_agent_event()
+        records = self.belief_store.supersede(
+            old_belief_id,
+            new_belief_id,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_belief_state()
+        self._sync_belief_working_memory(None)
+        return records
+
+    def expire_beliefs(self) -> list[BeliefRecord]:
+        records = self.belief_store.expire()
+        self._persist_belief_state()
+        self._sync_belief_working_memory(None)
+        return records
+
+    def list_beliefs(self) -> list[BeliefRecord]:
+        return self.belief_store.list_records()
+
+    def _sync_belief_working_memory(self, context_id: str | None) -> None:
+        for item in tuple(self.working_memory.items):
+            if item.kind == WorkingMemoryKind.BELIEF:
+                self.working_memory.forget(item.item_id)
+        for belief in self.belief_store.active(context_id=context_id):
+            self.working_memory.admit(
+                working_memory_item(
+                    item_id=f"belief:{belief.belief_id}",
+                    kind=WorkingMemoryKind.BELIEF,
+                    content=(
+                        f"Adopted belief ({belief.epistemic_status.value}, "
+                        f"confidence={belief.confidence:.3f}): "
+                        f"{belief.proposition.normalized}"
+                    ),
+                    activation=0.8,
+                    salience=belief.confidence,
+                    retention_reason=RetentionReason.ESTABLISHED_BELIEF,
+                    source="runtime.belief_store",
+                )
+            )
 
     def reassess_experience(
         self,
@@ -1007,6 +1155,7 @@ class KagyaMainLoop:
             if context_id is None
             else self.experience_store.latest_for_context(context_id)
         )
+        active_beliefs = self.belief_store.active(context_id=context_id)
         record = self.decision_store.create(
             candidates,
             triggering_event_id=None if event is None else event.event_id,
@@ -1040,12 +1189,19 @@ class KagyaMainLoop:
                     for value in self.value_system.list_values()
                     if value.origin_provenance is not None
                 },
+                **{
+                    f"belief:{belief.belief_id}": belief.identity_origin.origin_id
+                    for belief in active_beliefs
+                },
             },
             experience_refs=(
                 ()
                 if source_experience is None
                 else (source_experience.experience_id,)
             ),
+            belief_revision_refs={
+                belief.belief_id: belief.revision for belief in active_beliefs
+            },
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"
@@ -1434,7 +1590,10 @@ class KagyaMainLoop:
                 or record.lifecycle_status != MemoryLifecycleStatus.ACTIVE
             ):
                 return None
-            return f"User: {record.user_input} | Assistant: {record.response}"
+            return (
+                "Past recorded interaction (not a current fact): "
+                f"User: {record.user_input} | Assistant: {record.response}"
+            )
         if item.reference.startswith("semantic:"):
             record = self.memory_system.get_semantic(item.reference.removeprefix("semantic:"))
             if (
@@ -1444,7 +1603,7 @@ class KagyaMainLoop:
                 != "published"
             ):
                 return None
-            return record.text
+            return f"Stored semantic record (not an adopted belief): {record.text}"
         return None
 
 

@@ -240,6 +240,25 @@ export type Experience = {
   schema_version: number;
 };
 export type ExperienceListResponse = { experiences: Experience[] };
+export type Belief = {
+  belief_id: string;
+  proposition: { normalized: string; subject: string | null; predicate: string | null; object: string | null };
+  confidence: number;
+  epistemic_status: string;
+  lifecycle: string;
+  identity_origin: Record<string, unknown>;
+  evidence: Array<Record<string, unknown>>;
+  context_scope: string[];
+  valid_from: string | null;
+  valid_until: string | null;
+  contradiction_ids: string[];
+  supersedes_id: string | null;
+  superseded_by_id: string | null;
+  revision: number;
+  revisions: Array<Record<string, unknown>>;
+  schema_version: number;
+};
+export type BeliefListResponse = { beliefs: Belief[] };
 
 export class ApiError extends Error {
   constructor(
@@ -341,4 +360,5 @@ export const api = {
   eventJournal: () => adminRequest<JournalRecordListResponse>("/system/journal"),
   experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
   experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
+  beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
 };
