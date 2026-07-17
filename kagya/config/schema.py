@@ -196,6 +196,7 @@ class SleepSettings(StrictBaseModel):
     max_episodes_per_cycle: int = Field(gt=0)
     job_registry_path: Path = Path(".kagya/training_jobs.json")
     training_artifact_directory: Path = Path(".kagya/training_artifacts")
+    artifact_retention_days: int = Field(default=30, ge=1)
 
 
 class QloraSettings(StrictBaseModel):

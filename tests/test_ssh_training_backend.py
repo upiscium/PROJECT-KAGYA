@@ -140,6 +140,36 @@ def test_ssh_backend_rejects_partial_download(tmp_path: Path) -> None:
     assert not (tmp_path / "results" / "remote-results" / "result-job-1").exists()
 
 
+def test_ssh_backend_reports_worker_heartbeat_and_partition(tmp_path: Path) -> None:
+    settings = _remote_settings(tmp_path)
+
+    def healthy(argv, **kwargs):
+        return _completed(
+            argv,
+            {
+                "node_id": "training-01",
+                "hostname": "worker",
+                "heartbeat": "now",
+            },
+        )
+
+    status = SSHTrainingBackend(settings, tmp_path / "results", run=healthy).node_status()
+    assert status["reachable"] is True
+    assert status["node_id"] == "training-01"
+
+    def partitioned(argv, **kwargs):
+        raise subprocess.CalledProcessError(255, argv, stderr="partition")
+
+    unavailable = SSHTrainingBackend(
+        settings,
+        tmp_path / "results-2",
+        run=partitioned,
+        sleep=lambda _: None,
+    ).node_status()
+    assert unavailable["reachable"] is False
+    assert "partition" in unavailable["error"]
+
+
 def _remote_settings(tmp_path: Path) -> RemoteWorkerSettings:
     return RemoteWorkerSettings(
         node_id="training-01",

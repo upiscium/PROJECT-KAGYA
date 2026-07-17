@@ -20,6 +20,7 @@ from kagya.api.routes import (
     self_model,
     state,
     system,
+    training,
     values,
 )
 from kagya.api.observability import RuntimeEventLog
@@ -69,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(adapters.router)
         app.include_router(evaluations.router)
         app.include_router(system.router)
+        app.include_router(training.router)
         app.include_router(state.router)
         app.include_router(contexts.router)
         app.include_router(values.router)

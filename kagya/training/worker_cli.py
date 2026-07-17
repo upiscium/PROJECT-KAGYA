@@ -53,6 +53,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_job(service.inspect(args.job_id))
         elif args.action == "cancel":
             _print_job(service.cancel(args.job_id))
+        elif args.action == "health":
+            print(json.dumps(service.health(), sort_keys=True))
+        elif args.action == "cleanup":
+            print(json.dumps(service.cleanup(args.retention_days), sort_keys=True))
     except (OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)
         return 1
@@ -69,6 +73,9 @@ def _parser() -> argparse.ArgumentParser:
     for action in ("status", "cancel", "inspect", "_execute"):
         command = commands.add_parser(action)
         command.add_argument("--job-id", required=True)
+    commands.add_parser("health")
+    cleanup = commands.add_parser("cleanup")
+    cleanup.add_argument("--retention-days", type=int, required=True)
     return parser
 
 

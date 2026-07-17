@@ -1,5 +1,7 @@
 """Adapter lifecycle routes."""
 
+from dataclasses import asdict
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from kagya.api.dependencies import (
@@ -57,6 +59,21 @@ def adapter_runtime_state(
         adapter_hash=state.adapter_hash,
         activation_sequence=state.activation_sequence,
     )
+
+
+@router.get("/{adapter_id}/provenance")
+def adapter_provenance(
+    adapter_id: str,
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+    manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
+) -> dict:
+    entry = registry.lookup(adapter_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown adapter: {adapter_id}")
+    return {
+        "adapter": asdict(entry),
+        "activation_history": [asdict(record) for record in manager.history(adapter_id)],
+    }
 
 
 @router.get("", response_model=AdapterListResponse)

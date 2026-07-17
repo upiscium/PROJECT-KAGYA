@@ -82,6 +82,59 @@ def retry_sleep_job(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/jobs/{job_id}/reconcile", response_model=TrainingJobResponse)
+def reconcile_sleep_job(
+    job_id: str,
+    coordinator: SleepCoordinator = Depends(get_sleep_coordinator),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+) -> TrainingJobResponse:
+    try:
+        job = coordinator.reconcile(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    event_log.record(
+        category="training",
+        event_type="reconciled",
+        message="Training job reconciliation completed",
+        metadata={"job_id": job_id, "attempt_id": job.attempt_id, "status": job.status.value},
+    )
+    return _response(job)
+
+
+@router.post("/reconcile")
+def reconcile_sleep_jobs(
+    coordinator: SleepCoordinator = Depends(get_sleep_coordinator),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+) -> dict:
+    result = coordinator.reconcile_all()
+    event_log.record(
+        category="training",
+        event_type="reconciled_all",
+        message="Distributed training reconciliation completed",
+        metadata={
+            "orphan_result_job_ids": result["orphan_result_job_ids"],
+            "orphan_remote_job_ids": result["orphan_remote_job_ids"],
+        },
+    )
+    result["jobs"] = [_response(job).model_dump() for job in result["jobs"]]
+    return result
+
+
+@router.post("/cleanup")
+def cleanup_sleep_artifacts(
+    coordinator: SleepCoordinator = Depends(get_sleep_coordinator),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+) -> dict:
+    result = coordinator.cleanup()
+    event_log.record(
+        category="training",
+        event_type="cleanup",
+        message="Training artifact cleanup completed",
+        metadata=result,
+    )
+    return result
+
+
 def _response(job) -> TrainingJobResponse:
     payload = asdict(job)
     payload["status"] = job.status.value

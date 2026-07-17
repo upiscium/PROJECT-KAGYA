@@ -558,6 +558,12 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     runtime_state = client.get("/api/adapters/runtime", headers=admin_headers())
     assert runtime_state.json()["adapter_id"] == "adapter-api"
     assert runtime_state.json()["adapter_hash"] == "hash-api"
+    provenance = client.get(
+        "/api/adapters/adapter-api/provenance", headers=admin_headers()
+    )
+    assert provenance.status_code == 200
+    assert provenance.json()["adapter"]["adapter_hash"] == "hash-api"
+    assert provenance.json()["activation_history"][0]["action"] == "activate"
     listed = client.get("/api/adapters", headers=admin_headers())
     assert listed.status_code == 200
     assert listed.json()["adapters"][0]["status"] == "active"
@@ -682,6 +688,14 @@ def test_sleep_endpoint_returns_persistent_async_job(tmp_path: Path) -> None:
     assert data["semantic_memory_ids"]
     assert data["candidate_adapter_id"] is not None
     assert data["bundle_path"] is not None
+    assert data["phase_started_at"]
+    assert isinstance(data["phase_durations_seconds"], dict)
+    assert "preparing" in data["phase_durations_seconds"]
+    assert data["import_status"] == "completed"
+    assert data["correlation_id"] == "sleep-api-test"
+    nodes = client.get("/api/training/nodes", headers=admin_headers())
+    assert nodes.status_code == 200
+    assert nodes.json()["nodes"][0]["reachable"] is True
     duplicate = client.post(
         "/api/sleep/jobs",
         headers=admin_headers(),

@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 from threading import Event
 
@@ -84,6 +86,8 @@ def test_backend_failure_is_persisted_and_staged_memory_is_not_published(
     coordinator.shutdown()
     assert retry.retry_count == 1
     assert coordinator.inspect(retry.job_id).status == TrainingJobStatus.FAILED
+    duplicate_retry = coordinator.retry(job.job_id)
+    assert duplicate_retry.job_id == retry.job_id
 
 
 def test_coordinator_marks_interrupted_local_job_failed_on_restart(
@@ -146,6 +150,74 @@ def test_coordinator_resumes_persisted_remote_job(tmp_path: Path) -> None:
     assert restored.status == TrainingJobStatus.COMPLETED
     assert restored.candidate_adapter_id == "adapter-remote"
     assert consolidator.completed is True
+
+
+def test_reconcile_distinguishes_unreachable_worker_without_losing_job(
+    tmp_path: Path,
+) -> None:
+    coordinator = _coordinator(
+        tmp_path,
+        _FakeConsolidator(),
+        _ImmediateBuilder(tmp_path),
+        _UnreachableBackend(),
+    )
+    job, _ = coordinator.registry.create(
+        idempotency_key="remote",
+        base_model_id="model",
+        base_model_revision="revision",
+        parent_adapter_id=None,
+        backend="ssh",
+    )
+    coordinator.registry.update(
+        job.job_id,
+        status=TrainingJobStatus.RUNNING,
+        remote_last_contact=(datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+    )
+
+    reconciled = coordinator.reconcile(job.job_id)
+
+    assert reconciled.status == TrainingJobStatus.RUNNING
+    assert reconciled.failure_category == "worker_unreachable"
+    assert reconciled.retryable is True
+    assert reconciled.stale is True
+
+
+def test_reconcile_reports_orphan_result_and_cleanup_removes_only_old_artifacts(
+    tmp_path: Path,
+) -> None:
+    coordinator = _coordinator(
+        tmp_path,
+        _FakeConsolidator(),
+        _ImmediateBuilder(tmp_path),
+        _OrphanBackend(),
+    )
+    job, _ = coordinator.registry.create(
+        idempotency_key="cleanup",
+        base_model_id="model",
+        base_model_revision="revision",
+        parent_adapter_id=None,
+        backend="local",
+    )
+    bundle = tmp_path / "old-bundle"
+    bundle.mkdir()
+    old = (datetime.now(UTC) - timedelta(days=31)).timestamp()
+    os.utime(bundle, (old, old))
+    coordinator.registry.update(
+        job.job_id,
+        status=TrainingJobStatus.COMPLETED,
+        bundle_path=str(bundle),
+    )
+    orphan = tmp_path / "artifacts" / "remote-results" / "result-orphan"
+    orphan.mkdir(parents=True)
+
+    reconciled = coordinator.reconcile_all()
+    cleaned = coordinator.cleanup(now=datetime.now(UTC))
+
+    assert reconciled["orphan_result_job_ids"] == ["orphan"]
+    assert reconciled["orphan_remote_job_ids"] == ["remote-orphan"]
+    assert str(bundle) in cleaned["removed"]
+    assert not bundle.exists()
+    assert orphan.exists()
 
 
 @dataclass(frozen=True)
@@ -223,6 +295,22 @@ class _FakeBackend:
 class _FailingBackend(_FakeBackend):
     def submit(self, job, bundle_path: Path) -> str:
         raise RuntimeError("backend failed")
+
+
+class _UnreachableBackend(_FakeBackend):
+    def attach(self, job) -> None:
+        return None
+
+    def inspect(self, job_id: str):
+        raise RuntimeError("remote command failed: network partition")
+
+
+class _OrphanBackend(_FakeBackend):
+    def node_status(self):
+        return {
+            "reachable": True,
+            "jobs": [{"job_id": "remote-orphan", "status": "succeeded"}],
+        }
 
 
 class _RecoveringBackend(_FakeBackend):

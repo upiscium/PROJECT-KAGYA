@@ -7,6 +7,8 @@ from enum import StrEnum
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 from threading import Event, RLock, Thread
 from typing import Any, Protocol
 from uuid import uuid4
@@ -70,7 +72,21 @@ class TrainingJob:
     updated_at: str
     error: str | None = None
     retry_count: int = 0
-    schema_version: int = 1
+    phase_started_at: str | None = None
+    phase_durations_seconds: dict[str, float] | None = None
+    transferred_bytes: int = 0
+    remote_last_contact: str | None = None
+    worker_node_id: str | None = None
+    worker_hostname: str | None = None
+    failure_category: str | None = None
+    retryable: bool | None = None
+    import_status: str = "not_started"
+    correlation_id: str | None = None
+    processor_revision: str | None = None
+    training_metrics: dict[str, Any] | None = None
+    total_duration_seconds: float = 0.0
+    stale: bool = False
+    schema_version: int = 2
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "TrainingJob":
@@ -78,6 +94,10 @@ class TrainingJob:
         data["status"] = TrainingJobStatus(data["status"])
         data["selected_episode_ids"] = tuple(data.get("selected_episode_ids", ()))
         data["semantic_memory_ids"] = tuple(data.get("semantic_memory_ids", ()))
+        data["phase_durations_seconds"] = dict(
+            data.get("phase_durations_seconds") or {}
+        )
+        data["training_metrics"] = dict(data.get("training_metrics") or {})
         return cls(**data)
 
 
@@ -97,6 +117,7 @@ class TrainingJobRegistry:
         parent_adapter_id: str | None,
         backend: str,
         job_id: str | None = None,
+        processor_revision: str | None = None,
     ) -> tuple[TrainingJob, bool]:
         with self._lock:
             existing = next(
@@ -130,6 +151,11 @@ class TrainingJobRegistry:
                 semantic_memory_ids=(),
                 created_at=now,
                 updated_at=now,
+                phase_started_at=now,
+                phase_durations_seconds={},
+                correlation_id=idempotency_key,
+                processor_revision=processor_revision,
+                training_metrics={},
             )
             self._jobs[identifier] = job
             self._save()
@@ -150,6 +176,37 @@ class TrainingJobRegistry:
         with self._lock:
             current = self.get(job_id)
             updated = replace(current, updated_at=_now(), **changes)
+            self._jobs[job_id] = updated
+            self._save()
+            return updated
+
+    def transition(
+        self, job_id: str, status: TrainingJobStatus, **changes: Any
+    ) -> TrainingJob:
+        with self._lock:
+            current = self.get(job_id)
+            now = datetime.now(UTC)
+            durations = dict(current.phase_durations_seconds or {})
+            started = datetime.fromisoformat(
+                current.phase_started_at or current.updated_at
+            )
+            durations[current.status.value] = durations.get(
+                current.status.value, 0.0
+            ) + max(0.0, (now - started).total_seconds())
+            updated = replace(
+                current,
+                status=status,
+                updated_at=now.isoformat(),
+                phase_started_at=now.isoformat(),
+                phase_durations_seconds=durations,
+                total_duration_seconds=max(
+                    0.0,
+                    (
+                        now - datetime.fromisoformat(current.created_at)
+                    ).total_seconds(),
+                ),
+                **changes,
+            )
             self._jobs[job_id] = updated
             self._save()
             return updated
@@ -189,6 +246,9 @@ class TrainingBackend(Protocol):
     def fetch_result(self, job_id: str) -> QloraTrainingResult | None: ...
     def attach(self, job: TrainingJob) -> None: ...
     def shutdown(self) -> None: ...
+    def node_status(self) -> dict[str, Any]: ...
+    def job_metadata(self, job_id: str) -> dict[str, Any]: ...
+    def cleanup(self, retention_days: int) -> dict[str, Any]: ...
 
 
 class LocalTrainingBackend:
@@ -228,6 +288,21 @@ class LocalTrainingBackend:
 
     def shutdown(self) -> None:
         return None
+
+    def node_status(self) -> dict[str, Any]:
+        return {
+            "node_id": "local",
+            "hostname": os.uname().nodename,
+            "reachable": True,
+            "last_contact": _now(),
+            "backend": "local",
+        }
+
+    def job_metadata(self, job_id: str) -> dict[str, Any]:
+        return {"remote_last_contact": _now()}
+
+    def cleanup(self, retention_days: int) -> dict[str, Any]:
+        return {"removed": [], "retention_days": retention_days}
 
 
 @dataclass(frozen=True)
@@ -404,10 +479,12 @@ class SleepCoordinator:
         self._cancel: dict[str, Event] = {}
         for job in self.registry.list():
             if job.backend == "local" and job.status not in TERMINAL_JOB_STATUSES:
-                self.registry.update(
+                self.registry.transition(
                     job.job_id,
-                    status=TrainingJobStatus.FAILED,
+                    TrainingJobStatus.FAILED,
                     error="local runtime restarted before job completion",
+                    failure_category="runtime_restart",
+                    retryable=True,
                 )
             elif job.backend != "local" and job.status not in TERMINAL_JOB_STATUSES:
                 self.backend.attach(job)
@@ -420,6 +497,7 @@ class SleepCoordinator:
             base_model_revision=self.settings.model.revision,
             parent_adapter_id=None,
             backend=self.settings.deployment.training.backend.value,
+            processor_revision=self.settings.model.processor_revision,
         )
         if not created:
             return job
@@ -433,13 +511,18 @@ class SleepCoordinator:
             TrainingJobStatus.CANCELLED,
         }:
             raise ValueError("Only failed or cancelled jobs can be retried")
-        job, _ = self.registry.create(
+        if previous.retryable is False:
+            raise ValueError("Training failure is classified as non-retryable")
+        job, created = self.registry.create(
             idempotency_key=f"retry:{previous.job_id}:{previous.retry_count + 1}",
             base_model_id=previous.base_model_id,
             base_model_revision=previous.base_model_revision,
             parent_adapter_id=previous.parent_adapter_id,
             backend=previous.backend,
+            processor_revision=previous.processor_revision,
         )
+        if not created:
+            return job
         job = self.registry.update(job.job_id, retry_count=previous.retry_count + 1)
         self._start(job)
         return job
@@ -472,13 +555,129 @@ class SleepCoordinator:
     def list_jobs(self) -> list[TrainingJob]:
         return self.registry.list()
 
+    def node_status(self) -> list[dict[str, Any]]:
+        status = getattr(self.backend, "node_status", None)
+        return [status() if status is not None else {"reachable": True, "backend": "test"}]
+
+    def reconcile(self, job_id: str) -> TrainingJob:
+        job = self.registry.get(job_id)
+        if job.backend == "local" or job.status in TERMINAL_JOB_STATUSES:
+            return job
+        self.backend.attach(job)
+        try:
+            remote_status = self.backend.inspect(job.remote_job_id or job.job_id)
+        except Exception as exc:
+            return self.registry.update(
+                job_id,
+                failure_category="worker_unreachable",
+                retryable=True,
+                error=str(exc),
+                stale=self._is_stale(job),
+            )
+        self._sync_backend_metadata(job_id)
+        if remote_status == TrainingJobStatus.SUCCEEDED:
+            reconciled = self.registry.transition(
+                job_id,
+                TrainingJobStatus.SUCCEEDED,
+                failure_category=None,
+                retryable=None,
+                error=None,
+                stale=False,
+            )
+            current_thread = self._threads.get(job_id)
+            if current_thread is None or not current_thread.is_alive():
+                self._start_resume(reconciled)
+            return reconciled
+        if remote_status == TrainingJobStatus.FAILED:
+            current = self.registry.get(job_id)
+            return self.registry.transition(
+                job_id,
+                TrainingJobStatus.FAILED,
+                failure_category=current.failure_category
+                or "remote_training_failed",
+                retryable=(
+                    current.retryable
+                    if current.retryable is not None
+                    else False
+                ),
+                error="remote training job failed",
+                stale=False,
+            )
+        if remote_status == TrainingJobStatus.CANCELLED:
+            return self.registry.transition(job_id, TrainingJobStatus.CANCELLED)
+        return self.registry.transition(
+            job_id,
+            remote_status,
+            failure_category=None,
+            retryable=None,
+            error=None,
+            stale=False,
+        )
+
+    def reconcile_all(self) -> dict[str, Any]:
+        reconciled = [
+            self.reconcile(job.job_id)
+            for job in self.registry.list()
+            if job.backend != "local" and job.status not in TERMINAL_JOB_STATUSES
+        ]
+        known = {job.job_id for job in self.registry.list()}
+        result_root = self.settings.sleep.training_artifact_directory / "remote-results"
+        orphan_results = sorted(
+            item.name.removeprefix("result-")
+            for item in result_root.glob("result-*")
+            if item.is_dir() and item.name.removeprefix("result-") not in known
+        )
+        node = self.node_status()[0]
+        orphan_remote_jobs = sorted(
+            str(item["job_id"])
+            for item in node.get("jobs", [])
+            if isinstance(item, dict) and str(item.get("job_id", "")) not in known
+        )
+        return {
+            "jobs": reconciled,
+            "orphan_result_job_ids": orphan_results,
+            "orphan_remote_job_ids": orphan_remote_jobs,
+        }
+
+    def cleanup(self, *, now: datetime | None = None) -> dict[str, Any]:
+        cutoff = (now or datetime.now(UTC)).timestamp() - (
+            self.settings.sleep.artifact_retention_days * 86400
+        )
+        removed: list[str] = []
+        for job in self.registry.list():
+            if job.status not in TERMINAL_JOB_STATUSES:
+                continue
+            paths = []
+            if job.bundle_path is not None:
+                paths.append(Path(job.bundle_path))
+            paths.append(
+                self.settings.sleep.training_artifact_directory
+                / "remote-results"
+                / f"result-{job.job_id}"
+            )
+            for path in paths:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path)
+                    removed.append(str(path))
+        remote_cleanup = getattr(self.backend, "cleanup", None)
+        remote = (
+            {"removed": []}
+            if remote_cleanup is None
+            else remote_cleanup(self.settings.sleep.artifact_retention_days)
+        )
+        return {
+            "removed": removed,
+            "remote_removed": remote.get("removed", []),
+            "retention_days": self.settings.sleep.artifact_retention_days,
+        }
+
     def cancel(self, job_id: str) -> TrainingJob:
         job = self.registry.get(job_id)
         if job.status in TERMINAL_JOB_STATUSES:
             return job
         self._cancel.setdefault(job_id, Event()).set()
         self.backend.cancel(job_id)
-        return self.registry.update(job_id, status=TrainingJobStatus.CANCELLED)
+        return self.registry.transition(job_id, TrainingJobStatus.CANCELLED)
 
     def shutdown(self) -> None:
         shutdown = getattr(self.backend, "shutdown", None)
@@ -504,18 +703,21 @@ class SleepCoordinator:
             result = self.backend.fetch_result(job_id)
             if result is None:
                 raise RuntimeError("Training backend returned no result")
-            self.registry.update(job_id, status=TrainingJobStatus.IMPORTING)
+            self.registry.transition(job_id, TrainingJobStatus.IMPORTING)
+            self._sync_backend_metadata(job_id)
+            self.registry.update(job_id, import_status="importing")
             entry = self.subject_executor(
                 "runtime.sleep.resume_finalize",
                 lambda: self._finalize_subject_state(
                     preparation, job.attempt_id, result
                 ),
             )
-            self.registry.update(
+            self.registry.transition(
                 job_id,
-                status=TrainingJobStatus.COMPLETED,
+                TrainingJobStatus.COMPLETED,
                 candidate_adapter_id=entry.adapter_id,
                 error=None,
+                import_status="completed",
             )
         except InterruptedError:
             return
@@ -524,9 +726,7 @@ class SleepCoordinator:
                 "runtime.sleep.resume_fail",
                 lambda: self.consolidator.fail(preparation, job.attempt_id),
             )
-            self.registry.update(
-                job_id, status=TrainingJobStatus.FAILED, error=str(exc)
-            )
+            self._fail_job(job_id, exc)
 
     def _run(self, job_id: str, cancel: Event) -> None:
         preparation = ConsolidationPreparation((), ())
@@ -537,7 +737,7 @@ class SleepCoordinator:
                 lambda: self.consolidator.prepare(job.attempt_id),
             )
             if not preparation.episodes:
-                self.registry.update(job_id, status=TrainingJobStatus.COMPLETED)
+                self.registry.transition(job_id, TrainingJobStatus.COMPLETED)
                 return
             if cancel.is_set():
                 raise _Cancelled
@@ -548,9 +748,9 @@ class SleepCoordinator:
                 for episode in preparation.episodes
                 if episode.processing_sequence is not None
             ]
-            job = self.registry.update(
+            job = self.registry.transition(
                 job_id,
-                status=TrainingJobStatus.READY,
+                TrainingJobStatus.READY,
                 bundle_path=str(bundle),
                 bundle_hash=bundle_hash,
                 selected_episode_ids=tuple(item.id for item in preparation.episodes),
@@ -560,45 +760,88 @@ class SleepCoordinator:
             )
             if cancel.is_set():
                 raise _Cancelled
-            self.registry.update(job_id, status=TrainingJobStatus.DISPATCHED)
-            self.registry.update(job_id, status=TrainingJobStatus.RUNNING)
+            self.registry.transition(job_id, TrainingJobStatus.DISPATCHED)
+            self.registry.transition(job_id, TrainingJobStatus.RUNNING)
             remote_id = self.backend.submit(job, bundle)
             self.registry.update(job_id, remote_job_id=remote_id)
+            self._sync_backend_metadata(job_id)
             if cancel.is_set():
                 raise _Cancelled
             result = self.backend.fetch_result(job_id)
             if result is None:
                 raise RuntimeError("Training backend returned no result")
-            self.registry.update(
+            self.registry.transition(
                 job_id,
-                status=TrainingJobStatus.SUCCEEDED,
+                TrainingJobStatus.SUCCEEDED,
             )
-            self.registry.update(job_id, status=TrainingJobStatus.IMPORTING)
+            self._sync_backend_metadata(job_id)
+            self.registry.transition(job_id, TrainingJobStatus.IMPORTING)
+            self.registry.update(job_id, import_status="importing")
             entry = self.subject_executor(
                 "runtime.sleep.finalize",
                 lambda: self._finalize_subject_state(
                     preparation, job.attempt_id, result
                 ),
             )
-            self.registry.update(
+            self.registry.transition(
                 job_id,
-                status=TrainingJobStatus.COMPLETED,
+                TrainingJobStatus.COMPLETED,
                 candidate_adapter_id=entry.adapter_id,
+                import_status="completed",
             )
         except _Cancelled:
             self.subject_executor(
                 "runtime.sleep.cancel",
                 lambda: self.consolidator.fail(preparation, job.attempt_id),
             )
-            self.registry.update(job_id, status=TrainingJobStatus.CANCELLED)
+            self.registry.transition(job_id, TrainingJobStatus.CANCELLED)
         except Exception as exc:
             self.subject_executor(
                 "runtime.sleep.fail",
                 lambda: self.consolidator.fail(preparation, job.attempt_id),
             )
-            self.registry.update(
-                job_id, status=TrainingJobStatus.FAILED, error=str(exc)
+            self._fail_job(job_id, exc)
+
+    def _sync_backend_metadata(self, job_id: str) -> None:
+        metadata_getter = getattr(self.backend, "job_metadata", None)
+        metadata = {} if metadata_getter is None else metadata_getter(job_id)
+        if metadata:
+            self.registry.update(job_id, **metadata)
+
+    def _is_stale(self, job: TrainingJob) -> bool:
+        reference = datetime.fromisoformat(
+            job.remote_last_contact or job.updated_at
+        )
+        remote = self.settings.deployment.training.remote_worker
+        threshold = (
+            60.0
+            if remote is None
+            else max(
+                remote.connect_timeout_seconds,
+                remote.poll_interval_seconds * 2,
             )
+        )
+        return (datetime.now(UTC) - reference).total_seconds() > threshold
+
+    def _fail_job(self, job_id: str, exc: Exception) -> TrainingJob:
+        self._sync_backend_metadata(job_id)
+        current = self.registry.get(job_id)
+        category, retryable = _classify_failure(exc)
+        if current.failure_category is not None:
+            category = current.failure_category
+            retryable = bool(current.retryable)
+        return self.registry.transition(
+            job_id,
+            TrainingJobStatus.FAILED,
+            error=str(exc),
+            failure_category=category,
+            retryable=retryable,
+            import_status=(
+                "failed"
+                if current.status == TrainingJobStatus.IMPORTING
+                else current.import_status
+            ),
+        )
 
     def _finalize_subject_state(
         self,
@@ -642,3 +885,20 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _classify_failure(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, TimeoutError):
+        return "timeout", True
+    if isinstance(exc, (ConnectionError, subprocess.SubprocessError)):
+        return "worker_unreachable", True
+    message = str(exc).lower()
+    if "remote command failed" in message or "unavailable" in message:
+        return "worker_unreachable", True
+    if "backend failed" in message:
+        return "backend_failure", True
+    if "checksum" in message or "mismatch" in message or "unsafe" in message:
+        return "artifact_integrity", False
+    if "import" in message or "adapter" in message:
+        return "artifact_import", False
+    return "training_failure", False

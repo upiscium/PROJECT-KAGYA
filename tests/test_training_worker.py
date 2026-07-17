@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import shutil
 
@@ -9,6 +9,7 @@ from kagya.training import (
     TrainingArtifactContract,
     TrainingBundleManifest,
     TrainingWorkerService,
+    WorkerJob,
     WorkerJobStatus,
     sha256_bytes,
 )
@@ -101,6 +102,71 @@ def test_worker_rejects_job_id_reuse_with_different_idempotency_key(
         service.submit(
             _staged_bundle(settings, "job-1"), worker.result_directory, "request-2"
         )
+
+
+def test_worker_health_reports_node_revisions_and_capacity(tmp_path: Path) -> None:
+    settings = _worker_settings(tmp_path)
+
+    health = TrainingWorkerService(settings).health()
+
+    assert health["node_id"] == "training-01"
+    assert health["hostname"]
+    assert health["heartbeat"]
+    assert health["model_id"] == settings.model.primary_id
+    assert health["model_revision"] == settings.model.revision
+    assert health["processor_revision"] == settings.model.processor_revision
+    assert health["active_jobs"] == 0
+    assert "gpu" in health
+    assert "driver" in health["gpu"] or health["gpu"]["available"] is False
+
+
+def test_worker_cleanup_honors_retention_and_failed_job_policy(tmp_path: Path) -> None:
+    settings = _worker_settings(tmp_path)
+    service = TrainingWorkerService(settings)
+    old = (datetime.now(UTC) - timedelta(days=31)).isoformat()
+    paths = [tmp_path / name for name in ("bundle", "work", "result")]
+    for path in paths:
+        path.mkdir()
+    job = WorkerJob(
+        job_id="old-job",
+        attempt_id="old-attempt",
+        idempotency_key="old-request",
+        status=WorkerJobStatus.SUCCEEDED,
+        bundle_path=str(paths[0]),
+        work_path=str(paths[1]),
+        result_path=str(paths[2]),
+        submitter_node_id="inference-01",
+        base_model_id=settings.model.primary_id,
+        base_model_revision=settings.model.revision,
+        processor_revision=settings.model.processor_revision,
+        created_at=old,
+        updated_at=old,
+    )
+    service.store.create(job, settings.deployment.training.worker.max_concurrent_jobs)
+    failed_paths = [tmp_path / f"failed-{name}" for name in ("bundle", "work", "result")]
+    for path in failed_paths:
+        path.mkdir()
+    service.store.create(
+        WorkerJob(
+            **{
+                **job.__dict__,
+                "job_id": "failed-job",
+                "attempt_id": "failed-attempt",
+                "idempotency_key": "failed-request",
+                "status": WorkerJobStatus.FAILED,
+                "bundle_path": str(failed_paths[0]),
+                "work_path": str(failed_paths[1]),
+                "result_path": str(failed_paths[2]),
+            }
+        ),
+        settings.deployment.training.worker.max_concurrent_jobs,
+    )
+
+    result = service.cleanup(30)
+
+    assert set(result["removed"]) == {str(path) for path in paths}
+    assert not any(path.exists() for path in paths)
+    assert all(path.exists() for path in failed_paths)
 
 
 def _worker_settings(tmp_path: Path) -> Settings:
