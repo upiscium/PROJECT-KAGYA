@@ -4,24 +4,8 @@ from dataclasses import dataclass
 import re
 
 
-THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", flags=re.DOTALL | re.IGNORECASE)
-THINK_TAG_PATTERN = re.compile(r"</?think>", flags=re.IGNORECASE)
+THINK_TAG_PATTERN = re.compile(r"<(\/?)think>", flags=re.IGNORECASE)
 GEMMA_TURN_TOKEN_PATTERN = re.compile(r"<(?:start|end)_of_turn>\s*(?:user|model)?", flags=re.IGNORECASE)
-HTML_LIKE_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
-PROMPT_LABEL_ECHO_PATTERN = re.compile(r"\n(?:Question|User|Assistant|Answer|Context|Instruction):", flags=re.IGNORECASE)
-ASSISTANT_SELF_ECHO_PATTERN = re.compile(r"\nAssistant\b.*", flags=re.IGNORECASE | re.DOTALL)
-LEADING_ANSWER_LABEL_PATTERN = re.compile(r"^Answer:\s*", flags=re.IGNORECASE)
-LEADING_MODEL_LABEL_PATTERN = re.compile(r"^(?:model|assistant)\s*\n+", flags=re.IGNORECASE)
-LEADING_SAMPLE_RESPONSE_PATTERN = re.compile(
-    r"^Sure,\s+here\s+are\s+the\s+corresponding\s+responses:\s*",
-    flags=re.IGNORECASE,
-)
-MODEL_REASONING_TRAILER_PATTERN = re.compile(
-    r"(?:\nthought\s*(?:\n|$)|(?<=[。.!?！？])thought\s*$|\nThinking Process:)",
-    flags=re.IGNORECASE,
-)
-PROJECT_NAME_VARIANT_PATTERN = re.compile(r"PROJECT-KAGAY?A|Project-Kageye", flags=re.IGNORECASE)
-REPEATED_COMMA_WORD_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z-]*)(?:,\s*\1\b){2,}", flags=re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -34,22 +18,41 @@ class ResponsePostprocessor:
     """Extract internal thoughts while keeping normal output clean."""
 
     def process(self, response_text: str) -> ProcessedResponse:
-        hidden_parts = [match.group(1).strip() for match in THINK_BLOCK_PATTERN.finditer(response_text)]
-        visible_response = THINK_BLOCK_PATTERN.sub("", response_text)
-        visible_response = THINK_TAG_PATTERN.sub("", visible_response).strip()
+        visible_response, hidden_parts = _partition_think_channel(response_text)
         visible_response = GEMMA_TURN_TOKEN_PATTERN.sub("", visible_response).strip()
-        visible_response = HTML_LIKE_TAG_PATTERN.sub("", visible_response).strip()
-        visible_response = PROMPT_LABEL_ECHO_PATTERN.split(visible_response, maxsplit=1)[0].strip()
-        visible_response = ASSISTANT_SELF_ECHO_PATTERN.sub("", visible_response).strip()
-        visible_response = LEADING_ANSWER_LABEL_PATTERN.sub("", visible_response).strip()
-        visible_response = LEADING_MODEL_LABEL_PATTERN.sub("", visible_response).strip()
-        visible_response = LEADING_SAMPLE_RESPONSE_PATTERN.sub("", visible_response).strip()
-        visible_response = MODEL_REASONING_TRAILER_PATTERN.split(
-            visible_response, maxsplit=1
-        )[0].strip()
-        visible_response = PROJECT_NAME_VARIANT_PATTERN.sub("PROJECT-KAGYA", visible_response).strip()
-        visible_response = REPEATED_COMMA_WORD_PATTERN.sub(r"\1", visible_response).strip(" ,")
         return ProcessedResponse(
             visible_response=visible_response,
             hidden_thought="\n".join(part for part in hidden_parts if part),
         )
+
+
+def _partition_think_channel(response_text: str) -> tuple[str, list[str]]:
+    visible_parts: list[str] = []
+    hidden_parts: list[str] = []
+    hidden_buffer: list[str] = []
+    depth = 0
+    cursor = 0
+    for match in THINK_TAG_PATTERN.finditer(response_text):
+        content = response_text[cursor : match.start()]
+        if depth:
+            hidden_buffer.append(content)
+        else:
+            visible_parts.append(content)
+        is_closing = bool(match.group(1))
+        if is_closing:
+            if depth:
+                depth -= 1
+                if depth == 0:
+                    hidden_parts.append("".join(hidden_buffer).strip())
+                    hidden_buffer = []
+        else:
+            depth += 1
+        cursor = match.end()
+
+    remainder = response_text[cursor:]
+    if depth:
+        hidden_buffer.append(remainder)
+        hidden_parts.append("".join(hidden_buffer).strip())
+    else:
+        visible_parts.append(remainder)
+    return "".join(visible_parts), hidden_parts

@@ -1,8 +1,14 @@
 """Prompt construction for the conscious runtime loop."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from kagya.body import EmotionState
-from kagya.runtime.working_memory import WorkingMemoryView
-from kagya.runtime.context import ContextFrame
+
+if TYPE_CHECKING:
+    from kagya.runtime.context import ContextFrame
+    from kagya.runtime.working_memory import WorkingMemoryView
 
 
 class PromptBuilder:

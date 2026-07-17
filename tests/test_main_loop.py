@@ -86,6 +86,20 @@ def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
     assert "</think>" not in result.response
 
 
+def test_truncated_think_only_primary_response_uses_fallback(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkOnlyPrimaryProvider()
+    provider.response_text = "<think>private truncated reasoning"
+
+    result = KagyaMainLoop(settings, provider, _memory(settings)).chat(
+        "hello", debug=False
+    )
+
+    assert result.response == "Fallback visible answer."
+    assert "private truncated reasoning" not in result.response
+    assert result.fallback_used is True
+
+
 def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
