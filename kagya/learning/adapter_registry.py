@@ -39,6 +39,17 @@ class AdapterEntry:
     created_at: str = ""
     updated_at: str = ""
     notes: str = ""
+    base_model_revision: str | None = None
+    adapter_hash: str | None = None
+    parent_adapter_id: str | None = None
+    training_job_id: str | None = None
+    training_node_id: str | None = None
+    submitted_by_node_id: str | None = None
+    imported_by_node_id: str | None = None
+    training_manifest_path: str | None = None
+    worker_evaluation_path: str | None = None
+    local_evaluation_path: str | None = None
+    schema_version: int = 2
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -61,6 +72,17 @@ class AdapterEntry:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             notes=str(data.get("notes", "")),
+            base_model_revision=_optional_str(data.get("base_model_revision")),
+            adapter_hash=_optional_str(data.get("adapter_hash")),
+            parent_adapter_id=_optional_str(data.get("parent_adapter_id")),
+            training_job_id=_optional_str(data.get("training_job_id")),
+            training_node_id=_optional_str(data.get("training_node_id")),
+            submitted_by_node_id=_optional_str(data.get("submitted_by_node_id")),
+            imported_by_node_id=_optional_str(data.get("imported_by_node_id")),
+            training_manifest_path=_optional_str(data.get("training_manifest_path")),
+            worker_evaluation_path=_optional_str(data.get("worker_evaluation_path")),
+            local_evaluation_path=_optional_str(data.get("local_evaluation_path")),
+            schema_version=int(data.get("schema_version", 1)),
         )
 
 
@@ -81,11 +103,29 @@ class AdapterRegistry:
         dataset_hash: str,
         base_model: str | None = None,
         notes: str = "",
+        base_model_revision: str | None = None,
+        adapter_hash: str | None = None,
+        parent_adapter_id: str | None = None,
+        training_job_id: str | None = None,
+        training_node_id: str | None = None,
+        submitted_by_node_id: str | None = None,
+        imported_by_node_id: str | None = None,
+        training_manifest_path: str | None = None,
+        worker_evaluation_path: str | None = None,
+        local_evaluation_path: str | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             if self._lookup_locked(entries, adapter_id) is not None:
                 raise ValueError(f"Adapter already registered: {adapter_id}")
+            if adapter_hash is not None and any(
+                entry.adapter_hash == adapter_hash for entry in entries
+            ):
+                raise ValueError(f"Adapter hash already registered: {adapter_hash}")
+            if training_job_id is not None and any(
+                entry.training_job_id == training_job_id for entry in entries
+            ):
+                raise ValueError(f"Training job already registered: {training_job_id}")
             now = _now_iso()
             entry = AdapterEntry(
                 adapter_id=adapter_id,
@@ -97,6 +137,16 @@ class AdapterRegistry:
                 created_at=now,
                 updated_at=now,
                 notes=notes,
+                base_model_revision=base_model_revision,
+                adapter_hash=adapter_hash,
+                parent_adapter_id=parent_adapter_id,
+                training_job_id=training_job_id,
+                training_node_id=training_node_id,
+                submitted_by_node_id=submitted_by_node_id,
+                imported_by_node_id=imported_by_node_id,
+                training_manifest_path=training_manifest_path,
+                worker_evaluation_path=worker_evaluation_path,
+                local_evaluation_path=local_evaluation_path,
             )
             entries.append(entry)
             self._write_locked(entries)
