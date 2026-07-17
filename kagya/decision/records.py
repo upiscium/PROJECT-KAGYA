@@ -123,12 +123,15 @@ class DecisionRecord:
     prediction_error: float | None
     created_at: str
     updated_at: str
-    schema_version: int = 2
+    adapter_id: str | None = None
+    adapter_hash: str | None = None
+    activation_sequence: int | None = None
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -176,6 +179,9 @@ class DecisionStore:
         value_evaluator: ValueEvaluator | None = None,
         self_model_evaluator: SelfModelEvaluator | None = None,
         decision_id: str | None = None,
+        adapter_id: str | None = None,
+        adapter_hash: str | None = None,
+        activation_sequence: int | None = None,
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -252,6 +258,9 @@ class DecisionStore:
             prediction_error=None,
             created_at=now,
             updated_at=now,
+            adapter_id=adapter_id,
+            adapter_hash=adapter_hash,
+            activation_sequence=activation_sequence,
         )
         self.records[identifier] = record
         return record
@@ -356,6 +365,9 @@ class DecisionDatasetGenerator:
                         "active_goal_ids": list(record.active_goal_ids),
                         "value_revision_refs": record.value_revision_refs,
                         "emotion_snapshot": record.emotion_snapshot,
+                        "adapter_id": record.adapter_id,
+                        "adapter_hash": record.adapter_hash,
+                        "activation_sequence": record.activation_sequence,
                         "candidates": [
                             asdict(item.candidate)
                             for item in record.considered_candidates
@@ -519,6 +531,9 @@ def _candidate_from_json(payload: Any) -> ActionCandidate:
 
 def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data = dict(payload)
+    data.setdefault("adapter_id", None)
+    data.setdefault("adapter_hash", None)
+    data.setdefault("activation_sequence", None)
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)

@@ -13,6 +13,7 @@ def load_model_provider(
     adapter_path: str | Path | None = None,
     *,
     allow_candidate_adapter: bool = False,
+    allow_archived_adapter: bool = False,
 ) -> ModelProvider:
     """Load the configured model provider."""
 
@@ -25,5 +26,6 @@ def load_model_provider(
             app_settings,
             adapter_path=adapter_path,
             allow_candidate_adapter=allow_candidate_adapter,
+            allow_archived_adapter=allow_archived_adapter,
         )
     raise ValueError(f"Unsupported model provider: {app_settings.model.provider}")

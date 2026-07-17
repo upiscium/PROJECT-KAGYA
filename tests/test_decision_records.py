@@ -30,6 +30,9 @@ def test_candidate_comparison_tracks_contributions_and_selects_best() -> None:
             "no-op": {},
         },
         decision_id="decision-1",
+        adapter_id="adapter-1",
+        adapter_hash="hash-1",
+        activation_sequence=7,
     )
 
     assert record.selected_candidate_id == "respond"
@@ -41,6 +44,10 @@ def test_candidate_comparison_tracks_contributions_and_selects_best() -> None:
     assert selected.appraisal_contributions == {"goal_progress": 0.3}
     assert selected.total_score is not None
     assert record.active_goal_ids == ("goal-1",)
+    assert record.adapter_id == "adapter-1"
+    assert record.adapter_hash == "hash-1"
+    assert record.activation_sequence == 7
+    assert record.schema_version == 3
 
 
 def test_no_op_defer_and_observation_are_regular_candidates() -> None:
@@ -163,6 +170,9 @@ def test_v1_record_migrates_without_self_model_contributions() -> None:
     )
     payload = json.loads(json.dumps(store.to_json()))
     payload[0]["schema_version"] = 1
+    del payload[0]["adapter_id"]
+    del payload[0]["adapter_hash"]
+    del payload[0]["activation_sequence"]
     del payload[0]["considered_candidates"][0]["self_model_contributions"]
 
     restored = DecisionStore()
@@ -172,6 +182,7 @@ def test_v1_record_migrates_without_self_model_contributions() -> None:
         restored.get("legacy").considered_candidates[0].self_model_contributions
         == {}
     )
+    assert restored.get("legacy").adapter_id is None
 
 
 def test_schema_parser_rejects_free_form_reasoning_and_unknown_fields() -> None:

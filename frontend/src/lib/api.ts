@@ -2,7 +2,7 @@ const API_PROXY_BASE_URL = "/api-proxy";
 const ADMIN_PROXY_BASE_URL = "/admin-proxy";
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
-export type ModelInfo = { model_id: string; adapter_id: string | null; fallback_used: boolean };
+export type ModelInfo = { model_id: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null; fallback_used: boolean };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
 export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: boolean; context_id?: string; client_session_id?: string; interlocutor_key?: string };
@@ -105,10 +105,15 @@ export type Adapter = {
   created_at: string;
   updated_at: string;
   notes: string;
+  base_model_revision: string | null;
+  adapter_hash: string | null;
+  activation_sequence: number | null;
 };
 
 export type AdapterListResponse = { adapters: Adapter[] };
 export type AdapterEvaluateResponse = { adapter_id: string; score: number; decision: string; result_path: string; status: string };
+export type AdapterActivationResponse = { action: string; adapter_id: string | null; adapter_hash: string | null; previous_adapter_id: string | null; previous_adapter_hash: string | null; activation_sequence: number };
+export type AdapterRuntimeState = { base_model: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null };
 export type EvaluationResultSummary = {
   filename: string;
   adapter_id: string;
@@ -251,10 +256,12 @@ export const api = {
   cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
   retrySleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
+  adapterRuntime: () => adminRequest<AdapterRuntimeState>("/adapters/runtime"),
   evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),
   trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),
   approveAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
   activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
+  rollbackAdapter: () => adminRequest<AdapterActivationResponse>("/adapters/rollback", { method: "POST" }),
   rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
   evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
   adapterEvaluationHistory: (adapterId: string) => adminRequest<AdapterEvaluationHistoryResponse>(`/evaluations/adapters/${encodeURIComponent(adapterId)}/history`),

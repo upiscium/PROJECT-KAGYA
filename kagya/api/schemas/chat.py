@@ -32,6 +32,8 @@ class EmotionSchema(BaseModel):
 class ModelSchema(BaseModel):
     model_id: str
     adapter_id: str | None = None
+    adapter_hash: str | None = None
+    activation_sequence: int | None = None
     fallback_used: bool = False
 
 

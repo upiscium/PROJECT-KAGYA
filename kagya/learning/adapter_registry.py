@@ -49,6 +49,7 @@ class AdapterEntry:
     training_manifest_path: str | None = None
     worker_evaluation_path: str | None = None
     local_evaluation_path: str | None = None
+    activation_sequence: int | None = None
     schema_version: int = 2
 
     def to_json(self) -> dict[str, Any]:
@@ -82,6 +83,11 @@ class AdapterEntry:
             training_manifest_path=_optional_str(data.get("training_manifest_path")),
             worker_evaluation_path=_optional_str(data.get("worker_evaluation_path")),
             local_evaluation_path=_optional_str(data.get("local_evaluation_path")),
+            activation_sequence=(
+                None
+                if data.get("activation_sequence") is None
+                else int(data["activation_sequence"])
+            ),
             schema_version=int(data.get("schema_version", 1)),
         )
 
@@ -214,7 +220,9 @@ class AdapterRegistry:
                 notes=notes or entry.notes,
             )
 
-    def activate(self, adapter_id: str) -> AdapterEntry:
+    def activate(
+        self, adapter_id: str, *, activation_sequence: int | None = None
+    ) -> AdapterEntry:
         with self._locked(exclusive=True):
             current_entries = self._list_locked()
             entry = self._require_locked(current_entries, adapter_id)
@@ -224,7 +232,12 @@ class AdapterRegistry:
             now = _now_iso()
             for existing in current_entries:
                 if existing.adapter_id == adapter_id:
-                    activated = _copy_entry(existing, status=AdapterStatus.ACTIVE, updated_at=now)
+                    activated = _copy_entry(
+                        existing,
+                        status=AdapterStatus.ACTIVE,
+                        updated_at=now,
+                        activation_sequence=activation_sequence,
+                    )
                     entries.append(activated)
                 elif existing.status == AdapterStatus.ACTIVE:
                     entries.append(_copy_entry(existing, status=AdapterStatus.ARCHIVED, updated_at=now))
@@ -233,6 +246,44 @@ class AdapterRegistry:
             assert activated is not None
             self._write_locked(entries)
             return activated
+
+    def restore_active(
+        self, adapter_id: str | None, *, activation_sequence: int
+    ) -> AdapterEntry | None:
+        with self._locked(exclusive=True):
+            current_entries = self._list_locked()
+            target = (
+                None
+                if adapter_id is None
+                else self._require_locked(current_entries, adapter_id)
+            )
+            if target is not None and target.status not in {
+                AdapterStatus.ARCHIVED,
+                AdapterStatus.APPROVED,
+            }:
+                raise ValueError("Rollback target is not archived or approved")
+            restored: AdapterEntry | None = None
+            entries = []
+            now = _now_iso()
+            for entry in current_entries:
+                if entry.adapter_id == adapter_id:
+                    restored = _copy_entry(
+                        entry,
+                        status=AdapterStatus.ACTIVE,
+                        updated_at=now,
+                        activation_sequence=activation_sequence,
+                    )
+                    entries.append(restored)
+                elif entry.status == AdapterStatus.ACTIVE:
+                    entries.append(
+                        _copy_entry(
+                            entry, status=AdapterStatus.ARCHIVED, updated_at=now
+                        )
+                    )
+                else:
+                    entries.append(entry)
+            self._write_locked(entries)
+            return restored
 
     def transition(self, adapter_id: str, status: AdapterStatus) -> AdapterEntry:
         with self._locked(exclusive=True):
