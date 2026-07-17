@@ -175,12 +175,15 @@ class DualMemorySystem:
             "record_type": record_type.value,
             "archived": False,
             "created_at": created_at,
-            "schema_version": 2,
+            "schema_version": 3,
             "lifecycle_status": lifecycle.value,
             "validation_status": validation_status.value,
             "content_hash": content_hash,
             "dedup_key": dedup_key,
             "consolidation_status": ConsolidationStatus.PENDING.value,
+            "experience_id": "",
+            "subjective_salience": 0.0,
+            "autobiographical_importance": 0.0,
             "extra": json.dumps({
                 **(metadata or {}),
                 "generation_health": health.__dict__,
@@ -206,6 +209,33 @@ class DualMemorySystem:
             metadatas=[record_metadata],
         )
         return episode_id
+
+    def link_experience(
+        self,
+        episode_id: str,
+        *,
+        experience_id: str,
+        subjective_salience: float,
+        autobiographical_importance: float,
+    ) -> EpisodicMemoryRecord:
+        for name, value in (
+            ("subjective salience", subjective_salience),
+            ("autobiographical importance", autobiographical_importance),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between zero and one")
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            raise ValueError(f"Unknown episodic memory: {episode_id}")
+        metadata["experience_id"] = experience_id
+        metadata["subjective_salience"] = subjective_salience
+        metadata["autobiographical_importance"] = autobiographical_importance
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+        linked = self.get_episodic(episode_id)
+        if linked is None:
+            raise ValueError(f"Unknown episodic memory: {episode_id}")
+        return linked
 
     def save_semantic(
         self,
@@ -536,6 +566,11 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         consolidation_status=ConsolidationStatus(str(metadata.get("consolidation_status", ConsolidationStatus.PENDING.value))),
         consolidation_version=str(metadata.get("consolidation_version", "")),
         consolidation_attempt_id=_optional_str(metadata.get("consolidation_attempt_id")),
+        experience_id=_optional_str(metadata.get("experience_id")),
+        subjective_salience=float(metadata.get("subjective_salience", 0.0)),
+        autobiographical_importance=float(
+            metadata.get("autobiographical_importance", 0.0)
+        ),
     )
 
 
@@ -675,7 +710,9 @@ def _annotate_retrieval(
     return sorted(
         annotated,
         key=lambda item: (
-            0.7 * item.semantic_relevance + 0.3 * item.context_compatibility
+            0.6 * item.semantic_relevance
+            + 0.25 * item.context_compatibility
+            + 0.15 * getattr(item, "subjective_salience", 0.0)
         ),
         reverse=True,
     )

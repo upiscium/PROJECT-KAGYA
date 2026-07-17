@@ -2,6 +2,7 @@ from pathlib import Path
 import math
 
 from kagya.config import Settings, load_settings
+from kagya.experience import ExperienceAppraisal
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.runtime import KagyaMainLoop
@@ -56,6 +57,18 @@ def test_dummy_provider_drives_user_input_to_response_end_to_end(
     assert result.hidden_thought == "internal runtime thought"
     assert result.loss == DummyProvider.loss_value
     assert result.episode_id.startswith("episode-")
+    assert result.experience_id.startswith("experience-")
+    experience = loop.experience_store.get(result.experience_id)
+    assert experience.result_refs["memory"] == (f"episode:{result.episode_id}",)
+    episode_item = next(
+        item
+        for item in loop.working_memory.items
+        if item.item_id == f"episode:{result.episode_id}"
+    )
+    assert episode_item.salience == experience.subjective_salience
+    assert loop.persistent_state.extensions["experiences"]["records"][0][
+        "experience_id"
+    ] == result.experience_id
     assert result.model_id == _settings_for_tmp_memory(tmp_path).model.primary_id
     assert result.adapter_id is None
 
@@ -109,6 +122,38 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
 
     assert result.arousal != before.arousal
     assert result.valence != before.valence
+
+
+def test_experience_reassessment_updates_linked_memory_salience(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    result = loop.chat("reassess this", debug=True)
+
+    revised = loop.reassess_experience(
+        result.experience_id,
+        appraisal=ExperienceAppraisal(
+            valence=-0.5,
+            arousal=0.9,
+            novelty=1.0,
+            novelty_valid=True,
+            goal_progress=-0.5,
+            threat=0.8,
+            controllability=0.2,
+            certainty=0.9,
+            social_relevance=0.8,
+            effort_cost=0.3,
+            reason_codes=("later_evidence",),
+        ),
+        reason_code="later_evidence",
+        evidence_refs=("memory:evidence",),
+    )
+    episode = memory.get_episodic(result.episode_id)
+
+    assert episode is not None
+    assert revised.revision == 1
+    assert episode.subjective_salience == revised.subjective_salience
+    assert episode.autobiographical_importance == revised.autobiographical_importance
 
 
 def test_invalid_loss_does_not_abort_chat_or_become_zero_novelty(

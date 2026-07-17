@@ -70,7 +70,7 @@ class EpisodicMemoryRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     operator_metadata: dict[str, Any] = field(default_factory=dict)
-    schema_version: int = 2
+    schema_version: int = 3
     input_kind: MemoryRecordKind = MemoryRecordKind.EXTERNAL_CLAIM
     response_kind: MemoryRecordKind = MemoryRecordKind.GENERATED_RESPONSE
     input_confidence: float = 0.7
@@ -102,6 +102,9 @@ class EpisodicMemoryRecord:
     context_compatibility: float = 0.0
     context_relation: str = "legacy_unknown"
     cross_context: bool = False
+    experience_id: str | None = None
+    subjective_salience: float = 0.0
+    autobiographical_importance: float = 0.0
 
 
 @dataclass(frozen=True)

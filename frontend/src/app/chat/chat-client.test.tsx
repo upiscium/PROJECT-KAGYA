@@ -24,6 +24,7 @@ describe("ChatClient", () => {
       json: async () => ({
         context_id: "ctx-1",
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
@@ -48,6 +49,7 @@ describe("ChatClient", () => {
       json: async () => ({
         context_id: "ctx-1",
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E4B", adapter_id: null, fallback_used: false },
@@ -95,6 +97,7 @@ describe("ChatClient", () => {
       json: async () => ({
         context_id: "ctx-1",
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Fallback answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "google/gemma-4-E2B", adapter_id: null, fallback_used: true },
@@ -129,6 +132,7 @@ describe("ChatClient", () => {
       json: async () => ({
         context_id: "ctx-stable",
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
         model: { model_id: "model", adapter_id: null, fallback_used: false },

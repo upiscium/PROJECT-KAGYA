@@ -42,6 +42,8 @@ class AgentEventType(StrEnum):
     DECISION_GENERATE = "decision_generate"
     SELF_MODEL_READ = "self_model_read"
     SELF_MODEL_UPDATE = "self_model_update"
+    EXPERIENCE_READ = "experience_read"
+    EXPERIENCE_UPDATE = "experience_update"
 
 
 @dataclass(frozen=True)

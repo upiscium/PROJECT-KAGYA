@@ -23,6 +23,7 @@ describe("DebugClient", () => {
       ok: true,
       json: async () => ({
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         hidden_thought: "internal thought",
         loss: 1.25,
@@ -50,6 +51,7 @@ describe("DebugClient", () => {
       ok: true,
       json: async () => ({
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         hidden_thought: "internal thought",
         loss: 1.25,
@@ -86,6 +88,7 @@ describe("DebugClient", () => {
       ok: true,
       json: async () => ({
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Visible answer",
         hidden_thought: "",
         loss: 1.25,
@@ -126,6 +129,7 @@ describe("DebugClient", () => {
       ok: true,
       json: async () => ({
         episode_id: "episode-1",
+        experience_id: "experience-1",
         response: "Fallback visible answer",
         hidden_thought: "fallback thought",
         loss: 1.25,

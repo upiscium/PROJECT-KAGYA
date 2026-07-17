@@ -12,6 +12,7 @@ from kagya.memory import (
     ValidationStatus,
 )
 from kagya.models import DummyProvider
+from kagya.memory.memory_evaluator import MemoryEvaluator
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -64,6 +65,60 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
     assert stored["ids"] == [episode_id]
     assert stored["metadatas"][0]["archived"] is True
     assert memory.retrieve_context("fact").db1_results == []
+
+
+def test_experience_salience_affects_retrieval_order(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    low = memory.save_episodic(
+        "shared retrieval topic", "low", source_event_id="event-low"
+    )
+    high = memory.save_episodic(
+        "shared retrieval topic", "high", source_event_id="event-high"
+    )
+    memory.link_experience(
+        low,
+        experience_id="experience-low",
+        subjective_salience=0.1,
+        autobiographical_importance=0.1,
+    )
+    memory.link_experience(
+        high,
+        experience_id="experience-high",
+        subjective_salience=0.9,
+        autobiographical_importance=0.8,
+    )
+
+    context = memory.retrieve_context("shared retrieval topic")
+
+    assert [record.id for record in context.db1_results[:2]] == [high, low]
+    assert context.db1_results[0].experience_id == "experience-high"
+
+
+def test_experience_salience_can_select_low_arousal_episode_for_consolidation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(
+        settings,
+        embedding_function=DeterministicEmbeddingFunction(),
+        evaluator=MemoryEvaluator(
+            min_arousal=0.9,
+            min_subjective_salience=0.7,
+        ),
+    )
+    episode_id = memory.save_episodic(
+        "subjectively important", "response", emotion_arousal=0.1
+    )
+    memory.link_experience(
+        episode_id,
+        experience_id="experience-important",
+        subjective_salience=0.8,
+        autobiographical_importance=0.9,
+    )
+
+    semantic_ids = memory.consolidate_to_semantic(DummyProvider())
+
+    assert len(semantic_ids) == 1
 
 
 def test_operator_can_archive_episodic_record_without_deleting(tmp_path: Path) -> None:

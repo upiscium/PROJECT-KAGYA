@@ -209,6 +209,9 @@ def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
         context_compatibility=record.context_compatibility,
         context_relation=record.context_relation,
         cross_context=record.cross_context,
+        experience_id=record.experience_id,
+        subjective_salience=record.subjective_salience,
+        autobiographical_importance=record.autobiographical_importance,
     )
 
 

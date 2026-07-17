@@ -33,6 +33,7 @@ from kagya.api.schemas.debug import (
 )
 from kagya.config import Settings
 from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.identity import OriginActor
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -63,6 +64,7 @@ def debug_chat(
                 source_session_id=request.client_session_id,
                 interlocutor_key=request.interlocutor_key,
                 create_context=request.context_id is None,
+                origin_actor=OriginActor.OPERATOR,
             ),
             payload={
                 "text": request.text,

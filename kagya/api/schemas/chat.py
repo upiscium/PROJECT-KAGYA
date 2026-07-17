@@ -40,6 +40,7 @@ class ModelSchema(BaseModel):
 class ChatResponse(BaseModel):
     context_id: str
     episode_id: str
+    experience_id: str
     response: str
     emotion: EmotionSchema
     model: ModelSchema

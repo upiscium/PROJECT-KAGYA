@@ -30,6 +30,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Event journal | Persist accepted/started/prepared/terminal lifecycle and snapshot hash continuity | `.kagya/agent_journal.jsonl*` | Fsynced operator-safe lifecycle records | `tests/test_event_journal.py` |
 | Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
 | Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
+| Experience integration | Bind an event, context, appraisal, subjective salience, and downstream references into one first-person unit | `extensions.experiences` | Structured Observation/interaction events; later reassessment requires evidence refs | `tests/test_experience_store.py` |
 | Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
 | Value system | Maintain stable, rate-limited value weights and conflicts | `identity.values` | Structured observation/outcome/reflection proposals with event or memory evidence | `tests/test_value_system.py` |
@@ -53,17 +54,25 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 9. The completion hook atomically snapshots the resulting subject state.
 10. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
 
+## Experience Integration
+
+- A successful chat event creates one idempotent `ExperienceRecord` linked to its source event, external input observation, generated subject action, context, and interlocutor IDs.
+- Experience state stores opaque observation/action references and structured situation/interpretation codes. It does not copy user text, generated responses, prompts, attachments, or hidden thoughts into the subject snapshot.
+- Subjective salience is derived from calibrated novelty, affect intensity, self relevance, unresolved tension, and prediction error. It controls the linked episode's Working Memory score, contributes to retrieval ranking, and can qualify low-arousal episodes for consolidation.
+- Reassessment requires explicit evidence references and appends an immutable revision record. Updated salience and autobiographical importance are propagated to the linked episodic memory.
+- DecisionRecords freeze their source Experience IDs, while the Experience records the resulting Decision reference. Future Belief, Value, Goal, and Self Model layers use the same result-reference boundary.
+
 ## Versioning And Migration
 
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
-- Values, goals, commitments, action candidates, decision records, and self-model state carry their own schema versions or revisions.
+- Values, goals, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
 - Legacy flat values, goal/commitment dictionaries, DecisionRecord v1 data, and legacy self-model dictionaries are migrated at subsystem restore boundaries.
 - Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
 
 ## API And Privacy
 
-- Public `POST /api/chat` exposes only the response, context ID, emotion, and model metadata.
-- Debug, state, memory, value, goal, commitment, decision, and self-model inspection require `X-KAGYA-Admin-Token`.
+- Public `POST /api/chat` exposes only the response, opaque episode/Experience/context IDs, emotion, and model metadata.
+- Debug, state, memory, Experience, value, goal, commitment, decision, and self-model inspection require `X-KAGYA-Admin-Token`.
 - Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
 - Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.
