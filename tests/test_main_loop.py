@@ -191,6 +191,8 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     assert "optimal_loss:" in result.prompt
     assert "old episode" in result.prompt
     assert "stable semantic memory" in result.prompt
+    assert "Past recorded interaction (not a current fact)" in result.prompt
+    assert "Stored semantic record (not an adopted belief)" in result.prompt
     assert "hidden_thought" not in result.prompt
     assert "<think>" not in result.prompt
     assert "Assistant response:" not in result.prompt

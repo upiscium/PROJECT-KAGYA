@@ -31,6 +31,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
 | Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
 | Experience integration | Bind an event, context, appraisal, subjective salience, and downstream references into one first-person unit | `extensions.experiences` | Structured Observation/interaction events; later reassessment requires evidence refs | `tests/test_experience_store.py` |
+| Belief revision | Separate currently adopted propositions from observations and memory records | `extensions.beliefs` | Experience-backed proposals followed by explicit evidence review | `tests/test_belief_store.py` |
 | Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
 | Value system | Maintain stable, rate-limited value weights and conflicts | `identity.values` | Structured observation/outcome/reflection proposals with event or memory evidence | `tests/test_value_system.py` |
@@ -61,6 +62,15 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Subjective salience is derived from calibrated novelty, affect intensity, self relevance, unresolved tension, and prediction error. It controls the linked episode's Working Memory score, contributes to retrieval ranking, and can qualify low-arousal episodes for consolidation.
 - Reassessment requires explicit evidence references and appends an immutable revision record. Updated salience and autobiographical importance are propagated to the linked episodic memory.
 - DecisionRecords freeze their source Experience IDs, while the Experience records the resulting Decision reference. Future Belief, Value, Goal, and Self Model layers use the same result-reference boundary.
+- Experience-backed Belief proposals remain outside normal reasoning until reviewed. Accepted Beliefs link back to Experience and are versioned independently from their source Memory records.
+
+## Belief Boundary
+
+- Episodic and semantic memory are records, not automatically current facts. Prompt rendering labels them as recorded interactions or stored semantic records rather than adopted Beliefs.
+- External claims enter as Experience-backed proposals with source trust and origin provenance. Review records confidence, epistemic status, evidence, and explicit subject endorsement.
+- Structured contradictions retain both propositions and move them out of active reasoning until evidence-backed resolution or supersession.
+- Superseded, retracted, expired, rejected, disputed, and proposed records are excluded from Working Memory and Decision inputs. Context and validity windows are evaluated at selection time.
+- DecisionRecords freeze active Belief revision numbers and origin IDs, allowing later explanation to distinguish what was believed at decision time from what was merely remembered.
 
 ## Versioning And Migration
 
@@ -72,7 +82,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 ## API And Privacy
 
 - Public `POST /api/chat` exposes only the response, opaque episode/Experience/context IDs, emotion, and model metadata.
-- Debug, state, memory, Experience, value, goal, commitment, decision, and self-model inspection require `X-KAGYA-Admin-Token`.
+- Debug, state, memory, Experience, Belief, value, goal, commitment, decision, and self-model inspection require `X-KAGYA-Admin-Token`.
 - Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
 - Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.

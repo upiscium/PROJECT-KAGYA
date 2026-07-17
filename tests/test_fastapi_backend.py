@@ -136,6 +136,27 @@ def test_experience_state_survives_subject_restart(tmp_path: Path) -> None:
         created = first_client.post(
             "/api/chat", json={"text": "persist experience", "attachments": []}
         ).json()
+        proposed_belief = first_client.post(
+            "/api/beliefs",
+            headers=admin_headers(),
+            json={
+                "belief_id": "persistent-belief",
+                "experience_id": created["experience_id"],
+                "proposition": "A reviewed persistent proposition",
+            },
+        )
+        assert proposed_belief.status_code == 200
+        assert first_client.post(
+            "/api/beliefs/persistent-belief/resolve",
+            headers=admin_headers(),
+            json={
+                "accept": True,
+                "confidence": 0.7,
+                "epistemic_status": "probable",
+                "reason_code": "reviewed",
+                "evidence_refs": [f"experience:{created['experience_id']}"],
+            },
+        ).status_code == 200
     snapshot_text = settings.agent_state.path.read_text(encoding="utf-8")
     assert "persist experience" not in snapshot_text
     assert "hidden_thought" not in snapshot_text
@@ -145,9 +166,15 @@ def test_experience_state_survives_subject_restart(tmp_path: Path) -> None:
             f"/api/experiences/{created['experience_id']}",
             headers=admin_headers(),
         )
+        restored_beliefs = restarted_client.get(
+            "/api/beliefs",
+            params={"active_only": True},
+            headers=admin_headers(),
+        )
 
     assert restored.status_code == 200
     assert restored.json()["experience_id"] == created["experience_id"]
+    assert restored_beliefs.json()["beliefs"][0]["belief_id"] == "persistent-belief"
 
 
 def test_chat_creates_and_resumes_explicit_context(tmp_path: Path) -> None:
@@ -1130,9 +1157,54 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     headers = admin_headers()
 
     assert client.get("/api/decisions").status_code == 401
-    context_id = client.post(
+    context_response = client.post(
         "/api/chat", json={"text": "decision context", "attachments": []}
-    ).json()["context_id"]
+    ).json()
+    context_id = context_response["context_id"]
+    belief = client.post(
+        "/api/beliefs",
+        headers=headers,
+        json={
+            "belief_id": "decision-belief",
+            "experience_id": context_response["experience_id"],
+            "proposition": "The decision context is current",
+            "subject": "decision-context",
+            "predicate": "state",
+            "object": "current",
+            "context_scope": [context_id],
+            "source_trust": 0.8,
+            "confidence": 0.7,
+        },
+    )
+    assert belief.status_code == 200
+    assert belief.json()["lifecycle"] == "proposed"
+    assert client.get(
+        "/api/beliefs", headers=headers, params={"active_only": True}
+    ).json()["beliefs"] == []
+    resolved_belief = client.post(
+        "/api/beliefs/decision-belief/resolve",
+        headers=headers,
+        json={
+            "accept": True,
+            "confidence": 0.9,
+            "epistemic_status": "established",
+            "reason_code": "reviewed_context_evidence",
+            "evidence_refs": [f"experience:{context_response['experience_id']}"],
+        },
+    )
+    assert resolved_belief.status_code == 200
+    belief_context = client.post(
+        "/api/chat/debug",
+        headers=headers,
+        json={
+            "text": "use reviewed beliefs",
+            "attachments": [],
+            "context_id": context_id,
+        },
+    )
+    assert belief_context.status_code == 200
+    assert "Adopted belief (established" in belief_context.json()["prompt"]
+    assert "The decision context is current" in belief_context.json()["prompt"]
     goal = client.post(
         "/api/goals",
         headers=headers,
@@ -1201,11 +1273,14 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert record["active_goal_ids"] == ["decision-goal"]
     assert set(record["value_revision_refs"]) == {"care", "honesty"}
     assert set(record["identity_origin_refs"]) == {
+        "belief:decision-belief",
         "goal:decision-goal",
         "value:care",
         "value:honesty",
     }
     assert len(record["experience_refs"]) == 1
+    assert record["belief_revision_refs"] == {"decision-belief": 1}
+    assert "belief:decision-belief" in record["identity_origin_refs"]
     decision_experience = client.get(
         f"/api/experiences/{record['experience_refs'][0]}", headers=headers
     ).json()
