@@ -128,7 +128,8 @@ active_ids = {
     and entry.get("adapter_id")
 }
 rollback_ids = set()
-for active_id in active_ids:
+current_ids = active_ids if active_ids else {None}
+for active_id in current_ids:
     for record in reversed(records):
         if not isinstance(record, dict) or record.get("adapter_id") != active_id:
             continue

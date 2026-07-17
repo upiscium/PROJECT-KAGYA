@@ -65,6 +65,49 @@ def test_prune_protects_all_archived_adapters_without_activation_history(
     assert all(path.exists() for path in paths.values())
 
 
+def test_prune_preserves_rollback_target_when_runtime_is_back_on_base(
+    tmp_path: Path,
+) -> None:
+    app_dir, paths = _runtime_tree(tmp_path, include_history=True)
+    registry_path = app_dir / ".kagya" / "adapter_registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    for entry in registry["adapters"]:
+        if entry["adapter_id"] == "active":
+            entry["status"] = "archived"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    history_path = app_dir / ".kagya" / "adapter_registry_activations.json"
+    history_path.write_text(
+        json.dumps(
+            {
+                "activations": [
+                    {
+                        "action": "activate",
+                        "adapter_id": "active",
+                        "previous_adapter_id": None,
+                    },
+                    {
+                        "action": "rollback",
+                        "adapter_id": None,
+                        "previous_adapter_id": "active",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--confirm", "PRUNE", "--days", "30"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "KAGYA_APP_DIR": str(app_dir)},
+    )
+
+    assert paths["active"].exists()
+    assert not paths["expired"].exists()
+
+
 def _runtime_tree(
     tmp_path: Path, *, include_history: bool
 ) -> tuple[Path, dict[str, Path]]:

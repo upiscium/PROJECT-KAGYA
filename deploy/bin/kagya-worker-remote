@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${KAGYA_WORKER_ENV_FILE:-/etc/project-kagya/training-worker.env}"
+if [[ ! -r "${ENV_FILE}" ]]; then
+  printf 'Worker environment file is not readable: %s\n' "${ENV_FILE}" >&2
+  exit 2
+fi
+
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
+
+: "${KAGYA_APP_DIR:?KAGYA_APP_DIR is required}"
+: "${KAGYA_CONFIG_PATH:?KAGYA_CONFIG_PATH is required}"
+if [[ "${KAGYA_APP_DIR}" != /* || "${KAGYA_CONFIG_PATH}" != /* ]]; then
+  printf 'KAGYA_APP_DIR and KAGYA_CONFIG_PATH must be absolute paths.\n' >&2
+  exit 2
+fi
+if [[ ! -d "${KAGYA_APP_DIR}" || ! -r "${KAGYA_CONFIG_PATH}" ]]; then
+  printf 'Worker application directory or config is unavailable.\n' >&2
+  exit 2
+fi
+
+cd "${KAGYA_APP_DIR}"
+if [[ "${KAGYA_WORKER_NIX_DEVELOP:-0}" == "1" ]]; then
+  exec nix develop "${KAGYA_APP_DIR}" --command uv run kagya-worker "$@"
+fi
+exec uv run kagya-worker "$@"
