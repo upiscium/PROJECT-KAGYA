@@ -15,6 +15,9 @@ class AdapterResponse(BaseModel):
     created_at: str
     updated_at: str
     notes: str
+    base_model_revision: str | None = None
+    adapter_hash: str | None = None
+    activation_sequence: int | None = None
 
 
 class AdapterListResponse(BaseModel):
@@ -31,3 +34,19 @@ class AdapterEvaluateResponse(BaseModel):
     decision: str
     result_path: str
     status: str
+
+
+class AdapterActivationResponse(BaseModel):
+    action: str
+    adapter_id: str | None
+    adapter_hash: str | None
+    previous_adapter_id: str | None
+    previous_adapter_hash: str | None
+    activation_sequence: int
+
+
+class AdapterRuntimeStateResponse(BaseModel):
+    base_model: str
+    adapter_id: str | None
+    adapter_hash: str | None
+    activation_sequence: int | None

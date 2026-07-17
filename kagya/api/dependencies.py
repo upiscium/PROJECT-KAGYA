@@ -13,6 +13,8 @@ from kagya.learning import (
     AdapterEntry,
     AdapterRegistry,
     AdapterStatus,
+    AdapterRuntimeManager,
+    RuntimeAdapterState,
     SleepCycleManager,
 )
 from kagya.memory import DualMemorySystem
@@ -173,6 +175,15 @@ def get_model_provider(request: Request) -> ModelProvider:
 def sync_main_loop_to_active_adapter(request: Request) -> KagyaMainLoop:
     active_adapter = _get_active_adapter(request)
     provider = _get_runtime_model_provider(request, active_adapter)
+    return _replace_main_loop(request, provider, active_adapter)
+
+
+def _replace_main_loop(
+    request: Request,
+    provider: ModelProvider,
+    active_adapter: AdapterEntry | None,
+    activation_sequence_override: int | None = None,
+) -> KagyaMainLoop:
     previous_loop = getattr(request.app.state, "main_loop", None)
     main_loop = KagyaMainLoop(
         get_api_settings(request),
@@ -186,9 +197,68 @@ def sync_main_loop_to_active_adapter(request: Request) -> KagyaMainLoop:
         if previous_loop is None
         else previous_loop.context_registry,
         adapter_id=None if active_adapter is None else active_adapter.adapter_id,
+        adapter_hash=None if active_adapter is None else active_adapter.adapter_hash,
+        activation_sequence=(
+            activation_sequence_override
+            if activation_sequence_override is not None
+            else None
+            if active_adapter is None
+            else active_adapter.activation_sequence
+        ),
     )
     request.app.state.main_loop = main_loop
     return main_loop
+
+
+def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
+    manager = getattr(request.app.state, "adapter_runtime_manager", None)
+    if manager is not None:
+        return manager
+    settings = get_api_settings(request)
+    registry = get_adapter_registry(request)
+
+    def load(entry: AdapterEntry | None) -> ModelProvider:
+        return load_model_provider(
+            settings,
+            adapter_path=None if entry is None else entry.path,
+            allow_archived_adapter=(
+                entry is not None and entry.status == AdapterStatus.ARCHIVED
+            ),
+        )
+
+    def switch(
+        provider: ModelProvider, entry: AdapterEntry | None, sequence: int | None
+    ) -> None:
+        request.app.state.model_provider = provider
+        request.app.state.model_provider_adapter_id = (
+            None if entry is None else entry.adapter_id
+        )
+        _replace_main_loop(
+            request, provider, entry, activation_sequence_override=sequence
+        )
+
+    def snapshot() -> RuntimeAdapterState:
+        loop = getattr(request.app.state, "main_loop", None)
+        if loop is None:
+            loop = get_main_loop(request)
+        return RuntimeAdapterState(
+            adapter_id=loop.adapter_id,
+            adapter_hash=loop.adapter_hash,
+            activation_sequence=loop.activation_sequence,
+            provider=loop.provider,
+        )
+
+    manager = AdapterRuntimeManager(
+        registry,
+        provider_loader=load,
+        runtime_switch=switch,
+        runtime_snapshot=snapshot,
+        history_path=settings.adapter_registry.path.with_name(
+            f"{settings.adapter_registry.path.stem}_activations.json"
+        ),
+    )
+    request.app.state.adapter_runtime_manager = manager
+    return manager
 
 
 def get_memory_system(request: Request) -> DualMemorySystem:

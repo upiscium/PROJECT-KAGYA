@@ -79,6 +79,8 @@ class ChatResult:
     optimal_loss: float
     model_id: str
     adapter_id: str | None
+    adapter_hash: str | None
+    activation_sequence: int | None
     fallback_used: bool
     prompt: str
     memory_context: MemoryContext
@@ -104,6 +106,8 @@ class KagyaMainLoop:
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
+        adapter_hash: str | None = None,
+        activation_sequence: int | None = None,
         persistent_state: PersistentAgentState | None = None,
         working_memory: WorkingMemory | None = None,
         context_registry: ContextRegistry | None = None,
@@ -132,6 +136,8 @@ class KagyaMainLoop:
         self.agent = agent or ConsciousAgent(provider)
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
+        self.adapter_hash = adapter_hash
+        self.activation_sequence = activation_sequence
         self.persistent_state = persistent_state or PersistentAgentState()
         self.working_memory = working_memory or WorkingMemory(
             item_capacity=settings.working_memory.item_capacity,
@@ -374,6 +380,10 @@ class KagyaMainLoop:
             optimal_loss=emotion_state.optimal_loss,
             model_id=model_id,
             adapter_id=None if fallback_used else self.adapter_id,
+            adapter_hash=None if fallback_used else self.adapter_hash,
+            activation_sequence=(
+                None if fallback_used else self.activation_sequence
+            ),
             fallback_used=fallback_used,
             prompt=prompt,
             memory_context=memory_context,
@@ -840,6 +850,9 @@ class KagyaMainLoop:
                 "arousal": emotion.arousal,
                 "optimal_loss": emotion.optimal_loss,
             },
+            adapter_id=self.adapter_id,
+            adapter_hash=self.adapter_hash,
+            activation_sequence=self.activation_sequence,
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"

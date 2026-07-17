@@ -517,6 +517,7 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
         adapter_path=tmp_path / "adapter-api",
         dataset_path=tmp_path / "dataset.jsonl",
         dataset_hash="hash",
+        adapter_hash="hash-api",
     )
 
     invalid = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
@@ -542,7 +543,7 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     previous_emotion = previous_loop.emotion_engine
 
     active = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
-    assert active.status_code == 200
+    assert active.status_code == 200, active.text
     assert active.json()["status"] == "active"
     assert client.app.state.main_loop is not previous_loop
     assert client.app.state.main_loop.session_state.turns is previous_turns
@@ -552,9 +553,22 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     )
     assert after_activation_chat.status_code == 200
     assert after_activation_chat.json()["model"]["adapter_id"] == "adapter-api"
+    assert after_activation_chat.json()["model"]["adapter_hash"] == "hash-api"
+    assert after_activation_chat.json()["model"]["activation_sequence"] > 0
+    runtime_state = client.get("/api/adapters/runtime", headers=admin_headers())
+    assert runtime_state.json()["adapter_id"] == "adapter-api"
+    assert runtime_state.json()["adapter_hash"] == "hash-api"
     listed = client.get("/api/adapters", headers=admin_headers())
     assert listed.status_code == 200
     assert listed.json()["adapters"][0]["status"] == "active"
+    rolled_back = client.post("/api/adapters/rollback", headers=admin_headers())
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["action"] == "rollback"
+    assert rolled_back.json()["adapter_id"] is None
+    after_rollback_chat = client.post(
+        "/api/chat", json={"text": "after rollback", "attachments": []}
+    )
+    assert after_rollback_chat.json()["model"]["adapter_id"] is None
 
 
 def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate(

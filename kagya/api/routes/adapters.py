@@ -6,11 +6,11 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_adapter_registry,
+    get_adapter_runtime_manager,
     get_api_settings,
     get_model_provider,
     get_runtime_event_log,
     require_admin,
-    sync_main_loop_to_active_adapter,
 )
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.adapter import (
@@ -18,6 +18,8 @@ from kagya.api.schemas.adapter import (
     AdapterEvaluateResponse,
     AdapterListResponse,
     AdapterResponse,
+    AdapterActivationResponse,
+    AdapterRuntimeStateResponse,
 )
 from kagya.config import Settings
 from kagya.learning import (
@@ -25,6 +27,7 @@ from kagya.learning import (
     AdapterEvaluationResult,
     AdapterEvaluator,
     AdapterRegistry,
+    AdapterRuntimeManager,
     AdapterStatus,
 )
 from kagya.models import ModelProvider, load_model_provider
@@ -34,6 +37,26 @@ from kagya.runtime import AgentEventType, AgentRuntime
 router = APIRouter(
     prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)]
 )
+
+
+@router.get("/runtime", response_model=AdapterRuntimeStateResponse)
+def adapter_runtime_state(
+    settings: Settings = Depends(get_api_settings),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
+) -> AdapterRuntimeStateResponse:
+    state = execute_agent_event(
+        runtime,
+        AgentEventType.ADAPTER_READ,
+        source="api.adapters.runtime",
+        handler=manager.current,
+    ).value
+    return AdapterRuntimeStateResponse(
+        base_model=settings.model.primary_id,
+        adapter_id=state.adapter_id,
+        adapter_hash=state.adapter_hash,
+        activation_sequence=state.activation_sequence,
+    )
 
 
 @router.get("", response_model=AdapterListResponse)
@@ -142,23 +165,47 @@ def approve_adapter(
 @router.post("/{adapter_id}/activate", response_model=AdapterResponse)
 def activate_adapter(
     adapter_id: str,
-    request: Request,
     registry: AdapterRegistry = Depends(get_adapter_registry),
     runtime: AgentRuntime = Depends(get_agent_runtime),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+    manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
 ) -> AdapterResponse:
     try:
+        manager.stage(adapter_id)
+        manager.verify(adapter_id)
         return execute_agent_event(
             runtime,
             AgentEventType.ADAPTER_UPDATE,
             source="api.adapters.activate",
-            handler=lambda: _activate(
-                request, registry, adapter_id, event_log
-            ),
+            handler=lambda: _activate(manager, registry, adapter_id, event_log),
             payload={"adapter_id": adapter_id},
         ).value
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/rollback", response_model=AdapterActivationResponse)
+def rollback_adapter(
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    event_log: RuntimeEventLog = Depends(get_runtime_event_log),
+    manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
+) -> AdapterActivationResponse:
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.ADAPTER_UPDATE,
+            source="api.adapters.rollback",
+            handler=manager.rollback,
+        ).value
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    event_log.record(
+        category="adapter",
+        event_type="rollback",
+        message="Adapter runtime rollback completed",
+        metadata=record.__dict__,
+    )
+    return AdapterActivationResponse.model_validate(record.__dict__)
 
 
 @router.post("/{adapter_id}/reject", response_model=AdapterResponse)
@@ -233,14 +280,22 @@ def _approve(
 
 
 def _activate(
-    request: Request,
+    manager: AdapterRuntimeManager,
     registry: AdapterRegistry,
     adapter_id: str,
     event_log: RuntimeEventLog,
 ) -> AdapterResponse:
-    entry = registry.activate(adapter_id)
-    sync_main_loop_to_active_adapter(request)
+    record = manager.activate_at_event_boundary(adapter_id)
+    entry = registry.lookup(adapter_id)
+    if entry is None:
+        raise RuntimeError("Activated adapter disappeared from registry")
     _record_adapter_transition(event_log, entry, "activated")
+    event_log.record(
+        category="adapter",
+        event_type="runtime_activated",
+        message="Adapter runtime activation completed",
+        metadata=record.__dict__,
+    )
     return adapter_response(entry)
 
 
@@ -272,4 +327,7 @@ def adapter_response(entry: AdapterEntry) -> AdapterResponse:
         created_at=entry.created_at,
         updated_at=entry.updated_at,
         notes=entry.notes,
+        base_model_revision=entry.base_model_revision,
+        adapter_hash=entry.adapter_hash,
+        activation_sequence=entry.activation_sequence,
     )

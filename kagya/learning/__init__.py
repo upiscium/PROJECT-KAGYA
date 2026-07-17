@@ -2,6 +2,11 @@
 
 from kagya.learning.adapter_evaluator import AdapterEvaluationDecision, AdapterEvaluationResult, AdapterEvaluator
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
+from kagya.learning.adapter_runtime import (
+    AdapterActivationRecord,
+    AdapterRuntimeManager,
+    RuntimeAdapterState,
+)
 from kagya.learning.dream_dataset_generator import DreamDatasetGenerator, DreamDatasetRecord, format_training_text
 from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
 from kagya.learning.qlora_trainer import (
@@ -17,6 +22,9 @@ __all__ = [
     "AdapterEvaluationResult",
     "AdapterEvaluator",
     "AdapterRegistry",
+    "AdapterRuntimeManager",
+    "AdapterActivationRecord",
+    "RuntimeAdapterState",
     "AdapterStatus",
     "DreamDatasetGenerator",
     "DreamDatasetRecord",

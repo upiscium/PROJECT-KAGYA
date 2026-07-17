@@ -27,6 +27,7 @@ class TransformersProvider:
         model: Any | None = None,
         processor: Any | None = None,
         allow_candidate_adapter: bool = False,
+        allow_archived_adapter: bool = False,
     ) -> None:
         self.settings = settings
         self.model_id = settings.model.primary_id
@@ -40,6 +41,7 @@ class TransformersProvider:
         self._fallback_model: Any | None = None
         self._adapter_attached = False
         self.allow_candidate_adapter = allow_candidate_adapter
+        self.allow_archived_adapter = allow_archived_adapter
         self.last_model_id = self.model_id
         self.last_fallback_used = False
         if model is not None and adapter_path is not None:
@@ -175,6 +177,7 @@ class TransformersProvider:
             self.settings,
             adapter_path,
             allow_candidate=self.allow_candidate_adapter,
+            allow_archived=self.allow_archived_adapter,
         ):
             raise ValueError("Adapter path is not approved by the adapter registry")
         if self.model is None:
@@ -252,6 +255,7 @@ def is_registry_approved_adapter(
     adapter_path: str | Path,
     *,
     allow_candidate: bool = False,
+    allow_archived: bool = False,
 ) -> bool:
     """Return whether an adapter path is registered in a loadable state."""
 
@@ -266,6 +270,8 @@ def is_registry_approved_adapter(
         path = entry.get("path")
         state = entry.get("state")
         allowed_states = LOADABLE_ADAPTER_STATES | ({"candidate"} if allow_candidate else set())
+        if allow_archived:
+            allowed_states.add("archived")
         if path is None or state not in allowed_states:
             continue
         if Path(path).expanduser().resolve() == requested_path:

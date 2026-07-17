@@ -163,6 +163,10 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             provider,
             app.state.memory_system,
             adapter_id=None if active_adapter is None else active_adapter.adapter_id,
+            adapter_hash=None if active_adapter is None else active_adapter.adapter_hash,
+            activation_sequence=(
+                None if active_adapter is None else active_adapter.activation_sequence
+            ),
         )
     app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
     if getattr(app.state, "agent_runtime", None) is None:

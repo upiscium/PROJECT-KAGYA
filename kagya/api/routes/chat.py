@@ -80,6 +80,8 @@ def chat_response_from_result(result: ChatResult) -> ChatResponse:
         model=ModelSchema(
             model_id=result.model_id,
             adapter_id=result.adapter_id,
+            adapter_hash=result.adapter_hash,
+            activation_sequence=result.activation_sequence,
             fallback_used=result.fallback_used,
         ),
     )
