@@ -18,17 +18,17 @@ def test_visible_response_removes_complete_think_blocks() -> None:
     assert processed.hidden_thought == "secret\nmore"
 
 
-def test_malformed_think_tags_do_not_crash_or_leave_tag_residue() -> None:
+def test_unclosed_think_block_is_fail_closed() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("Visible <think>unfinished thought")
 
-    assert processed.hidden_thought == ""
+    assert processed.hidden_thought == "unfinished thought"
     assert "<think>" not in processed.visible_response
-    assert processed.visible_response == "Visible unfinished thought"
+    assert processed.visible_response == "Visible"
 
 
-def test_visible_response_contains_no_closing_think_tag_residue() -> None:
+def test_orphan_closing_think_tag_does_not_hide_visible_content() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("Visible orphan</think> text")
@@ -37,12 +37,12 @@ def test_visible_response_contains_no_closing_think_tag_residue() -> None:
     assert processed.visible_response == "Visible orphan text"
 
 
-def test_visible_response_removes_html_like_tag_residue() -> None:
+def test_visible_response_preserves_html() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("<h1>Title</h1><strong>Answer</strong>")
 
-    assert processed.visible_response == "TitleAnswer"
+    assert processed.visible_response == "<h1>Title</h1><strong>Answer</strong>"
 
 
 def test_visible_response_removes_gemma_turn_tokens() -> None:
@@ -53,65 +53,69 @@ def test_visible_response_removes_gemma_turn_tokens() -> None:
     assert processed.visible_response == "A concise answer."
 
 
-def test_visible_response_truncates_generated_prompt_label_echoes() -> None:
+def test_visible_response_preserves_role_labelled_text() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("A concise answer.\nQuestion: repeated prompt\nAnswer: repeated answer")
 
-    assert processed.visible_response == "A concise answer."
+    assert processed.visible_response == (
+        "A concise answer.\nQuestion: repeated prompt\nAnswer: repeated answer"
+    )
 
 
-def test_visible_response_removes_leading_answer_label() -> None:
+def test_visible_response_preserves_leading_answer_label() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("Answer: A concise answer.")
 
-    assert processed.visible_response == "A concise answer."
+    assert processed.visible_response == "Answer: A concise answer."
 
 
-def test_visible_response_truncates_assistant_self_echo_lines() -> None:
+def test_visible_response_preserves_assistant_labelled_text() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("A concise answer.\nAssistant is a repeated label.")
 
-    assert processed.visible_response == "A concise answer."
+    assert processed.visible_response == "A concise answer.\nAssistant is a repeated label."
 
 
-def test_visible_response_normalizes_common_project_name_variants() -> None:
+def test_visible_response_does_not_rewrite_project_names() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("PROJECT-KAGAYA helps locally.")
 
-    assert processed.visible_response == "PROJECT-KAGYA helps locally."
+    assert processed.visible_response == "PROJECT-KAGAYA helps locally."
 
 
-def test_visible_response_collapses_repeated_comma_word_tails() -> None:
+def test_visible_response_preserves_repeated_words() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("It writes guide, guide, guide, guide,")
 
-    assert processed.visible_response == "It writes guide"
+    assert processed.visible_response == "It writes guide, guide, guide, guide,"
 
 
-def test_visible_response_removes_leading_sample_response_preface() -> None:
+def test_visible_response_preserves_sample_response_preface() -> None:
     postprocessor = ResponsePostprocessor()
 
     processed = postprocessor.process("Sure, here are the corresponding responses:\n\nこんにちは")
 
-    assert processed.visible_response == "こんにちは"
-
-
-def test_visible_response_truncates_model_reasoning_trailer() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process(
-        "おはようございます！\n\n何かお手伝いできますか？\nthought\nThinking Process:\nprivate reasoning"
+    assert processed.visible_response == (
+        "Sure, here are the corresponding responses:\n\nこんにちは"
     )
 
-    assert processed.visible_response == "おはようございます！\n\n何かお手伝いできますか？"
+
+def test_multiple_and_nested_think_blocks_stay_internal() -> None:
+    processed = ResponsePostprocessor().process(
+        "A<think>one<think>nested</think>end</think>B<think>two</think>C"
+    )
+
+    assert processed.visible_response == "ABC"
+    assert processed.hidden_thought == "onenestedend\ntwo"
 
 
-def test_visible_response_removes_truncated_reasoning_marker() -> None:
-    processed = ResponsePostprocessor().process("お手伝いできますか？thought")
+def test_think_only_truncated_response_has_no_visible_content() -> None:
+    processed = ResponsePostprocessor().process("<think>private truncated reasoning")
 
-    assert processed.visible_response == "お手伝いできますか？"
+    assert processed.visible_response == ""
+    assert processed.hidden_thought == "private truncated reasoning"
