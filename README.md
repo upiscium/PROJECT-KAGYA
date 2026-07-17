@@ -167,6 +167,79 @@ Distributed training operations are available through admin-token-protected endp
 - `POST /api/sleep/cleanup` applies `sleep.artifact_retention_days` to terminal bundle/result/work artifacts. Imported ACTIVE and rollback adapter directories are outside this cleanup boundary.
 - `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
 
+### Split Training Worker Runbook
+
+The worker is invoked as a one-shot command over SSH; it is not a long-running systemd daemon. Install `deploy/bin/kagya-worker-remote` at a stable absolute path on the worker and create its restricted environment file:
+
+```bash
+sudo install -o kagya -g kagya -m 0755 deploy/bin/kagya-worker-remote /opt/project-kagya/bin/kagya-worker-remote
+sudo install -o kagya -g kagya -m 0600 deploy/env/training-worker.env.example /etc/project-kagya/training-worker.env
+```
+
+Set `KAGYA_CONFIG_PATH` to a private worker config, set `CUDA_VISIBLE_DEVICES` to the dedicated training GPU, and enable `KAGYA_WORKER_NIX_DEVELOP=1` on NixOS when the flake supplies CUDA libraries. The worker config must use `split + training_worker + worker`, `model.provider: transformers`, the exact model and processor revision, `qlora.dry_run: false`, and distinct absolute runtime directories:
+
+```yaml
+deployment:
+  mode: split
+  node:
+    id: training-eve-01
+    role: training_worker
+    expected_hostname: Eve
+    enforce_hostname_match: true
+  training:
+    backend: worker
+    worker:
+      inbox_directory: /var/lib/project-kagya/worker/inbox
+      work_directory: /var/lib/project-kagya/worker/work
+      result_directory: /var/lib/project-kagya/worker/results
+      max_concurrent_jobs: 1
+      retain_failed_jobs: true
+      allowed_submitters:
+        - inference-01
+```
+
+On the inference node, verify the worker host-key fingerprint out of band before adding it to the dedicated known-hosts file. Configure `split + inference + ssh` with the same immutable revisions:
+
+```yaml
+deployment:
+  mode: split
+  node:
+    id: inference-01
+    role: inference
+    expected_hostname: null
+    enforce_hostname_match: false
+  training:
+    backend: ssh
+    remote_worker:
+      node_id: training-eve-01
+      host: eve.internal
+      port: 22
+      user: kagya
+      identity_file: /etc/project-kagya/ssh/training-worker
+      known_hosts_file: /etc/project-kagya/ssh/known_hosts
+      remote_inbox: /var/lib/project-kagya/worker/inbox
+      remote_results: /var/lib/project-kagya/worker/results
+      command: /opt/project-kagya/bin/kagya-worker-remote
+      connect_timeout_seconds: 10
+      job_timeout_seconds: 86400
+      poll_interval_seconds: 30
+      expected_worker_model:
+        model_id: google/gemma-4-12B-it
+        revision: 12ace6d648d72bd41519e140f1185f34d38c7e3d
+        processor_revision: 12ace6d648d72bd41519e140f1185f34d38c7e3d
+```
+
+After both configs pass `just config-check`, run the explicit end-to-end smoke from the inference node. The work directory must be empty and should be retained as the execution record until its result and provenance have been reviewed:
+
+```bash
+KAGYA_CONFIG_PATH=/etc/project-kagya/inference.yaml \
+  uv run python -m kagya.training.split_smoke \
+  --work-dir /var/lib/project-kagya/smoke/$(date -u +%Y%m%dT%H%M%SZ) \
+  --confirm RUN-SPLIT-TRAINING
+```
+
+The smoke checks strict SSH worker health, CUDA visibility, duplicate-submit idempotency, immutable bundle/result checksums, local PEFT candidate import, provenance, and event-boundary activation/rollback. It never prunes remote artifacts and never writes to the configured authoritative adapter registry; local import state is isolated under `--work-dir`.
+
 ## Configuration Field Status
 
 Most `config.yaml` fields are active runtime settings. The fields below are intentionally retained but have limited or future-facing behavior:
@@ -375,6 +448,7 @@ Use backups before pruning. `.kagya/` contains private memories, training data, 
 - Never prune `.kagya/chroma` with filesystem commands. Use future memory archive/tag tooling instead so DB1/DB2 invariants are preserved.
 - Never prune `.kagya/adapter_registry.json`; it is the source of adapter lifecycle truth.
 - Do not prune active, approved, trial, candidate, or rejected adapter directories. Only archived adapter artifact directories are eligible for manual pruning.
+- Preserve the immediate rollback target recorded for the ACTIVE adapter. If activation history is missing or unreadable, `private-prune.sh` protects every archived adapter rather than guessing.
 - Evaluation results under `.kagya/eval_results` and dream datasets under `.kagya/dreams` may be pruned after they are older than the operator-selected retention window and a backup exists.
 - Runtime lifecycle events are currently in-memory and disappear on process restart. Tool registry definitions persist in `.kagya/tool_registry.json`, and tool audit events persist in inspectable JSONL at `.kagya/tool_audit.jsonl`.
 - Hugging Face/model caches are outside `.kagya` and are reproducible. Prune them with provider-specific cache tools only when disk pressure requires it.
