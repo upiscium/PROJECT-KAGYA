@@ -13,6 +13,7 @@ from kagya.api.dependencies import (
     require_admin,
 )
 from kagya.motivation import CommitmentStatus, GoalStatus, GoalType
+from kagya.identity import OriginActor
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -107,6 +108,11 @@ def propose_goal(
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
+    if body.goal_type != GoalType.EXTERNAL_REQUEST:
+        raise HTTPException(
+            status_code=409,
+            detail="Admin goal proposals are external requests; intrinsic and commitment goals require their dedicated subject lifecycle",
+        )
     main_loop = get_main_loop(request)
     try:
         goal = execute_agent_event(
@@ -118,6 +124,8 @@ def propose_goal(
                 description=body.description,
                 structured_target=body.structured_target,
                 origin_value_id=body.origin_value_id,
+                origin_actor=OriginActor.OPERATOR,
+                origin_source_ref="admin:goal_proposal",
                 priority=body.priority,
                 urgency=body.urgency,
                 expected_utility=body.expected_utility,
@@ -241,6 +249,8 @@ def create_commitment(
                 value_effects=body.value_effects,
                 conflict_ids=tuple(body.conflict_ids),
                 commitment_id=body.commitment_id,
+                origin_actor=OriginActor.OPERATOR,
+                origin_source_ref="admin:commitment_request",
             ),
             payload={"commitment_id": body.commitment_id},
             correlation_id=body.commitment_id,

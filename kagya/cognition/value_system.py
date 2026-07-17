@@ -1,6 +1,6 @@
 """Persistent, rate-limited values and structured action evaluation."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
@@ -8,6 +8,14 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from kagya.cognition.appraisal import AppraisalResult
+from kagya.identity import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    identity_origin_from_json,
+    legacy_identity_origin,
+    new_identity_origin,
+)
 
 
 class ValueUpdateKind(StrEnum):
@@ -28,9 +36,10 @@ class ValueState:
     origin: str
     last_updated_at: str
     allowed_update_rate: float
+    origin_provenance: IdentityOrigin | None = None
     revision: int = 0
     frozen: bool = False
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.value_id or not self.name:
@@ -41,8 +50,16 @@ class ValueState:
                 raise ValueError(f"{field_name} must be finite and between zero and one")
         if not math.isfinite(self.allowed_update_rate) or self.allowed_update_rate <= 0:
             raise ValueError("allowed_update_rate must be finite and greater than zero")
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(f"Unsupported value schema version: {self.schema_version}")
+        if self.origin_provenance is None:
+            object.__setattr__(
+                self,
+                "origin_provenance",
+                legacy_identity_origin(self.origin),
+            )
+        if self.schema_version == 1:
+            object.__setattr__(self, "schema_version", 2)
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,9 @@ class ValueEvidence:
     event_sequence: int | None = None
     memory_ids: tuple[str, ...] = ()
     source: str = "runtime"
+    identity_origin: IdentityOrigin = field(
+        default_factory=lambda: legacy_identity_origin("value_evidence")
+    )
 
 
 @dataclass(frozen=True)
@@ -81,6 +101,7 @@ class ValueUpdateRecord:
     memory_ids: tuple[str, ...]
     kind: str
     reason_codes: tuple[str, ...]
+    identity_origin: IdentityOrigin
     requested_delta: float
     applied_delta: float
     before: dict[str, Any]
@@ -180,6 +201,13 @@ class ValueSystem:
         for proposal in proposals:
             if proposal.proposal_id in self.applied_proposals:
                 continue
+            if proposal.evidence.identity_origin.input_kind in {
+                OriginInputKind.REQUEST,
+                OriginInputKind.SUGGESTION,
+            }:
+                raise ValueError(
+                    "Requests and suggestions cannot directly update subject values"
+                )
             self._require(proposal.value_id)
             grouped.setdefault(proposal.value_id, []).append(proposal)
         records: list[ValueUpdateRecord] = []
@@ -232,6 +260,7 @@ class ValueSystem:
                 reason_codes=("value_frozen",)
                 if state.frozen
                 else tuple(code for item in candidates for code in item.reason_codes),
+                identity_origin=candidates[-1].evidence.identity_origin,
                 requested_delta=requested,
                 applied_delta=applied,
                 before=before,
@@ -390,17 +419,16 @@ class ValueSystem:
         values = payload.get("values")
         if isinstance(values, dict):
             self.values = {
-                key: ValueState(**value)
+                key: _value_state_from_json(value)
                 for key, value in values.items()
                 if isinstance(key, str) and isinstance(value, dict)
             }
         self.history = [
-            ValueUpdateRecord(**record)
+            _value_update_record_from_json(record)
             for record in payload.get("history", [])
             if isinstance(record, dict)
         ]
         self.applied_proposals = set(payload.get("applied_proposals", []))
-
     def _require(self, value_id: str) -> ValueState:
         state = self.values.get(value_id)
         if state is None:
@@ -425,6 +453,11 @@ class ValueSystem:
                 memory_ids=(),
                 kind=ValueUpdateKind.ADMIN.value,
                 reason_codes=(operation,),
+                identity_origin=new_identity_origin(
+                    OriginActor.OPERATOR,
+                    OriginInputKind.CONSTRAINT,
+                    source_ref="value_admin",
+                ),
                 requested_delta=0.0,
                 applied_delta=after.weight - before.weight,
                 before=_revision_snapshot(before),
@@ -433,6 +466,26 @@ class ValueSystem:
                 rollback_target_revision=rollback_target_revision,
             )
         )
+
+
+def _value_state_from_json(payload: dict[str, Any]) -> ValueState:
+    data = dict(payload)
+    data["origin_provenance"] = identity_origin_from_json(
+        data.get("origin_provenance"),
+        fallback_source=str(data.get("origin", "legacy_value")),
+    )
+    data["schema_version"] = 2
+    return ValueState(**data)
+
+
+def _value_update_record_from_json(payload: dict[str, Any]) -> ValueUpdateRecord:
+    data = dict(payload)
+    data["memory_ids"] = tuple(data.get("memory_ids", ()))
+    data["reason_codes"] = tuple(data.get("reason_codes", ()))
+    data["identity_origin"] = identity_origin_from_json(
+        data.get("identity_origin"), fallback_source="legacy_value_update"
+    )
+    return ValueUpdateRecord(**data)
 
 
 def _revision_snapshot(state: ValueState) -> dict[str, Any]:

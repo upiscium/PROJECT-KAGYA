@@ -32,11 +32,16 @@ from kagya.decision import (
     schema_candidate_prompt,
 )
 from kagya.identity import (
+    EndorsementStatus,
     EpistemicUncertainty,
+    IdentityOrigin,
     IdentityRevisionProposal,
     KnownLimitation,
+    OriginActor,
+    OriginInputKind,
     SelfModel,
     SelfModelState,
+    new_identity_origin,
 )
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
@@ -157,6 +162,13 @@ class KagyaMainLoop:
                     origin=seed.origin,
                     last_updated_at=datetime.now(UTC).isoformat(),
                     allowed_update_rate=seed.allowed_update_rate,
+                    origin_provenance=new_identity_origin(
+                        OriginActor.INHERITED,
+                        OriginInputKind.CONFIG_SEED,
+                        source_ref=f"config:{seed.value_id}",
+                        confidence=seed.confidence,
+                        endorsement=EndorsementStatus.UNCERTAIN,
+                    ),
                 )
                 for seed in settings.values.seeds
             ],
@@ -438,6 +450,8 @@ class KagyaMainLoop:
         memory_ids: tuple[str, ...] = (),
         source: str = "runtime",
         proposal_id: str | None = None,
+        origin_actor: OriginActor = OriginActor.SELF,
+        origin_input_kind: OriginInputKind = OriginInputKind.INTERNAL_STATE,
     ) -> list[ValueUpdateRecord]:
         event = current_agent_event()
         evidence = ValueEvidence(
@@ -445,6 +459,13 @@ class KagyaMainLoop:
             event_sequence=None if event is None else event.processing_sequence,
             memory_ids=memory_ids,
             source=source,
+            identity_origin=new_identity_origin(
+                origin_actor,
+                origin_input_kind,
+                source_ref=source,
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            ),
         )
         proposals = self.value_system.proposals_from_appraisal(
             appraisal,
@@ -502,6 +523,9 @@ class KagyaMainLoop:
         description: str,
         structured_target: dict[str, Any] | None = None,
         origin_value_id: str | None = None,
+        origin_actor: OriginActor | None = None,
+        origin_input_kind: OriginInputKind | None = None,
+        origin_source_ref: str | None = None,
         priority: float = 0.5,
         urgency: float = 0.5,
         expected_utility: float = 0.5,
@@ -518,12 +542,22 @@ class KagyaMainLoop:
             self.value_system.get(origin_value_id)
         if value_effects:
             self.value_system.evaluate({"goal_proposal": value_effects})
+        identity_origin: IdentityOrigin | None = None
+        if origin_actor is not None:
+            identity_origin = new_identity_origin(
+                origin_actor,
+                origin_input_kind or OriginInputKind.SUGGESTION,
+                source_ref=origin_source_ref,
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            )
         goal = self.goal_manager.propose(
             goal_type=goal_type,
             description=description,
             structured_target=structured_target,
             origin_event_id=None if event is None else event.event_id,
             origin_value_id=origin_value_id,
+            identity_origin=identity_origin,
             priority=priority,
             urgency=urgency,
             expected_utility=expected_utility,
@@ -628,12 +662,23 @@ class KagyaMainLoop:
         value_effects: dict[str, float] | None = None,
         conflict_ids: tuple[str, ...] = (),
         commitment_id: str | None = None,
+        origin_actor: OriginActor | None = None,
+        origin_source_ref: str | None = None,
     ) -> Commitment:
         event = current_agent_event()
         identifier = commitment_id or str(uuid4())
+        if deadline is not None:
+            parsed_deadline = datetime.fromisoformat(deadline)
+            if parsed_deadline.tzinfo is None:
+                raise ValueError("Commitment deadline must include a timezone")
+            if parsed_deadline <= datetime.now(UTC):
+                raise ValueError("Commitment deadline has expired")
         goal = self.propose_goal(
             goal_type=GoalType.COMMITMENT,
             description=description,
+            origin_actor=origin_actor,
+            origin_input_kind=OriginInputKind.REQUEST,
+            origin_source_ref=origin_source_ref,
             priority=priority,
             urgency=urgency,
             expected_utility=expected_utility,
@@ -643,14 +688,18 @@ class KagyaMainLoop:
             value_effects=value_effects,
             goal_id=f"commitment:{identifier}",
         )
+        self.adopt_goal(goal.goal_id)
+        adopted_goal = self.goal_manager.get(goal.goal_id)
+        if adopted_goal.status != GoalStatus.ACTIVE:
+            raise ValueError("Commitment goal was not endorsed for activation")
         commitment = self.commitment_store.create(
             description=description,
             related_goal_id=goal.goal_id,
             origin_event_id=None if event is None else event.event_id,
+            identity_origin=adopted_goal.identity_origin,
             deadline=deadline,
             commitment_id=identifier,
         )
-        self.adopt_goal(goal.goal_id)
         self._sync_self_references()
         self._persist_self_model_state()
         self._sync_motivation_working_memory()
@@ -853,6 +902,17 @@ class KagyaMainLoop:
             adapter_id=self.adapter_id,
             adapter_hash=self.adapter_hash,
             activation_sequence=self.activation_sequence,
+            identity_origin_refs={
+                **{
+                    f"goal:{goal.goal_id}": goal.identity_origin.origin_id
+                    for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+                },
+                **{
+                    f"value:{value.value_id}": value.origin_provenance.origin_id
+                    for value in self.value_system.list_values()
+                    if value.origin_provenance is not None
+                },
+            },
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"
@@ -995,13 +1055,29 @@ class KagyaMainLoop:
         proposed_traits: dict[str, float],
         evidence_refs: tuple[str, ...],
         source: str,
+        origin_actor: OriginActor | None = None,
+        origin_input_kind: OriginInputKind | None = None,
         proposal_id: str | None = None,
     ) -> IdentityRevisionProposal:
+        event = current_agent_event()
         proposal = self.self_model.propose_identity_revision(
             proposed_summary=proposed_summary,
             proposed_traits=proposed_traits,
             evidence_refs=evidence_refs,
             source=source,
+            identity_origin=(
+                None
+                if origin_actor is None
+                else new_identity_origin(
+                    origin_actor,
+                    origin_input_kind or OriginInputKind.SUGGESTION,
+                    source_ref="self_model_proposal",
+                    event_id=None if event is None else event.event_id,
+                    event_sequence=None
+                    if event is None
+                    else event.processing_sequence,
+                )
+            ),
             proposal_id=proposal_id,
         )
         self._persist_self_model_state()

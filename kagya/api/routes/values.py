@@ -12,6 +12,7 @@ from kagya.api.dependencies import (
     require_admin,
 )
 from kagya.cognition import AppraisalResult, ValueUpdateKind
+from kagya.identity import OriginActor, OriginInputKind
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -98,8 +99,10 @@ def update_values(
                 body.impacts,
                 kind=body.kind,
                 memory_ids=tuple(body.memory_ids),
-                source=body.source,
+                source="admin:value_evidence",
                 proposal_id=body.proposal_id,
+                origin_actor=OriginActor.OPERATOR,
+                origin_input_kind=OriginInputKind.FEEDBACK,
             ),
             payload={"proposal_id": body.proposal_id},
             correlation_id=body.proposal_id,

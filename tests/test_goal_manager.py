@@ -11,6 +11,12 @@ from kagya.motivation import (
     GoalStatus,
     GoalType,
 )
+from kagya.identity import (
+    EndorsementStatus,
+    OriginActor,
+    OriginInputKind,
+    new_identity_origin,
+)
 
 
 def test_goal_types_distinguish_intrinsic_external_and_commitment_origins() -> None:
@@ -37,6 +43,10 @@ def test_goal_types_distinguish_intrinsic_external_and_commitment_origins() -> N
     assert intrinsic.goal_type == GoalType.INTRINSIC
     assert external.goal_type == GoalType.EXTERNAL_REQUEST
     assert commitment.goal_type == GoalType.COMMITMENT
+    assert intrinsic.identity_origin.actor == OriginActor.SELF
+    assert intrinsic.identity_origin.endorsement == EndorsementStatus.ENDORSED
+    assert external.identity_origin.actor == OriginActor.UNKNOWN
+    assert external.identity_origin.endorsement == EndorsementStatus.PENDING
 
 
 def test_goal_rejects_unknown_dependency_and_conflict_references() -> None:
@@ -83,6 +93,7 @@ def test_higher_priority_conflict_suspends_active_goal_with_reason() -> None:
 
     assert manager.get("low").status == GoalStatus.SUSPENDED
     assert manager.get("high").status == GoalStatus.ACTIVE
+    assert manager.get("high").identity_origin.endorsement == EndorsementStatus.ENDORSED
     assert decision.action == GoalDecisionAction.ACTIVATE
     assert decision.conflicting_goal_ids == ("low",)
     assert manager.get("low").transitions[-1].reason == "superseded_by:high"
@@ -275,6 +286,66 @@ def test_goal_and_decision_history_round_trip_through_json() -> None:
     assert restored.decisions[-1].event_sequence == 6
 
 
+def test_v1_goal_migrates_without_claiming_self_origin() -> None:
+    manager = GoalManager()
+    manager.restore(
+        [
+            {
+                "schema_version": 1,
+                "goal_id": "legacy-goal",
+                "goal_type": "intrinsic",
+                "description": "Legacy state",
+                "structured_target": None,
+                "origin_event_id": None,
+                "origin_value_id": None,
+                "priority": 0.5,
+                "urgency": 0.5,
+                "expected_utility": 0.5,
+                "confidence": 0.5,
+                "status": "active",
+                "dependency_ids": [],
+                "conflict_ids": [],
+                "deadline": None,
+                "value_effects": {},
+                "needs_information": False,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "transitions": [],
+            }
+        ]
+    )
+
+    restored = manager.get("legacy-goal")
+    assert restored.schema_version == 2
+    assert restored.identity_origin.actor == OriginActor.INHERITED
+    assert restored.identity_origin.endorsement == EndorsementStatus.UNCERTAIN
+
+
+def test_v1_commitment_migrates_without_claiming_self_origin() -> None:
+    store = CommitmentStore()
+    store.restore(
+        [
+            {
+                "schema_version": 1,
+                "commitment_id": "legacy-promise",
+                "description": "Legacy promise",
+                "origin_event_id": None,
+                "related_goal_id": "legacy-goal",
+                "status": "active",
+                "deadline": None,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "transitions": [],
+            }
+        ]
+    )
+
+    restored = store.get("legacy-promise")
+    assert restored.schema_version == 2
+    assert restored.identity_origin.actor == OriginActor.INHERITED
+    assert restored.identity_origin.endorsement == EndorsementStatus.UNCERTAIN
+
+
 def test_commitment_store_records_fulfillment_release_and_breach() -> None:
     for status in (
         CommitmentStatus.FULFILLED,
@@ -297,3 +368,19 @@ def test_commitment_store_records_fulfillment_release_and_breach() -> None:
 
         assert commitment.status == status
         assert commitment.transitions[-1].reason == "resolved"
+
+
+def test_commitment_store_rejects_unendorsed_external_origin() -> None:
+    store = CommitmentStore()
+
+    with pytest.raises(ValueError, match="requires endorsed"):
+        store.create(
+            commitment_id="unendorsed",
+            description="External request",
+            related_goal_id="goal",
+            identity_origin=new_identity_origin(
+                OriginActor.USER,
+                OriginInputKind.REQUEST,
+                source_ref="context:one",
+            ),
+        )

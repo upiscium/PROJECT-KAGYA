@@ -866,9 +866,17 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
         "impacts": {"care": 1.0},
         "certainty": 1.0,
         "memory_ids": ["memory-api-1"],
+        "source": "self",
     }
     updated = client.post("/api/values/updates", headers=headers, json=update)
     assert updated.status_code == 200
+    assert updated.json()["updates"][0]["identity_origin"]["actor"] == "operator"
+    assert (
+        updated.json()["updates"][0]["identity_origin"]["input_kind"]
+        == "feedback"
+    )
+    value_state = client.get("/api/values", headers=headers).json()["values"][0]
+    assert value_state["origin_provenance"]["actor"] == "inherited"
     record = updated.json()["updates"][0]
     assert record["event_id"]
     assert record["event_sequence"] > 0
@@ -908,12 +916,21 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     headers = admin_headers()
 
     assert client.get("/api/goals").status_code == 401
+    rejected_intrinsic = client.post(
+        "/api/goals",
+        headers=headers,
+        json={
+            "goal_type": "intrinsic",
+            "description": "Operator cannot declare an intrinsic goal",
+        },
+    )
+    assert rejected_intrinsic.status_code == 409
     intrinsic = client.post(
         "/api/goals",
         headers=headers,
         json={
             "goal_id": "intrinsic-goal",
-            "goal_type": "intrinsic",
+            "goal_type": "external_request",
             "description": "Maintain internal coherence",
             "origin_value_id": "honesty",
             "priority": 0.3,
@@ -924,12 +941,20 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
         },
     )
     assert intrinsic.status_code == 200
-    assert intrinsic.json()["goal_type"] == "intrinsic"
+    assert intrinsic.json()["goal_type"] == "external_request"
+    assert intrinsic.json()["identity_origin"]["actor"] == "operator"
+    assert intrinsic.json()["identity_origin"]["endorsement"] == "pending"
     adopted = client.post(
         "/api/goals/intrinsic-goal/adopt", headers=headers
     )
     assert adopted.status_code == 200
     assert adopted.json()["action"] == "activate"
+    adopted_goal = next(
+        goal
+        for goal in client.get("/api/goals", headers=headers).json()["goals"]
+        if goal["goal_id"] == "intrinsic-goal"
+    )
+    assert adopted_goal["identity_origin"]["endorsement"] == "endorsed"
 
     external = client.post(
         "/api/goals",
@@ -1004,6 +1029,8 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     )
     assert commitment.status_code == 200
     assert commitment.json()["status"] == "active"
+    assert commitment.json()["identity_origin"]["actor"] == "operator"
+    assert commitment.json()["identity_origin"]["endorsement"] == "endorsed"
     assert "promise-1" in client.app.state.main_loop.self_model.state.commitment_refs
     fulfilled = client.post(
         "/api/commitments/promise-1/transition",
@@ -1031,11 +1058,12 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
             "deadline": "2000-01-01T00:00:00Z",
         },
     )
-    assert expired_commitment.status_code == 200
-    assert expired_commitment.json()["status"] == "breached"
-    assert client.app.state.main_loop.goal_manager.get(
+    assert expired_commitment.status_code == 409
+    assert "expired-promise" not in client.app.state.main_loop.commitment_store.commitments
+    assert (
         "commitment:expired-promise"
-    ).status.value == "failed"
+        not in client.app.state.main_loop.goal_manager.goals
+    )
 
 
 def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
@@ -1051,7 +1079,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         headers=headers,
         json={
             "goal_id": "decision-goal",
-            "goal_type": "intrinsic",
+            "goal_type": "external_request",
             "description": "Make a traceable decision",
         },
     )
@@ -1113,6 +1141,11 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert record["triggering_event_sequence"] > 0
     assert record["active_goal_ids"] == ["decision-goal"]
     assert set(record["value_revision_refs"]) == {"care", "honesty"}
+    assert set(record["identity_origin_refs"]) == {
+        "goal:decision-goal",
+        "value:care",
+        "value:honesty",
+    }
     assert set(record["emotion_snapshot"]) == {
         "valence",
         "arousal",
@@ -1296,6 +1329,9 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     )
     assert proposal.status_code == 200
     assert proposal.json()["status"] == "pending"
+    assert proposal.json()["source"] == "operator_proposal"
+    assert proposal.json()["identity_origin"]["actor"] == "operator"
+    assert proposal.json()["identity_origin"]["endorsement"] == "pending"
     assert "identity_summary_changed" in proposal.json()["contradictions"]
     assert client.get("/api/self-model", headers=headers).json()["state"][
         "identity_summary"
@@ -1307,6 +1343,7 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
         json={"apply": True, "reason": "manual review"},
     )
     assert applied.status_code == 200
+    assert applied.json()["identity_origin"]["endorsement"] == "endorsed"
     inspected = client.get("/api/self-model", headers=headers).json()
     assert inspected["state"]["traits"]["cautious"] == pytest.approx(0.1)
     assert inspected["history"][-1]["event_id"]

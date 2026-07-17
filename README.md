@@ -101,6 +101,8 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Passwords, private key contents, Hugging Face tokens, and worker token values do not belong in YAML. Configuration stores credential file paths or environment-variable names only.
 - Legacy configs without `deployment` are explicitly migrated to `standalone/all/local`; `just config-check` reports the migration note. Split configs never use that migration as an implicit topology fallback.
 
+Identity-changing state uses typed origin provenance. Admin `POST /api/goals` accepts external-request proposals only; it cannot declare a Goal intrinsic on the subject's behalf. Adoption is a separate subject event that records endorsement. Value update requests are retained as operator feedback/evidence and cannot spoof self-origin through a caller-provided source label. Legacy Goal, Commitment, Value, and identity-proposal records migrate as inherited and uncertain rather than self-originated.
+
 ## Multimodal Attachments
 
 The first real multimodal milestone supports one local image attachment for capable Transformers image-text models.

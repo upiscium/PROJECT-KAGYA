@@ -62,8 +62,8 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.emotion_engine.state == EmotionState(0.2, 0.4, 0.8)
     assert restored_loop.goal_manager.get("goal-1").status.value == "active"
     assert restored_loop.commitment_store.get("promise-1").status.value == "active"
-    assert restored_loop.persistent_state.active_goals[0]["schema_version"] == 1
-    assert restored_loop.persistent_state.commitments[0]["schema_version"] == 1
+    assert restored_loop.persistent_state.active_goals[0]["schema_version"] == 2
+    assert restored_loop.persistent_state.commitments[0]["schema_version"] == 2
     assert restored_loop.persistent_state.values["schema_version"] == 1
     assert restored_loop.value_system.get("care").weight == 0.9
     assert restored_loop.self_model.state.traits == {"certainty": 0.5}
