@@ -320,6 +320,38 @@ def test_qlora_prod_check_reports_missing_dependency_and_cuda(tmp_path: Path) ->
     assert "CUDA must be available for the production QLoRA path" in report.failures
 
 
+def test_qlora_prod_check_rejects_transformers_without_gemma4_mapping(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    eval_set = tmp_path / "eval_set.json"
+    eval_set.write_text('{"cases": []}', encoding="utf-8")
+    settings = settings.model_copy(
+        update={
+            "model": settings.model.model_copy(
+                update={
+                    "provider": "transformers",
+                    "revision": "model-commit",
+                    "processor_revision": "processor-commit",
+                }
+            ),
+            "qlora": settings.qlora.model_copy(update={"dry_run": False}),
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_sets": [eval_set]}
+            ),
+        }
+    )
+
+    report = check_qlora_production_readiness(
+        settings,
+        dependency_available=lambda name: True,
+        dependency_version=lambda name: "5.9.0",
+        cuda_available=lambda: True,
+    )
+
+    assert "transformers>=5.14.1 is required for gemma4_unified" in report.failures
+
+
 def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     memory = _memory(settings)

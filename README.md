@@ -137,6 +137,7 @@ Production QLoRA assumptions:
 - CUDA is available; CPU training is not part of the supported production path.
 - `model.load_in_4bit` remains enabled for the supported QLoRA path.
 - `datasets`, `peft`, `torch`, `transformers`, and `trl` are installed in the runtime environment.
+- `transformers>=5.14.1` is required. Version 5.9.0 exposes multimodal auto classes but cannot resolve the `gemma4_unified` config used by `google/gemma-4-12B-it`.
 - `adapter_registry.eval_sets` points to at least one existing eval set so trained adapters can be evaluated before promotion.
 - `adapter_registry.manual_approval_required` remains true; no trained adapter is activated without explicit operator approval.
 - Interrupted or failed training artifacts should be treated as incomplete and must not be manually registered as approved/active adapters.
@@ -155,6 +156,8 @@ Training flow for real adapters:
 7. Manually approve and activate only if the evaluation result is acceptable.
 
 For the manual RTX 3090 integration check, pin `model.revision` and `model.processor_revision` to immutable commits on both nodes, set `model.provider: transformers` and `qlora.dry_run: false`, run the production preflight, then submit a short `dream-v2`/`gemma-v1` bundle through `kagya-worker run`. Preserve the resulting `result.json`, `training_metrics.json`, checksums, GPU name, CUDA/package versions, peak VRAM observation, and a successful adapter-load generation as the execution record. This hardware check is intentionally opt-in and is not run in CI.
+
+The public `google/gemma-4-12B-it` repository is not gated and may be downloaded anonymously. The compatibility-verified immutable revision is `12ace6d648d72bd41519e140f1185f34d38c7e3d`; use the same revision for `model.revision` and `model.processor_revision` on both nodes.
 
 Distributed training operations are available through admin-token-protected endpoints:
 

@@ -5,15 +5,19 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import importlib.util
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import sys
 from typing import Callable
+
+from packaging.version import Version
 
 from kagya.config import Settings, get_settings, load_settings
 
 
 DependencyChecker = Callable[[str], bool]
 CudaChecker = Callable[[], bool]
+VersionGetter = Callable[[str], str]
 
 
 @dataclass(frozen=True)
@@ -28,11 +32,13 @@ def check_qlora_production_readiness(
     *,
     dependency_available: DependencyChecker | None = None,
     cuda_available: CudaChecker | None = None,
+    dependency_version: VersionGetter | None = None,
 ) -> QloraRequirementReport:
     """Validate production QLoRA boundaries without starting training."""
 
     dependency_available = dependency_available or _dependency_available
     cuda_available = cuda_available or _cuda_available
+    dependency_version = dependency_version or _dependency_version
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -60,6 +66,8 @@ def check_qlora_production_readiness(
     ]
     if missing_deps:
         failures.append("missing training dependencies: " + ", ".join(missing_deps))
+    elif Version(dependency_version("transformers")) < Version("5.14.1"):
+        failures.append("transformers>=5.14.1 is required for gemma4_unified")
     if not cuda_available():
         failures.append("CUDA must be available for the production QLoRA path")
     if settings.qlora.output_dir == settings.memory.persist_directory:
@@ -99,6 +107,13 @@ def _cuda_available() -> bool:
     except ImportError:
         return False
     return bool(torch.cuda.is_available())
+
+
+def _dependency_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "0"
 
 
 if __name__ == "__main__":
