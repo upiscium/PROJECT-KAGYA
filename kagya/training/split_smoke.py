@@ -64,6 +64,21 @@ def run_split_smoke(settings: Settings, work_dir: Path) -> dict[str, Any]:
     if training_result is None or training_result.artifact_path is None:
         raise RuntimeError("remote worker returned no training result")
 
+    reconnected = SSHTrainingBackend(remote, work_dir / "reconnected-transport")
+    reconnected.attach(job)
+    if reconnected.inspect(job.job_id) != TrainingJobStatus.SUCCEEDED:
+        raise RuntimeError("reconnected backend did not rediscover the completed job")
+    recovered_result = reconnected.fetch_result(job.job_id)
+    if recovered_result is None or recovered_result.adapter_id != training_result.adapter_id:
+        raise RuntimeError("reconnected backend recovered a mismatched result")
+    post_training_health = reconnected.node_status()
+    worker_job_discoverable = any(
+        isinstance(item, dict) and item.get("job_id") == job.job_id
+        for item in post_training_health.get("jobs", [])
+    )
+    if not worker_job_discoverable:
+        raise RuntimeError("completed job is absent from worker reconciliation metadata")
+
     isolated = _isolated_settings(settings, work_dir)
     registry = AdapterRegistry(isolated)
     entry = CandidateArtifactImporter(isolated, registry).import_result(
@@ -84,6 +99,8 @@ def run_split_smoke(settings: Settings, work_dir: Path) -> dict[str, Any]:
         "job_id": job.job_id,
         "remote_job_id": first_remote_id,
         "duplicate_submit_idempotent": True,
+        "restart_recovery_succeeded": True,
+        "worker_job_discoverable": True,
         "worker_node_id": health.get("node_id"),
         "worker_hostname": health.get("hostname"),
         "gpu": health.get("gpu"),

@@ -238,7 +238,7 @@ KAGYA_CONFIG_PATH=/etc/project-kagya/inference.yaml \
   --confirm RUN-SPLIT-TRAINING
 ```
 
-The smoke checks strict SSH worker health, CUDA visibility, duplicate-submit idempotency, immutable bundle/result checksums, local PEFT candidate import, provenance, and event-boundary activation/rollback. It never prunes remote artifacts and never writes to the configured authoritative adapter registry; local import state is isolated under `--work-dir`.
+The smoke checks strict SSH worker health, CUDA visibility, duplicate-submit idempotency, immutable bundle/result checksums, backend restart recovery, completed-job discovery, local PEFT candidate import, provenance, and event-boundary activation/rollback. It never prunes remote artifacts and never writes to the configured authoritative adapter registry; local import state is isolated under `--work-dir`.
 
 ## Configuration Field Status
 
