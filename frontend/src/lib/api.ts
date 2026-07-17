@@ -9,6 +9,7 @@ export type ChatRequest = { text: string; attachments?: Attachment[]; debug?: bo
 export type ChatResponse = {
   context_id: string;
   episode_id: string;
+  experience_id: string;
   response: string;
   emotion: Emotion;
   model: ModelInfo;
@@ -70,6 +71,9 @@ export type EpisodeMemory = {
   context_compatibility: number;
   context_relation: string;
   cross_context: boolean;
+  experience_id: string | null;
+  subjective_salience: number;
+  autobiographical_importance: number;
 };
 
 export type SemanticMemory = {
@@ -206,6 +210,36 @@ export type JournalRecord = {
   record_hash: string;
 };
 export type JournalRecordListResponse = { records: JournalRecord[] };
+export type Experience = {
+  experience_id: string;
+  source_event_id: string | null;
+  source_event_sequence: number | null;
+  external_observation_refs: string[];
+  subject_action_refs: string[];
+  identity_origin: Record<string, unknown>;
+  context_id: string;
+  interlocutor_ids: string[];
+  situation_codes: string[];
+  interpretation_codes: string[];
+  self_relevance: number;
+  appraisal: Record<string, unknown>;
+  subjective_salience: number;
+  familiarity: number;
+  agency_attribution: string;
+  prediction_error: number | null;
+  value_revision_refs: Record<string, number>;
+  active_goal_refs: string[];
+  self_model_revision: number;
+  unresolved_tension: number;
+  autobiographical_importance: number;
+  result_refs: Record<string, string[]>;
+  created_at: string;
+  updated_at: string;
+  revision: number;
+  revisions: Array<Record<string, unknown>>;
+  schema_version: number;
+};
+export type ExperienceListResponse = { experiences: Experience[] };
 
 export class ApiError extends Error {
   constructor(
@@ -305,4 +339,6 @@ export const api = {
   systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
   runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),
   eventJournal: () => adminRequest<JournalRecordListResponse>("/system/journal"),
+  experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
+  experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
 };

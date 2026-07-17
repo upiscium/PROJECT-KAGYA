@@ -47,6 +47,9 @@ class EpisodeMemoryResponse(BaseModel):
     context_compatibility: float
     context_relation: str
     cross_context: bool
+    experience_id: str | None
+    subjective_salience: float
+    autobiographical_importance: float
 
 
 class SemanticMemoryResponse(BaseModel):

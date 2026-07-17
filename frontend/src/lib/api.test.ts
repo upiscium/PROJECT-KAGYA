@@ -18,7 +18,7 @@ function errorResponse(status: number, statusText: string, body: unknown) {
 
 describe("api client", () => {
   it("/chat sends requests to /api/chat", async () => {
-    fetchMock.mockReturnValue(jsonResponse({ episode_id: "e", response: "ok", emotion: { valence: 0, arousal: 0, optimal_loss: 1 }, model: { model_id: "m", adapter_id: null, fallback_used: false } }));
+    fetchMock.mockReturnValue(jsonResponse({ context_id: "c", episode_id: "e", experience_id: "x", response: "ok", emotion: { valence: 0, arousal: 0, optimal_loss: 1 }, model: { model_id: "m", adapter_id: null, adapter_hash: null, activation_sequence: null, fallback_used: false } }));
 
     await api.chat({ text: "hello", attachments: [], debug: false });
 

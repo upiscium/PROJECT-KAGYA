@@ -12,6 +12,7 @@ from kagya.api.dependencies import (
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.chat import ChatRequest, ChatResponse, EmotionSchema, ModelSchema
 from kagya.runtime import AgentEventType, AgentRuntime, ChatResult
+from kagya.identity import OriginActor
 
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -39,6 +40,7 @@ def chat(
                 source_session_id=request.client_session_id,
                 interlocutor_key=request.interlocutor_key,
                 create_context=request.context_id is None,
+                origin_actor=OriginActor.USER,
             ),
             payload={
                 "text": request.text,
@@ -71,6 +73,7 @@ def chat_response_from_result(result: ChatResult) -> ChatResponse:
     return ChatResponse(
         context_id=result.context_id,
         episode_id=result.episode_id,
+        experience_id=result.experience_id,
         response=result.response,
         emotion=EmotionSchema(
             valence=result.valence,

@@ -43,6 +43,12 @@ from kagya.identity import (
     SelfModelState,
     new_identity_origin,
 )
+from kagya.experience import (
+    ExperienceAppraisal,
+    ExperienceRecord,
+    ExperienceStore,
+    build_chat_experience,
+)
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.memory.quality import assess_generation_health
@@ -76,6 +82,7 @@ from kagya.runtime.context import ContextFrame, ContextRegistry, InterlocutorMod
 @dataclass(frozen=True)
 class ChatResult:
     episode_id: str
+    experience_id: str
     response: str
     hidden_thought: str
     loss: float | None
@@ -187,12 +194,14 @@ class KagyaMainLoop:
         self.commitment_store = CommitmentStore()
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
+        self.experience_store = ExperienceStore()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
         self.restore_motivation_state()
         self.restore_decision_state()
         self.restore_self_model_state()
+        self.restore_experience_state()
 
     def chat(
         self,
@@ -205,11 +214,13 @@ class KagyaMainLoop:
         source_session_id: str | None = None,
         interlocutor_key: str | None = None,
         create_context: bool = False,
+        origin_actor: OriginActor = OriginActor.USER,
     ) -> ChatResult:
         previous_context_frames = self.context_registry.frames
         previous_interlocutors = self.context_registry.interlocutors
         previous_default_context_id = self.default_context_id
         previous_calibration = self.surprisal_calculator.export_history()
+        previous_experience_state = self.experience_store.to_json()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -348,6 +359,50 @@ class KagyaMainLoop:
                 adapter_id=None if fallback_used else self.adapter_id,
                 validation_status=ValidationStatus.UNVERIFIED,
             )
+            experience = self.experience_store.integrate(
+                build_chat_experience(
+                    source_event_id=None if event is None else event.event_id,
+                    source_event_sequence=None
+                    if event is None
+                    else event.processing_sequence,
+                    episode_id=episode_id,
+                    identity_origin=new_identity_origin(
+                        origin_actor,
+                        OriginInputKind.OBSERVATION,
+                        source_ref=f"context:{current_context.context_id}",
+                        event_id=None if event is None else event.event_id,
+                        event_sequence=None
+                        if event is None
+                        else event.processing_sequence,
+                    ),
+                    context_id=current_context.context_id,
+                    interlocutor_ids=current_context.participant_ids,
+                    appraisal=appraisal,
+                    valence=emotion_state.valence,
+                    arousal=emotion_state.arousal,
+                    prediction_error=(
+                        loss_measurement.mean_token_loss
+                        if loss_measurement.valid
+                        else None
+                    ),
+                    value_revision_refs={
+                        value.value_id: value.revision
+                        for value in self.value_system.list_values()
+                    },
+                    active_goal_refs=tuple(
+                        goal.goal_id
+                        for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+                    ),
+                    self_model_revision=self.self_model.state.revision,
+                )
+            )
+            self._persist_experience_state()
+            self.memory_system.link_experience(
+                episode_id,
+                experience_id=experience.experience_id,
+                subjective_salience=experience.subjective_salience,
+                autobiographical_importance=experience.autobiographical_importance,
+            )
             self.context_registry.record_shared_history(
                 current_context.participant_ids, f"episode:{episode_id}"
             )
@@ -365,8 +420,8 @@ class KagyaMainLoop:
                     source="runtime.chat" if event is None else event.source,
                     source_channel=current_context.source_channel,
                     source_session_id=current_context.source_session_id,
-                    activation=1.0,
-                    salience=max(0.5, emotion_state.arousal),
+                    activation=0.5 + 0.5 * experience.subjective_salience,
+                    salience=experience.subjective_salience,
                     retention_reason=RetentionReason.RECENT_CONTEXT,
                 )
             )
@@ -379,9 +434,12 @@ class KagyaMainLoop:
             self.default_context_id = previous_default_context_id
             self.surprisal_calculator.restore_history(previous_calibration)
             self._persist_appraisal_state()
+            self.experience_store.restore(previous_experience_state)
+            self._persist_experience_state()
             raise
         return ChatResult(
             episode_id=episode_id,
+            experience_id=experience.experience_id,
             response=processed_response.visible_response,
             hidden_thought=processed_response.hidden_thought
             if debug
@@ -433,6 +491,71 @@ class KagyaMainLoop:
         self.persistent_state.extensions["appraisal_calibration"] = (
             self.surprisal_calculator.export_history()
         )
+
+    def restore_experience_state(self) -> None:
+        self.experience_store.restore(
+            self.persistent_state.extensions.get("experiences")
+        )
+        self._persist_experience_state()
+
+    def _persist_experience_state(self) -> None:
+        self.persistent_state.extensions["experiences"] = (
+            self.experience_store.to_json()
+        )
+
+    def get_experience(self, experience_id: str) -> ExperienceRecord:
+        return self.experience_store.get(experience_id)
+
+    def list_experiences(self) -> list[ExperienceRecord]:
+        return self.experience_store.list_records()
+
+    def reassess_experience(
+        self,
+        experience_id: str,
+        *,
+        appraisal: ExperienceAppraisal,
+        reason_code: str,
+        evidence_refs: tuple[str, ...],
+    ) -> ExperienceRecord:
+        event = current_agent_event()
+        record = self.experience_store.revise_appraisal(
+            experience_id,
+            appraisal=appraisal,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        for reference in record.result_refs.get("memory", ()):
+            if reference.startswith("episode:"):
+                self.memory_system.link_experience(
+                    reference.removeprefix("episode:"),
+                    experience_id=record.experience_id,
+                    subjective_salience=record.subjective_salience,
+                    autobiographical_importance=record.autobiographical_importance,
+                )
+        self._persist_experience_state()
+        return record
+
+    def link_experience_result(
+        self,
+        experience_id: str,
+        *,
+        kind: str,
+        reference: str,
+        evidence_refs: tuple[str, ...],
+    ) -> ExperienceRecord:
+        event = current_agent_event()
+        record = self.experience_store.link_result(
+            experience_id,
+            kind=kind,
+            reference=reference,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_experience_state()
+        return record
 
     def restore_value_state(self) -> None:
         self.value_system.restore(self.persistent_state.values)
@@ -879,6 +1002,11 @@ class KagyaMainLoop:
             if goal.status == GoalStatus.COMPLETED
         }
         emotion = self.emotion_engine.state
+        source_experience = (
+            None
+            if context_id is None
+            else self.experience_store.latest_for_context(context_id)
+        )
         record = self.decision_store.create(
             candidates,
             triggering_event_id=None if event is None else event.event_id,
@@ -913,6 +1041,11 @@ class KagyaMainLoop:
                     if value.origin_provenance is not None
                 },
             },
+            experience_refs=(
+                ()
+                if source_experience is None
+                else (source_experience.experience_id,)
+            ),
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"
@@ -924,6 +1057,13 @@ class KagyaMainLoop:
             self_model_evaluator=self.self_model.evaluate_candidates,
             decision_id=decision_id,
         )
+        if source_experience is not None:
+            self.link_experience_result(
+                source_experience.experience_id,
+                kind="decision",
+                reference=f"decision:{record.decision_id}",
+                evidence_refs=(f"decision:{record.decision_id}",),
+            )
         self._sync_self_model_working_memory(candidates)
         self._persist_decision_state()
         return record

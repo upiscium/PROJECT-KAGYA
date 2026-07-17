@@ -83,12 +83,71 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
 
     assert response.status_code == 200
     data = response.json()
-    assert set(data) == {"context_id", "episode_id", "response", "emotion", "model"}
+    assert set(data) == {
+        "context_id",
+        "episode_id",
+        "experience_id",
+        "response",
+        "emotion",
+        "model",
+    }
     assert data["response"] == "Visible API answer."
+    assert data["experience_id"].startswith("experience-")
     assert data["model"]["fallback_used"] is False
     assert "hidden_thought" not in data
     assert "prompt" not in data
     assert "<think>" not in str(data)
+
+
+def test_experience_api_exposes_structured_state_without_chat_content(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    chat = client.post(
+        "/api/chat",
+        json={
+            "text": "private experience request",
+            "attachments": [],
+            "interlocutor_key": "person-one",
+        },
+    ).json()
+
+    assert client.get("/api/experiences").status_code == 401
+    listed = client.get("/api/experiences", headers=admin_headers())
+    detail = client.get(
+        f"/api/experiences/{chat['experience_id']}", headers=admin_headers()
+    )
+
+    assert listed.status_code == 200
+    assert detail.status_code == 200
+    assert listed.json()["experiences"][0] == detail.json()
+    assert detail.json()["identity_origin"]["actor"] == "user"
+    assert detail.json()["interlocutor_ids"] == ["person-one"]
+    assert detail.json()["result_refs"]["memory"] == [f"episode:{chat['episode_id']}"]
+    serialized = json.dumps(detail.json())
+    assert "private experience request" not in serialized
+    assert "Visible API answer" not in serialized
+    assert "hidden_thought" not in serialized
+
+
+def test_experience_state_survives_subject_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as first_client:
+        created = first_client.post(
+            "/api/chat", json={"text": "persist experience", "attachments": []}
+        ).json()
+    snapshot_text = settings.agent_state.path.read_text(encoding="utf-8")
+    assert "persist experience" not in snapshot_text
+    assert "hidden_thought" not in snapshot_text
+
+    with _client(tmp_path, settings=settings) as restarted_client:
+        restored = restarted_client.get(
+            f"/api/experiences/{created['experience_id']}",
+            headers=admin_headers(),
+        )
+
+    assert restored.status_code == 200
+    assert restored.json()["experience_id"] == created["experience_id"]
 
 
 def test_chat_creates_and_resumes_explicit_context(tmp_path: Path) -> None:
@@ -1146,6 +1205,13 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         "value:care",
         "value:honesty",
     }
+    assert len(record["experience_refs"]) == 1
+    decision_experience = client.get(
+        f"/api/experiences/{record['experience_refs'][0]}", headers=headers
+    ).json()
+    assert decision_experience["result_refs"]["decision"] == [
+        "decision:decision-api-1"
+    ]
     assert set(record["emotion_snapshot"]) == {
         "valence",
         "arousal",

@@ -127,12 +127,13 @@ class DecisionRecord:
     adapter_hash: str | None = None
     activation_sequence: int | None = None
     identity_origin_refs: dict[str, str] = field(default_factory=dict)
-    schema_version: int = 4
+    experience_refs: tuple[str, ...] = ()
+    schema_version: int = 5
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4}:
+        if self.schema_version not in {1, 2, 3, 4, 5}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -184,6 +185,7 @@ class DecisionStore:
         adapter_hash: str | None = None,
         activation_sequence: int | None = None,
         identity_origin_refs: dict[str, str] | None = None,
+        experience_refs: tuple[str, ...] = (),
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -264,6 +266,7 @@ class DecisionStore:
             adapter_hash=adapter_hash,
             activation_sequence=activation_sequence,
             identity_origin_refs=dict(identity_origin_refs or {}),
+            experience_refs=experience_refs,
         )
         self.records[identifier] = record
         return record
@@ -538,6 +541,7 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data.setdefault("adapter_hash", None)
     data.setdefault("activation_sequence", None)
     data.setdefault("identity_origin_refs", {})
+    data["experience_refs"] = tuple(data.get("experience_refs", ()))
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)
