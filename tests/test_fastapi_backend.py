@@ -968,9 +968,15 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     assert record["event_id"]
     assert record["event_sequence"] > 0
     assert record["memory_ids"] == ["memory-api-1"]
-    assert client.post("/api/values/updates", headers=headers, json=update).json() == {
-        "updates": []
-    }
+    assert record["evidence_ids"] == ["proposal:api-outcome-1:care"]
+    revisions = client.get("/api/values/care/revisions", headers=headers)
+    assert revisions.status_code == 200
+    assert revisions.json()["revisions"][0]["revision_diff"]["changed_fields"][
+        "weight"
+    ][0] == pytest.approx(0.8)
+    assert client.post(
+        "/api/values/updates", headers=headers, json=update
+    ).json() == {"updates": []}
 
     frozen = client.post(
         "/api/values/care/freeze", headers=headers, json={"frozen": True}
@@ -996,6 +1002,37 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     )
     assert reset.status_code == 200
     assert reset.json()["values"][0]["weight"] == 0.8
+
+
+def test_experience_value_evidence_keeps_provenance_boundary(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+    experience_id = client.post(
+        "/api/chat", json={"text": "evidence", "attachments": []}
+    ).json()["experience_id"]
+
+    response = client.post(
+        "/api/values/evidence/experience",
+        headers=headers,
+        json={
+            "experience_id": experience_id,
+            "impacts": {"care": 0.8},
+            "proposal_id": "experience-evidence-api",
+        },
+    )
+
+    assert response.status_code == 200
+    update = response.json()["updates"][0]
+    evidence_id = update["evidence_ids"][0]
+    inspected = client.get("/api/values", headers=headers).json()
+    care = next(item for item in inspected["values"] if item["value_id"] == "care")
+    evidence = next(
+        item for item in inspected["evidence"] if item["evidence_id"] == evidence_id
+    )
+    assert care["origin_provenance"]["actor"] == "inherited"
+    assert care["origin_experience_ids"] == [experience_id]
+    assert evidence["experience_ids"] == [experience_id]
+    assert evidence["identity_origin"]["actor"] == "user"
 
 
 def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
@@ -1345,6 +1382,13 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert resolved.json()["status"] == "resolved"
     assert resolved.json()["prediction_error"] == pytest.approx(-0.6)
     assert resolved.json()["actual_outcome"]["observed_event_id"]
+    value_snapshot = client.get("/api/values", headers=headers).json()
+    assert value_snapshot["reassessments"][0]["decision_id"] == "decision-api-1"
+    assert value_snapshot["reassessments"][0]["regret"] == pytest.approx(0.6)
+    assert any(
+        item["decision_id"] == "decision-api-1"
+        for item in value_snapshot["evidence"]
+    )
 
     dataset = client.get("/api/decisions/dataset", headers=headers)
     assert dataset.status_code == 200

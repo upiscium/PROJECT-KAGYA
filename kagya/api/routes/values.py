@@ -44,6 +44,13 @@ class ValueResetRequest(BaseModel):
 
 class ValueEvaluationRequest(BaseModel):
     options: dict[str, dict[str, float]] = Field(min_length=1)
+    context_id: str | None = None
+
+
+class ExperienceValueEvidenceRequest(BaseModel):
+    experience_id: str = Field(min_length=1)
+    impacts: dict[str, float] = Field(min_length=1)
+    proposal_id: str | None = Field(default=None, min_length=1)
 
 
 router = APIRouter(
@@ -63,6 +70,9 @@ def inspect_values(
         "values": [asdict(state) for state in system.list_values()],
         "conflicts": [asdict(conflict) for conflict in system.conflicts],
         "history": [asdict(record) for record in system.history],
+        "evidence": [asdict(record) for record in system.evidence.values()],
+        "tradeoffs": [asdict(record) for record in system.tradeoffs],
+        "reassessments": [asdict(record) for record in system.reassessments],
     }
     return execute_agent_event(
         runtime,
@@ -111,6 +121,51 @@ def update_values(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Value not found") from exc
     return {"updates": [asdict(record) for record in records]}
+
+
+@router.post("/evidence/experience")
+def update_values_from_experience(
+    body: ExperienceValueEvidenceRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        records = execute_agent_event(
+            runtime,
+            AgentEventType.VALUE_UPDATE,
+            source="api.values.experience_evidence",
+            handler=lambda: main_loop.apply_value_evidence_from_experience(
+                body.experience_id,
+                body.impacts,
+                proposal_id=body.proposal_id,
+            ),
+            payload={"experience_id": body.experience_id},
+            correlation_id=body.proposal_id or body.experience_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"updates": [asdict(record) for record in records]}
+
+
+@router.get("/{value_id}/revisions")
+def inspect_value_revisions(
+    value_id: str,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    system = get_main_loop(request).value_system
+    try:
+        records = execute_agent_event(
+            runtime,
+            AgentEventType.VALUE_READ,
+            source="api.values.revisions",
+            handler=lambda: system.revisions(value_id),
+            correlation_id=value_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"revisions": [asdict(record) for record in records]}
 
 
 @router.post("/{value_id}/freeze")
@@ -190,7 +245,9 @@ def evaluate_options(
             runtime,
             AgentEventType.VALUE_READ,
             source="api.values.evaluate",
-            handler=lambda: main_loop.evaluate_value_options(body.options),
+            handler=lambda: main_loop.evaluate_value_options(
+                body.options, context_id=body.context_id
+            ),
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Value not found") from exc

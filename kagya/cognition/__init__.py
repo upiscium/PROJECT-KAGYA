@@ -17,6 +17,14 @@ from kagya.cognition.value_system import (
     ValueUpdateProposal,
     ValueUpdateRecord,
 )
+from kagya.cognition.value_records import (
+    EvidenceDirection,
+    ValueEvidenceRecord,
+    ValueReassessmentRecord,
+    ValueRevisionDiff,
+    ValueScope,
+    ValueTradeoffRecord,
+)
 
 __all__ = [
     "AppraisalResult",
@@ -32,4 +40,10 @@ __all__ = [
     "ValueUpdateKind",
     "ValueUpdateProposal",
     "ValueUpdateRecord",
+    "EvidenceDirection",
+    "ValueEvidenceRecord",
+    "ValueReassessmentRecord",
+    "ValueRevisionDiff",
+    "ValueScope",
+    "ValueTradeoffRecord",
 ]

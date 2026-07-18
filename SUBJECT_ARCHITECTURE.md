@@ -34,7 +34,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Belief revision | Separate currently adopted propositions from observations and memory records | `extensions.beliefs` | Experience-backed proposals followed by explicit evidence review | `tests/test_belief_store.py` |
 | Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
-| Value system | Maintain stable, rate-limited value weights and conflicts | `identity.values` | Structured observation/outcome/reflection proposals with event or memory evidence | `tests/test_value_system.py` |
+| Value system | Maintain context-aware, protected, rate-limited values with supporting/opposing evidence, conflicts, trade-offs, and revision diffs | `identity.values` | Experience evidence and Decision outcomes; operator commands remain evidence and cannot replace a core Value directly | `tests/test_value_system.py` |
 | Goal manager | Maintain candidates, active/suspended goals, dependencies, deadlines, and transition reasons | `motivation.active_goals`; decisions under motivation extensions | Explicit proposals, value-aware adoption, internal reevaluation events | `tests/test_goal_manager.py` |
 | Motivation dynamics | Form persistent Drive, Interest, Desire, Aversion, and bounded intrinsic Goal proposals | `motivation.extensions.dynamics` | Repeated Experience signals, explicit conflict links, elapsed time, and Goal outcomes | `tests/test_motivation_dynamics.py` |
 | Commitment store | Distinguish promises from intrinsic and external-request goals | `motivation.commitments` | Explicit commitment lifecycle events | `tests/test_goal_manager.py`, `tests/test_fastapi_backend.py` |
@@ -50,8 +50,8 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 3. Appraisal and emotion provide structured current-state signals.
 4. `ValueSystem`, `GoalManager`, and `SelfModel` contribute separate scores to schema-validated `ActionCandidate` records.
 5. `DecisionStore` records all considered candidates, contributions, the selected regular action or no-op/defer/observation choice, and selection confidence.
-6. The DecisionRecord freezes the origin IDs of active Goals and referenced Values so later explanation cannot rewrite their authority source.
-7. A later event appends the actual outcome and prediction error to the same `DecisionRecord`.
+6. The DecisionRecord freezes the origin IDs and revisions of active Goals and referenced Values, plus structured Value trade-offs, so later explanation cannot rewrite their authority source.
+7. A later event appends the actual outcome and prediction error to the same `DecisionRecord`; bounded Value reassessment records use that outcome as evidence without allowing one-event reversal.
 8. Only resolved records whose selected action declared the relevant capability can update capability confidence. Identity claims become reviewable proposals rather than immediate state changes.
 9. The completion hook atomically snapshots the resulting subject state.
 10. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
@@ -85,7 +85,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
 - Values, goals, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
-- Legacy flat values, goal/commitment dictionaries, DecisionRecord v1 data, and legacy self-model dictionaries are migrated at subsystem restore boundaries.
+- Legacy flat and v1 Value snapshots migrate to evidence-aware Value schema v2/record schema v3. Goal records migrate to schema v3, DecisionRecords to schema v7, and Self Model state to schema v2 at subsystem restore boundaries.
 - Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
 
 ## API And Privacy

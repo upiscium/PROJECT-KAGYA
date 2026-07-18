@@ -316,7 +316,7 @@ def test_v1_goal_migrates_without_claiming_self_origin() -> None:
     )
 
     restored = manager.get("legacy-goal")
-    assert restored.schema_version == 2
+    assert restored.schema_version == 3
     assert restored.identity_origin.actor == OriginActor.INHERITED
     assert restored.identity_origin.endorsement == EndorsementStatus.UNCERTAIN
 
