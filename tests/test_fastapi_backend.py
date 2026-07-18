@@ -146,17 +146,20 @@ def test_experience_state_survives_subject_restart(tmp_path: Path) -> None:
             },
         )
         assert proposed_belief.status_code == 200
-        assert first_client.post(
-            "/api/beliefs/persistent-belief/resolve",
-            headers=admin_headers(),
-            json={
-                "accept": True,
-                "confidence": 0.7,
-                "epistemic_status": "probable",
-                "reason_code": "reviewed",
-                "evidence_refs": [f"experience:{created['experience_id']}"],
-            },
-        ).status_code == 200
+        assert (
+            first_client.post(
+                "/api/beliefs/persistent-belief/resolve",
+                headers=admin_headers(),
+                json={
+                    "accept": True,
+                    "confidence": 0.7,
+                    "epistemic_status": "probable",
+                    "reason_code": "reviewed",
+                    "evidence_refs": [f"experience:{created['experience_id']}"],
+                },
+            ).status_code
+            == 200
+        )
     snapshot_text = settings.agent_state.path.read_text(encoding="utf-8")
     assert "persist experience" not in snapshot_text
     assert "hidden_thought" not in snapshot_text
@@ -218,9 +221,7 @@ def test_chat_rejects_closed_context(tmp_path: Path) -> None:
     suspended = client.post(
         f"/api/contexts/{context_id}/suspend", headers=admin_headers()
     )
-    resumed = client.post(
-        f"/api/contexts/{context_id}/resume", headers=admin_headers()
-    )
+    resumed = client.post(f"/api/contexts/{context_id}/resume", headers=admin_headers())
     ended = client.post(f"/api/contexts/{context_id}/end", headers=admin_headers())
 
     response = client.post(
@@ -234,7 +235,9 @@ def test_chat_rejects_closed_context(tmp_path: Path) -> None:
     assert response.status_code == 409
 
 
-def test_concurrent_chat_requests_share_one_ordered_subject_state(tmp_path: Path) -> None:
+def test_concurrent_chat_requests_share_one_ordered_subject_state(
+    tmp_path: Path,
+) -> None:
     client = _client(tmp_path)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -270,7 +273,12 @@ def test_concurrent_chat_requests_share_one_ordered_subject_state(tmp_path: Path
         for event in client.app.state.runtime_event_log.recent()
         if event.category == "agent" and event.event_type == "completed"
     ]
-    assert [event.metadata["processing_sequence"] for event in completed] == [1, 2, 3, 4]
+    assert [event.metadata["processing_sequence"] for event in completed] == [
+        1,
+        2,
+        3,
+        4,
+    ]
     assert all("text" not in event.metadata for event in completed)
 
 
@@ -460,9 +468,7 @@ def test_system_events_include_safe_appraisal_components(tmp_path: Path) -> None
 
     assert chat.status_code == 200
     appraisal_events = [
-        event
-        for event in events.json()["events"]
-        if event["category"] == "appraisal"
+        event for event in events.json()["events"] if event["category"] == "appraisal"
     ]
     assert appraisal_events[-1]["metadata"]["measurement_valid"] is True
     assert "novelty" in appraisal_events[-1]["metadata"]
@@ -587,7 +593,9 @@ def test_startup_preloads_transformers_provider(tmp_path: Path, monkeypatch) -> 
         update={"model": settings.model.model_copy(update={"provider": "transformers"})}
     )
     provider = PreloadProvider()
-    monkeypatch.setattr("kagya.api.server.load_model_provider", lambda settings: provider)
+    monkeypatch.setattr(
+        "kagya.api.server.load_model_provider", lambda settings: provider
+    )
     app = create_app(settings)
     app.state.memory_system = DualMemorySystem(
         settings, embedding_function=DeterministicEmbeddingFunction()
@@ -867,9 +875,7 @@ def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
         "arousal": 0.4,
         "optimal_loss": 0.8,
     }
-    restored = client.post(
-        "/api/state/restore", headers=admin_headers(), json=snapshot
-    )
+    restored = client.post("/api/state/restore", headers=admin_headers(), json=snapshot)
     assert restored.status_code == 200
     assert restored.json()["emotion_state"]["valence"] == -0.25
 
@@ -941,9 +947,7 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
         },
     )
     assert evaluated.status_code == 200
-    assert evaluated.json()["options"][1]["conflicts"] == [
-        "compassionate-honesty"
-    ]
+    assert evaluated.json()["options"][1]["conflicts"] == ["compassionate-honesty"]
     assert evaluated.json()["options"][0]["contributions"][0]["value_id"] == "care"
 
     update = {
@@ -957,19 +961,16 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     updated = client.post("/api/values/updates", headers=headers, json=update)
     assert updated.status_code == 200
     assert updated.json()["updates"][0]["identity_origin"]["actor"] == "operator"
-    assert (
-        updated.json()["updates"][0]["identity_origin"]["input_kind"]
-        == "feedback"
-    )
+    assert updated.json()["updates"][0]["identity_origin"]["input_kind"] == "feedback"
     value_state = client.get("/api/values", headers=headers).json()["values"][0]
     assert value_state["origin_provenance"]["actor"] == "inherited"
     record = updated.json()["updates"][0]
     assert record["event_id"]
     assert record["event_sequence"] > 0
     assert record["memory_ids"] == ["memory-api-1"]
-    assert client.post(
-        "/api/values/updates", headers=headers, json=update
-    ).json() == {"updates": []}
+    assert client.post("/api/values/updates", headers=headers, json=update).json() == {
+        "updates": []
+    }
 
     frozen = client.post(
         "/api/values/care/freeze", headers=headers, json={"frozen": True}
@@ -1030,9 +1031,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     assert intrinsic.json()["goal_type"] == "external_request"
     assert intrinsic.json()["identity_origin"]["actor"] == "operator"
     assert intrinsic.json()["identity_origin"]["endorsement"] == "pending"
-    adopted = client.post(
-        "/api/goals/intrinsic-goal/adopt", headers=headers
-    )
+    adopted = client.post("/api/goals/intrinsic-goal/adopt", headers=headers)
     assert adopted.status_code == 200
     assert adopted.json()["action"] == "activate"
     adopted_goal = next(
@@ -1057,9 +1056,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
         },
     )
     assert external.status_code == 200
-    selected = client.post(
-        "/api/goals/external-goal/adopt", headers=headers
-    )
+    selected = client.post("/api/goals/external-goal/adopt", headers=headers)
     assert selected.status_code == 200
     assert selected.json()["conflicting_goal_ids"] == ["intrinsic-goal"]
 
@@ -1069,12 +1066,8 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
         "external-goal": "active",
         "intrinsic-goal": "suspended",
     }
-    assert any(
-        decision["action"] == "suspend" for decision in inspected["decisions"]
-    )
-    decision_input = client.get(
-        "/api/goals/decision-input", headers=headers
-    ).json()
+    assert any(decision["action"] == "suspend" for decision in inspected["decisions"])
+    decision_input = client.get("/api/goals/decision-input", headers=headers).json()
     assert decision_input["active_goals"][0]["goal_id"] == "external-goal"
     assert "no_action" in decision_input["allowed_actions"]
 
@@ -1095,8 +1088,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     reevaluated = client.post("/api/goals/reevaluate", headers=headers)
     assert reevaluated.status_code == 200
     assert any(
-        decision["action"] == "resume"
-        and decision["goal_id"] == "intrinsic-goal"
+        decision["action"] == "resume" and decision["goal_id"] == "intrinsic-goal"
         for decision in reevaluated.json()["decisions"]
     )
     assert any(
@@ -1129,9 +1121,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     )
     assert fulfilled.status_code == 200
     assert fulfilled.json()["status"] == "fulfilled"
-    related_goal = client.app.state.main_loop.goal_manager.get(
-        "commitment:promise-1"
-    )
+    related_goal = client.app.state.main_loop.goal_manager.get("commitment:promise-1")
     assert related_goal.goal_type.value == "commitment"
     assert related_goal.status.value == "completed"
 
@@ -1145,7 +1135,9 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
         },
     )
     assert expired_commitment.status_code == 409
-    assert "expired-promise" not in client.app.state.main_loop.commitment_store.commitments
+    assert (
+        "expired-promise" not in client.app.state.main_loop.commitment_store.commitments
+    )
     assert (
         "commitment:expired-promise"
         not in client.app.state.main_loop.goal_manager.goals
@@ -1218,9 +1210,12 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     )
     assert belief.status_code == 200
     assert belief.json()["lifecycle"] == "proposed"
-    assert client.get(
-        "/api/beliefs", headers=headers, params={"active_only": True}
-    ).json()["beliefs"] == []
+    assert (
+        client.get(
+            "/api/beliefs", headers=headers, params={"active_only": True}
+        ).json()["beliefs"]
+        == []
+    )
     resolved_belief = client.post(
         "/api/beliefs/decision-belief/resolve",
         headers=headers,
@@ -1255,9 +1250,10 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         },
     )
     assert goal.status_code == 200
-    assert client.post(
-        "/api/goals/decision-goal/adopt", headers=headers
-    ).status_code == 200
+    assert (
+        client.post("/api/goals/decision-goal/adopt", headers=headers).status_code
+        == 200
+    )
 
     candidates = [
         {
@@ -1324,17 +1320,13 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     decision_experience = client.get(
         f"/api/experiences/{record['experience_refs'][0]}", headers=headers
     ).json()
-    assert decision_experience["result_refs"]["decision"] == [
-        "decision:decision-api-1"
-    ]
+    assert decision_experience["result_refs"]["decision"] == ["decision:decision-api-1"]
     assert set(record["emotion_snapshot"]) == {
         "valence",
         "arousal",
         "optimal_loss",
     }
-    assert record["considered_candidates"][0]["value_contributions"][
-        "honesty"
-    ] > 0
+    assert record["considered_candidates"][0]["value_contributions"]["honesty"] > 0
 
     awaiting = client.get(
         "/api/decisions", headers=headers, params={"status": "awaiting_outcome"}
@@ -1397,16 +1389,22 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
         "value_effects": {},
         "appraisal_contributions": {},
     }
-    assert client.post(
-        "/api/decisions",
-        headers=headers,
-        json={"decision_id": "self-evidence", "candidates": [candidate]},
-    ).status_code == 200
-    assert client.post(
-        "/api/decisions/self-evidence/outcome",
-        headers=headers,
-        json={"description": "Waited safely", "utility": 0.8, "success": True},
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/decisions",
+            headers=headers,
+            json={"decision_id": "self-evidence", "candidates": [candidate]},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/decisions/self-evidence/outcome",
+            headers=headers,
+            json={"description": "Waited safely", "utility": 0.8, "success": True},
+        ).status_code
+        == 200
+    )
 
     capability = client.post(
         "/api/self-model/capabilities/from-decision",
@@ -1421,9 +1419,10 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     assert capability.status_code == 200
     capability_state = capability.json()
     assert capability_state["capabilities"]["safe-waiting"]["confidence"] > 0.5
-    assert capability_state["capabilities"]["safe-waiting"]["evidence"][0][
-        "source_id"
-    ] == "self-evidence"
+    assert (
+        capability_state["capabilities"]["safe-waiting"]["evidence"][0]["source_id"]
+        == "self-evidence"
+    )
 
     limitation = client.post(
         "/api/self-model/limitations",
@@ -1514,9 +1513,12 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     assert proposal.json()["identity_origin"]["actor"] == "operator"
     assert proposal.json()["identity_origin"]["endorsement"] == "pending"
     assert "identity_summary_changed" in proposal.json()["contradictions"]
-    assert client.get("/api/self-model", headers=headers).json()["state"][
-        "identity_summary"
-    ] == original_summary
+    assert (
+        client.get("/api/self-model", headers=headers).json()["state"][
+            "identity_summary"
+        ]
+        == original_summary
+    )
 
     applied = client.post(
         "/api/self-model/identity/proposals/self-claim/resolve",
@@ -1542,9 +1544,7 @@ def test_agent_event_journal_commits_snapshot_without_private_chat_data(
             "/api/chat", json={"text": "private journal input", "attachments": []}
         )
         assert response.status_code == 200
-        inspected = client.get(
-            "/api/system/journal", headers=admin_headers()
-        )
+        inspected = client.get("/api/system/journal", headers=admin_headers())
         assert inspected.status_code == 200
         assert "private journal input" not in inspected.text
         assert "debug thought" not in inspected.text
@@ -1570,13 +1570,19 @@ def test_agent_event_journal_commits_snapshot_without_private_chat_data(
 def test_agent_event_journal_continues_sequence_across_restart(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        assert client.post(
-            "/api/chat", json={"text": "first", "attachments": []}
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/chat", json={"text": "first", "attachments": []}
+            ).status_code
+            == 200
+        )
     with _client(tmp_path, settings=settings) as restarted:
-        assert restarted.post(
-            "/api/chat", json={"text": "second", "attachments": []}
-        ).status_code == 200
+        assert (
+            restarted.post(
+                "/api/chat", json={"text": "second", "attachments": []}
+            ).status_code
+            == 200
+        )
 
     records = EventJournal(settings.agent_journal.path).verify()
     assert [
@@ -1653,9 +1659,12 @@ def test_readiness_fails_when_subject_runtime_stops(tmp_path: Path) -> None:
 def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        assert client.post(
-            "/api/chat", json={"text": "commit", "attachments": []}
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/chat", json={"text": "commit", "attachments": []}
+            ).status_code
+            == 200
+        )
     store = AgentStateStore(settings.agent_state.path)
     snapshot = store.load(1.0)
     store.save(
@@ -1671,6 +1680,102 @@ def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> N
     with pytest.raises(RuntimeError, match="hashes disagree"):
         with _client(tmp_path, settings=settings):
             pass
+
+
+def test_optional_admin_auth_preserves_disabled_token_only_behavior(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+
+    response = client.post(
+        "/api/state/snapshot",
+        headers={**admin_headers(), "Origin": "https://untrusted.example"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_admin_auth_rejects_cross_site_and_enforces_roles(tmp_path: Path) -> None:
+    settings = _auth_settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.cookies.update(
+            {"kagya_admin_session": "session", "kagya_admin_csrf": "csrf"}
+        )
+        cross_site = client.post(
+            "/api/state/snapshot",
+            headers=_actor_headers("full_admin", origin="https://evil.example"),
+        )
+        read_only = client.post(
+            "/api/state/snapshot",
+            headers=_actor_headers("read_only"),
+        )
+        approval_training = client.post(
+            "/api/sleep/jobs",
+            headers=_actor_headers("approval_only"),
+            json={},
+        )
+        approval_action = client.post(
+            "/api/adapters/missing-adapter/reject",
+            headers=_actor_headers("approval_only"),
+        )
+        readable = client.get(
+            "/api/state/export", headers=_actor_headers("read_only", mutation=False)
+        )
+
+    assert cross_site.status_code == 403
+    assert read_only.status_code == 403
+    assert approval_training.status_code == 403
+    assert approval_action.status_code != 403
+    assert readable.status_code == 200
+
+
+def test_admin_auth_requires_csrf_and_recent_reauthentication_for_reset(
+    tmp_path: Path,
+) -> None:
+    settings = _auth_settings(tmp_path)
+    cookies = {"kagya_admin_session": "session", "kagya_admin_csrf": "csrf"}
+    with _client(tmp_path, settings=settings) as client:
+        client.cookies.update(cookies)
+        missing_csrf = client.post(
+            "/api/state/snapshot",
+            headers={
+                **admin_headers(),
+                "X-KAGYA-Actor": "alice",
+                "X-KAGYA-Role": "full_admin",
+                "Origin": "http://localhost:3000",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        stale_auth = client.post(
+            "/api/state/reset",
+            headers=_actor_headers("full_admin"),
+        )
+        reset = client.post(
+            "/api/state/reset",
+            headers={
+                **_actor_headers("full_admin"),
+                "X-KAGYA-Reauthenticated-At": str(time.time()),
+            },
+        )
+
+    assert missing_csrf.status_code == 403
+    assert stale_auth.status_code == 403
+    assert reset.status_code == 200
+    records = EventJournal(settings.agent_journal.path).verify()
+    audit = [record for record in records if record.lifecycle == JournalLifecycle.AUDIT]
+    assert audit[-1].actor_id == "alice"
+    assert audit[-1].actor_role == "full_admin"
+    assert audit[-1].target == "POST /api/state/reset"
+    journal_text = settings.agent_journal.path.read_text(encoding="utf-8")
+    assert ADMIN_TOKEN not in journal_text
+    assert "csrf" not in journal_text.lower()
+
+
+def test_admin_auth_allows_token_only_loopback_recovery(tmp_path: Path) -> None:
+    with _client(tmp_path, settings=_auth_settings(tmp_path)) as client:
+        response = client.post("/api/state/snapshot", headers=admin_headers())
+
+    assert response.status_code == 200
 
 
 def _client(
@@ -1746,15 +1851,50 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
+def _auth_settings(tmp_path: Path) -> Settings:
+    settings = _settings(tmp_path)
+    return settings.model_copy(
+        update={
+            "api": settings.api.model_copy(
+                update={
+                    "admin_auth": settings.api.admin_auth.model_copy(
+                        update={"enabled": True}
+                    )
+                }
+            )
+        }
+    )
+
+
+def _actor_headers(
+    role: str,
+    *,
+    origin: str = "http://localhost:3000",
+    mutation: bool = True,
+) -> dict[str, str]:
+    headers = {
+        **admin_headers(),
+        "X-KAGYA-Actor": "alice",
+        "X-KAGYA-Role": role,
+    }
+    if mutation:
+        headers.update(
+            {
+                "Origin": origin,
+                "Sec-Fetch-Site": "same-origin",
+                "X-KAGYA-CSRF-Token": "csrf",
+            }
+        )
+    return headers
+
+
 def admin_headers() -> dict[str, str]:
     return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:
     for _ in range(100):
-        response = client.get(
-            f"/api/sleep/jobs/{job_id}", headers=admin_headers()
-        )
+        response = client.get(f"/api/sleep/jobs/{job_id}", headers=admin_headers())
         data = response.json()
         if data["status"] in {"completed", "failed", "cancelled"}:
             return data

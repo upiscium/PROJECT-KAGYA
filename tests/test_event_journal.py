@@ -62,7 +62,7 @@ def test_journal_rejects_tamper_and_unsupported_records(tmp_path: Path) -> None:
     with pytest.raises(JournalIntegrityError, match="hash mismatch"):
         EventJournal(journal.path)
 
-    payload["schema_version"] = 2
+    payload["schema_version"] = 3
     journal.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     with pytest.raises(JournalIntegrityError, match="invalid"):
         EventJournal(journal.path)
@@ -122,15 +122,11 @@ def test_existing_snapshot_bootstraps_journal_checkpoint(tmp_path: Path) -> None
 
 
 def test_rotation_keeps_verifiable_checkpointed_hash_chain(tmp_path: Path) -> None:
-    journal = EventJournal(
-        tmp_path / "journal.jsonl", max_bytes=1, retained_files=2
-    )
+    journal = EventJournal(tmp_path / "journal.jsonl", max_bytes=1, retained_files=2)
     for sequence in range(1, 8):
         journal.started(replace(_event(), processing_sequence=sequence))
 
-    records = EventJournal(
-        journal.path, max_bytes=1, retained_files=2
-    ).verify()
+    records = EventJournal(journal.path, max_bytes=1, retained_files=2).verify()
 
     assert records
     assert any(record.lifecycle == JournalLifecycle.CHECKPOINT for record in records)
@@ -148,9 +144,7 @@ def test_journal_rejects_processing_sequence_gap(tmp_path: Path) -> None:
 
 
 def test_journal_rejects_missing_rotation_file(tmp_path: Path) -> None:
-    journal = EventJournal(
-        tmp_path / "journal.jsonl", max_bytes=1, retained_files=3
-    )
+    journal = EventJournal(tmp_path / "journal.jsonl", max_bytes=1, retained_files=3)
     for sequence in range(1, 5):
         journal.started(replace(_event(), processing_sequence=sequence))
     journal.path.with_name(f"{journal.path.name}.1").unlink()
@@ -178,9 +172,7 @@ def test_reconcile_rejects_snapshot_sequence_without_prepared_evidence(
 def test_rotation_checkpoint_preserves_snapshot_sequence_and_hash(
     tmp_path: Path,
 ) -> None:
-    journal = EventJournal(
-        tmp_path / "journal.jsonl", max_bytes=1, retained_files=1
-    )
+    journal = EventJournal(tmp_path / "journal.jsonl", max_bytes=1, retained_files=1)
     event = replace(_event(), processing_sequence=1)
     snapshot = default_agent_state_snapshot(1.0).model_copy(
         update={"last_processed_event_sequence": 1}
@@ -217,12 +209,31 @@ def test_real_journal_fsync_failure_rejects_event_before_handler(
     )
 
     with pytest.raises(AgentRuntimeJournalError, match="durably accepted"):
-        runtime.submit(
-            AgentEventType.CHAT, source="test", handler=lambda: ran.set()
-        )
+        runtime.submit(AgentEventType.CHAT, source="test", handler=lambda: ran.set())
     runtime.shutdown()
 
     assert ran.is_set() is False
+
+
+def test_admin_audit_record_contains_actor_and_target_without_credentials(
+    tmp_path: Path,
+) -> None:
+    journal = EventJournal(tmp_path / "journal.jsonl")
+
+    record = journal.audit_admin_action(
+        event_id="request-1",
+        actor_id="operator@example.test",
+        actor_role="full_admin",
+        target="POST /api/state/reset",
+        reauthenticated=True,
+    )
+
+    assert record.lifecycle == JournalLifecycle.AUDIT
+    assert record.actor_id == "operator@example.test"
+    assert record.target == "POST /api/state/reset"
+    serialized = journal.path.read_text(encoding="utf-8")
+    assert "admin-token" not in serialized
+    assert "csrf" not in serialized.lower()
 
 
 def _event(*, payload: dict[str, object] | None = None) -> AgentEvent:

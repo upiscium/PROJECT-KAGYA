@@ -31,6 +31,7 @@ class JournalLifecycle(StrEnum):
     FAILED = "failed"
     RECOVERY_CLASSIFIED = "recovery_classified"
     CHECKPOINT = "checkpoint"
+    AUDIT = "audit"
 
 
 class JournalEvent(Protocol):
@@ -51,7 +52,7 @@ class JournalTelemetry(Protocol):
 class JournalRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     record_id: str
     timestamp: datetime
     lifecycle: JournalLifecycle
@@ -66,6 +67,10 @@ class JournalRecord(BaseModel):
     state_hash_after: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     failure_category: str | None = None
+    actor_id: str | None = None
+    actor_role: str | None = None
+    target: str | None = None
+    reauthenticated: bool | None = None
     previous_record_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -78,12 +83,16 @@ class JournalRecord(BaseModel):
             and self.processing_sequence is not None
         ):
             raise ValueError("accepted journal record must not have a sequence")
-        if self.lifecycle in {
-            JournalLifecycle.STARTED,
-            JournalLifecycle.PREPARED,
-            JournalLifecycle.COMPLETED,
-            JournalLifecycle.FAILED,
-        } and self.processing_sequence is None:
+        if (
+            self.lifecycle
+            in {
+                JournalLifecycle.STARTED,
+                JournalLifecycle.PREPARED,
+                JournalLifecycle.COMPLETED,
+                JournalLifecycle.FAILED,
+            }
+            and self.processing_sequence is None
+        ):
             raise ValueError("journal lifecycle record requires a sequence")
         if self.lifecycle == JournalLifecycle.PREPARED and (
             self.state_hash_before is None or self.state_hash_after is None
@@ -99,6 +108,10 @@ class JournalRecord(BaseModel):
             and self.failure_category is None
         ):
             raise ValueError("recovery journal record requires a classification")
+        if self.lifecycle == JournalLifecycle.AUDIT and (
+            self.actor_id is None or self.actor_role is None or self.target is None
+        ):
+            raise ValueError("audit journal record requires actor and target")
         return self
 
 
@@ -128,10 +141,7 @@ class EventJournal:
         if records:
             self._last_hash = records[-1].record_hash
             self._last_sequence = max(
-                (
-                    record.processing_sequence or 0
-                    for record in records
-                ),
+                (record.processing_sequence or 0 for record in records),
                 default=0,
             )
             snapshot_records = [
@@ -194,6 +204,26 @@ class EventJournal:
         with self._lock:
             return self.verify()[-limit:]
 
+    def audit_admin_action(
+        self,
+        *,
+        event_id: str,
+        actor_id: str,
+        actor_role: str,
+        target: str,
+        reauthenticated: bool,
+    ) -> JournalRecord:
+        return self._append(
+            lifecycle=JournalLifecycle.AUDIT,
+            event_id=_safe_label(event_id),
+            event_type="admin_action",
+            source="api.admin",
+            actor_id=_safe_label(actor_id),
+            actor_role=_safe_label(actor_role),
+            target=_safe_target(target),
+            reauthenticated=reauthenticated,
+        )
+
     def reconcile(self, snapshot: AgentStateSnapshot) -> list[JournalRecord]:
         snapshot_hash = hash_snapshot(snapshot)
         records = self.verify()
@@ -231,7 +261,9 @@ class EventJournal:
         if last_terminal is not None:
             terminal_sequence = last_terminal.snapshot_sequence
             if terminal_sequence is None:
-                raise JournalIntegrityError("terminal journal record has no snapshot sequence")
+                raise JournalIntegrityError(
+                    "terminal journal record has no snapshot sequence"
+                )
             if terminal_sequence > snapshot.last_processed_event_sequence:
                 raise JournalIntegrityError("journal sequence is ahead of the snapshot")
             if (
@@ -242,8 +274,7 @@ class EventJournal:
                 raise JournalIntegrityError("journal and snapshot hashes disagree")
             if terminal_sequence < snapshot.last_processed_event_sequence and not any(
                 record.lifecycle == JournalLifecycle.PREPARED
-                and record.processing_sequence
-                == snapshot.last_processed_event_sequence
+                and record.processing_sequence == snapshot.last_processed_event_sequence
                 and record.state_hash_after == snapshot_hash
                 for record in latest_by_event.values()
             ):
@@ -296,9 +327,16 @@ class EventJournal:
                     ) from exc
                 if _record_hash(record) != record.record_hash:
                     raise JournalIntegrityError("journal record hash mismatch")
-                if previous_hash is not None and record.previous_record_hash != previous_hash:
+                if (
+                    previous_hash is not None
+                    and record.previous_record_hash != previous_hash
+                ):
                     raise JournalIntegrityError("journal hash chain is broken")
-                if previous_hash is None and records and record.lifecycle != JournalLifecycle.CHECKPOINT:
+                if (
+                    previous_hash is None
+                    and records
+                    and record.lifecycle != JournalLifecycle.CHECKPOINT
+                ):
                     raise JournalIntegrityError("rotated journal has no checkpoint")
                 if (
                     record.lifecycle == JournalLifecycle.CHECKPOINT
@@ -482,7 +520,9 @@ class EventJournal:
         if existing:
             indices = [index for index, _path in existing]
             if indices != list(range(1, max(indices) + 1)):
-                raise JournalIntegrityError("rotated journal file sequence is incomplete")
+                raise JournalIntegrityError(
+                    "rotated journal file sequence is incomplete"
+                )
             if not self.path.exists():
                 raise JournalIntegrityError("active journal file is missing")
         return [path for _index, path in reversed(existing)] + (
@@ -502,7 +542,7 @@ def hash_snapshot(snapshot: AgentStateSnapshot) -> str:
 
 def _new_record(*, previous_record_hash: str | None, **values: Any) -> JournalRecord:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "record_id": str(uuid4()),
         "timestamp": datetime.now(UTC),
         "previous_record_hash": previous_record_hash,
@@ -513,7 +553,10 @@ def _new_record(*, previous_record_hash: str | None, **values: Any) -> JournalRe
 
 
 def _record_hash(record: JournalRecord) -> str:
-    payload = record.model_dump(mode="json", exclude={"record_hash"})
+    exclude = {"record_hash"}
+    if record.schema_version == 1:
+        exclude.update({"actor_id", "actor_role", "target", "reauthenticated"})
+    payload = record.model_dump(mode="json", exclude=exclude)
     canonical = json.dumps(
         payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
     ).encode()
@@ -526,6 +569,14 @@ def _safe_optional_label(value: str | None) -> str | None:
 
 def _safe_label(value: str) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", value) else "redacted"
+
+
+def _safe_target(value: str) -> str:
+    return (
+        value
+        if re.fullmatch(r"[A-Z]+ /[A-Za-z0-9._:@/*-]{1,240}", value)
+        else "redacted"
+    )
 
 
 def _fsync_directory(path: Path) -> None:

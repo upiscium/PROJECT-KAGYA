@@ -148,6 +148,27 @@ api:
   host: 127.0.0.1
   port: 8000
   admin_token_env: KAGYA_ADMIN_TOKEN
+  # Optional identity/role sessions are disabled for the private token-only default.
+  admin_auth:
+    enabled: false
+    actor_header: X-KAGYA-Actor
+    role_header: X-KAGYA-Role
+    reauthenticated_at_header: X-KAGYA-Reauthenticated-At
+    session_cookie_name: kagya_admin_session
+    csrf_cookie_name: kagya_admin_csrf
+    csrf_header: X-KAGYA-CSRF-Token
+    reauthentication_max_age_seconds: 300
+    reauthentication_paths:
+      - /api/state/restore
+      - /api/state/reset
+      - /api/sleep/jobs
+      - /api/sleep/jobs/*
+      - /api/sleep/cleanup
+      - /api/adapters/rollback
+      - /api/adapters/*/activate
+      - /api/values/reset
+      - /api/self-model/rollback
+    allow_loopback_recovery: true
   cors_origins:
     - http://localhost:3000
     - http://127.0.0.1:3000
