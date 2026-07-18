@@ -18,6 +18,7 @@ from kagya.api.routes import (
     experiences,
     goals,
     memory,
+    motivation,
     sleep,
     self_model,
     state,
@@ -85,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(self_model.router)
         app.include_router(experiences.router)
         app.include_router(beliefs.router)
+        app.include_router(motivation.router)
 
     return app
 

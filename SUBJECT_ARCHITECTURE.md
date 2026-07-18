@@ -36,6 +36,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
 | Value system | Maintain stable, rate-limited value weights and conflicts | `identity.values` | Structured observation/outcome/reflection proposals with event or memory evidence | `tests/test_value_system.py` |
 | Goal manager | Maintain candidates, active/suspended goals, dependencies, deadlines, and transition reasons | `motivation.active_goals`; decisions under motivation extensions | Explicit proposals, value-aware adoption, internal reevaluation events | `tests/test_goal_manager.py` |
+| Motivation dynamics | Form persistent Drive, Interest, Desire, Aversion, and bounded intrinsic Goal proposals | `motivation.extensions.dynamics` | Repeated Experience signals, explicit conflict links, elapsed time, and Goal outcomes | `tests/test_motivation_dynamics.py` |
 | Commitment store | Distinguish promises from intrinsic and external-request goals | `motivation.commitments` | Explicit commitment lifecycle events | `tests/test_goal_manager.py`, `tests/test_fastapi_backend.py` |
 | Decision store | Track candidates, predictions, contributions, selection, outcome, and prediction error in one record | `extensions.decision_records` | Schema-constrained candidates and later outcome events | `tests/test_decision_records.py` |
 | Self model | Maintain identity, capabilities, limitations, known unknowns, roles, and references | `identity.self_model` | Resolved declared DecisionRecord outcomes or explicit admin correction; self-reports remain proposals | `tests/test_self_model.py` |
@@ -71,6 +72,14 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Structured contradictions retain both propositions and move them out of active reasoning until evidence-backed resolution or supersession.
 - Superseded, retracted, expired, rejected, disputed, and proposed records are excluded from Working Memory and Decision inputs. Context and validity windows are evaluated at selection time.
 - DecisionRecords freeze active Belief revision numbers and origin IDs, allowing later explanation to distinguish what was believed at decision time from what was merely remembered.
+
+## Motivation Dynamics
+
+- Experience novelty can reinforce curiosity Interest; unresolved tension can reinforce closure Drive; threat can form an Aversion. Records retain source Experience refs and never copy user request text into generated Goal descriptions.
+- A single high-intensity event cannot create a long-term Goal. Goal formation requires minimum strength, persistence, and multiple distinct Experience observations, and each reevaluation has a fixed proposal budget.
+- Conflicting eligible motivations remain as linked records and are held from Goal conversion rather than deleting or arbitrarily selecting one side.
+- Internal reevaluation creates intrinsic Goal proposals with `self/internal_state` origin and a structured motivation ID target. It does not auto-activate the Goal.
+- Goal completion satisfies and satiates the linked motivation; failure or abandonment weakens it; elapsed time decays active motivation. Repeated evidence reinforces Interest with increasing satiation, preventing unbounded growth.
 
 ## Versioning And Migration
 

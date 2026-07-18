@@ -23,6 +23,8 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^experiences(?:\/[^/]+)?$/ },
   { method: "GET", pattern: /^beliefs$/ },
   { method: "POST", pattern: /^beliefs(?:\/[^/]+\/(resolve|retract|supersede)|\/expire)?$/ },
+  { method: "GET", pattern: /^motivation$/ },
+  { method: "POST", pattern: /^motivation\/(reevaluate|decay)$/ },
 ];
 
 export async function GET(request: NextRequest, context: RouteContext) {
