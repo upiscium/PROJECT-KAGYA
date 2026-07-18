@@ -314,9 +314,7 @@ class KagyaMainLoop:
                     certainty=self.settings.appraisal.default_certainty
                     if loss_measurement.valid
                     else 0.2,
-                    social_relevance=0.5
-                    if current_context.participant_ids
-                    else 0.0,
+                    social_relevance=0.5 if current_context.participant_ids else 0.0,
                     effort_cost=min(
                         1.0,
                         len(user_input.encode("utf-8"))
@@ -458,9 +456,7 @@ class KagyaMainLoop:
                 source_session_id=current_context.source_session_id,
                 provider=self.settings.model.provider,
                 model_id=model_id,
-                model_revision=str(
-                    getattr(self.provider, "model_revision", "unknown")
-                ),
+                model_revision=str(getattr(self.provider, "model_revision", "unknown")),
                 adapter_id=None if fallback_used else self.adapter_id,
                 validation_status=ValidationStatus.UNVERIFIED,
             )
@@ -571,9 +567,7 @@ class KagyaMainLoop:
             model_id=model_id,
             adapter_id=None if fallback_used else self.adapter_id,
             adapter_hash=None if fallback_used else self.adapter_hash,
-            activation_sequence=(
-                None if fallback_used else self.activation_sequence
-            ),
+            activation_sequence=(None if fallback_used else self.activation_sequence),
             fallback_used=fallback_used,
             prompt=prompt,
             memory_context=memory_context,
@@ -1019,6 +1013,9 @@ class KagyaMainLoop:
         proposal_id: str | None = None,
         origin_actor: OriginActor = OriginActor.SELF,
         origin_input_kind: OriginInputKind = OriginInputKind.INTERNAL_STATE,
+        experience_ids: tuple[str, ...] = (),
+        decision_id: str | None = None,
+        context_id: str | None = None,
     ) -> list[ValueUpdateRecord]:
         event = current_agent_event()
         evidence = ValueEvidence(
@@ -1026,6 +1023,9 @@ class KagyaMainLoop:
             event_sequence=None if event is None else event.processing_sequence,
             memory_ids=memory_ids,
             source=source,
+            experience_ids=experience_ids,
+            decision_id=decision_id,
+            context_id=context_id,
             identity_origin=new_identity_origin(
                 origin_actor,
                 origin_input_kind,
@@ -1045,10 +1045,34 @@ class KagyaMainLoop:
         self._persist_value_state()
         return records
 
+    def apply_value_evidence_from_experience(
+        self,
+        experience_id: str,
+        impacts: dict[str, float],
+        *,
+        proposal_id: str | None = None,
+    ) -> list[ValueUpdateRecord]:
+        experience = self.experience_store.get(experience_id)
+        proposals = self.value_system.proposals_from_experience(
+            experience, impacts, proposal_id=proposal_id
+        )
+        records = self.value_system.apply(proposals)
+        for record in records:
+            self.link_experience_result(
+                experience_id,
+                kind="value",
+                reference=f"value:{record.value_id}@{record.after['revision']}",
+                evidence_refs=record.evidence_ids,
+            )
+        self._sync_self_references()
+        self._persist_self_model_state()
+        self._persist_value_state()
+        return records
+
     def evaluate_value_options(
-        self, options: dict[str, dict[str, float]]
+        self, options: dict[str, dict[str, float]], *, context_id: str | None = None
     ) -> list[ActionScore]:
-        return self.value_system.evaluate(options)
+        return self.value_system.evaluate(options, context_id=context_id)
 
     def freeze_value(self, value_id: str, *, frozen: bool) -> ValueState:
         state = self.value_system.freeze(value_id, frozen=frozen)
@@ -1060,7 +1084,9 @@ class KagyaMainLoop:
         self._persist_value_state()
         return state
 
-    def reset_values(self, value_ids: tuple[str, ...] | None = None) -> list[ValueState]:
+    def reset_values(
+        self, value_ids: tuple[str, ...] | None = None
+    ) -> list[ValueState]:
         states = self.value_system.reset(value_ids)
         self._persist_value_state()
         return states
@@ -1188,6 +1214,11 @@ class KagyaMainLoop:
             conflict_ids=conflict_ids,
             deadline=deadline,
             value_effects=value_effects,
+            value_revision_refs={
+                value_id: self.value_system.get(value_id).revision
+                for value_id in set(value_effects or {})
+                | ({origin_value_id} if origin_value_id is not None else set())
+            },
             needs_information=needs_information,
             goal_id=goal_id,
         )
@@ -1392,9 +1423,7 @@ class KagyaMainLoop:
             for score in self.value_system.evaluate(options)
         }
 
-    def _apply_goal_outcome_appraisal(
-        self, goal: Goal, status: GoalStatus
-    ) -> None:
+    def _apply_goal_outcome_appraisal(self, goal: Goal, status: GoalStatus) -> None:
         progress = {
             GoalStatus.COMPLETED: 1.0,
             GoalStatus.FAILED: -1.0,
@@ -1524,8 +1553,7 @@ class KagyaMainLoop:
             else event.processing_sequence,
             context_id=context_id,
             active_goal_ids=tuple(
-                goal.goal_id
-                for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+                goal.goal_id for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
             ),
             value_revision_refs={
                 value.value_id: value.revision
@@ -1555,9 +1583,7 @@ class KagyaMainLoop:
                 },
             },
             experience_refs=(
-                ()
-                if source_experience is None
-                else (source_experience.experience_id,)
+                () if source_experience is None else (source_experience.experience_id,)
             ),
             belief_revision_refs={
                 belief.belief_id: belief.revision for belief in active_beliefs
@@ -1569,10 +1595,29 @@ class KagyaMainLoop:
                 if capability.confidence >= 0.5
             }
             | (satisfied_prerequisites or set()),
-            value_evaluator=self._decision_value_evaluator,
+            value_evaluator=lambda options: self._decision_value_evaluator(
+                options, context_id=context_id
+            ),
             self_model_evaluator=self.self_model.evaluate_candidates,
             decision_id=decision_id,
         )
+        decision_scores = self.value_system.evaluate(
+            {
+                candidate.candidate_id: candidate.value_effects
+                for candidate in candidates
+                if candidate.value_effects
+            },
+            context_id=context_id,
+        )
+        tradeoffs = self.value_system.record_tradeoffs(
+            decision_scores,
+            context_id=context_id,
+            decision_id=record.decision_id,
+        )
+        if tradeoffs:
+            record = self.decision_store.link_value_tradeoffs(
+                record.decision_id, tuple(item.tradeoff_id for item in tradeoffs)
+            )
         if source_experience is not None:
             self.link_experience_result(
                 source_experience.experience_id,
@@ -1607,6 +1652,12 @@ class KagyaMainLoop:
             if event is None
             else event.processing_sequence,
         )
+        proposals = self.value_system.proposals_from_decision_outcome(record)
+        updates = self.value_system.apply(proposals)
+        self.value_system.record_reassessment(record, updates)
+        self._persist_value_state()
+        self._sync_self_references()
+        self._persist_self_model_state()
         self._persist_decision_state()
         return record
 
@@ -1616,7 +1667,10 @@ class KagyaMainLoop:
         )
 
     def _decision_value_evaluator(
-        self, options: dict[str, dict[str, float]]
+        self,
+        options: dict[str, dict[str, float]],
+        *,
+        context_id: str | None = None,
     ) -> dict[str, dict[str, float]]:
         if not options:
             return {}
@@ -1625,7 +1679,7 @@ class KagyaMainLoop:
                 contribution.value_id: contribution.contribution
                 for contribution in score.contributions
             }
-            for score in self.value_system.evaluate(options)
+            for score in self.value_system.evaluate(options, context_id=context_id)
         }
 
     def restore_self_model_state(self) -> None:
@@ -1729,9 +1783,7 @@ class KagyaMainLoop:
                     origin_input_kind or OriginInputKind.SUGGESTION,
                     source_ref="self_model_proposal",
                     event_id=None if event is None else event.event_id,
-                    event_sequence=None
-                    if event is None
-                    else event.processing_sequence,
+                    event_sequence=None if event is None else event.processing_sequence,
                 )
             ),
             proposal_id=proposal_id,
@@ -1753,7 +1805,9 @@ class KagyaMainLoop:
         self._persist_self_model_state()
         return proposal
 
-    def rollback_self_model(self, target_revision: int, *, reason: str) -> SelfModelState:
+    def rollback_self_model(
+        self, target_revision: int, *, reason: str
+    ) -> SelfModelState:
         event = current_agent_event()
         state = self.self_model.rollback(
             target_revision,
@@ -1769,7 +1823,11 @@ class KagyaMainLoop:
             commitment_refs=(
                 commitment.commitment_id
                 for commitment in self.commitment_store.commitments.values()
-            )
+            ),
+            value_revision_refs={
+                value.value_id: value.revision
+                for value in self.value_system.list_values()
+            },
         )
 
     def _sync_self_model_working_memory(
@@ -1922,9 +1980,7 @@ class KagyaMainLoop:
         for entry in entries:
             if required_status is not None and entry.get("status") != required_status:
                 continue
-            entry_id = entry.get(
-                "id", entry.get("goal_id", entry.get("commitment_id"))
-            )
+            entry_id = entry.get("id", entry.get("goal_id", entry.get("commitment_id")))
             content = entry.get("content", entry.get("description", entry.get("text")))
             if not isinstance(entry_id, str) or not isinstance(content, str):
                 continue

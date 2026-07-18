@@ -1,6 +1,6 @@
 """Evidence-bound capabilities and revision-controlled identity state."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
@@ -126,12 +126,13 @@ class SelfModelState:
     autobiographical_summary_refs: tuple[str, ...]
     revision: int
     updated_at: str
-    schema_version: int = 1
+    value_revision_refs: dict[str, int] = field(default_factory=dict)
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.identity_summary:
             raise ValueError("Identity summary must not be empty")
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(
                 f"Unsupported self-model schema version: {self.schema_version}"
             )
@@ -188,16 +189,17 @@ class SelfModel:
         event_id: str | None = None,
         event_sequence: int | None = None,
     ) -> Capability:
-        if decision.status != DecisionStatus.RESOLVED or decision.actual_outcome is None:
+        if (
+            decision.status != DecisionStatus.RESOLVED
+            or decision.actual_outcome is None
+        ):
             raise ValueError("Capability updates require a resolved DecisionRecord")
         selected = next(
             item.candidate
             for item in decision.considered_candidates
             if item.candidate.candidate_id == decision.selected_candidate_id
         )
-        declared_capabilities = _string_tuple(
-            selected.parameters.get("capability_ids")
-        )
+        declared_capabilities = _string_tuple(selected.parameters.get("capability_ids"))
         if capability_id not in declared_capabilities:
             raise ValueError(
                 "Selected action did not declare the capability being updated"
@@ -473,6 +475,7 @@ class SelfModel:
         *,
         commitment_refs: Iterable[str],
         autobiographical_summary_refs: Iterable[str] | None = None,
+        value_revision_refs: dict[str, int] | None = None,
     ) -> None:
         commitments = tuple(sorted(set(commitment_refs)))
         autobiography = (
@@ -480,15 +483,22 @@ class SelfModel:
             if autobiographical_summary_refs is None
             else tuple(sorted(set(autobiographical_summary_refs)))
         )
+        values = (
+            self.state.value_revision_refs
+            if value_revision_refs is None
+            else dict(value_revision_refs)
+        )
         if (
             commitments == self.state.commitment_refs
             and autobiography == self.state.autobiographical_summary_refs
+            and values == self.state.value_revision_refs
         ):
             return
         self.state = replace(
             self.state,
             commitment_refs=commitments,
             autobiographical_summary_refs=autobiography,
+            value_revision_refs=values,
             updated_at=_now(),
         )
 
@@ -595,7 +605,7 @@ class SelfModel:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "state": asdict(self.state),
             "history": [asdict(item) for item in self.history],
             "proposals": [asdict(item) for item in self.proposals.values()],
@@ -607,7 +617,7 @@ class SelfModel:
             self.history = []
             self.proposals = {}
             return
-        if payload.get("schema_version") != 1 or not isinstance(
+        if payload.get("schema_version") not in {1, 2} or not isinstance(
             payload.get("state"), dict
         ):
             self._restore_legacy(payload)
@@ -739,6 +749,8 @@ def _state_from_json(payload: dict[str, Any]) -> SelfModelState:
         "autobiographical_summary_refs",
     ):
         data[field_name] = tuple(data.get(field_name, ()))
+    data.setdefault("value_revision_refs", {})
+    data["schema_version"] = 2
     return SelfModelState(**data)
 
 

@@ -1,6 +1,6 @@
 """Persistent goals, conflict-aware adoption, and commitments."""
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
@@ -90,7 +90,8 @@ class Goal:
     created_at: str
     updated_at: str
     transitions: tuple[GoalTransition, ...] = ()
-    schema_version: int = 2
+    value_revision_refs: dict[str, int] = field(default_factory=dict)
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
         if not self.goal_id or not self.description:
@@ -99,7 +100,7 @@ class Goal:
             value = getattr(self, name)
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be finite and between zero and one")
-        if self.schema_version != 2:
+        if self.schema_version not in {2, 3}:
             raise ValueError(f"Unsupported goal schema version: {self.schema_version}")
         if len(self.dependency_ids) != len(set(self.dependency_ids)):
             raise ValueError("Goal dependencies must be unique")
@@ -194,6 +195,7 @@ class GoalManager:
         conflict_ids: tuple[str, ...] = (),
         deadline: str | None = None,
         value_effects: dict[str, float] | None = None,
+        value_revision_refs: dict[str, int] | None = None,
         needs_information: bool = False,
         goal_id: str | None = None,
     ) -> Goal:
@@ -230,6 +232,7 @@ class GoalManager:
             needs_information=needs_information,
             created_at=now,
             updated_at=now,
+            value_revision_refs=dict(value_revision_refs or {}),
         )
         self.goals[identifier] = goal
         return goal
@@ -247,7 +250,9 @@ class GoalManager:
             if status is None or goal.status == status
         ]
 
-    def rank(self, value_scores: dict[str, float] | None = None) -> list[tuple[Goal, float]]:
+    def rank(
+        self, value_scores: dict[str, float] | None = None
+    ) -> list[tuple[Goal, float]]:
         scores = value_scores or {}
         ranked = [
             (goal, self._score(goal, scores.get(goal.goal_id, 0.0)))
@@ -296,8 +301,10 @@ class GoalManager:
             if self.get(dependency_id).status != GoalStatus.COMPLETED
         )
         if goal.needs_information or incomplete:
-            reasons = ("additional_information_required",) if goal.needs_information else (
-                "dependencies_incomplete",
+            reasons = (
+                ("additional_information_required",)
+                if goal.needs_information
+                else ("dependencies_incomplete",)
             )
             return self._decision(
                 GoalDecisionAction.REQUEST_INFORMATION
@@ -722,7 +729,8 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
             updated_at=now,
         )
     data = dict(payload)
-    data["schema_version"] = 2
+    data["schema_version"] = 3
+    data.setdefault("value_revision_refs", {})
     data["identity_origin"] = identity_origin_from_json(
         data.get("identity_origin"), fallback_source="legacy_goal"
     )
@@ -769,8 +777,7 @@ def _commitment_from_json(payload: dict[str, Any]) -> Commitment:
     )
     data["status"] = CommitmentStatus(data["status"])
     data["transitions"] = tuple(
-        CommitmentTransition(**transition)
-        for transition in data.get("transitions", ())
+        CommitmentTransition(**transition) for transition in data.get("transitions", ())
     )
     return Commitment(**data)
 

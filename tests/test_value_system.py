@@ -5,9 +5,11 @@ import pytest
 
 from kagya.cognition import (
     AppraisalResult,
+    EvidenceDirection,
     ValueConflictDefinition,
     ValueEvidence,
     ValueState,
+    ValueScope,
     ValueSystem,
     ValueUpdateKind,
 )
@@ -84,8 +86,14 @@ def test_different_value_states_change_option_ranking() -> None:
         "candid": {"honesty": 1.0},
     }
 
-    assert care_first.evaluate(options)[0].total_score > care_first.evaluate(options)[1].total_score
-    assert honesty_first.evaluate(options)[0].total_score < honesty_first.evaluate(options)[1].total_score
+    assert (
+        care_first.evaluate(options)[0].total_score
+        > care_first.evaluate(options)[1].total_score
+    )
+    assert (
+        honesty_first.evaluate(options)[0].total_score
+        < honesty_first.evaluate(options)[1].total_score
+    )
 
 
 def test_legacy_flat_values_migrate_and_round_trip() -> None:
@@ -125,8 +133,9 @@ def test_json_snapshot_preserves_update_evidence_and_history() -> None:
     assert restored.history[0].memory_ids == ("memory-2",)
     assert restored.history[0].before["weight"] == 0.6
     assert restored.history[0].after["weight"] > 0.6
-    assert restored.get("care").schema_version == 2
+    assert restored.get("care").schema_version == 3
     assert restored.history[0].identity_origin.actor.value == "inherited"
+    assert json.loads(json.dumps(restored.to_json())) == serialized
 
 
 def test_invalid_value_references_are_rejected() -> None:
@@ -136,7 +145,7 @@ def test_invalid_value_references_are_rejected() -> None:
         system.evaluate({"option": {"missing": 1.0}})
 
 
-def test_external_request_cannot_directly_update_subject_values() -> None:
+def test_external_request_is_evidence_without_directly_updating_strength() -> None:
     system = _system()
     proposal = system.proposals_from_appraisal(
         _appraisal(),
@@ -152,9 +161,156 @@ def test_external_request_cannot_directly_update_subject_values() -> None:
         proposal_id="external-request",
     )[0]
 
-    with pytest.raises(ValueError, match="cannot directly update"):
-        system.apply([proposal])
+    record = system.apply([proposal])[0]
+
+    assert record.operation == "evidence_only"
+    assert record.applied_delta == 0.0
     assert system.get("care").weight == 0.6
+    assert system.get("care").supporting_evidence_ids == (
+        "proposal:external-request:care",
+    )
+    assert system.evidence["proposal:external-request:care"].identity_origin.actor == (
+        OriginActor.USER
+    )
+
+
+def test_repeated_independent_evidence_reinforces_with_durable_provenance() -> None:
+    system = _system()
+
+    first = system.apply(
+        system.proposals_from_appraisal(
+            _appraisal(),
+            {"care": 1.0},
+            kind=ValueUpdateKind.OBSERVATION,
+            evidence=ValueEvidence(
+                evidence_id="evidence-1",
+                experience_ids=("experience-1",),
+                context_id="context-a",
+            ),
+            proposal_id="reinforce-1",
+        )
+    )[0]
+    second = system.apply(
+        system.proposals_from_appraisal(
+            _appraisal(),
+            {"care": 1.0},
+            kind=ValueUpdateKind.OBSERVATION,
+            evidence=ValueEvidence(
+                evidence_id="evidence-2",
+                experience_ids=("experience-2",),
+                context_id="context-a",
+            ),
+            proposal_id="reinforce-2",
+        )
+    )[0]
+
+    state = system.get("care")
+    assert second.applied_delta > first.applied_delta > 0
+    assert state.origin_experience_ids == ("experience-1", "experience-2")
+    assert state.supporting_evidence_ids == ("evidence-1", "evidence-2")
+    assert system.evidence["evidence-1"].direction == EvidenceDirection.SUPPORTING
+    assert second.revision_diff is not None
+    assert "weight" in second.revision_diff.changed_fields
+
+    replay = system.apply(
+        system.proposals_from_appraisal(
+            _appraisal(),
+            {"care": 1.0},
+            kind=ValueUpdateKind.OBSERVATION,
+            evidence=ValueEvidence(evidence_id="evidence-2"),
+            proposal_id="replayed-under-new-proposal",
+        )
+    )
+    assert replay == []
+    assert system.get("care") == state
+
+
+def test_context_values_do_not_leak_and_protected_values_resist_one_event() -> None:
+    scoped = replace(
+        _system().get("care"),
+        scope=ValueScope.CONTEXT,
+        context_ids=("context-a",),
+        protectedness=1.0,
+        negotiability=0.2,
+    )
+    system = ValueSystem(seeds=[scoped], max_update_per_event=0.05)
+
+    assert (
+        system.evaluate({"option": {"care": 1.0}}, context_id="context-b")[
+            0
+        ].contributions
+        == ()
+    )
+    assert system.evaluate({"option": {"care": 1.0}}, context_id="context-a")[
+        0
+    ].contributions
+    before = system.get("care")
+    update = system.apply(
+        system.proposals_from_appraisal(
+            _appraisal(),
+            {"care": -1.0},
+            kind=ValueUpdateKind.OUTCOME,
+            evidence=ValueEvidence(evidence_id="single-challenge"),
+            proposal_id="single-challenge",
+        )
+    )[0]
+    after = system.get("care")
+
+    assert abs(update.applied_delta) < 0.001
+    assert after.polarity == before.polarity
+    assert after.opposing_evidence_ids == ("single-challenge",)
+
+
+def test_conflicting_values_are_retained_in_tradeoff_records() -> None:
+    system = _system()
+    scores = system.evaluate({"blunt": {"care": -1.0, "honesty": 1.0}})
+
+    records = system.record_tradeoffs(
+        scores, context_id="context-a", decision_id="decision-1"
+    )
+
+    assert records[0].conflict_names == ("compassionate-honesty",)
+    assert records[0].value_revision_refs == {"care": 0, "honesty": 0}
+    assert records[0].reasoning_codes == (
+        "simultaneous_values_retained",
+        "tradeoff_required",
+    )
+    assert set(system.values) == {"care", "honesty"}
+
+
+def test_polarity_reversal_requires_repeated_opposing_evidence() -> None:
+    seed = replace(
+        _system().get("care"),
+        weight=0.01,
+        stability=0.0,
+        protectedness=0.0,
+    )
+    system = ValueSystem(seeds=[seed], max_update_per_event=0.05)
+
+    for index in range(2):
+        system.apply(
+            system.proposals_from_appraisal(
+                _appraisal(),
+                {"care": -1.0},
+                kind=ValueUpdateKind.OUTCOME,
+                evidence=ValueEvidence(evidence_id=f"challenge-{index}"),
+                proposal_id=f"challenge-{index}",
+            )
+        )
+
+    assert system.get("care").polarity == 1
+    assert system.get("care").weight == 0.0
+    system.apply(
+        system.proposals_from_appraisal(
+            _appraisal(),
+            {"care": -1.0},
+            kind=ValueUpdateKind.OUTCOME,
+            evidence=ValueEvidence(evidence_id="challenge-2"),
+            proposal_id="challenge-2",
+        )
+    )
+    assert system.get("care").polarity == -1
+    assert system.get("care").weight > 0.0
 
 
 def _system() -> ValueSystem:
@@ -183,9 +339,7 @@ def _system() -> ValueSystem:
                 allowed_update_rate=0.05,
             ),
         ],
-        conflicts=[
-            ValueConflictDefinition("care", "honesty", "compassionate-honesty")
-        ],
+        conflicts=[ValueConflictDefinition("care", "honesty", "compassionate-honesty")],
         max_update_per_event=0.05,
         max_total_update_per_event=0.1,
     )

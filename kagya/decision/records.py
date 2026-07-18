@@ -69,9 +69,7 @@ class ActionCandidate:
         _bounded(self.estimated_cost, "estimated_cost", minimum=0.0, maximum=1.0)
         _bounded(self.estimated_risk, "estimated_risk", minimum=0.0, maximum=1.0)
         _bounded_mapping(self.value_effects, "value_effects")
-        _bounded_mapping(
-            self.appraisal_contributions, "appraisal_contributions"
-        )
+        _bounded_mapping(self.appraisal_contributions, "appraisal_contributions")
         if _contains_private_key(asdict(self)):
             raise ValueError("Action candidate contains a private reasoning field")
 
@@ -129,16 +127,19 @@ class DecisionRecord:
     identity_origin_refs: dict[str, str] = field(default_factory=dict)
     experience_refs: tuple[str, ...] = ()
     belief_revision_refs: dict[str, int] = field(default_factory=dict)
-    schema_version: int = 6
+    value_tradeoff_refs: tuple[str, ...] = ()
+    schema_version: int = 7
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4, 5, 6}:
+        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
-        candidate_ids = [item.candidate.candidate_id for item in self.considered_candidates]
+        candidate_ids = [
+            item.candidate.candidate_id for item in self.considered_candidates
+        ]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("Considered candidate IDs must be unique")
         if self.selected_candidate_id not in candidate_ids:
@@ -285,7 +286,9 @@ class DecisionStore:
     ) -> list[DecisionRecord]:
         return [
             record
-            for record in sorted(self.records.values(), key=lambda item: item.created_at)
+            for record in sorted(
+                self.records.values(), key=lambda item: item.created_at
+            )
             if status is None or record.status == status
         ]
 
@@ -321,6 +324,20 @@ class DecisionStore:
             actual_outcome=outcome,
             prediction_error=utility - selected.predicted_utility,
             updated_at=outcome.recorded_at,
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def link_value_tradeoffs(
+        self, decision_id: str, tradeoff_ids: tuple[str, ...]
+    ) -> DecisionRecord:
+        record = self.get(decision_id)
+        updated = replace(
+            record,
+            value_tradeoff_refs=tuple(
+                dict.fromkeys((*record.value_tradeoff_refs, *tradeoff_ids))
+            ),
+            updated_at=_now(),
         )
         self.records[decision_id] = updated
         return updated
@@ -499,9 +516,7 @@ def _selection_confidence(
         if item.candidate.candidate_id != selected.candidate.candidate_id
     ]
     margin = 1.0 if not alternatives else max(0.0, selected_score - max(alternatives))
-    confidence = (1.0 - selected.candidate.uncertainty) * (
-        0.5 + 0.5 * min(1.0, margin)
-    )
+    confidence = (1.0 - selected.candidate.uncertainty) * (0.5 + 0.5 * min(1.0, margin))
     return max(0.0, min(1.0, confidence))
 
 
@@ -532,9 +547,7 @@ def _candidate_from_json(payload: Any) -> ActionCandidate:
         PredictedOutcome(**item) for item in data.get("predicted_outcomes", ())
     )
     data["value_effects"] = dict(data.get("value_effects", {}))
-    data["appraisal_contributions"] = dict(
-        data.get("appraisal_contributions", {})
-    )
+    data["appraisal_contributions"] = dict(data.get("appraisal_contributions", {}))
     return ActionCandidate(**data)
 
 
@@ -546,6 +559,8 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data.setdefault("identity_origin_refs", {})
     data["experience_refs"] = tuple(data.get("experience_refs", ()))
     data.setdefault("belief_revision_refs", {})
+    data["value_tradeoff_refs"] = tuple(data.get("value_tradeoff_refs", ()))
+    data["schema_version"] = 7
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)
@@ -577,7 +592,13 @@ def _bounded_mapping(values: dict[str, float], name: str) -> None:
 
 
 def _contains_private_key(value: Any) -> bool:
-    private = {"hidden_thought", "prompt", "raw_prompt", "reasoning", "chain_of_thought"}
+    private = {
+        "hidden_thought",
+        "prompt",
+        "raw_prompt",
+        "reasoning",
+        "chain_of_thought",
+    }
     if isinstance(value, dict):
         return any(
             key in private or _contains_private_key(item) for key, item in value.items()
