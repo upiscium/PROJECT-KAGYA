@@ -59,15 +59,16 @@ def inspect_values(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     system = get_main_loop(request).value_system
+    payload: dict[str, object] = {
+        "values": [asdict(state) for state in system.list_values()],
+        "conflicts": [asdict(conflict) for conflict in system.conflicts],
+        "history": [asdict(record) for record in system.history],
+    }
     return execute_agent_event(
         runtime,
         AgentEventType.VALUE_READ,
         source="api.values.inspect",
-        handler=lambda: {
-            "values": [asdict(state) for state in system.list_values()],
-            "conflicts": [asdict(conflict) for conflict in system.conflicts],
-            "history": [asdict(record) for record in system.history],
-        },
+        handler=lambda: payload,
     ).value
 
 

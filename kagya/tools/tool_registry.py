@@ -99,11 +99,16 @@ def _tool_from_dict(data: dict[str, object]) -> ToolDefinition:
     return ToolDefinition(
         name=str(data["name"]),
         description=str(data["description"]),
-        input_schema=dict(data.get("input_schema", {})),
+        input_schema=_dict_value(data, "input_schema"),
         tool_type=ToolType(str(data.get("tool_type", ToolType.METADATA.value))),
         output_template=str(data.get("output_template", "")),
-        metadata=dict(data.get("metadata", {})),
+        metadata=_dict_value(data, "metadata"),
         status=ToolStatus(str(data.get("status", ToolStatus.DECLARED.value))),
         human_approved=bool(data.get("human_approved", False)),
         generated=bool(data.get("generated", False)),
     )
+
+
+def _dict_value(data: dict[str, object], key: str) -> dict[str, object]:
+    value = data.get(key)
+    return dict(value) if isinstance(value, dict) else {}

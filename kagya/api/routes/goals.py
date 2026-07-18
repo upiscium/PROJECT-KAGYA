@@ -76,14 +76,15 @@ def inspect_goals(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     main_loop = get_main_loop(request)
+    payload: dict[str, object] = {
+        "goals": main_loop.goal_manager.goals_json(),
+        "decisions": main_loop.goal_manager.decisions_json(),
+    }
     return execute_agent_event(
         runtime,
         AgentEventType.GOAL_READ,
         source="api.goals.inspect",
-        handler=lambda: {
-            "goals": main_loop.goal_manager.goals_json(),
-            "decisions": main_loop.goal_manager.decisions_json(),
-        },
+        handler=lambda: payload,
     ).value
 
 
@@ -219,11 +220,12 @@ def inspect_commitments(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     store = get_main_loop(request).commitment_store
+    payload: dict[str, object] = {"commitments": store.to_json()}
     return execute_agent_event(
         runtime,
         AgentEventType.GOAL_READ,
         source="api.commitments.inspect",
-        handler=lambda: {"commitments": store.to_json()},
+        handler=lambda: payload,
     ).value
 
 

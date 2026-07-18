@@ -62,7 +62,7 @@ api:
 # =============================================================================
 
 # プルリクエスト作成前や、大きな変更の後にエージェントに実行させる一括検証
-check-all: lint typecheck test
+check-all: lint typecheck test config-check schema-check
     @echo "==> [OK] All checks passed successfully."
 
 # =============================================================================

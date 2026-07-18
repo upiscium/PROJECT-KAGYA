@@ -1528,8 +1528,8 @@ class KagyaMainLoop:
             )
             self.default_context_id = frame.context_id
         else:
-            frame = self.context_registry.get(identifier)
-            if frame is None:
+            existing_frame = self.context_registry.get(identifier)
+            if existing_frame is None:
                 raise KeyError(identifier)
             frame = self.context_registry.resume(identifier)
         if (
@@ -1567,18 +1567,18 @@ class KagyaMainLoop:
                     salience=0.6,
                 )
             )
-        for record in memory_context.db2_results:
+        for semantic_record in memory_context.db2_results:
             self.working_memory.admit(
                 working_memory_item(
-                    item_id=f"semantic:{record.id}",
+                    item_id=f"semantic:{semantic_record.id}",
                     kind=WorkingMemoryKind.SEMANTIC,
-                    reference=f"semantic:{record.id}",
+                    reference=f"semantic:{semantic_record.id}",
                     source_event_id=None,
                     source_event_sequence=None,
-                    context_id=record.context_id,
-                    source=record.source,
-                    source_channel=record.source_channel,
-                    source_session_id=record.source_session_id,
+                    context_id=semantic_record.context_id,
+                    source=semantic_record.source,
+                    source_channel=semantic_record.source_channel,
+                    source_session_id=semantic_record.source_session_id,
                     activation=0.65,
                     salience=0.65,
                 )
@@ -1656,27 +1656,27 @@ class KagyaMainLoop:
         if item.reference is None:
             return item.content
         if item.reference.startswith("episode:"):
-            record = self.memory_system.get_episodic(item.reference.removeprefix("episode:"))
+            episode = self.memory_system.get_episodic(item.reference.removeprefix("episode:"))
             if (
-                record is None
-                or record.archived
-                or record.lifecycle_status != MemoryLifecycleStatus.ACTIVE
+                episode is None
+                or episode.archived
+                or episode.lifecycle_status != MemoryLifecycleStatus.ACTIVE
             ):
                 return None
             return (
                 "Past recorded interaction (not a current fact): "
-                f"User: {record.user_input} | Assistant: {record.response}"
+                f"User: {episode.user_input} | Assistant: {episode.response}"
             )
         if item.reference.startswith("semantic:"):
-            record = self.memory_system.get_semantic(item.reference.removeprefix("semantic:"))
+            semantic = self.memory_system.get_semantic(item.reference.removeprefix("semantic:"))
             if (
-                record is None
-                or record.archived
-                or record.metadata.get("publication_status", "published")
+                semantic is None
+                or semantic.archived
+                or semantic.metadata.get("publication_status", "published")
                 != "published"
             ):
                 return None
-            return f"Stored semantic record (not an adopted belief): {record.text}"
+            return f"Stored semantic record (not an adopted belief): {semantic.text}"
         return None
 
 

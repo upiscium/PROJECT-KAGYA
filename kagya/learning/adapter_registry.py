@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+import builtins
 import fcntl
 import json
 import os
@@ -162,7 +163,7 @@ class AdapterRegistry:
         with self._locked(exclusive=False):
             return self._list_locked()
 
-    def _list_locked(self) -> list[AdapterEntry]:
+    def _list_locked(self) -> builtins.list[AdapterEntry]:
         if not self.path.exists():
             return []
         with self.path.open("r", encoding="utf-8") as registry_file:
@@ -293,20 +294,25 @@ class AdapterRegistry:
             return self._replace_locked(entries, adapter_id, status=status)
 
     def _lookup_locked(
-        self, entries: list[AdapterEntry], adapter_id: str
+        self, entries: builtins.list[AdapterEntry], adapter_id: str
     ) -> AdapterEntry | None:
         return next((entry for entry in entries if entry.adapter_id == adapter_id), None)
 
-    def _require_locked(self, entries: list[AdapterEntry], adapter_id: str) -> AdapterEntry:
+    def _require_locked(
+        self, entries: builtins.list[AdapterEntry], adapter_id: str
+    ) -> AdapterEntry:
         entry = self._lookup_locked(entries, adapter_id)
         if entry is None:
             raise ValueError(f"Unknown adapter: {adapter_id}")
         return entry
 
     def _replace_locked(
-        self, current_entries: list[AdapterEntry], adapter_id: str, **updates: Any
+        self,
+        current_entries: builtins.list[AdapterEntry],
+        adapter_id: str,
+        **updates: Any,
     ) -> AdapterEntry:
-        entries: list[AdapterEntry] = []
+        entries: builtins.list[AdapterEntry] = []
         updated_entry: AdapterEntry | None = None
         for entry in current_entries:
             if entry.adapter_id != adapter_id:
@@ -319,7 +325,7 @@ class AdapterRegistry:
         self._write_locked(entries)
         return updated_entry
 
-    def _write_locked(self, entries: list[AdapterEntry]) -> None:
+    def _write_locked(self, entries: builtins.list[AdapterEntry]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(
             dir=self.path.parent,
