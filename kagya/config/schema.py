@@ -233,7 +233,9 @@ class QloraSettings(StrictBaseModel):
     def validate_target_modules(self) -> "QloraSettings":
         if len(self.target_modules) != len(set(self.target_modules)):
             raise ValueError("qlora.target_modules must be unique")
-        if any(re.fullmatch(r"[A-Za-z0-9_]+", item) is None for item in self.target_modules):
+        if any(
+            re.fullmatch(r"[A-Za-z0-9_]+", item) is None for item in self.target_modules
+        ):
             raise ValueError("qlora.target_modules contains an unsafe module name")
         return self
 
@@ -298,7 +300,10 @@ class ValueSystemSettings(StrictBaseModel):
             raise ValueError("value seed IDs must be unique")
         known = set(value_ids)
         for conflict in self.conflicts:
-            if conflict.left_value_id not in known or conflict.right_value_id not in known:
+            if (
+                conflict.left_value_id not in known
+                or conflict.right_value_id not in known
+            ):
                 raise ValueError("value conflict references unknown seed")
             if conflict.left_value_id == conflict.right_value_id:
                 raise ValueError("value conflict must reference two values")
@@ -311,6 +316,22 @@ class ApiSettings(StrictBaseModel):
     admin_token_env: str = Field(min_length=1)
     agent_queue_capacity: int = Field(default=32, gt=0)
     cors_origins: list[str]
+    admin_auth: "AdminAuthSettings" = Field(default_factory=lambda: AdminAuthSettings())
+
+
+class AdminAuthSettings(StrictBaseModel):
+    enabled: bool = False
+    actor_header: str = Field(default="X-KAGYA-Actor", min_length=1)
+    role_header: str = Field(default="X-KAGYA-Role", min_length=1)
+    reauthenticated_at_header: str = Field(
+        default="X-KAGYA-Reauthenticated-At", min_length=1
+    )
+    session_cookie_name: str = Field(default="kagya_admin_session", min_length=1)
+    csrf_cookie_name: str = Field(default="kagya_admin_csrf", min_length=1)
+    csrf_header: str = Field(default="X-KAGYA-CSRF-Token", min_length=1)
+    reauthentication_max_age_seconds: int = Field(default=300, gt=0)
+    reauthentication_paths: list[str] = Field(default_factory=list)
+    allow_loopback_recovery: bool = True
 
 
 class FrontendSettings(StrictBaseModel):
@@ -383,7 +404,9 @@ class Settings(StrictBaseModel):
                     "training worker requires worker settings and forbids remote_worker"
                 )
             if self.model.revision == "main" or self.model.processor_revision == "main":
-                raise ValueError("split training worker requires exact immutable revisions")
+                raise ValueError(
+                    "split training worker requires exact immutable revisions"
+                )
         elif training.remote_worker is not None or training.worker is not None:
             raise ValueError(
                 "standalone deployment forbids remote worker and worker settings"

@@ -66,7 +66,7 @@ cd frontend
 npm run dev
 ```
 
-7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. Keep this service off the public internet; browser login/session auth is intentionally not part of the default private deployment model.
+7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. Optional browser authentication is disabled by default, so keep this token-only mode on loopback, a private LAN/VPN, or an SSH tunnel and off the public internet.
 
 8. After the first useful session, create a backup because `.kagya/` contains private runtime state:
 
@@ -80,7 +80,38 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
 - The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
 - Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
-- Browser login/session auth is intentionally not required for the default private LAN/VPN/SSH-tunnel deployment model. Keep the backend admin token as a lightweight safety gate for state-changing admin APIs, and keep the service off the public internet.
+- `api.admin_auth.enabled` defaults to `false`. In that mode the existing admin-token behavior is unchanged; Origin, session, role, CSRF, and re-authentication checks are not applied. This mode is private/loopback only and must not be exposed directly to the public internet.
+
+### Optional Admin Identity
+
+Enable identity only behind a reverse proxy that has already authenticated the operator through SSO or WebAuthn. The reverse proxy must remove browser-supplied copies of its assertion headers before adding trusted values. Do not expose the Next.js port around that proxy.
+
+1. Set `api.admin_auth.enabled: true` in the backend config. Roles are `read_only`, `approval_only`, and `full_admin`. Read-only actors may use safe methods only. Approval-only actors may perform explicit approval/rejection/review workflows, but cannot edit general state or start training. Full admins retain all admin operations.
+2. Set matching frontend environment values:
+
+```bash
+KAGYA_ADMIN_AUTH_ENABLED=true
+NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED=true
+KAGYA_SSO_TRUST_TOKEN=<random reverse-proxy-to-Next secret>
+KAGYA_SSO_TRUST_HEADER=x-kagya-sso-secret
+KAGYA_SSO_ACTOR_HEADER=x-forwarded-user
+KAGYA_SSO_ROLE_HEADER=x-kagya-role
+KAGYA_SSO_REAUTH_HEADER=x-kagya-reauthenticated-at
+KAGYA_ADMIN_ALLOWED_ORIGINS=https://kagya.private.example
+# Set these only when the matching api.admin_auth header names are customized:
+KAGYA_BACKEND_ACTOR_HEADER=X-KAGYA-Actor
+KAGYA_BACKEND_ROLE_HEADER=X-KAGYA-Role
+KAGYA_BACKEND_REAUTH_HEADER=X-KAGYA-Reauthenticated-At
+KAGYA_ADMIN_CSRF_HEADER=X-KAGYA-CSRF-Token
+```
+
+3. After SSO/WebAuthn succeeds, the reverse proxy injects the trust token, stable actor ID, role, and optional Unix re-authentication timestamp. `GET /admin-proxy/auth/session` exchanges that assertion for a signed, `HttpOnly`, `SameSite=Strict` session cookie and a separate `SameSite=Strict` double-submit CSRF token. The frontend initializes this session automatically when `NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED=true`.
+4. Browser mutations require an allowed `Origin`, non-cross-site Fetch Metadata, the signed session, and matching CSRF cookie/header. FastAPI repeats Origin, Fetch Metadata, CSRF, role, and configured re-authentication checks behind the proxy.
+5. `api.admin_auth.reauthentication_paths` uses shell-style path patterns. Matching mutations require the re-authentication timestamp to be no older than `reauthentication_max_age_seconds`. Configure expensive or destructive paths explicitly; the committed defaults include state restore/reset, training job operations, cleanup, adapter activation/rollback, and identity/value rollbacks.
+
+The backend token remains the emergency local recovery path when `allow_loopback_recovery` is enabled: a token-authenticated, non-browser request from loopback with no asserted actor is attributed as `local-recovery` and receives full-admin access. Keep this path local, rotate the token after emergency use, and disable it if operational recovery is provided another way.
+
+Authorized mutations append a hash-chained Journal audit record containing only a sanitized actor ID, role, re-authentication status, and method/path target. Admin tokens, SSO trust tokens, session signatures, CSRF values, WebAuthn material, and other credentials are never written to agent state, traces, Journal records, or backup manifests. All secrets remain environment values or transient cookies/headers.
 
 ## Model Provider
 

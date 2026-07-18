@@ -236,6 +236,8 @@ def test_api_settings_come_from_config() -> None:
     assert settings.api.host == raw_config["api"]["host"]
     assert settings.api.port == raw_config["api"]["port"]
     assert settings.api.admin_token_env == raw_config["api"]["admin_token_env"]
+    assert settings.api.admin_auth.enabled is False
+    assert settings.api.admin_auth.session_cookie_name == "kagya_admin_session"
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
 
 
@@ -243,8 +245,14 @@ def test_working_memory_capacities_come_from_config() -> None:
     raw_config = read_raw_config()
     settings = load_settings(CONFIG_PATH)
 
-    assert settings.working_memory.item_capacity == raw_config["working_memory"]["item_capacity"]
-    assert settings.working_memory.token_capacity == raw_config["working_memory"]["token_capacity"]
+    assert (
+        settings.working_memory.item_capacity
+        == raw_config["working_memory"]["item_capacity"]
+    )
+    assert (
+        settings.working_memory.token_capacity
+        == raw_config["working_memory"]["token_capacity"]
+    )
 
 
 def test_working_memory_capacities_must_be_positive() -> None:

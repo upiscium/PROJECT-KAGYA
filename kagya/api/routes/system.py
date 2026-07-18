@@ -140,6 +140,10 @@ def journal_record_schema(record: JournalRecord) -> JournalRecordSchema:
         state_hash_after=record.state_hash_after,
         snapshot_hash=record.snapshot_hash,
         failure_category=record.failure_category,
+        actor_id=record.actor_id,
+        actor_role=record.actor_role,
+        target=record.target,
+        reauthenticated=record.reauthenticated,
         previous_record_hash=record.previous_record_hash,
         record_hash=record.record_hash,
     )
