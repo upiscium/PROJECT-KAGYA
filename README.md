@@ -170,6 +170,20 @@ Distributed training operations are available through admin-token-protected endp
 - `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
 - `GET /api/system/journal` returns admin-only, operator-safe durable event lifecycle records and hash continuity metadata. It never returns event payloads, prompts, generated text, attachments, credentials, or hidden thoughts.
 
+### Operational Observability
+
+`GET /health/live` is a process liveness check. `GET /health/ready` separately verifies the role-specific runtime and, on inference nodes, journal integrity; it returns `503` while dependencies are not ready. The legacy `GET /health` remains a basic deployment identity check.
+
+Admin-token-protected observability exports are dependency-free:
+
+- `GET /api/system/metrics` returns Prometheus text metrics.
+- `GET /api/system/telemetry` returns OTLP JSON-compatible metrics and spans for collectors that accept OTLP JSON payloads.
+- `GET /api/system/traces?event_id=...` follows an authoritative journal event into its bounded causal span. Correlation and causation IDs are records, never metric labels.
+
+Metrics persist at `observability.metrics_path`; the newest `observability.max_traces` spans persist at `observability.traces_path`. `observability.max_series` is a hard series limit. Labels are fixed categorical dimensions: prompts, generated text, hidden thoughts, credentials, IDs, model paths, job names, and user metadata are never labels or span content. Unsafe trace identifiers are one-way hashed. Treat both files as operational state and retain them across service restarts for before/after comparison.
+
+Latency, queue depth, generation rate, memory retrieval, fallback/quarantine, storage, sleep, adapter, and runtime lifecycle metrics describe processing. `kagya_active_goals`, `kagya_unresolved_decisions`, and `kagya_attention_focus_items` describe current subjective state; do not interpret them as throughput or performance scores. RAM is sampled during export, and accelerator allocated/reserved memory is exported when CUDA is available.
+
 ### Split Training Worker Runbook
 
 The worker is invoked as a one-shot command over SSH; it is not a long-running systemd daemon. Install `deploy/bin/kagya-worker-remote` at a stable absolute path on the worker and create its restricted environment file:
@@ -404,6 +418,8 @@ Backups must include both runtime data and private environment files:
 - `.kagya/adapter_registry.json`: adapter lifecycle state.
 - `.kagya/agent_state.json`: versioned subject state and last processed event sequence.
 - `.kagya/agent_journal.jsonl*`: fsynced event lifecycle journal and retained hash-chain rotation files.
+- `.kagya/operational_metrics.json`: atomic persistent bounded-cardinality metric aggregates.
+- `.kagya/operational_traces.json`: atomic bounded recent correlation/causation spans.
 - `/etc/project-kagya/*.env`: backend/frontend env files, including `KAGYA_ADMIN_TOKEN`.
 
 Create a restricted archive on the deployment host:

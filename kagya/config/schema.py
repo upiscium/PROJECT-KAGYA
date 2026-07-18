@@ -263,6 +263,14 @@ class AgentJournalSettings(StrictBaseModel):
     retained_files: int = Field(default=3, ge=1, le=100)
 
 
+class ObservabilitySettings(StrictBaseModel):
+    enabled: bool = True
+    metrics_path: Path = Path(".kagya/operational_metrics.json")
+    traces_path: Path = Path(".kagya/operational_traces.json")
+    max_series: int = Field(default=512, ge=32, le=10000)
+    max_traces: int = Field(default=1000, ge=10, le=100000)
+
+
 class WorkingMemorySettings(StrictBaseModel):
     item_capacity: int = Field(default=32, gt=0)
     token_capacity: int = Field(default=2048, gt=0)
@@ -331,6 +339,7 @@ class Settings(StrictBaseModel):
     tools: ToolRegistrySettings
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     agent_journal: AgentJournalSettings = Field(default_factory=AgentJournalSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
     api: ApiSettings
@@ -390,4 +399,12 @@ class Settings(StrictBaseModel):
             )
         if self.agent_state.path.resolve() == self.agent_journal.path.resolve():
             raise ValueError("agent state and journal paths must be distinct")
+        operational_paths = {
+            self.agent_state.path.resolve(),
+            self.agent_journal.path.resolve(),
+            self.observability.metrics_path.resolve(),
+            self.observability.traces_path.resolve(),
+        }
+        if len(operational_paths) != 4:
+            raise ValueError("state, journal, metrics, and traces paths must be distinct")
         return self
