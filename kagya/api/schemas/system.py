@@ -53,6 +53,10 @@ class JournalRecordSchema(BaseModel):
     state_hash_after: str | None
     snapshot_hash: str | None
     failure_category: str | None
+    actor_id: str | None
+    actor_role: str | None
+    target: str | None
+    reauthenticated: bool | None
     previous_record_hash: str | None
     record_hash: str
 

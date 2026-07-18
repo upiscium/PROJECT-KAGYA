@@ -1,5 +1,8 @@
 const API_PROXY_BASE_URL = "/api-proxy";
 const ADMIN_PROXY_BASE_URL = "/admin-proxy";
+const ADMIN_AUTH_ENABLED = process.env.NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED === "true";
+let adminSessionPromise: Promise<void> | null = null;
+let adminCsrfToken: string | null = null;
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
 export type ModelInfo = { model_id: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null; fallback_used: boolean };
@@ -200,12 +203,17 @@ export type JournalRecord = {
   event_type: string;
   source: string;
   processing_sequence: number | null;
+  snapshot_sequence: number | null;
   causation_id: string | null;
   correlation_id: string | null;
   state_hash_before: string | null;
   state_hash_after: string | null;
   snapshot_hash: string | null;
   failure_category: string | null;
+  actor_id: string | null;
+  actor_role: string | null;
+  target: string | null;
+  reauthenticated: boolean | null;
   previous_record_hash: string | null;
   record_hash: string;
 };
@@ -278,7 +286,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, init);
+  if (ADMIN_AUTH_ENABLED) await initializeAdminSession();
+  const headers = new Headers(init?.headers);
+  if (adminCsrfToken && (init?.method ?? "GET") !== "GET") {
+    headers.set("X-KAGYA-CSRF-Token", adminCsrfToken);
+  }
+  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, { ...init, headers });
+}
+
+export function initializeAdminSession(): Promise<void> {
+  adminSessionPromise ??= fetch(`${ADMIN_PROXY_BASE_URL}/auth/session`, {
+    headers: { "Content-Type": "application/json" },
+  }).then(async (response) => {
+    if (!response.ok) {
+      const detail = await readErrorDetail(response);
+      throw new ApiError(formatHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
+    }
+    const body = await response.json() as { csrfToken: string };
+    adminCsrfToken = body.csrfToken;
+  }).catch((error) => {
+    adminSessionPromise = null;
+    throw error;
+  });
+  return adminSessionPromise;
 }
 
 async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
