@@ -26,7 +26,11 @@ def load_settings_with_notes(
 ) -> tuple[Settings, list[str]]:
     """Load settings and return explicit compatibility migration notes."""
 
-    config_path = Path(path or os.getenv(CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH))
+    if path is None:
+        configured_path = os.getenv(CONFIG_PATH_ENV)
+        config_path = Path(configured_path) if configured_path else DEFAULT_CONFIG_PATH
+    else:
+        config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as config_file:
         raw_config: dict[str, Any] = yaml.safe_load(config_file) or {}
     migrated, notes = migrate_config(raw_config)

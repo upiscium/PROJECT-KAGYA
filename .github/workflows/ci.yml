@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    env:
+      KAGYA_ADMIN_TOKEN: test-admin-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Backend tests
+        run: uv run pytest tests/ -v
+      - name: Ruff
+        run: uv run ruff check kagya tests
+      - name: Mypy
+        run: uv run mypy kagya
+      - name: Config validation
+        run: uv run python -m kagya.config.check config.yaml
+      - name: Schema alignment
+        run: uv run pytest tests/test_frontend_api_schema_sync.py -q
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Frontend tests
+        run: npm test
+      - name: Frontend build
+        run: npm run build

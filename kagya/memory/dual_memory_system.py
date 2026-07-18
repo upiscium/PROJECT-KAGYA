@@ -1,6 +1,6 @@
 """ChromaDB-backed dual memory implementation."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import chromadb
+from chromadb.api.types import Metadata
 
 from kagya.config import Settings
 from kagya.memory.consolidation import build_consolidation_prompt
@@ -165,7 +166,7 @@ class DualMemorySystem:
             return str(existing["ids"][0])
         episode_id = f"episode-{uuid4()}"
         created_at = _now_iso()
-        record_metadata = {
+        record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
             "hidden_thought": hidden_thought,
@@ -245,7 +246,7 @@ class DualMemorySystem:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         semantic_id = f"semantic-{uuid4()}"
-        record_metadata = {
+        record_metadata: Metadata = {
             "text": text,
             "source_episode_ids": json.dumps(source_episode_ids or []),
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
@@ -471,13 +472,13 @@ def _episodic_document(user_input: str, response: str, hidden_thought: str) -> s
     return f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
 
 
-def _episodic_records_from_query(result: dict[str, Any]) -> list[EpisodicMemoryRecord]:
+def _episodic_records_from_query(result: Mapping[str, Any]) -> list[EpisodicMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     metadatas = _first_result_list(result.get("metadatas"))
     return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
 
 
-def _semantic_records_from_query(result: dict[str, Any]) -> list[SemanticMemoryRecord]:
+def _semantic_records_from_query(result: Mapping[str, Any]) -> list[SemanticMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     documents = _first_result_list(result.get("documents"))
     metadatas = _first_result_list(result.get("metadatas"))
@@ -487,13 +488,13 @@ def _semantic_records_from_query(result: dict[str, Any]) -> list[SemanticMemoryR
     ]
 
 
-def _episodic_records_from_get(result: dict[str, Any]) -> list[EpisodicMemoryRecord]:
+def _episodic_records_from_get(result: Mapping[str, Any]) -> list[EpisodicMemoryRecord]:
     ids = result.get("ids") or []
     metadatas = result.get("metadatas") or []
     return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
 
 
-def _semantic_records_from_get(result: dict[str, Any]) -> list[SemanticMemoryRecord]:
+def _semantic_records_from_get(result: Mapping[str, Any]) -> list[SemanticMemoryRecord]:
     ids = result.get("ids") or []
     documents = result.get("documents") or []
     metadatas = result.get("metadatas") or []
@@ -503,20 +504,26 @@ def _semantic_records_from_get(result: dict[str, Any]) -> list[SemanticMemoryRec
     ]
 
 
-def _first_episode_from_get(result: dict[str, Any]) -> EpisodicMemoryRecord | None:
+def _first_episode_from_get(result: Mapping[str, Any]) -> EpisodicMemoryRecord | None:
     records = _episodic_records_from_get(result)
     return records[0] if records else None
 
 
-def _first_semantic_from_get(result: dict[str, Any]) -> SemanticMemoryRecord | None:
+def _first_semantic_from_get(result: Mapping[str, Any]) -> SemanticMemoryRecord | None:
     records = _semantic_records_from_get(result)
     return records[0] if records else None
 
 
 def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> EpisodicMemoryRecord:
     extra = _loads_json_dict(metadata.get("extra"))
-    provenance = extra.get("provenance") if isinstance(extra.get("provenance"), dict) else {}
-    health_data = extra.get("generation_health") if isinstance(extra.get("generation_health"), dict) else {}
+    raw_provenance = extra.get("provenance")
+    provenance: dict[str, Any] = (
+        raw_provenance if isinstance(raw_provenance, dict) else {}
+    )
+    raw_health_data = extra.get("generation_health")
+    health_data: dict[str, Any] = (
+        raw_health_data if isinstance(raw_health_data, dict) else {}
+    )
     response = str(metadata.get("response", ""))
     loss = float(metadata.get("loss", 0.0))
     health = (
@@ -593,7 +600,7 @@ def _semantic_record_from_metadata(record_id: str, document: str, metadata: dict
     )
 
 
-def _first_metadata(result: dict[str, Any]) -> dict[str, Any] | None:
+def _first_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
     metadatas = result.get("metadatas") or []
     if not metadatas:
         return None

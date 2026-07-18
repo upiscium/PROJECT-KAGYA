@@ -20,6 +20,7 @@ from kagya.learning import (
 from kagya.memory import DualMemorySystem
 from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import (
+    AgentEvent,
     AgentEventOutcome,
     AgentEventType,
     AgentRuntime,
@@ -28,6 +29,7 @@ from kagya.runtime import (
     AgentStateStore,
     KagyaMainLoop,
     EmotionTimer,
+    hash_snapshot,
 )
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
 from kagya.training import (
@@ -35,6 +37,7 @@ from kagya.training import (
     MemoryConsolidator,
     SleepCoordinator,
     SSHTrainingBackend,
+    TrainingBackend,
     CandidateArtifactImporter,
     TrainingBundleBuilder,
     TrainingJobRegistry,
@@ -69,19 +72,28 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
             snapshot = store.load(get_api_settings(request).emotion.baseline_surprisal)
             main_loop = get_main_loop(request)
             store.restore_into(main_loop, snapshot)
-            runtime = AgentRuntime(
-                queue_capacity=get_api_settings(request).api.agent_queue_capacity,
-                event_recorder=get_runtime_event_log(request),
-                initial_sequence=snapshot.last_processed_event_sequence,
-                completion_hook=lambda event: store.save(
+
+            def persist_completed(event: AgentEvent) -> str:
+                saved = store.save(
                     store.capture(
                         request.app.state.main_loop,
                         _event_sequence(event.processing_sequence),
                     )
-                ),
-                failure_hook=lambda event, exc: store.save_failed_sequence(
+                )
+                return hash_snapshot(saved)
+
+            def persist_failed(event: AgentEvent, exception: Exception) -> str | None:
+                saved = store.save_failed_sequence(
                     _event_sequence(event.processing_sequence)
-                ),
+                )
+                return None if saved is None else hash_snapshot(saved)
+
+            runtime = AgentRuntime(
+                queue_capacity=get_api_settings(request).api.agent_queue_capacity,
+                event_recorder=get_runtime_event_log(request),
+                initial_sequence=snapshot.last_processed_event_sequence,
+                completion_hook=persist_completed,
+                failure_hook=persist_failed,
             )
             runtime.start()
             request.app.state.agent_runtime = runtime
@@ -333,7 +345,7 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
                     raise RuntimeError(
                         "SSH training backend requires remote worker settings"
                     )
-                backend = SSHTrainingBackend(
+                backend: TrainingBackend = SSHTrainingBackend(
                     remote, settings.sleep.training_artifact_directory
                 )
             else:
