@@ -182,6 +182,7 @@ class WorkingMemory:
         *,
         resolver: Resolver | None = None,
         context_compatibility: ContextCompatibility | None = None,
+        attention_refs: frozenset[str] | None = None,
     ) -> WorkingMemoryView:
         def context_score(item: WorkingMemoryItem) -> tuple[float, str]:
             if context_compatibility is None:
@@ -191,7 +192,9 @@ class WorkingMemory:
         ranked = sorted(
             self._items.values(),
             key=lambda item: (
-                self._score(item) + 0.3 * context_score(item)[0],
+                self._score(item)
+                + 0.3 * context_score(item)[0]
+                + _attention_bonus(item, attention_refs),
                 item.last_accessed_at,
                 item.created_at,
                 item.item_id,
@@ -204,9 +207,15 @@ class WorkingMemory:
         for item in ranked:
             rendered = item.content or (resolver(item) if resolver is not None else None)
             compatibility, relation = context_score(item)
-            score = self._score(item) + 0.3 * compatibility
+            score = (
+                self._score(item)
+                + 0.3 * compatibility
+                + _attention_bonus(item, attention_refs)
+            )
             cross_context = item.context_id is not None and relation != "same_context"
             reasons = [item.retention_reason.value, relation]
+            if _attention_bonus(item, attention_refs):
+                reasons.append("attention_focus")
             selected_item = False
             if not rendered:
                 reasons.append("unresolved_reference")
@@ -338,6 +347,14 @@ def working_memory_item(
 
 def _conservative_token_count(text: str) -> int:
     return max(1, len(text.encode("utf-8")))
+
+
+def _attention_bonus(
+    item: WorkingMemoryItem, attention_refs: frozenset[str] | None
+) -> float:
+    if not attention_refs:
+        return 0.0
+    return 0.45 if item.item_id in attention_refs or item.reference in attention_refs else 0.0
 
 
 def _now() -> datetime:

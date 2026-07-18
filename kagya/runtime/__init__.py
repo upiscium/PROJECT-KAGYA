@@ -43,6 +43,15 @@ from kagya.runtime.working_memory import (
     working_memory_item,
 )
 from kagya.runtime.bootstrap import RemoteTrainingDispatcher, TrainingWorkerRuntime
+from kagya.attention import (
+    AttentionAction,
+    AttentionCandidate,
+    AttentionCandidateStatus,
+    AttentionFocus,
+    AttentionHistoryEntry,
+    AttentionSource,
+    AttentionSystem,
+)
 
 __all__ = [
     "AgentEvent",
@@ -55,6 +64,13 @@ __all__ = [
     "current_agent_event",
     "AgentStateSnapshot",
     "AgentStateStore",
+    "AttentionAction",
+    "AttentionCandidate",
+    "AttentionCandidateStatus",
+    "AttentionFocus",
+    "AttentionHistoryEntry",
+    "AttentionSource",
+    "AttentionSystem",
     "EventJournal",
     "ChatResult",
     "ContextFrame",

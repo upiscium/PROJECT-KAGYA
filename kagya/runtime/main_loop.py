@@ -7,6 +7,12 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from kagya.attention import (
+    AttentionCandidate,
+    AttentionFocus,
+    AttentionSource,
+    AttentionSystem,
+)
 from kagya.belief import (
     BeliefEvidence,
     BeliefRecord,
@@ -74,6 +80,7 @@ from kagya.motivation import (
     MotivationDynamics,
     MotivationEpisode,
     MotivationRecord,
+    MotivationStatus,
 )
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_state import SessionState
@@ -214,6 +221,10 @@ class KagyaMainLoop:
         self.goal_manager = GoalManager()
         self.commitment_store = CommitmentStore()
         self.motivation_dynamics = MotivationDynamics()
+        self.attention_system = AttentionSystem(
+            capacity=min(3, self.working_memory.item_capacity),
+            high_arousal_cap=1,
+        )
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
@@ -226,6 +237,7 @@ class KagyaMainLoop:
         self.restore_self_model_state()
         self.restore_experience_state()
         self.restore_belief_state()
+        self.restore_attention_state()
 
     def chat(
         self,
@@ -274,6 +286,7 @@ class KagyaMainLoop:
             context_view = self.working_memory.select(
                 resolver=self._resolve_working_memory,
                 context_compatibility=compatibility,
+                attention_refs=self.attention_system.focused_working_memory_refs(),
             )
             context_text = context_view.context_text()
             model_key = (
@@ -344,6 +357,7 @@ class KagyaMainLoop:
             working_memory_view = self.working_memory.select(
                 resolver=self._resolve_working_memory,
                 context_compatibility=compatibility,
+                attention_refs=self.attention_system.focused_working_memory_refs(),
             )
             prompt = self.prompt_builder.build(
                 user_input,
@@ -528,6 +542,7 @@ class KagyaMainLoop:
                 "kagya_attention_focus_items",
                 float(len(working_memory_view.selected)),
             )
+            self.refresh_attention(compete=True)
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)
@@ -618,6 +633,181 @@ class KagyaMainLoop:
         self.persistent_state.extensions["experiences"] = (
             self.experience_store.to_json()
         )
+
+    def restore_attention_state(self) -> None:
+        self.attention_system.restore(self.persistent_state.extensions.get("attention"))
+        self._persist_attention_state()
+
+    def _persist_attention_state(self) -> None:
+        self.persistent_state.extensions["attention"] = self.attention_system.to_json()
+
+    def refresh_attention(self, *, compete: bool = False) -> AttentionFocus:
+        """Refresh structured candidates from authoritative internal stores."""
+        experience_candidate_ids: set[str] = set()
+        for experience in self.experience_store.list_records():
+            experience_candidate_ids.add(f"experience:{experience.experience_id}")
+            memory_refs = experience.result_refs.get("memory", ())
+            self.attention_system.observe(
+                candidate_id=f"experience:{experience.experience_id}",
+                target_ref=f"experience:{experience.experience_id}",
+                source=AttentionSource.EXPERIENCE,
+                source_refs=(f"experience:{experience.experience_id}",),
+                working_memory_ref=memory_refs[0] if memory_refs else None,
+                salience=experience.subjective_salience,
+                novelty=(experience.appraisal.novelty or 0.0)
+                if experience.appraisal.novelty_valid
+                else 0.0,
+                value_relevance=experience.self_relevance,
+                arousal=experience.appraisal.arousal,
+                persistence=experience.autobiographical_importance,
+            )
+        self.attention_system.synchronize_source(
+            AttentionSource.EXPERIENCE, experience_candidate_ids
+        )
+        active_motivations = [
+            item
+            for item in self.motivation_dynamics.list_records()
+            if item.status == MotivationStatus.ACTIVE
+        ]
+        motivation_candidate_ids = {
+            f"motivation:{item.motivation_id}" for item in active_motivations
+        }
+        for motivation in active_motivations:
+            self.attention_system.observe(
+                candidate_id=f"motivation:{motivation.motivation_id}",
+                target_ref=motivation.target_ref,
+                source=AttentionSource.MOTIVATION,
+                source_refs=tuple(
+                    dict.fromkeys(
+                        (
+                            f"motivation:{motivation.motivation_id}",
+                            *(f"experience:{item}" for item in motivation.related_experience_ids),
+                        )
+                    )
+                ),
+                drive=motivation.strength,
+                urgency=motivation.strength * (1.0 - motivation.satiation),
+                persistence=motivation.persistence,
+            )
+        self.attention_system.synchronize_source(
+            AttentionSource.MOTIVATION, motivation_candidate_ids
+        )
+        active_commitments = {
+            item.related_goal_id: item
+            for item in self.commitment_store.list_commitments(CommitmentStatus.ACTIVE)
+        }
+        active_goals = [
+            goal
+            for goal in self.goal_manager.list_goals()
+            if goal.status in {GoalStatus.ACTIVE, GoalStatus.CANDIDATE, GoalStatus.SUSPENDED}
+        ]
+        goal_candidate_ids = {f"goal:{goal.goal_id}" for goal in active_goals}
+        for goal in active_goals:
+            commitment = active_commitments.get(goal.goal_id)
+            value_relevance = min(1.0, max((abs(item) for item in goal.value_effects.values()), default=0.0))
+            self.attention_system.observe(
+                candidate_id=f"goal:{goal.goal_id}",
+                target_ref=f"goal:{goal.goal_id}",
+                source=AttentionSource.GOAL,
+                source_refs=tuple(
+                    ref
+                    for ref in (
+                        f"goal:{goal.goal_id}",
+                        None if goal.origin_value_id is None else f"value:{goal.origin_value_id}",
+                    )
+                    if ref is not None
+                ),
+                working_memory_ref=f"goal:{goal.goal_id}",
+                urgency=goal.urgency,
+                value_relevance=value_relevance,
+                commitment_cost=0.8 if commitment is not None else 0.0,
+                persistence=max(goal.priority, 0.8 if goal.status == GoalStatus.ACTIVE else 0.0),
+            )
+        self.attention_system.synchronize_source(
+            AttentionSource.GOAL, goal_candidate_ids
+        )
+        active_commitment_records = self.commitment_store.list_commitments(
+            CommitmentStatus.ACTIVE
+        )
+        commitment_candidate_ids = {
+            f"commitment:{item.commitment_id}" for item in active_commitment_records
+        }
+        for commitment in active_commitment_records:
+            self.attention_system.observe(
+                candidate_id=f"commitment:{commitment.commitment_id}",
+                target_ref=f"commitment:{commitment.commitment_id}",
+                source=AttentionSource.COMMITMENT,
+                source_refs=(
+                    f"commitment:{commitment.commitment_id}",
+                    f"goal:{commitment.related_goal_id}",
+                ),
+                working_memory_ref=f"commitment:{commitment.commitment_id}",
+                urgency=self.goal_manager.get(commitment.related_goal_id).urgency,
+                commitment_cost=1.0,
+                persistence=1.0,
+            )
+        self.attention_system.synchronize_source(
+            AttentionSource.COMMITMENT, commitment_candidate_ids
+        )
+        event = current_agent_event()
+        if compete:
+            self.attention_system.compete(
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            )
+        self._persist_attention_state()
+        return self.attention_system.focus
+
+    def refocus_attention(
+        self,
+        candidate_ids: tuple[str, ...],
+        *,
+        reason_code: str,
+        provenance_refs: tuple[str, ...],
+    ) -> AttentionFocus:
+        event = current_agent_event()
+        focus = self.attention_system.refocus(
+            candidate_ids,
+            reason_code=reason_code,
+            provenance_refs=provenance_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_attention_state()
+        return focus
+
+    def defer_attention(
+        self, candidate_id: str, *, reason_code: str, provenance_refs: tuple[str, ...]
+    ) -> AttentionFocus:
+        event = current_agent_event()
+        focus = self.attention_system.defer(
+            candidate_id,
+            reason_code=reason_code,
+            provenance_refs=provenance_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_attention_state()
+        return focus
+
+    def ignore_attention(
+        self, candidate_id: str, *, reason_code: str, provenance_refs: tuple[str, ...]
+    ) -> AttentionFocus:
+        event = current_agent_event()
+        focus = self.attention_system.ignore(
+            candidate_id,
+            reason_code=reason_code,
+            provenance_refs=provenance_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_attention_state()
+        return focus
+
+    def resume_attention(self, candidate_id: str) -> AttentionCandidate:
+        candidate = self.attention_system.resume(candidate_id)
+        self._persist_attention_state()
+        return candidate
 
     def get_experience(self, experience_id: str) -> ExperienceRecord:
         return self.experience_store.get(experience_id)

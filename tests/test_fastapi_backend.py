@@ -1184,6 +1184,58 @@ def test_internal_motivation_forms_bounded_intrinsic_goal(tmp_path: Path) -> Non
     assert repeated.json()["goals"] == []
 
 
+def test_attention_admin_api_competes_and_controls_focus(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+    chat = client.post(
+        "/api/chat", json={"text": "private attention stimulus", "attachments": []}
+    ).json()
+
+    assert client.get("/api/attention").status_code == 401
+    state = client.get("/api/attention", headers=headers)
+    competed = client.post("/api/attention/compete", headers=headers)
+
+    assert state.status_code == 200
+    assert competed.status_code == 200
+    candidate_id = f"experience:{chat['experience_id']}"
+    assert candidate_id in {item["candidate_id"] for item in state.json()["candidates"]}
+    refocused = client.post(
+        "/api/attention/refocus",
+        headers=headers,
+        json={
+            "candidate_ids": [candidate_id],
+            "reason_code": "administrator_review",
+            "provenance_refs": ["decision:attention-review"],
+        },
+    )
+    deferred = client.post(
+        f"/api/attention/{candidate_id}/defer",
+        headers=headers,
+        json={
+            "reason_code": "defer_review",
+            "provenance_refs": ["decision:attention-defer"],
+        },
+    )
+
+    assert refocused.status_code == 200
+    assert refocused.json()["candidate_ids"] == [candidate_id]
+    assert deferred.status_code == 200
+    resumed = client.post(
+        f"/api/attention/{candidate_id}/resume", headers=headers
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "available"
+    final_state = client.get("/api/attention", headers=headers).json()
+    candidate = next(
+        item for item in final_state["candidates"] if item["candidate_id"] == candidate_id
+    )
+    assert candidate["status"] == "available"
+    serialized = json.dumps(final_state)
+    assert "private attention stimulus" not in serialized
+    assert "hidden_thought" not in serialized
+    assert "prompt" not in serialized
+
+
 def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     client = _client(tmp_path)
     headers = admin_headers()

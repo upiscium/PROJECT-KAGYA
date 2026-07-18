@@ -49,6 +49,9 @@ class AgentEventType(StrEnum):
     MOTIVATION_READ = "motivation_read"
     MOTIVATION_UPDATE = "motivation_update"
     MOTIVATION_REEVALUATE = "motivation_reevaluate"
+    ATTENTION_READ = "attention_read"
+    ATTENTION_UPDATE = "attention_update"
+    ATTENTION_COMPETE = "attention_compete"
 
 
 @dataclass(frozen=True)

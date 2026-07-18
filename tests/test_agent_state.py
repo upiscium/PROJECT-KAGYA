@@ -144,6 +144,31 @@ def test_decision_records_restore_from_agent_snapshot(tmp_path: Path) -> None:
     assert record.selected_candidate_id == "no-op"
 
 
+def test_attention_state_restores_from_agent_snapshot(tmp_path: Path) -> None:
+    loop = _loop(tmp_path)
+    loop.propose_goal(
+        goal_id="attention-goal",
+        goal_type=GoalType.INTRINSIC,
+        description="Persist structured attention",
+        urgency=0.9,
+        priority=0.9,
+    )
+    loop.refresh_attention(compete=True)
+    store = AgentStateStore(tmp_path / "agent_state.json")
+    store.save(store.capture(loop, 10))
+
+    restored = _loop(tmp_path / "restored-attention")
+    store.restore_into(restored, store.load(1.0))
+
+    assert restored.attention_system.focus.candidate_ids == ("goal:attention-goal",)
+    serialized_attention = json.dumps(
+        store.load(1.0).extensions["attention"], sort_keys=True
+    )
+    assert "Persist structured attention" not in serialized_attention
+    assert "hidden_thought" not in serialized_attention
+    assert "prompt" not in serialized_attention
+
+
 def test_self_model_restores_from_agent_snapshot(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
     loop.manual_correct_capability(
