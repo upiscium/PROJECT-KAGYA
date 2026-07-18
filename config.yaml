@@ -137,6 +137,13 @@ agent_journal:
   max_bytes: 10485760
   retained_files: 3
 
+observability:
+  enabled: true
+  metrics_path: .kagya/operational_metrics.json
+  traces_path: .kagya/operational_traces.json
+  max_series: 512
+  max_traces: 1000
+
 api:
   host: 127.0.0.1
   port: 8000

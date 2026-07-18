@@ -1592,6 +1592,70 @@ def test_agent_event_journal_continues_sequence_across_restart(tmp_path: Path) -
     ] == [1, 2]
 
 
+def test_operational_exports_are_private_persistent_and_traceable(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/health/live").json() == {"status": "alive"}
+        ready = client.get("/health/ready")
+        assert ready.status_code == 200
+        assert ready.json()["status"] == "ready"
+        assert client.get("/api/system/metrics").status_code == 401
+
+        response = client.post(
+            "/api/chat",
+            json={"text": "do not export this private prompt", "attachments": []},
+        )
+        assert response.status_code == 200
+        metrics = client.get("/api/system/metrics", headers=admin_headers())
+        assert metrics.status_code == 200
+        assert "kagya_agent_events_total" in metrics.text
+        assert "kagya_storage_operation_seconds" in metrics.text
+        assert "kagya_active_goals" in metrics.text
+        assert "kagya_unresolved_decisions" in metrics.text
+        assert "private prompt" not in metrics.text
+
+        journal = client.get("/api/system/journal", headers=admin_headers()).json()
+        event_id = next(
+            record["event_id"]
+            for record in journal["records"]
+            if record["event_type"] == "chat"
+        )
+        traces = client.get(
+            "/api/system/traces",
+            params={"event_id": event_id},
+            headers=admin_headers(),
+        )
+        assert traces.status_code == 200
+        assert traces.json()["traces"][0]["event_id"] == event_id
+        otlp = client.get("/api/system/telemetry", headers=admin_headers())
+        assert otlp.status_code == 200
+        assert otlp.json()["resourceMetrics"]
+
+    persisted_before = settings.observability.metrics_path.read_text(encoding="utf-8")
+    assert "do not export" not in persisted_before
+    assert "debug thought" not in persisted_before
+    assert "do not export" not in settings.observability.traces_path.read_text(
+        encoding="utf-8"
+    )
+    with _client(tmp_path, settings=settings) as restarted:
+        metrics_after = restarted.get(
+            "/api/system/metrics", headers=admin_headers()
+        ).text
+        assert 'event_type="chat"' in metrics_after
+
+
+def test_readiness_fails_when_subject_runtime_stops(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.app.state.agent_runtime.shutdown()
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["status"] == "not_ready"
+        assert response.json()["checks"]["agent_runtime"] is False
+
+
 def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
@@ -1773,6 +1837,12 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "agent_journal": settings.agent_journal.model_copy(
                 update={"path": tmp_path / "agent_journal.jsonl"}
+            ),
+            "observability": settings.observability.model_copy(
+                update={
+                    "metrics_path": tmp_path / "operational_metrics.json",
+                    "traces_path": tmp_path / "operational_traces.json",
+                }
             ),
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}

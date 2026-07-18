@@ -111,6 +111,16 @@ class DurableEventJournal(Protocol):
     ) -> object: ...
 
 
+class RuntimeTelemetry(Protocol):
+    def event_accepted(self, event: AgentEvent, queue_depth: int) -> None: ...
+
+    def event_started(self, event: AgentEvent, queue_depth: int) -> None: ...
+
+    def event_finished(
+        self, event: AgentEvent, status: str, queue_depth: int
+    ) -> None: ...
+
+
 class AgentRuntimeQueueFull(RuntimeError):
     """Raised when an event cannot be accepted without blocking."""
 
@@ -135,6 +145,7 @@ class AgentRuntime:
         completion_hook: EventCompletionHook | None = None,
         failure_hook: EventFailureHook | None = None,
         event_journal: DurableEventJournal | None = None,
+        telemetry: RuntimeTelemetry | None = None,
     ) -> None:
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be greater than zero")
@@ -145,6 +156,7 @@ class AgentRuntime:
         self._completion_hook = completion_hook
         self._failure_hook = failure_hook
         self._event_journal = event_journal
+        self._telemetry = telemetry
         self._state_lock = Lock()
         self._state = "created"
         self._sequence = initial_sequence
@@ -206,6 +218,7 @@ class AgentRuntime:
                 self._queue.put_nowait(envelope)
             except Full as exc:
                 raise AgentRuntimeQueueFull("Agent event queue is full") from exc
+            self._observe_telemetry("event_accepted", event, self._queue.qsize())
         return future
 
     def execute(
@@ -282,6 +295,9 @@ class AgentRuntime:
                         )
                         return
                 self._record(event, "started")
+                self._observe_telemetry(
+                    "event_started", event, self._queue.qsize()
+                )
                 event_token = _current_event.set(event)
                 try:
                     value = envelope.handler()
@@ -306,6 +322,12 @@ class AgentRuntime:
                         )
                         return
                     self._record(event, "failed", exception_type=type(exc).__name__)
+                    self._observe_telemetry(
+                        "event_finished",
+                        event,
+                        self._queue.qsize(),
+                        status="failure",
+                    )
                     if can_deliver:
                         envelope.future.set_exception(exc)
                 else:
@@ -339,6 +361,12 @@ class AgentRuntime:
                             return
                     else:
                         self._record(event, "completed")
+                        self._observe_telemetry(
+                            "event_finished",
+                            event,
+                            self._queue.qsize(),
+                            status="success",
+                        )
                         if can_deliver:
                             envelope.future.set_result(
                                 AgentEventOutcome(event=event, value=value)
@@ -357,6 +385,12 @@ class AgentRuntime:
     ) -> None:
         with self._state_lock:
             self._state = "failed"
+        self._observe_telemetry(
+            "event_finished",
+            envelope.event,
+            self._queue.qsize(),
+            status="failure",
+        )
         if can_deliver and not envelope.future.done():
             envelope.future.set_exception(error)
         while True:
@@ -405,6 +439,26 @@ class AgentRuntime:
             )
         except Exception:
             # Observability must never terminate the subject's event consumer.
+            return
+
+    def _observe_telemetry(
+        self,
+        method: str,
+        event: AgentEvent,
+        queue_depth: int,
+        *,
+        status: str | None = None,
+    ) -> None:
+        if self._telemetry is None:
+            return
+        try:
+            callback = getattr(self._telemetry, method)
+            if status is None:
+                callback(event, queue_depth)
+            else:
+                callback(event, status, queue_depth)
+        except Exception:
+            # Telemetry persistence and export are never authoritative runtime work.
             return
 
 

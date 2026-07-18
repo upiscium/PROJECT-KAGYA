@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from fastapi import Header, HTTPException, Request, status
 
-from kagya.api.observability import RuntimeEventLog
+from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.config import Settings, TrainingBackendType, get_settings
 from kagya.learning import (
     AdapterEntry,
@@ -91,6 +91,21 @@ def get_runtime_event_log(request: Request) -> RuntimeEventLog:
     return event_log
 
 
+def get_operational_telemetry(request: Request) -> OperationalTelemetry:
+    telemetry = getattr(request.app.state, "operational_telemetry", None)
+    if telemetry is None:
+        settings = get_api_settings(request).observability
+        telemetry = OperationalTelemetry(
+            settings.metrics_path,
+            settings.traces_path,
+            max_series=settings.max_series,
+            max_traces=settings.max_traces,
+            enabled=settings.enabled,
+        )
+        request.app.state.operational_telemetry = telemetry
+    return telemetry
+
+
 def get_agent_runtime(request: Request) -> AgentRuntime:
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is not None:
@@ -124,6 +139,7 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
                 initial_sequence=snapshot.last_processed_event_sequence,
                 completion_hook=persist_completed,
                 failure_hook=persist_failed,
+                telemetry=get_operational_telemetry(request),
             )
             runtime.start()
             request.app.state.agent_runtime = runtime
@@ -356,6 +372,7 @@ def _replace_main_loop(
             if active_adapter is None
             else active_adapter.activation_sequence
         ),
+        telemetry=get_operational_telemetry(request),
     )
     request.app.state.main_loop = main_loop
     return main_loop

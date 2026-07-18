@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+import time
+from typing import Any, Protocol
 from uuid import uuid4
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
@@ -113,6 +114,14 @@ class ChatResult:
     emotion_update: EmotionUpdate
 
 
+class OperationalObserver(Protocol):
+    def counter(self, name: str, amount: float = 1.0, **labels: str) -> None: ...
+
+    def gauge(self, name: str, value: float, **labels: str) -> None: ...
+
+    def observe(self, name: str, value: float, **labels: str) -> None: ...
+
+
 class KagyaMainLoop:
     """Connect prediction error, emotion, memory, generation, and storage."""
 
@@ -134,6 +143,7 @@ class KagyaMainLoop:
         working_memory: WorkingMemory | None = None,
         context_registry: ContextRegistry | None = None,
         appraiser: CognitiveAppraiser | None = None,
+        telemetry: OperationalObserver | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -167,6 +177,7 @@ class KagyaMainLoop:
         )
         self.context_registry = context_registry or ContextRegistry()
         self.appraiser = appraiser or CognitiveAppraiser()
+        self.telemetry = telemetry
         self.value_system = ValueSystem(
             seeds=[
                 ValueState(
@@ -245,7 +256,16 @@ class KagyaMainLoop:
         previous_working_memory = self.working_memory.items
         previous_emotion_state = self.emotion_engine.state
         try:
+            working_memory_count = len(self.working_memory.items)
             self.working_memory.advance()
+            evicted = max(0, working_memory_count - len(self.working_memory.items))
+            if evicted:
+                self._metric(
+                    "counter",
+                    "kagya_working_memory_evictions_total",
+                    float(evicted),
+                    reason="decay",
+                )
             self._sync_belief_working_memory(current_context.context_id)
 
             def compatibility(source_id: str | None) -> tuple[float, str]:
@@ -293,11 +313,30 @@ class KagyaMainLoop:
             )
             emotion_update = self.emotion_engine.update_from_appraisal(appraisal)
             emotion_state = emotion_update.state
-            memory_context = self.memory_system.retrieve_context(
-                user_input,
-                current_context_id=current_context.context_id,
-                context_compatibility=compatibility,
-            )
+            retrieval_started = time.perf_counter()
+            try:
+                memory_context = self.memory_system.retrieve_context(
+                    user_input,
+                    current_context_id=current_context.context_id,
+                    context_compatibility=compatibility,
+                )
+            finally:
+                self._metric(
+                    "observe",
+                    "kagya_memory_retrieval_duration_seconds",
+                    time.perf_counter() - retrieval_started,
+                )
+            for tier, records in (
+                ("episodic", memory_context.db1_results),
+                ("semantic", memory_context.db2_results),
+            ):
+                for record in records:
+                    self._metric(
+                        "observe",
+                        "kagya_memory_relevance",
+                        record.semantic_relevance,
+                        tier=tier,
+                    )
             event = current_agent_event()
             self._admit_runtime_context(
                 memory_context, emotion_state, event, current_context
@@ -313,6 +352,7 @@ class KagyaMainLoop:
                 current_context=current_context,
                 attachments=attachments or [],
             )
+            generation_started = time.perf_counter()
             try:
                 raw_response = self.agent.generate(
                     prompt, attachments=attachments or []
@@ -339,6 +379,35 @@ class KagyaMainLoop:
             fallback_used = bool(
                 getattr(self.provider, "last_fallback_used", False)
             )
+            generation_duration = max(
+                time.perf_counter() - generation_started, 1e-9
+            )
+            metric_labels = {
+                "provider": self.settings.model.provider.lower(),
+                "fallback": str(fallback_used).lower(),
+            }
+            self._metric(
+                "observe",
+                "kagya_generation_duration_seconds",
+                generation_duration,
+                **metric_labels,
+            )
+            approximate_tokens = max(
+                1.0, len(processed_response.visible_response.encode("utf-8")) / 4.0
+            )
+            self._metric(
+                "observe",
+                "kagya_generation_tokens_per_second",
+                approximate_tokens / generation_duration,
+                **metric_labels,
+            )
+            if fallback_used:
+                self._metric(
+                    "counter",
+                    "kagya_provider_fallback_total",
+                    1.0,
+                    provider=self.settings.model.provider.lower(),
+                )
             generation_health = assess_generation_health(
                 processed_response.visible_response,
                 loss=loss_measurement.raw_loss
@@ -346,6 +415,13 @@ class KagyaMainLoop:
                 else float("nan"),
                 fallback_used=fallback_used,
             )
+            if not generation_health.healthy:
+                self._metric(
+                    "counter",
+                    "kagya_memory_quarantine_total",
+                    1.0,
+                    reason="health_check",
+                )
             episode_id = self.memory_system.save_episodic(
                 user_input,
                 processed_response.visible_response,
@@ -442,6 +518,16 @@ class KagyaMainLoop:
                     retention_reason=RetentionReason.RECENT_CONTEXT,
                 )
             )
+            self._metric(
+                "gauge",
+                "kagya_working_memory_items",
+                float(len(self.working_memory.items)),
+            )
+            self._metric(
+                "gauge",
+                "kagya_attention_focus_items",
+                float(len(working_memory_view.selected)),
+            )
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)
@@ -482,6 +568,17 @@ class KagyaMainLoop:
             appraisal=appraisal,
             emotion_update=emotion_update,
         )
+
+    def _metric(
+        self, method: str, name: str, value: float, **labels: str
+    ) -> None:
+        if self.telemetry is None:
+            return
+        try:
+            getattr(self.telemetry, method)(name, value, **labels)
+        except Exception:
+            # Operational telemetry cannot alter cognition or event outcomes.
+            return
 
     def advance_time(self, elapsed_seconds: float) -> EmotionUpdate:
         update = self.emotion_engine.advance_time(elapsed_seconds)

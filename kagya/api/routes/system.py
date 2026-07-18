@@ -2,16 +2,18 @@
 
 from importlib.metadata import PackageNotFoundError, version
 import os
+import resource
 import subprocess
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 
 from kagya.api.dependencies import (
     get_api_settings,
+    get_operational_telemetry,
     get_runtime_event_log,
     require_admin,
 )
-from kagya.api.observability import RuntimeEvent, RuntimeEventLog
+from kagya.api.observability import OperationalTelemetry, RuntimeEvent, RuntimeEventLog
 from kagya.api.schemas.system import (
     BuildInfoSchema,
     JournalRecordListResponse,
@@ -85,6 +87,45 @@ def event_journal(
     return JournalRecordListResponse(
         records=[journal_record_schema(record) for record in journal.recent(limit)]
     )
+
+
+@router.get("/metrics", dependencies=[Depends(require_admin)])
+def operational_metrics(
+    telemetry: OperationalTelemetry = Depends(get_operational_telemetry),
+) -> Response:
+    """Export bounded operational metrics in Prometheus text format."""
+
+    _observe_resources(telemetry)
+    return Response(
+        content=telemetry.prometheus_text(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@router.get("/telemetry", dependencies=[Depends(require_admin)])
+def otlp_telemetry(
+    telemetry: OperationalTelemetry = Depends(get_operational_telemetry),
+) -> dict:
+    """Export dependency-free OpenTelemetry Protocol JSON-compatible data."""
+
+    _observe_resources(telemetry)
+    return telemetry.otlp_json()
+
+
+@router.get("/traces", dependencies=[Depends(require_admin)])
+def operational_traces(
+    limit: int = Query(default=100, ge=1, le=1000),
+    event_id: str | None = Query(default=None, max_length=128),
+    telemetry: OperationalTelemetry = Depends(get_operational_telemetry),
+) -> dict[str, object]:
+    """Find safe causal spans, optionally by authoritative event ID."""
+
+    return {
+        "traces": [
+            record.__dict__
+            for record in telemetry.recent_traces(limit, event_id=event_id)
+        ]
+    }
 
 
 def _package_version() -> str:
@@ -184,3 +225,30 @@ def _tool_audit_event_schema(
             "reason": audit_event.reason,
         },
     )
+
+
+def _observe_resources(telemetry: OperationalTelemetry) -> None:
+    try:
+        # Linux reports KiB; this project deploys on Linux/NixOS.
+        telemetry.gauge(
+            "kagya_process_resident_memory_bytes",
+            float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024),
+        )
+    except (OSError, ValueError):
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            telemetry.gauge(
+                "kagya_accelerator_memory_bytes",
+                float(torch.cuda.memory_allocated()),
+                kind="allocated",
+            )
+            telemetry.gauge(
+                "kagya_accelerator_memory_bytes",
+                float(torch.cuda.memory_reserved()),
+                kind="reserved",
+            )
+    except (ImportError, RuntimeError):
+        pass

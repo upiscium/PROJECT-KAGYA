@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 from threading import Lock
+import time
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
@@ -40,6 +41,12 @@ class JournalEvent(Protocol):
     processing_sequence: int | None
     causation_id: str | None
     correlation_id: str | None
+
+
+class JournalTelemetry(Protocol):
+    def storage_observation(
+        self, component: str, operation: str, status: str, duration: float
+    ) -> None: ...
 
 
 class JournalRecord(BaseModel):
@@ -115,6 +122,7 @@ class EventJournal:
         *,
         max_bytes: int = 10 * 1024 * 1024,
         retained_files: int = 3,
+        telemetry: JournalTelemetry | None = None,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("journal max_bytes must be positive")
@@ -123,6 +131,7 @@ class EventJournal:
         self.path = path
         self.max_bytes = max_bytes
         self.retained_files = retained_files
+        self._telemetry = telemetry
         self._lock = Lock()
         self._last_hash: str | None = None
         self._last_sequence = 0
@@ -383,31 +392,37 @@ class EventJournal:
         )
 
     def _append(self, **values: Any) -> JournalRecord:
-        with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._rotate_if_needed()
-            record = _new_record(previous_record_hash=self._last_hash, **values)
-            line = record.model_dump_json() + "\n"
-            try:
+        started = time.perf_counter()
+        status = "failure"
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._rotate_if_needed()
+                record = _new_record(previous_record_hash=self._last_hash, **values)
+                line = record.model_dump_json() + "\n"
                 with self.path.open("a", encoding="utf-8") as output:
                     output.write(line)
                     output.flush()
                     os.fsync(output.fileno())
                 _fsync_directory(self.path.parent)
-            except OSError:
-                raise
-            self._last_hash = record.record_hash
-            if record.processing_sequence is not None:
-                self._last_sequence = max(
-                    self._last_sequence, record.processing_sequence
-                )
-            if (
-                record.snapshot_hash is not None
-                and record.snapshot_sequence is not None
-            ):
-                self._last_snapshot_hash = record.snapshot_hash
-                self._last_snapshot_sequence = record.snapshot_sequence
-            return record
+                self._last_hash = record.record_hash
+                if record.processing_sequence is not None:
+                    self._last_sequence = max(
+                        self._last_sequence, record.processing_sequence
+                    )
+                if record.snapshot_hash is not None and record.snapshot_sequence is not None:
+                    self._last_snapshot_hash = record.snapshot_hash
+                    self._last_snapshot_sequence = record.snapshot_sequence
+                status = "success"
+                return record
+        finally:
+            if self._telemetry is not None:
+                try:
+                    self._telemetry.storage_observation(
+                        "journal", "append", status, time.perf_counter() - started
+                    )
+                except Exception:
+                    pass
 
     def _rotate_if_needed(self) -> None:
         if not self.path.exists() or self.path.stat().st_size < self.max_bytes:

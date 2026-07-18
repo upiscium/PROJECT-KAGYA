@@ -2,9 +2,10 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import time
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from kagya.api.routes import (
@@ -26,11 +27,13 @@ from kagya.api.routes import (
     training,
     values,
 )
-from kagya.api.observability import RuntimeEventLog
+from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.config import NodeRole, Settings, get_settings, validate_deployment_hostname
+from kagya.decision import DecisionStatus
 from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
+from kagya.motivation import GoalStatus
 from kagya.runtime import (
     AgentRuntime,
     AgentEvent,
@@ -66,6 +69,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "project": app_settings.project.name,
             "role": app_settings.deployment.node.role.value,
         }
+
+    @app.get("/health/live")
+    def liveness() -> dict[str, str]:
+        """Report only whether the API process can serve requests."""
+
+        return {"status": "alive"}
+
+    @app.get("/health/ready")
+    def readiness(response: Response) -> dict[str, object]:
+        """Report whether role-specific authoritative runtime dependencies are ready."""
+
+        if app_settings.deployment.node.role == NodeRole.TRAINING_WORKER:
+            ready = getattr(app.state, "worker_runtime", None) is not None
+            checks = {"worker_runtime": ready}
+        else:
+            runtime = getattr(app.state, "agent_runtime", None)
+            journal = getattr(app.state, "event_journal", None)
+            journal_ready = False
+            if journal is not None:
+                try:
+                    journal.verify()
+                    journal_ready = True
+                except Exception:
+                    journal_ready = False
+            runtime_ready = bool(
+                runtime is not None and runtime.is_alive and runtime.is_accepting
+            )
+            checks = {"agent_runtime": runtime_ready, "journal": journal_ready}
+            ready = all(checks.values())
+        if not ready:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "ready" if ready else "not_ready", "checks": checks}
 
     role = app_settings.deployment.node.role
     if role in {NodeRole.ALL, NodeRole.INFERENCE}:
@@ -121,6 +156,15 @@ def _lifespan(settings: Settings):
 def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     if getattr(app.state, "runtime_event_log", None) is None:
         app.state.runtime_event_log = RuntimeEventLog()
+    if getattr(app.state, "operational_telemetry", None) is None:
+        observability = settings.observability
+        app.state.operational_telemetry = OperationalTelemetry(
+            observability.metrics_path,
+            observability.traces_path,
+            max_series=observability.max_series,
+            max_traces=observability.max_traces,
+            enabled=observability.enabled,
+        )
     if getattr(app.state, "agent_state_store", None) is None:
         app.state.agent_state_store = AgentStateStore(
             settings.agent_state.path, app.state.runtime_event_log
@@ -133,6 +177,7 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             settings.agent_journal.path,
             max_bytes=settings.agent_journal.max_bytes,
             retained_files=settings.agent_journal.retained_files,
+            telemetry=app.state.operational_telemetry,
         )
     app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:
@@ -185,6 +230,7 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             activation_sequence=(
                 None if active_adapter is None else active_adapter.activation_sequence
             ),
+            telemetry=app.state.operational_telemetry,
         )
     app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
     if getattr(app.state, "agent_runtime", None) is None:
@@ -195,6 +241,7 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             initial_sequence=snapshot.last_processed_event_sequence,
             completion_hook=lambda event: _commit_subject_event(app, event),
             failure_hook=lambda event, exc: _fail_subject_event(app, event),
+            telemetry=app.state.operational_telemetry,
         )
         app.state.agent_runtime.start()
     if settings.appraisal.timer_enabled and getattr(app.state, "emotion_timer", None) is None:
@@ -227,6 +274,8 @@ def _event_sequence(sequence: int | None) -> int:
 
 
 def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    started = time.perf_counter()
+    status = "failure"
     store = app.state.agent_state_store
     previous = store.last_snapshot
     if previous is None:
@@ -241,8 +290,21 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
         state_hash_before=before_hash,
         state_hash_after=after_hash,
     )
-    saved = store.save(candidate)
-    return hash_snapshot(saved)
+    try:
+        saved = store.save(candidate)
+        try:
+            _observe_subject_state(app)
+        except Exception:
+            pass
+        status = "success"
+        return hash_snapshot(saved)
+    finally:
+        try:
+            app.state.operational_telemetry.storage_observation(
+                "snapshot", "save", status, time.perf_counter() - started
+            )
+        except Exception:
+            pass
 
 
 def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
@@ -255,6 +317,26 @@ def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
     if saved is None:
         raise RuntimeError("Agent failure snapshot was not saved")
     return hash_snapshot(saved)
+
+
+def _observe_subject_state(app: FastAPI) -> None:
+    loop = app.state.main_loop
+    telemetry = app.state.operational_telemetry
+    telemetry.gauge(
+        "kagya_active_goals",
+        float(len(loop.goal_manager.list_goals(status=GoalStatus.ACTIVE))),
+    )
+    telemetry.gauge(
+        "kagya_unresolved_decisions",
+        float(
+            len(
+                loop.decision_store.list_records(
+                    status=DecisionStatus.AWAITING_OUTCOME
+                )
+            )
+        ),
+    )
+    telemetry.gauge("kagya_working_memory_items", float(len(loop.working_memory.items)))
 
 
 app = create_app()
