@@ -62,6 +62,7 @@ def test_frontend_api_client_exposes_backend_routes() -> None:
         "/system/events",
         "/experiences",
         "/beliefs",
+        "/motivation",
     ]
     missing = [snippet for snippet in expected_route_snippets if snippet not in frontend_api]
 

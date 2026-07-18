@@ -259,6 +259,7 @@ export type Belief = {
   schema_version: number;
 };
 export type BeliefListResponse = { beliefs: Belief[] };
+export type MotivationState = { schema_version: number; records: Array<Record<string, unknown>>; episodes: Array<Record<string, unknown>> };
 
 export class ApiError extends Error {
   constructor(
@@ -361,4 +362,5 @@ export const api = {
   experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
   experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
   beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
+  motivation: () => adminRequest<MotivationState>("/motivation"),
 };

@@ -1152,6 +1152,46 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     )
 
 
+def test_internal_motivation_forms_bounded_intrinsic_goal(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    headers = admin_headers()
+    first = client.post(
+        "/api/chat", json={"text": "novel observation one", "attachments": []}
+    )
+    context_id = first.json()["context_id"]
+    client.post(
+        "/api/chat",
+        json={
+            "text": "novel observation two",
+            "attachments": [],
+            "context_id": context_id,
+        },
+    )
+    client.post(
+        "/api/chat",
+        json={
+            "text": "novel observation three",
+            "attachments": [],
+            "context_id": context_id,
+        },
+    )
+
+    assert client.get("/api/motivation").status_code == 401
+    state = client.get("/api/motivation", headers=headers)
+    formed = client.post("/api/motivation/reevaluate", headers=headers)
+
+    assert state.status_code == 200
+    assert state.json()["records"]
+    assert formed.status_code == 200
+    assert 0 < len(formed.json()["goals"]) <= 2
+    goal = formed.json()["goals"][0]
+    assert goal["goal_type"] == "intrinsic"
+    assert goal["identity_origin"]["actor"] == "self"
+    assert goal["structured_target"]["motivation_id"]
+    repeated = client.post("/api/motivation/reevaluate", headers=headers)
+    assert repeated.json()["goals"] == []
+
+
 def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     client = _client(tmp_path)
     headers = admin_headers()

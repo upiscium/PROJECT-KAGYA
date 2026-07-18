@@ -5,6 +5,7 @@ from kagya.config import Settings, load_settings
 from kagya.experience import ExperienceAppraisal
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.motivation import GoalStatus
 from kagya.runtime import KagyaMainLoop
 
 
@@ -215,6 +216,33 @@ def test_previous_exchange_reaches_prompt_through_bounded_working_memory(
     assert first.response in second.prompt
     assert loop.session_state.turns == []
     assert len(loop.working_memory.items) <= settings.working_memory.item_capacity
+
+
+def test_repeated_experience_can_form_bounded_intrinsic_goal(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
+    loop.chat("novel subject one", context_id="ctx-motive", create_context=True)
+    loop.chat("novel subject two", context_id="ctx-motive")
+    loop.chat("novel subject three", context_id="ctx-motive")
+
+    episode, goals = loop.reevaluate_motivation()
+
+    assert 0 < len(goals) <= loop.motivation_dynamics.max_goal_proposals_per_cycle
+    assert episode.generated_goal_ids == tuple(goal.goal_id for goal in goals)
+    assert all(goal.goal_type.value == "intrinsic" for goal in goals)
+    assert all(goal.identity_origin.actor.value == "self" for goal in goals)
+    assert all(goal.structured_target["motivation_id"] for goal in goals)
+    second_episode, duplicate_goals = loop.reevaluate_motivation()
+    assert duplicate_goals == []
+    assert second_episode.generated_goal_ids == ()
+
+    completed = loop.transition_goal(
+        goals[0].goal_id,
+        status=GoalStatus.COMPLETED,
+        reason="internally_satisfied",
+    )
+    motivation_id = completed.structured_target["motivation_id"]
+    assert loop.motivation_dynamics.get(motivation_id).status.value == "satisfied"
 
 
 def test_cross_context_memory_is_marked_with_its_origin(tmp_path: Path) -> None:

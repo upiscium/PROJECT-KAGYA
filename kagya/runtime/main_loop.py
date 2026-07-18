@@ -70,6 +70,9 @@ from kagya.motivation import (
     GoalManager,
     GoalStatus,
     GoalType,
+    MotivationDynamics,
+    MotivationEpisode,
+    MotivationRecord,
 )
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_state import SessionState
@@ -199,6 +202,7 @@ class KagyaMainLoop:
         )
         self.goal_manager = GoalManager()
         self.commitment_store = CommitmentStore()
+        self.motivation_dynamics = MotivationDynamics()
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
@@ -230,6 +234,7 @@ class KagyaMainLoop:
         previous_default_context_id = self.default_context_id
         previous_calibration = self.surprisal_calculator.export_history()
         previous_experience_state = self.experience_store.to_json()
+        previous_motivation_state = self.motivation_dynamics.to_json()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -407,6 +412,8 @@ class KagyaMainLoop:
                 )
             )
             self._persist_experience_state()
+            self.motivation_dynamics.observe_experience(experience)
+            self._persist_motivation_state()
             self.memory_system.link_experience(
                 episode_id,
                 experience_id=experience.experience_id,
@@ -446,6 +453,8 @@ class KagyaMainLoop:
             self._persist_appraisal_state()
             self.experience_store.restore(previous_experience_state)
             self._persist_experience_state()
+            self.motivation_dynamics.restore(previous_motivation_state)
+            self._persist_motivation_state()
             raise
         return ChatResult(
             episode_id=episode_id,
@@ -778,6 +787,9 @@ class KagyaMainLoop:
             decisions if isinstance(decisions, list) else [],
         )
         self.commitment_store.restore(self.persistent_state.commitments)
+        self.motivation_dynamics.restore(
+            self.persistent_state.motivation_extensions.get("dynamics")
+        )
         self._persist_motivation_state()
 
     def _persist_motivation_state(self) -> None:
@@ -786,6 +798,58 @@ class KagyaMainLoop:
         self.persistent_state.motivation_extensions["goal_decisions"] = (
             self.goal_manager.decisions_json()
         )
+        self.persistent_state.motivation_extensions["dynamics"] = (
+            self.motivation_dynamics.to_json()
+        )
+
+    def reevaluate_motivation(self) -> tuple[MotivationEpisode, list[Goal]]:
+        event = current_agent_event()
+        candidates, held_ids = self.motivation_dynamics.goal_candidates()
+        goals: list[Goal] = []
+        selected_ids: list[str] = []
+        for candidate in candidates:
+            goal = self.propose_goal(
+                goal_type=GoalType.INTRINSIC,
+                description=candidate.description,
+                structured_target={
+                    "motivation_id": candidate.motivation_id,
+                    "target_ref": candidate.target_ref,
+                },
+                origin_actor=OriginActor.SELF,
+                origin_input_kind=OriginInputKind.INTERNAL_STATE,
+                origin_source_ref=f"motivation:{candidate.motivation_id}",
+                priority=candidate.priority,
+                urgency=candidate.urgency,
+                expected_utility=candidate.priority,
+                confidence=candidate.confidence,
+                goal_id=f"intrinsic:{candidate.motivation_id}",
+            )
+            motivation = self.motivation_dynamics.link_goal(
+                candidate.motivation_id, goal.goal_id
+            )
+            for experience_id in motivation.related_experience_ids:
+                self.link_experience_result(
+                    experience_id,
+                    kind="goal",
+                    reference=f"goal:{goal.goal_id}",
+                    evidence_refs=(f"motivation:{motivation.motivation_id}",),
+                )
+            goals.append(goal)
+            selected_ids.append(candidate.motivation_id)
+        episode = self.motivation_dynamics.record_episode(
+            selected_ids=tuple(selected_ids),
+            held_ids=held_ids,
+            generated_goal_ids=tuple(goal.goal_id for goal in goals),
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        return episode, goals
+
+    def decay_motivation(self, elapsed_hours: float) -> list[MotivationRecord]:
+        records = self.motivation_dynamics.decay(elapsed_hours)
+        self._persist_motivation_state()
+        return records
 
     def propose_goal(
         self,
@@ -883,6 +947,14 @@ class KagyaMainLoop:
         )
         self._apply_goal_outcome_appraisal(goal, status)
         self._sync_commitment_from_goal(goal, status, reason, outcome)
+        if status in {
+            GoalStatus.COMPLETED,
+            GoalStatus.FAILED,
+            GoalStatus.ABANDONED,
+        }:
+            self.motivation_dynamics.resolve_goal(
+                goal.goal_id, success=status == GoalStatus.COMPLETED
+            )
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
         return goal
@@ -906,6 +978,7 @@ class KagyaMainLoop:
                 self._sync_commitment_from_goal(
                     goal, GoalStatus.FAILED, "deadline_expired", None
                 )
+                self.motivation_dynamics.resolve_goal(goal.goal_id, success=False)
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
         return decisions
