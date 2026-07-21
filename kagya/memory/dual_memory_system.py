@@ -24,6 +24,7 @@ from kagya.memory.memory_schema import (
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
+    SemanticLifecycleStatus,
     ValidationStatus,
 )
 from kagya.memory.quality import assess_generation_health
@@ -130,6 +131,7 @@ class DualMemorySystem:
             embedding_function=self.embedding_function,
             metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
+        self._backfill_semantic_records()
 
     def save_episodic(
         self,
@@ -251,15 +253,78 @@ class DualMemorySystem:
         text: str,
         *,
         source_episode_ids: list[str] | None = None,
+        source_feedback_ids: list[str] | None = None,
+        confidence: float = 1.0,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
+        expires_at: str | None = None,
+        decay_rate: float = 0.0,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        if not text.strip():
+            raise ValueError("Semantic memory text must not be empty")
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("Semantic confidence must be between zero and one")
+        if not 0.0 <= decay_rate <= 1.0:
+            raise ValueError("Semantic decay rate must be between zero and one")
+        _validate_semantic_timestamps(valid_from, valid_until, expires_at)
+        content_hash = _semantic_content_hash(text)
+        duplicate = self.db2.get(
+            where={"content_hash": content_hash}, include=["metadatas"]
+        )
+        duplicate_metadata = _first_metadata(duplicate)
+        duplicate_ids = duplicate.get("ids") or []
+        if duplicate_metadata is not None and duplicate_ids:
+            duplicate_metadata["source_episode_ids"] = json.dumps(
+                _unique_strings(
+                    _loads_json_list(duplicate_metadata.get("source_episode_ids"))
+                    + (source_episode_ids or [])
+                )
+            )
+            duplicate_metadata["source_feedback_ids"] = json.dumps(
+                _unique_strings(
+                    _loads_json_list(duplicate_metadata.get("source_feedback_ids"))
+                    + (source_feedback_ids or [])
+                )
+            )
+            _append_semantic_audit(
+                duplicate_metadata,
+                operation="deduplicate",
+                detail={"content_hash": content_hash},
+            )
+            semantic_id = str(duplicate_ids[0])
+            self.db2.update(ids=[semantic_id], metadatas=[duplicate_metadata])
+            self.reevaluate_semantic_sources(semantic_id)
+            return semantic_id
         semantic_id = f"semantic-{uuid4()}"
+        now = _now_iso()
         record_metadata: Metadata = {
             "text": text,
             "source_episode_ids": json.dumps(source_episode_ids or []),
+            "source_feedback_ids": json.dumps(source_feedback_ids or []),
+            "rejected_source_feedback_ids": "[]",
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
             "archived": False,
-            "created_at": _now_iso(),
+            "created_at": now,
+            "schema_version": 2,
+            "version": 1,
+            "content_hash": content_hash,
+            "confidence": confidence,
+            "validity": "valid",
+            "valid_from": valid_from or "",
+            "valid_until": valid_until or "",
+            "expires_at": expires_at or "",
+            "decay_rate": decay_rate,
+            "last_confirmed_at": now,
+            "lifecycle_status": SemanticLifecycleStatus.ACTIVE.value,
+            "supersedes_id": "",
+            "superseded_by_id": "",
+            "corrected_by_id": "",
+            "contradiction_ids": "[]",
+            "merge_candidate_ids": "[]",
+            "audit_log": json.dumps(
+                [_semantic_audit_entry("create", {"content_hash": content_hash})]
+            ),
             "extra": json.dumps(metadata or {}),
         }
         self.db2.add(ids=[semantic_id], documents=[text], metadatas=[record_metadata])
@@ -272,6 +337,7 @@ class DualMemorySystem:
         current_context_id: str | None = None,
         context_compatibility: Callable[[str | None], tuple[float, str]] | None = None,
     ) -> MemoryContext:
+        self.expire_semantic_records()
         db1_results = self.db1.query(
             query_texts=[query],
             n_results=self.settings.memory.db1_top_k * 3,
@@ -303,9 +369,9 @@ class DualMemorySystem:
                 if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE
             ][: self.settings.memory.db1_top_k],
             db2_results=[
-                record
+                _with_effective_confidence(record)
                 for record in semantic
-                if not record.archived
+                if _semantic_is_retrievable(record)
                 and record.metadata.get("publication_status", "published")
                 == "published"
             ][: self.settings.memory.db2_top_k],
@@ -346,6 +412,7 @@ class DualMemorySystem:
         metadata["validation_status"] = validation_status.value
         metadata["lifecycle_status"] = lifecycle_status.value
         self.db1.update(ids=[episode_id], metadatas=[metadata])
+        self.reevaluate_semantics_for_episode(episode_id)
         return self.get_episodic(episode_id)
 
     def apply_feedback_policy(
@@ -371,6 +438,7 @@ class DualMemorySystem:
         metadata["training_included"] = not refs
         metadata["training_exclusion_refs"] = json.dumps(refs)
         self.db1.update(ids=[episode_id], metadatas=[metadata])
+        self.reevaluate_semantics_for_episode(episode_id)
         record = self.get_episodic(episode_id)
         if record is None:
             raise ValueError(f"Unknown episodic memory: {episode_id}")
@@ -477,6 +545,12 @@ class DualMemorySystem:
         result = self.db2.get(ids=[memory_id], include=["documents", "metadatas"])
         return _first_semantic_from_get(result)
 
+    def semantic_is_retrievable(self, record: SemanticMemoryRecord) -> bool:
+        return (
+            _semantic_is_retrievable(record)
+            and record.metadata.get("publication_status", "published") == "published"
+        )
+
     def archive_episodic(self, episode_id: str) -> EpisodicMemoryRecord | None:
         result = self.db1.get(ids=[episode_id], include=["metadatas"])
         metadata = _first_metadata(result)
@@ -484,16 +558,443 @@ class DualMemorySystem:
             return None
         metadata["archived"] = True
         self.db1.update(ids=[episode_id], metadatas=[metadata])
+        self.reevaluate_semantics_for_episode(episode_id)
         return self.get_episodic(episode_id)
 
-    def archive_semantic(self, memory_id: str) -> SemanticMemoryRecord | None:
+    def archive_semantic(
+        self, memory_id: str, *, idempotency_key: str | None = None
+    ) -> SemanticMemoryRecord | None:
         result = self.db2.get(ids=[memory_id], include=["metadatas"])
         metadata = _first_metadata(result)
         if metadata is None:
             return None
+        if idempotency_key is not None and _semantic_operation_seen(
+            metadata, idempotency_key, "archive", {}
+        ):
+            return self.get_semantic(memory_id)
+        if metadata.get("archived") is True:
+            if idempotency_key is not None:
+                _append_semantic_audit(
+                    metadata,
+                    operation="archive",
+                    detail={},
+                    idempotency_key=idempotency_key,
+                )
+                self.db2.update(ids=[memory_id], metadatas=[metadata])
+            return self.get_semantic(memory_id)
         metadata["archived"] = True
+        _append_semantic_audit(
+            metadata,
+            operation="archive",
+            detail={},
+            idempotency_key=idempotency_key,
+        )
         self.db2.update(ids=[memory_id], metadatas=[metadata])
         return self.get_semantic(memory_id)
+
+    def restore_semantic(
+        self, memory_id: str, *, idempotency_key: str
+    ) -> SemanticMemoryRecord | None:
+        metadata = self._semantic_metadata(memory_id)
+        if metadata is None:
+            return None
+        if _semantic_operation_seen(metadata, idempotency_key, "restore", {}):
+            return self.get_semantic(memory_id)
+        metadata["archived"] = False
+        _append_semantic_audit(
+            metadata, operation="restore", detail={}, idempotency_key=idempotency_key
+        )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        self.reevaluate_semantic_sources(memory_id)
+        return self.get_semantic(memory_id)
+
+    def forget_semantic(
+        self, memory_id: str, *, idempotency_key: str
+    ) -> SemanticMemoryRecord | None:
+        return self._set_semantic_lifecycle(
+            memory_id,
+            SemanticLifecycleStatus.FORGOTTEN,
+            operation="forget",
+            idempotency_key=idempotency_key,
+        )
+
+    def delete_semantic(self, memory_id: str, *, idempotency_key: str) -> bool:
+        metadata = self._semantic_metadata(memory_id)
+        if metadata is None:
+            return False
+        result = self.db2.get(include=["metadatas"])
+        for related_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            if related_id == memory_id:
+                continue
+            related = dict(raw_metadata or {})
+            changed = False
+            for field in ("contradiction_ids", "merge_candidate_ids"):
+                values = _loads_json_list(related.get(field))
+                if memory_id in values:
+                    related[field] = json.dumps(
+                        [value for value in values if value != memory_id]
+                    )
+                    changed = True
+            for field in ("supersedes_id", "superseded_by_id", "corrected_by_id"):
+                if related.get(field) == memory_id:
+                    related[field] = ""
+                    changed = True
+            if changed:
+                _append_semantic_audit(
+                    related,
+                    operation="lineage_target_deleted",
+                    detail={"target_id": memory_id},
+                    idempotency_key=idempotency_key,
+                )
+                self.db2.update(ids=[str(related_id)], metadatas=[related])
+        # Logical forgetting is the reversible path that retains the record's
+        # complete content and audit history.
+        self.db2.delete(ids=[memory_id])
+        return True
+
+    def propose_semantic_relationship(
+        self,
+        memory_id: str,
+        *,
+        target_id: str,
+        relationship: str,
+        idempotency_key: str,
+    ) -> SemanticMemoryRecord:
+        if relationship not in {"merge", "contradiction", "supersession", "correction"}:
+            raise ValueError("Unsupported semantic relationship")
+        if memory_id == target_id:
+            raise ValueError("Semantic memory cannot relate to itself")
+        metadata = self._semantic_metadata(memory_id)
+        target = self._semantic_metadata(target_id)
+        if metadata is None or target is None:
+            raise ValueError("Unknown semantic relationship endpoint")
+        detail = {"target_id": target_id, "relationship": relationship}
+        if _semantic_operation_seen(metadata, idempotency_key, "relationship", detail):
+            record = self.get_semantic(memory_id)
+            assert record is not None
+            return record
+        if relationship == "merge":
+            candidates = _loads_json_list(metadata.get("merge_candidate_ids"))
+            metadata["merge_candidate_ids"] = json.dumps(
+                _unique_strings([*candidates, target_id])
+            )
+        elif relationship == "contradiction":
+            self._link_contradiction(memory_id, metadata, target_id, target)
+        else:
+            old_id, old_metadata = target_id, target
+            new_status = (
+                SemanticLifecycleStatus.CORRECTED
+                if relationship == "correction"
+                else SemanticLifecycleStatus.SUPERSEDED
+            )
+            old_metadata["lifecycle_status"] = new_status.value
+            reverse_field = (
+                "corrected_by_id"
+                if relationship == "correction"
+                else "superseded_by_id"
+            )
+            old_metadata[reverse_field] = memory_id
+            metadata["supersedes_id"] = old_id
+            _append_semantic_audit(
+                old_metadata,
+                operation="relationship_target",
+                detail={"source_id": memory_id, "relationship": relationship},
+            )
+            self.db2.update(ids=[old_id], metadatas=[old_metadata])
+        _append_semantic_audit(
+            metadata,
+            operation="relationship",
+            detail=detail,
+            idempotency_key=idempotency_key,
+        )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        record = self.get_semantic(memory_id)
+        assert record is not None
+        return record
+
+    def update_semantic_policy(
+        self,
+        memory_id: str,
+        *,
+        idempotency_key: str,
+        confidence: float,
+        validity: str,
+        valid_from: str | None,
+        valid_until: str | None,
+        expires_at: str | None,
+        decay_rate: float,
+    ) -> SemanticMemoryRecord | None:
+        if not 0.0 <= confidence <= 1.0 or not 0.0 <= decay_rate <= 1.0:
+            raise ValueError(
+                "Semantic confidence and decay rate must be between zero and one"
+            )
+        if validity not in {"valid", "disputed", "invalid"}:
+            raise ValueError("Unsupported semantic validity")
+        _validate_semantic_timestamps(valid_from, valid_until, expires_at)
+        metadata = self._semantic_metadata(memory_id)
+        if metadata is None:
+            return None
+        detail = {
+            "confidence": confidence,
+            "validity": validity,
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+            "expires_at": expires_at,
+            "decay_rate": decay_rate,
+        }
+        if _semantic_operation_seen(metadata, idempotency_key, "policy", detail):
+            return self.get_semantic(memory_id)
+        metadata.update(
+            {
+                "confidence": confidence,
+                "validity": validity,
+                "valid_from": valid_from or "",
+                "valid_until": valid_until or "",
+                "expires_at": expires_at or "",
+                "decay_rate": decay_rate,
+                "last_confirmed_at": _now_iso(),
+            }
+        )
+        if metadata.get("lifecycle_status") == SemanticLifecycleStatus.EXPIRED.value:
+            metadata["lifecycle_status"] = SemanticLifecycleStatus.ACTIVE.value
+        _append_semantic_audit(
+            metadata,
+            operation="policy",
+            detail=detail,
+            idempotency_key=idempotency_key,
+        )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        return self.reevaluate_semantic_sources(memory_id)
+
+    def semantic_graph(self, memory_id: str) -> list[SemanticMemoryRecord]:
+        root = self.get_semantic(memory_id)
+        if root is None:
+            return []
+        records: list[SemanticMemoryRecord] = []
+        pending = [root]
+        seen: set[str] = set()
+        while pending:
+            record = pending.pop(0)
+            if record.id in seen:
+                continue
+            seen.add(record.id)
+            records.append(record)
+            related = {
+                *record.contradiction_ids,
+                *record.merge_candidate_ids,
+                *([record.supersedes_id] if record.supersedes_id else []),
+                *([record.superseded_by_id] if record.superseded_by_id else []),
+                *([record.corrected_by_id] if record.corrected_by_id else []),
+            }
+            for related_id in sorted(related - seen):
+                related_record = self.get_semantic(related_id)
+                if related_record is not None:
+                    pending.append(related_record)
+        return records
+
+    def reevaluate_semantics_for_episode(self, episode_id: str) -> None:
+        result = self.db2.get(include=["metadatas"])
+        for semantic_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            if episode_id in _loads_json_list(metadata.get("source_episode_ids")):
+                self.reevaluate_semantic_sources(str(semantic_id))
+
+    def reevaluate_semantic_sources(
+        self, memory_id: str
+    ) -> SemanticMemoryRecord | None:
+        metadata = self._semantic_metadata(memory_id)
+        if metadata is None:
+            return None
+        source_ids = _loads_json_list(metadata.get("source_episode_ids"))
+        feedback_ids = _loads_json_list(metadata.get("source_feedback_ids"))
+        rejected_feedback_ids = set(
+            _loads_json_list(metadata.get("rejected_source_feedback_ids"))
+        )
+        if not source_ids and not feedback_ids:
+            return self.get_semantic(memory_id)
+        viable = any(item not in rejected_feedback_ids for item in feedback_ids)
+        for source_id in source_ids:
+            source = self.get_episodic(source_id)
+            if (
+                source is not None
+                and source.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+                and source.validation_status != ValidationStatus.REJECTED
+            ):
+                viable = True
+                break
+        current = str(metadata.get("lifecycle_status", "active"))
+        if not viable and current == SemanticLifecycleStatus.ACTIVE.value:
+            metadata["lifecycle_status"] = SemanticLifecycleStatus.SOURCE_REJECTED.value
+            _append_semantic_audit(
+                metadata, operation="source_reevaluation", detail={"viable": False}
+            )
+        elif viable and current == SemanticLifecycleStatus.SOURCE_REJECTED.value:
+            metadata["lifecycle_status"] = SemanticLifecycleStatus.ACTIVE.value
+            _append_semantic_audit(
+                metadata, operation="source_reevaluation", detail={"viable": True}
+            )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        return self.get_semantic(memory_id)
+
+    def reevaluate_semantics_for_feedback(
+        self, feedback_id: str, *, rejected: bool
+    ) -> None:
+        result = self.db2.get(include=["metadatas"])
+        for semantic_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            if feedback_id not in _loads_json_list(metadata.get("source_feedback_ids")):
+                continue
+            rejected_ids = _loads_json_list(
+                metadata.get("rejected_source_feedback_ids")
+            )
+            if rejected:
+                rejected_ids = _unique_strings([*rejected_ids, feedback_id])
+            else:
+                rejected_ids = [item for item in rejected_ids if item != feedback_id]
+            if rejected_ids == _loads_json_list(
+                metadata.get("rejected_source_feedback_ids")
+            ):
+                continue
+            metadata["rejected_source_feedback_ids"] = json.dumps(rejected_ids)
+            _append_semantic_audit(
+                metadata,
+                operation="feedback_source_status",
+                detail={"feedback_id": feedback_id, "rejected": rejected},
+            )
+            self.db2.update(ids=[str(semantic_id)], metadatas=[metadata])
+            self.reevaluate_semantic_sources(str(semantic_id))
+
+    def expire_semantic_records(self) -> None:
+        result = self.db2.get(include=["metadatas"])
+        now = datetime.now(UTC)
+        for semantic_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            if metadata.get("lifecycle_status", "active") != "active":
+                continue
+            expires_at = _parse_timestamp(_optional_str(metadata.get("expires_at")))
+            valid_until = _parse_timestamp(_optional_str(metadata.get("valid_until")))
+            confidence = float(str(metadata.get("confidence", 1.0)))
+            decay_rate = float(str(metadata.get("decay_rate", 0.0)))
+            confirmed = _parse_timestamp(
+                str(metadata.get("last_confirmed_at", metadata.get("created_at", "")))
+            )
+            decayed = confidence
+            if confirmed is not None and decay_rate > 0.0:
+                elapsed_days = max(0.0, (now - confirmed).total_seconds() / 86400)
+                decayed *= (1.0 - decay_rate) ** elapsed_days
+            reason = None
+            if expires_at is not None and expires_at <= now:
+                reason = "expiry"
+            elif valid_until is not None and valid_until <= now:
+                reason = "validity_end"
+            elif decayed <= 0.01:
+                reason = "confidence_decay"
+            if reason is None:
+                continue
+            metadata["lifecycle_status"] = SemanticLifecycleStatus.EXPIRED.value
+            _append_semantic_audit(
+                metadata,
+                operation="expire",
+                detail={"reason": reason},
+            )
+            self.db2.update(ids=[str(semantic_id)], metadatas=[metadata])
+
+    def _semantic_metadata(self, memory_id: str) -> dict[str, Any] | None:
+        return _first_metadata(self.db2.get(ids=[memory_id], include=["metadatas"]))
+
+    def _set_semantic_lifecycle(
+        self,
+        memory_id: str,
+        status: SemanticLifecycleStatus,
+        *,
+        operation: str,
+        idempotency_key: str,
+    ) -> SemanticMemoryRecord | None:
+        metadata = self._semantic_metadata(memory_id)
+        if metadata is None:
+            return None
+        detail = {"status": status.value}
+        if _semantic_operation_seen(metadata, idempotency_key, operation, detail):
+            return self.get_semantic(memory_id)
+        metadata["lifecycle_status"] = status.value
+        _append_semantic_audit(
+            metadata,
+            operation=operation,
+            detail=detail,
+            idempotency_key=idempotency_key,
+        )
+        self.db2.update(ids=[memory_id], metadatas=[metadata])
+        return self.get_semantic(memory_id)
+
+    def _link_contradiction(
+        self,
+        memory_id: str,
+        metadata: dict[str, Any],
+        target_id: str,
+        target: dict[str, Any],
+    ) -> None:
+        metadata["contradiction_ids"] = json.dumps(
+            _unique_strings(
+                [*_loads_json_list(metadata.get("contradiction_ids")), target_id]
+            )
+        )
+        target["contradiction_ids"] = json.dumps(
+            _unique_strings(
+                [*_loads_json_list(target.get("contradiction_ids")), memory_id]
+            )
+        )
+        _append_semantic_audit(
+            target,
+            operation="relationship_target",
+            detail={"source_id": memory_id, "relationship": "contradiction"},
+        )
+        self.db2.update(ids=[target_id], metadatas=[target])
+
+    def _backfill_semantic_records(self) -> None:
+        result = self.db2.get(include=["documents", "metadatas"])
+        for semantic_id, document, raw_metadata in zip(
+            result.get("ids") or [],
+            result.get("documents") or [],
+            result.get("metadatas") or [],
+            strict=False,
+        ):
+            metadata = dict(raw_metadata or {})
+            if int(str(metadata.get("schema_version", 1))) >= 2:
+                continue
+            text = str(metadata.get("text", document or ""))
+            now = str(metadata.get("created_at", "")) or _now_iso()
+            metadata.update(
+                {
+                    "schema_version": 2,
+                    "version": 1,
+                    "content_hash": _semantic_content_hash(text),
+                    "confidence": 1.0,
+                    "validity": "valid",
+                    "valid_from": "",
+                    "valid_until": "",
+                    "expires_at": "",
+                    "decay_rate": 0.0,
+                    "last_confirmed_at": now,
+                    "lifecycle_status": "active",
+                    "supersedes_id": "",
+                    "superseded_by_id": "",
+                    "corrected_by_id": "",
+                    "contradiction_ids": "[]",
+                    "source_feedback_ids": "[]",
+                    "rejected_source_feedback_ids": "[]",
+                    "merge_candidate_ids": "[]",
+                    "audit_log": json.dumps([_semantic_audit_entry("backfill", {})]),
+                }
+            )
+            self.db2.update(ids=[str(semantic_id)], metadatas=[metadata])
 
     def update_episodic_metadata(
         self,
@@ -733,7 +1234,15 @@ def _semantic_record_from_metadata(
     record_id: str, document: str, metadata: dict[str, Any]
 ) -> SemanticMemoryRecord:
     extra = _loads_json_dict(metadata.get("extra"))
-    return SemanticMemoryRecord(
+    lifecycle = SemanticLifecycleStatus(
+        str(metadata.get("lifecycle_status", SemanticLifecycleStatus.ACTIVE.value))
+    )
+    expires_at = _optional_str(metadata.get("expires_at"))
+    if lifecycle == SemanticLifecycleStatus.ACTIVE and _timestamp_has_passed(
+        expires_at
+    ):
+        lifecycle = SemanticLifecycleStatus.EXPIRED
+    record = SemanticMemoryRecord(
         id=record_id,
         text=str(metadata.get("text", document)),
         source_episode_ids=_loads_json_list(metadata.get("source_episode_ids")),
@@ -749,7 +1258,30 @@ def _semantic_record_from_metadata(
         source=str(extra.get("source", "unknown")),
         source_channel=str(extra.get("source_channel", "unknown")),
         source_session_id=_optional_str(extra.get("source_session_id")),
+        schema_version=int(metadata.get("schema_version", 1)),
+        version=int(metadata.get("version", 1)),
+        content_hash=str(
+            metadata.get("content_hash", _semantic_content_hash(document))
+        ),
+        confidence=float(metadata.get("confidence", 1.0)),
+        validity=str(metadata.get("validity", "valid")),
+        valid_from=_optional_str(metadata.get("valid_from")),
+        valid_until=_optional_str(metadata.get("valid_until")),
+        expires_at=expires_at,
+        decay_rate=float(metadata.get("decay_rate", 0.0)),
+        last_confirmed_at=str(
+            metadata.get("last_confirmed_at", metadata.get("created_at", ""))
+        ),
+        lifecycle_status=lifecycle,
+        supersedes_id=_optional_str(metadata.get("supersedes_id")),
+        superseded_by_id=_optional_str(metadata.get("superseded_by_id")),
+        corrected_by_id=_optional_str(metadata.get("corrected_by_id")),
+        contradiction_ids=_loads_json_list(metadata.get("contradiction_ids")),
+        source_feedback_ids=_loads_json_list(metadata.get("source_feedback_ids")),
+        merge_candidate_ids=_loads_json_list(metadata.get("merge_candidate_ids")),
+        audit_log=_loads_json_dict_list(metadata.get("audit_log")),
     )
+    return _with_effective_confidence(record)
 
 
 def _first_metadata(result: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -819,6 +1351,18 @@ def _loads_json_list(value: Any) -> list[str]:
     return [str(item) for item in loaded] if isinstance(loaded, list) else []
 
 
+def _loads_json_dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, str):
+        return []
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)]
+
+
 def _content_hash(user_input: str, response: str) -> str:
     normalized = json.dumps([user_input.strip(), response.strip()], ensure_ascii=False)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -826,6 +1370,113 @@ def _content_hash(user_input: str, response: str) -> str:
 
 def _dedup_key(source_event_id: str | None, content_hash: str) -> str:
     return f"{source_event_id or 'content'}:{content_hash}"
+
+
+def _semantic_content_hash(text: str) -> str:
+    normalized = " ".join(text.casefold().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _semantic_audit_entry(
+    operation: str,
+    detail: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "event_id": f"memory-audit-{uuid4()}",
+        "operation": operation,
+        "detail": detail,
+        "idempotency_key": idempotency_key,
+        "created_at": _now_iso(),
+    }
+
+
+def _append_semantic_audit(
+    metadata: dict[str, Any],
+    *,
+    operation: str,
+    detail: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> None:
+    audit = _loads_json_dict_list(metadata.get("audit_log"))
+    audit.append(_semantic_audit_entry(operation, detail, idempotency_key))
+    metadata["audit_log"] = json.dumps(audit)
+    metadata["version"] = int(metadata.get("version", 1)) + 1
+
+
+def _semantic_operation_seen(
+    metadata: dict[str, Any],
+    idempotency_key: str,
+    operation: str,
+    detail: dict[str, Any],
+) -> bool:
+    for event in _loads_json_dict_list(metadata.get("audit_log")):
+        if event.get("idempotency_key") != idempotency_key:
+            continue
+        if event.get("operation") != operation or event.get("detail") != detail:
+            raise ValueError("Idempotency key was already used for another operation")
+        return True
+    return False
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _timestamp_has_passed(value: str | None) -> bool:
+    parsed = _parse_timestamp(value)
+    return parsed is not None and parsed <= datetime.now(UTC)
+
+
+def _validate_semantic_timestamps(
+    valid_from: str | None, valid_until: str | None, expires_at: str | None
+) -> None:
+    parsed = [
+        _parse_timestamp(value) for value in (valid_from, valid_until, expires_at)
+    ]
+    for value, timestamp in zip(
+        (valid_from, valid_until, expires_at), parsed, strict=True
+    ):
+        if value and timestamp is None:
+            raise ValueError("Semantic validity timestamps must be ISO-8601 values")
+    if parsed[0] is not None and parsed[1] is not None and parsed[0] >= parsed[1]:
+        raise ValueError("Semantic valid_from must precede valid_until")
+
+
+def _with_effective_confidence(record: SemanticMemoryRecord) -> SemanticMemoryRecord:
+    confirmed = _parse_timestamp(record.last_confirmed_at)
+    if confirmed is None or record.decay_rate == 0.0:
+        effective = record.confidence
+    else:
+        elapsed_days = max(0.0, (datetime.now(UTC) - confirmed).total_seconds() / 86400)
+        effective = record.confidence * ((1.0 - record.decay_rate) ** elapsed_days)
+    return replace(record, effective_confidence=max(0.0, min(1.0, effective)))
+
+
+def _semantic_is_retrievable(record: SemanticMemoryRecord) -> bool:
+    now = datetime.now(UTC)
+    valid_from = _parse_timestamp(record.valid_from)
+    valid_until = _parse_timestamp(record.valid_until)
+    expires_at = _parse_timestamp(record.expires_at)
+    return (
+        not record.archived
+        and record.lifecycle_status == SemanticLifecycleStatus.ACTIVE
+        and record.validity == "valid"
+        and (valid_from is None or valid_from <= now)
+        and (valid_until is None or valid_until > now)
+        and (expires_at is None or expires_at > now)
+        and record.effective_confidence > 0.01
+    )
 
 
 def _optional_str(value: Any) -> str | None:

@@ -1,4 +1,7 @@
 from pathlib import Path
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.memory import (
@@ -54,6 +57,246 @@ def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
     assert context.db2_results[0].record_type == MemoryRecordType.SEMANTIC_MEMORY
 
 
+def test_semantic_dedup_merges_provenance_without_growing_db2(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    first_source = memory.save_episodic("first", "source")
+    second_source = memory.save_episodic("second", "source")
+
+    first = memory.save_semantic(
+        " The user likes lunar gardens. ", source_episode_ids=[first_source]
+    )
+    duplicate = memory.save_semantic(
+        "the user likes LUNAR gardens.",
+        source_episode_ids=[second_source],
+        source_feedback_ids=["feedback-1"],
+    )
+
+    assert duplicate == first
+    assert memory.db2.count() == 1
+    record = memory.get_semantic(first)
+    assert record is not None
+    assert record.source_episode_ids == [first_source, second_source]
+    assert record.source_feedback_ids == ["feedback-1"]
+    assert record.version == 2
+    assert [event["operation"] for event in record.audit_log] == [
+        "create",
+        "deduplicate",
+    ]
+
+
+def test_inactive_semantic_records_never_enter_retrieval(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    expired = memory.save_semantic(
+        "expired semantic",
+        expires_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+    )
+    forgotten = memory.save_semantic("forgotten semantic")
+    memory.forget_semantic(forgotten, idempotency_key="forget-once")
+
+    assert memory.retrieve_context("semantic").db2_results == []
+    expired_record = memory.get_semantic(expired)
+    assert expired_record is not None
+    assert expired_record.lifecycle_status.value == "expired"
+    assert expired_record.audit_log[-1]["operation"] == "expire"
+
+
+def test_semantic_policy_updates_are_idempotent_and_control_retrieval(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic("policy controlled semantic")
+    arguments = {
+        "idempotency_key": "policy-1",
+        "confidence": 0.4,
+        "validity": "invalid",
+        "valid_from": None,
+        "valid_until": None,
+        "expires_at": None,
+        "decay_rate": 0.1,
+    }
+
+    first = memory.update_semantic_policy(semantic_id, **arguments)
+    replay = memory.update_semantic_policy(semantic_id, **arguments)
+
+    assert first is not None and replay is not None
+    assert first.version == replay.version
+    assert first.confidence == 0.4
+    assert first.validity == "invalid"
+    assert memory.retrieve_context("policy controlled semantic").db2_results == []
+
+
+def test_source_rejection_and_restore_reevaluate_derived_semantic(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic("source fact", "response")
+    semantic_id = memory.save_semantic(
+        "derived source fact", source_episode_ids=[episode_id]
+    )
+
+    memory.review_episodic(
+        episode_id,
+        validation_status=ValidationStatus.REJECTED,
+        lifecycle_status=MemoryLifecycleStatus.REJECTED,
+    )
+
+    rejected = memory.get_semantic(semantic_id)
+    assert rejected is not None
+    assert rejected.lifecycle_status.value == "source_rejected"
+    assert memory.retrieve_context("derived source fact").db2_results == []
+
+    memory.review_episodic(
+        episode_id,
+        validation_status=ValidationStatus.VERIFIED,
+        lifecycle_status=MemoryLifecycleStatus.ACTIVE,
+    )
+    restored = memory.get_semantic(semantic_id)
+    assert restored is not None
+    assert restored.lifecycle_status.value == "active"
+
+
+def test_cold_source_archive_does_not_reject_derived_semantic(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic("archived source", "response")
+    semantic_id = memory.save_semantic(
+        "derived from cold source", source_episode_ids=[episode_id]
+    )
+
+    memory.archive_episodic(episode_id)
+
+    semantic = memory.get_semantic(semantic_id)
+    assert semantic is not None
+    assert semantic.lifecycle_status.value == "active"
+    assert [item.id for item in memory.retrieve_context("cold source").db2_results] == [
+        semantic_id
+    ]
+
+
+def test_withdrawn_feedback_source_is_reevaluated(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic(
+        "feedback derived semantic", source_feedback_ids=["feedback-1"]
+    )
+
+    memory.reevaluate_semantics_for_feedback("feedback-1", rejected=True)
+
+    rejected = memory.get_semantic(semantic_id)
+    assert rejected is not None
+    assert rejected.lifecycle_status.value == "source_rejected"
+    assert memory.retrieve_context("feedback derived semantic").db2_results == []
+
+    memory.reevaluate_semantics_for_feedback("feedback-1", rejected=False)
+    restored = memory.get_semantic(semantic_id)
+    assert restored is not None
+    assert restored.lifecycle_status.value == "active"
+
+
+def test_semantic_lineage_is_bidirectional_idempotent_and_audited(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    original = memory.save_semantic("old fact")
+    correction = memory.save_semantic("corrected fact")
+
+    first = memory.propose_semantic_relationship(
+        correction,
+        target_id=original,
+        relationship="correction",
+        idempotency_key="correction-1",
+    )
+    replay = memory.propose_semantic_relationship(
+        correction,
+        target_id=original,
+        relationship="correction",
+        idempotency_key="correction-1",
+    )
+
+    old = memory.get_semantic(original)
+    assert old is not None
+    assert old.lifecycle_status.value == "corrected"
+    assert old.corrected_by_id == correction
+    assert first.supersedes_id == original
+    assert replay.version == first.version
+    assert {item.id for item in memory.semantic_graph(correction)} == {
+        original,
+        correction,
+    }
+    assert original not in {
+        item.id for item in memory.retrieve_context("old fact").db2_results
+    }
+
+    with pytest.raises(ValueError, match="Idempotency key"):
+        memory.propose_semantic_relationship(
+            correction,
+            target_id=original,
+            relationship="merge",
+            idempotency_key="correction-1",
+        )
+
+
+def test_semantic_archive_restore_and_physical_delete_are_distinct(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic("cold archive fact")
+
+    archived = memory.archive_semantic(semantic_id, idempotency_key="archive-1")
+    restored = memory.restore_semantic(semantic_id, idempotency_key="restore-1")
+
+    assert archived is not None and archived.archived is True
+    assert restored is not None and restored.archived is False
+    assert [
+        item.id for item in memory.retrieve_context("cold archive fact").db2_results
+    ] == [semantic_id]
+    assert memory.delete_semantic(semantic_id, idempotency_key="delete-1") is True
+    assert memory.get_semantic(semantic_id) is None
+
+
+def test_physical_delete_removes_dangling_lineage_references(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    original = memory.save_semantic("delete lineage original")
+    replacement = memory.save_semantic("delete lineage replacement")
+    memory.propose_semantic_relationship(
+        replacement,
+        target_id=original,
+        relationship="correction",
+        idempotency_key="link-before-delete",
+    )
+
+    memory.delete_semantic(original, idempotency_key="delete-original")
+
+    remaining = memory.get_semantic(replacement)
+    assert remaining is not None
+    assert remaining.supersedes_id is None
+    assert remaining.audit_log[-1]["operation"] == "lineage_target_deleted"
+
+
+def test_legacy_semantic_records_are_backfilled_on_startup(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    memory.db2.add(
+        ids=["legacy-semantic"],
+        documents=["legacy fact"],
+        metadatas=[
+            {
+                "text": "legacy fact",
+                "source_episode_ids": "[]",
+                "record_type": "semantic_memory",
+                "archived": False,
+                "extra": "{}",
+            }
+        ],
+    )
+
+    migrated = _memory(settings).get_semantic("legacy-semantic")
+
+    assert migrated is not None
+    assert migrated.schema_version == 2
+    assert migrated.content_hash
+    assert migrated.lifecycle_status.value == "active"
+    assert migrated.audit_log[0]["operation"] == "backfill"
+
+
 def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) -> None:
     memory = _memory(_settings_for_tmp_memory(tmp_path))
     episode_id = memory.save_episodic("fact", "response", emotion_arousal=1.0)
@@ -65,6 +308,9 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
     assert stored["ids"] == [episode_id]
     assert stored["metadatas"][0]["archived"] is True
     assert memory.retrieve_context("fact").db1_results == []
+    semantic = memory.get_semantic(semantic_ids[0])
+    assert semantic is not None
+    assert semantic.lifecycle_status.value == "active"
 
 
 def test_experience_salience_affects_retrieval_order(tmp_path: Path) -> None:
@@ -203,7 +449,9 @@ def test_quarantined_generation_is_persisted_but_not_retrieved(tmp_path: Path) -
         lifecycle_status=MemoryLifecycleStatus.ACTIVE,
     )
     assert reviewed is not None
-    assert [item.id for item in memory.retrieve_context("hello").db1_results] == [episode_id]
+    assert [item.id for item in memory.retrieve_context("hello").db1_results] == [
+        episode_id
+    ]
 
 
 def test_same_event_and_content_is_deduplicated(tmp_path: Path) -> None:
@@ -304,18 +552,24 @@ def test_non_legacy_embedding_uses_versioned_collection_names(tmp_path: Path) ->
     assert memory.db2.name.startswith("cortex_test-sentence-transformers-test-model-")
 
 
-def test_sentence_transformer_embedding_function_encodes_with_configured_model() -> None:
+def test_sentence_transformer_embedding_function_encodes_with_configured_model() -> (
+    None
+):
     loaded: dict[str, object] = {}
 
     class FakeModel:
-        def encode(self, texts: list[str], *, normalize_embeddings: bool) -> list[list[float]]:
+        def encode(
+            self, texts: list[str], *, normalize_embeddings: bool
+        ) -> list[list[float]]:
             loaded["texts"] = texts
             loaded["normalize_embeddings"] = normalize_embeddings
             return [[1.0, 0.0] for _ in texts]
 
     embedding = SentenceTransformerEmbeddingFunction(
         "sentence-transformers/test-model",
-        model_loader=lambda model_id: loaded.setdefault("model_id", model_id) and FakeModel(),
+        model_loader=lambda model_id: (
+            loaded.setdefault("model_id", model_id) and FakeModel()
+        ),
     )
 
     vectors = embedding(["hello", "world"])
@@ -327,7 +581,9 @@ def test_sentence_transformer_embedding_function_encodes_with_configured_model()
 
 
 def _memory(settings: Settings) -> DualMemorySystem:
-    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
+    return DualMemorySystem(
+        settings, embedding_function=DeterministicEmbeddingFunction()
+    )
 
 
 def _settings_for_tmp_memory(

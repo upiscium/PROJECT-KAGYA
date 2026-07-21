@@ -15,6 +15,27 @@ class MemoryReviewRequest(BaseModel):
     lifecycle_status: str
 
 
+class SemanticLifecycleRequest(BaseModel):
+    action: str
+    idempotency_key: str
+
+
+class SemanticRelationshipRequest(BaseModel):
+    target_id: str
+    relationship: str
+    idempotency_key: str
+
+
+class SemanticPolicyRequest(BaseModel):
+    confidence: float
+    validity: str
+    valid_from: str | None = None
+    valid_until: str | None = None
+    expires_at: str | None = None
+    decay_rate: float = 0.0
+    idempotency_key: str
+
+
 class EpisodeMemoryResponse(BaseModel):
     id: str
     user_input: str
@@ -72,8 +93,31 @@ class SemanticMemoryResponse(BaseModel):
     context_compatibility: float
     context_relation: str
     cross_context: bool
+    schema_version: int
+    version: int
+    content_hash: str
+    confidence: float
+    effective_confidence: float
+    validity: str
+    valid_from: str | None
+    valid_until: str | None
+    expires_at: str | None
+    decay_rate: float
+    last_confirmed_at: str
+    lifecycle_status: str
+    supersedes_id: str | None
+    superseded_by_id: str | None
+    corrected_by_id: str | None
+    contradiction_ids: list[str]
+    source_feedback_ids: list[str]
+    merge_candidate_ids: list[str]
+    audit_log: list[dict[str, Any]]
 
 
 class MemorySearchResponse(BaseModel):
     db1_results: list[EpisodeMemoryResponse]
     db2_results: list[SemanticMemoryResponse]
+
+
+class SemanticGraphResponse(BaseModel):
+    records: list[SemanticMemoryResponse]
