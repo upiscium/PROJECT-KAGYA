@@ -131,6 +131,35 @@ def test_experience_api_exposes_structured_state_without_chat_content(
     assert "hidden_thought" not in serialized
 
 
+def test_narrative_self_api_is_admin_only_and_returns_structured_state(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+
+    assert client.get("/api/narrative-self").status_code == 401
+    created = client.post(
+        "/api/narrative-self/future-self",
+        headers=admin_headers(),
+        json={
+            "projection_id": "planning-future",
+            "description": "Become more capable at planning",
+            "theme_codes": ["planning"],
+            "desired_level": 0.9,
+            "current_level": 0.3,
+            "evidence_refs": ["identity-claim:planning"],
+        },
+    )
+    inspected = client.get("/api/narrative-self", headers=admin_headers())
+
+    assert created.status_code == 200
+    assert created.json()["gap"] == pytest.approx(0.6)
+    assert created.json()["related_motivation_ids"]
+    assert inspected.status_code == 200
+    assert inspected.json()["future_self"][0]["projection_id"] == "planning-future"
+    assert "hidden_thought" not in json.dumps(inspected.json())
+    assert "prompt" not in json.dumps(inspected.json())
+
+
 def test_experience_state_survives_subject_restart(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as first_client:

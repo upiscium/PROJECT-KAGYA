@@ -91,6 +91,7 @@ class Goal:
     updated_at: str
     transitions: tuple[GoalTransition, ...] = ()
     value_revision_refs: dict[str, int] = field(default_factory=dict)
+    narrative_self_refs: tuple[str, ...] = ()
     schema_version: int = 3
 
     def __post_init__(self) -> None:
@@ -196,6 +197,7 @@ class GoalManager:
         deadline: str | None = None,
         value_effects: dict[str, float] | None = None,
         value_revision_refs: dict[str, int] | None = None,
+        narrative_self_refs: tuple[str, ...] = (),
         needs_information: bool = False,
         goal_id: str | None = None,
     ) -> Goal:
@@ -233,6 +235,7 @@ class GoalManager:
             created_at=now,
             updated_at=now,
             value_revision_refs=dict(value_revision_refs or {}),
+            narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
         )
         self.goals[identifier] = goal
         return goal
@@ -731,6 +734,7 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
     data = dict(payload)
     data["schema_version"] = 3
     data.setdefault("value_revision_refs", {})
+    data["narrative_self_refs"] = tuple(data.get("narrative_self_refs", ()))
     data["identity_origin"] = identity_origin_from_json(
         data.get("identity_origin"), fallback_source="legacy_goal"
     )

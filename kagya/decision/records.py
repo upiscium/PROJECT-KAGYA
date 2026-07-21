@@ -132,6 +132,7 @@ class DecisionRecord:
     value_tradeoff_refs: tuple[str, ...] = ()
     training_included: bool = True
     training_exclusion_refs: tuple[str, ...] = ()
+    narrative_self_refs: tuple[str, ...] = ()
     schema_version: int = 7
 
     def __post_init__(self) -> None:
@@ -193,6 +194,7 @@ class DecisionStore:
         identity_origin_refs: dict[str, str] | None = None,
         experience_refs: tuple[str, ...] = (),
         belief_revision_refs: dict[str, int] | None = None,
+        narrative_self_refs: tuple[str, ...] = (),
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -275,6 +277,7 @@ class DecisionStore:
             identity_origin_refs=dict(identity_origin_refs or {}),
             experience_refs=experience_refs,
             belief_revision_refs=dict(belief_revision_refs or {}),
+            narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
         )
         self.records[identifier] = record
         return record
@@ -477,6 +480,7 @@ class DecisionDatasetGenerator:
                         "adapter_id": record.adapter_id,
                         "adapter_hash": record.adapter_hash,
                         "activation_sequence": record.activation_sequence,
+                        "narrative_self_refs": list(record.narrative_self_refs),
                         "candidates": [
                             asdict(item.candidate)
                             for item in record.considered_candidates
@@ -645,6 +649,7 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data["value_tradeoff_refs"] = tuple(data.get("value_tradeoff_refs", ()))
     data.setdefault("training_included", True)
     data["training_exclusion_refs"] = tuple(data.get("training_exclusion_refs", ()))
+    data["narrative_self_refs"] = tuple(data.get("narrative_self_refs", ()))
     data["schema_version"] = 7
     evaluations = []
     for raw in data.get("considered_candidates", ()):

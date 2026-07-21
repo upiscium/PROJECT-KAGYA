@@ -129,7 +129,9 @@ class MotivationDynamics:
         self.records: dict[str, MotivationRecord] = {}
         self.episodes: list[MotivationEpisode] = []
 
-    def observe_experience(self, experience: ExperienceRecord) -> list[MotivationRecord]:
+    def observe_experience(
+        self, experience: ExperienceRecord
+    ) -> list[MotivationRecord]:
         experience_ref = f"experience:{experience.experience_id}"
         if any(
             experience.experience_id in record.related_experience_ids
@@ -184,6 +186,37 @@ class MotivationDynamics:
                 )
             )
         return generated
+
+    def observe_future_self_gap(
+        self,
+        projection_id: str,
+        *,
+        gap: float,
+        uncertainty: float,
+        related_value_ids: tuple[str, ...] = (),
+    ) -> MotivationRecord | None:
+        """Connect a durable desired/current self discrepancy to motivation."""
+        _unit(gap, "future-self gap")
+        _unit(uncertainty, "future-self uncertainty")
+        if gap <= 0.0:
+            return None
+        source_ref = f"future-self:{projection_id}"
+        if any(source_ref in record.source_refs for record in self.records.values()):
+            return next(
+                record
+                for record in self.records.values()
+                if source_ref in record.source_refs
+            )
+        return self._reinforce(
+            MotivationKind.DESIRE,
+            MotivationSource.LEARNING,
+            source_ref,
+            signal=gap,
+            uncertainty=uncertainty,
+            source_ref=source_ref,
+            experience_id=None,
+            value_ids=related_value_ids,
+        )
 
     def register_conflict(self, left_id: str, right_id: str) -> None:
         if left_id == right_id:
@@ -289,7 +322,9 @@ class MotivationDynamics:
         for current in list(self.records.values()):
             if current.status != MotivationStatus.ACTIVE:
                 continue
-            strength = max(0.0, current.strength - current.decay_per_hour * elapsed_hours)
+            strength = max(
+                0.0, current.strength - current.decay_per_hour * elapsed_hours
+            )
             satiation = max(0.0, current.satiation - 0.05 * elapsed_hours)
             status = MotivationStatus.DECAYED if strength < 0.1 else current.status
             updated = self._revise(
@@ -380,7 +415,7 @@ class MotivationDynamics:
         signal: float,
         uncertainty: float,
         source_ref: str,
-        experience_id: str,
+        experience_id: str | None,
         value_ids: tuple[str, ...],
     ) -> MotivationRecord:
         existing = next(
@@ -408,7 +443,9 @@ class MotivationDynamics:
                 decay_per_hour=0.05,
                 conflict_ids=(),
                 related_value_ids=value_ids,
-                related_experience_ids=(experience_id,),
+                related_experience_ids=()
+                if experience_id is None
+                else (experience_id,),
                 related_goal_ids=(),
                 evidence_count=1,
                 status=MotivationStatus.ACTIVE,
@@ -431,9 +468,13 @@ class MotivationDynamics:
                 persistence=min(1.0, existing.persistence + 0.25),
                 satiation=satiation,
                 uncertainty=(existing.uncertainty + uncertainty) / 2.0,
-                related_experience_ids=(
-                    *existing.related_experience_ids,
-                    experience_id,
+                related_experience_ids=tuple(
+                    dict.fromkeys(
+                        (
+                            *existing.related_experience_ids,
+                            *(() if experience_id is None else (experience_id,)),
+                        )
+                    )
                 ),
                 related_value_ids=tuple(
                     dict.fromkeys((*existing.related_value_ids, *value_ids))

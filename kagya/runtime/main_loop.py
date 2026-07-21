@@ -47,10 +47,18 @@ from kagya.decision import (
 )
 from kagya.identity import (
     EndorsementStatus,
+    AutobiographicalEpisode,
+    ContinuityLink,
     EpistemicUncertainty,
     IdentityOrigin,
     IdentityRevisionProposal,
     KnownLimitation,
+    IdentityClaim,
+    IdentityClaimKind,
+    IdentityClaimStatus,
+    FutureSelfProjection,
+    NarrativeChapter,
+    NarrativeSelf,
     OriginActor,
     OriginInputKind,
     SelfModel,
@@ -243,6 +251,7 @@ class KagyaMainLoop:
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
+        self.narrative_self = NarrativeSelf()
         self.belief_store = BeliefStore()
         self.feedback_store = FeedbackStore()
         self.default_context_id: str | None = None
@@ -252,6 +261,7 @@ class KagyaMainLoop:
         self.restore_decision_state()
         self.restore_self_model_state()
         self.restore_experience_state()
+        self.restore_narrative_self_state()
         self.restore_belief_state()
         self.restore_attention_state()
         self.restore_feedback_state()
@@ -275,6 +285,7 @@ class KagyaMainLoop:
         previous_calibration = self.surprisal_calculator.export_history()
         previous_experience_state = self.experience_store.to_json()
         previous_motivation_state = self.motivation_dynamics.to_json()
+        previous_narrative_state = self.narrative_self.to_json()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -511,6 +522,20 @@ class KagyaMainLoop:
                 )
             )
             self._persist_experience_state()
+            narrative_episode = self.narrative_self.observe_experience(experience)
+            if narrative_episode is not None:
+                experience = self.experience_store.link_result(
+                    experience.experience_id,
+                    kind="narrative",
+                    reference=f"narrative:{narrative_episode.episode_id}",
+                    evidence_refs=(f"experience:{experience.experience_id}",),
+                    event_id=None if event is None else event.event_id,
+                    event_sequence=None if event is None else event.processing_sequence,
+                )
+                self._persist_experience_state()
+                self._sync_self_references()
+                self._persist_self_model_state()
+            self._persist_narrative_self_state()
             self.motivation_dynamics.observe_experience(experience)
             self._persist_motivation_state()
             self.memory_system.link_experience(
@@ -565,6 +590,10 @@ class KagyaMainLoop:
             self._persist_experience_state()
             self.motivation_dynamics.restore(previous_motivation_state)
             self._persist_motivation_state()
+            self.narrative_self.restore(previous_narrative_state)
+            self._persist_narrative_self_state()
+            self._sync_self_references()
+            self._persist_self_model_state()
             raise
         return ChatResult(
             episode_id=episode_id,
@@ -637,6 +666,18 @@ class KagyaMainLoop:
     def _persist_experience_state(self) -> None:
         self.persistent_state.extensions["experiences"] = (
             self.experience_store.to_json()
+        )
+
+    def restore_narrative_self_state(self) -> None:
+        self.narrative_self.restore(
+            self.persistent_state.identity_extensions.get("narrative_self")
+        )
+        self._sync_self_references()
+        self._persist_narrative_self_state()
+
+    def _persist_narrative_self_state(self) -> None:
+        self.persistent_state.identity_extensions["narrative_self"] = (
+            self.narrative_self.to_json()
         )
 
     def restore_attention_state(self) -> None:
@@ -1014,7 +1055,9 @@ class KagyaMainLoop:
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
         )
+        self.narrative_self.observe_experience(record)
         self._persist_experience_state()
+        self._persist_narrative_self_state()
         return record
 
     def restore_value_state(self) -> None:
@@ -1212,6 +1255,22 @@ class KagyaMainLoop:
             self.value_system.get(origin_value_id)
         if value_effects:
             self.value_system.evaluate({"goal_proposal": value_effects})
+        target = structured_target or {}
+        narrative_selection = self.narrative_self.select_relevant(
+            theme_codes=_string_values(target.get("theme_codes"))
+            + _string_values(target.get("topic_tags")),
+            capability_ids=_string_values(target.get("capability_ids")),
+        )
+        narrative_refs = tuple(
+            f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
+            for claim_id in narrative_selection.claim_ids
+        )
+        projection_id = target.get("future_self_projection_id")
+        if (
+            isinstance(projection_id, str)
+            and projection_id in self.narrative_self.future_self
+        ):
+            narrative_refs = (*narrative_refs, f"future-self:{projection_id}")
         identity_origin: IdentityOrigin | None = None
         if origin_actor is not None:
             identity_origin = new_identity_origin(
@@ -1241,6 +1300,7 @@ class KagyaMainLoop:
                 for value_id in set(value_effects or {})
                 | ({origin_value_id} if origin_value_id is not None else set())
             },
+            narrative_self_refs=narrative_refs,
             needs_information=needs_information,
             goal_id=goal_id,
         )
@@ -2042,6 +2102,19 @@ class KagyaMainLoop:
             else self.experience_store.latest_for_context(context_id)
         )
         active_beliefs = self.belief_store.active(context_id=context_id)
+        narrative_claim_ids = tuple(
+            dict.fromkeys(
+                claim_id
+                for candidate in candidates
+                for claim_id in self.narrative_self.select_relevant(
+                    theme_codes=_string_values(candidate.parameters.get("topic_tags"))
+                    + _string_values(candidate.parameters.get("theme_codes")),
+                    capability_ids=_string_values(
+                        candidate.parameters.get("capability_ids")
+                    ),
+                ).claim_ids
+            )
+        )
         record = self.decision_store.create(
             candidates,
             triggering_event_id=None if event is None else event.event_id,
@@ -2085,6 +2158,10 @@ class KagyaMainLoop:
             belief_revision_refs={
                 belief.belief_id: belief.revision for belief in active_beliefs
             },
+            narrative_self_refs=tuple(
+                f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
+                for claim_id in narrative_claim_ids
+            ),
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"
@@ -2315,6 +2392,149 @@ class KagyaMainLoop:
         self._persist_self_model_state()
         return state
 
+    def form_autobiographical_episode(
+        self, experience_id: str
+    ) -> AutobiographicalEpisode:
+        experience = self.experience_store.get(experience_id)
+        episode = self.narrative_self.observe_experience(experience)
+        if episode is None:
+            raise ValueError(
+                "Experience does not meet autobiographical importance threshold"
+            )
+        self.link_experience_result(
+            experience_id,
+            kind="narrative",
+            reference=f"narrative:{episode.episode_id}",
+            evidence_refs=(f"experience:{experience_id}",),
+        )
+        self._sync_self_references()
+        self._persist_self_model_state()
+        self._persist_narrative_self_state()
+        return episode
+
+    def create_narrative_chapter(
+        self,
+        *,
+        title: str,
+        theme_codes: tuple[str, ...],
+        episode_ids: tuple[str, ...],
+        chapter_id: str | None = None,
+    ) -> NarrativeChapter:
+        chapter = self.narrative_self.create_chapter(
+            title=title,
+            theme_codes=theme_codes,
+            episode_ids=episode_ids,
+            chapter_id=chapter_id,
+        )
+        self._persist_narrative_self_state()
+        return chapter
+
+    def propose_narrative_claim(
+        self,
+        *,
+        kind: IdentityClaimKind,
+        statement: str,
+        polarity: int,
+        theme_codes: tuple[str, ...],
+        confidence: float,
+        stability: float,
+        evidence_refs: tuple[str, ...],
+        related_experience_ids: tuple[str, ...] = (),
+        related_value_refs: tuple[str, ...] = (),
+        related_goal_refs: tuple[str, ...] = (),
+        related_decision_refs: tuple[str, ...] = (),
+        claim_id: str | None = None,
+    ) -> IdentityClaim:
+        claim = self.narrative_self.propose_claim(
+            kind=kind,
+            statement=statement,
+            polarity=polarity,
+            theme_codes=theme_codes,
+            confidence=confidence,
+            stability=stability,
+            evidence_refs=evidence_refs,
+            related_experience_ids=related_experience_ids,
+            related_value_refs=related_value_refs,
+            related_goal_refs=related_goal_refs,
+            related_decision_refs=related_decision_refs,
+            claim_id=claim_id,
+        )
+        self._persist_narrative_self_state()
+        return claim
+
+    def revise_narrative_claim(
+        self,
+        claim_id: str,
+        *,
+        confidence: float,
+        reason_code: str,
+        evidence_refs: tuple[str, ...] = (),
+        counterevidence_refs: tuple[str, ...] = (),
+        status: IdentityClaimStatus | None = None,
+    ) -> IdentityClaim:
+        claim = self.narrative_self.revise_claim(
+            claim_id,
+            confidence=confidence,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            counterevidence_refs=counterevidence_refs,
+            status=status,
+        )
+        self._persist_narrative_self_state()
+        return claim
+
+    def set_future_self_projection(
+        self,
+        *,
+        description: str,
+        theme_codes: tuple[str, ...],
+        desired_level: float,
+        current_level: float,
+        evidence_refs: tuple[str, ...],
+        projection_id: str | None = None,
+    ) -> FutureSelfProjection:
+        projection = self.narrative_self.set_future_self(
+            description=description,
+            theme_codes=theme_codes,
+            desired_level=desired_level,
+            current_level=current_level,
+            evidence_refs=evidence_refs,
+            projection_id=projection_id,
+        )
+        motivation = self.motivation_dynamics.observe_future_self_gap(
+            projection.projection_id,
+            gap=projection.gap,
+            uncertainty=1.0 - min(1.0, len(evidence_refs) * 0.25),
+        )
+        if motivation is not None:
+            projection = self.narrative_self.link_future_motivation(
+                projection.projection_id, motivation.motivation_id
+            )
+        self._persist_narrative_self_state()
+        self._persist_motivation_state()
+        return projection
+
+    def create_narrative_continuity_link(
+        self,
+        earlier_ref: str,
+        later_ref: str,
+        *,
+        relation_code: str,
+        evidence_refs: tuple[str, ...],
+        confidence: float,
+        link_id: str | None = None,
+    ) -> ContinuityLink:
+        link = self.narrative_self.link_continuity(
+            earlier_ref,
+            later_ref,
+            relation_code=relation_code,
+            evidence_refs=evidence_refs,
+            confidence=confidence,
+            link_id=link_id,
+        )
+        self._persist_narrative_self_state()
+        return link
+
     def _sync_self_references(self) -> None:
         self.self_model.sync_references(
             commitment_refs=(
@@ -2325,6 +2545,10 @@ class KagyaMainLoop:
                 value.value_id: value.revision
                 for value in self.value_system.list_values()
             },
+            autobiographical_summary_refs=(
+                f"narrative:{episode.episode_id}"
+                for episode in self.narrative_self.episodes.values()
+            ),
         )
 
     def _sync_self_model_working_memory(
@@ -2335,7 +2559,16 @@ class KagyaMainLoop:
                 self.working_memory.forget(item.item_id)
         for candidate in candidates:
             selection = self.self_model.select_relevant(candidate)
-            for index, rendered in enumerate(selection.rendered_items):
+            narrative = self.narrative_self.select_relevant(
+                theme_codes=_string_values(candidate.parameters.get("topic_tags"))
+                + _string_values(candidate.parameters.get("theme_codes")),
+                capability_ids=_string_values(
+                    candidate.parameters.get("capability_ids")
+                ),
+            )
+            for index, rendered in enumerate(
+                (*selection.rendered_items, *narrative.rendered_items)
+            ):
                 self.working_memory.admit(
                     working_memory_item(
                         item_id=f"self:{candidate.candidate_id}:{index}",
@@ -2529,6 +2762,12 @@ def _generate_fallback(provider: ModelProvider, prompt: str) -> str:
     if not callable(generate_fallback):
         raise RuntimeError("Model generation failed and no fallback model is available")
     return str(generate_fallback(prompt))
+
+
+def _string_values(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 def _fallback_used(provider: ModelProvider) -> bool:
