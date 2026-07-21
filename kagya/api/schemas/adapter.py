@@ -17,7 +17,20 @@ class AdapterResponse(BaseModel):
     notes: str
     base_model_revision: str | None = None
     adapter_hash: str | None = None
+    parent_adapter_id: str | None = None
+    parent_adapter_hash: str | None = None
     activation_sequence: int | None = None
+    dataset_repetition_count: int = 0
+    dataset_overlap_count: int = 0
+    dataset_overlap_ratio: float = 0.0
+    holdout_score: float | None = None
+    holdout_baseline_score: float | None = None
+    holdout_regression: bool = False
+    drift_scores: dict[str, float] | None = None
+    activation_gate_passed: bool = False
+    rollout_state: str = "candidate"
+    canary_failures: int = 0
+    rollback_target_id: str | None = None
 
 
 class AdapterListResponse(BaseModel):
@@ -26,6 +39,12 @@ class AdapterListResponse(BaseModel):
 
 class AdapterEvaluateRequest(BaseModel):
     deterministic_score: float | None = None
+    deterministic_dimensions: dict[str, float] | None = None
+    deterministic_baselines: dict[str, float] | None = None
+
+
+class AdapterCanaryRequest(BaseModel):
+    success: bool
 
 
 class AdapterEvaluateResponse(BaseModel):

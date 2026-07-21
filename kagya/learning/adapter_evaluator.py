@@ -11,7 +11,7 @@ from typing import Any
 
 from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterRegistry, AdapterStatus
-from kagya.learning.eval_sets import EvalSet, load_eval_sets
+from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
 from kagya.models import ModelProvider
 
 
@@ -36,6 +36,10 @@ class AdapterEvaluationResult:
     regression: bool = False
     status_before: str = ""
     status_after: str = ""
+    holdout_score: float | None = None
+    holdout_baseline_score: float | None = None
+    drift_scores: dict[str, float] | None = None
+    activation_gate_passed: bool = False
 
 
 class AdapterEvaluator:
@@ -52,6 +56,8 @@ class AdapterEvaluator:
         *,
         baseline_provider: ModelProvider | None = None,
         deterministic_score: float | None = None,
+        deterministic_dimensions: dict[str, float] | None = None,
+        deterministic_baselines: dict[str, float] | None = None,
     ) -> AdapterEvaluationResult:
         entry = self.registry.lookup(adapter_id)
         if entry is None:
@@ -64,12 +70,21 @@ class AdapterEvaluator:
             self.settings.adapter_registry.eval_sets,
             require_existing=deterministic_score is None,
         )
+        if entry.evaluation_dataset_path is not None:
+            eval_sets.append(_load_lineage_holdout(Path(entry.evaluation_dataset_path)))
         case_count = sum(len(eval_set.cases) for eval_set in eval_sets)
         if deterministic_score is None and case_count == 0:
-            raise ValueError("No evaluation cases loaded; configure eval sets or provide a deterministic score")
+            raise ValueError(
+                "No evaluation cases loaded; configure eval sets or provide a deterministic score"
+            )
         baseline_score: float | None = None
         if deterministic_score is None:
-            baseline_score, candidate_score = self._score_pair(
+            (
+                baseline_score,
+                candidate_score,
+                baseline_dimensions,
+                candidate_dimensions,
+            ) = self._score_pair(
                 provider,
                 baseline_provider or provider,
                 eval_sets,
@@ -78,13 +93,41 @@ class AdapterEvaluator:
         else:
             candidate_score = deterministic_score
             score_delta = None
+            candidate_dimensions = dict(deterministic_dimensions or {})
+            baseline_dimensions = dict(deterministic_baselines or {})
         score = candidate_score
         decision = self._decision(score)
         previous_score = self._previous_score(adapter_id)
         if deterministic_score is not None:
             score_delta = None if previous_score is None else score - previous_score
         regression = score_delta is not None and score_delta < 0
-        if regression and deterministic_score is None:
+        drift_scores = {
+            dimension: candidate_dimensions[dimension] - baseline_dimensions[dimension]
+            for dimension in ("identity", "value", "behavior")
+            if dimension in candidate_dimensions and dimension in baseline_dimensions
+        }
+        holdout_score = candidate_dimensions.get("holdout")
+        holdout_baseline_score = baseline_dimensions.get("holdout")
+        holdout_regression = (
+            holdout_score is not None
+            and holdout_baseline_score is not None
+            and holdout_score
+            < holdout_baseline_score
+            - self.settings.adapter_registry.holdout_regression_tolerance
+        )
+        drift_limits = {
+            "identity": self.settings.adapter_registry.max_identity_drift,
+            "value": self.settings.adapter_registry.max_value_drift,
+            "behavior": self.settings.adapter_registry.max_behavior_drift,
+        }
+        drift_regression = any(
+            delta < -drift_limits[dimension]
+            for dimension, delta in drift_scores.items()
+        )
+        activation_gate_passed = not (
+            regression or holdout_regression or drift_regression
+        )
+        if not activation_gate_passed:
             decision = AdapterEvaluationDecision.CANDIDATE
         status_after = decision.value
         result_path = self._write_result(
@@ -99,12 +142,20 @@ class AdapterEvaluator:
             regression=regression,
             status_before=status_before,
             status_after=status_after,
+            holdout_score=holdout_score,
+            holdout_baseline_score=holdout_baseline_score,
+            drift_scores=drift_scores,
+            activation_gate_passed=activation_gate_passed,
         )
         self.registry.apply_evaluation(
             adapter_id,
             score=score,
             result_path=result_path,
             next_status=AdapterStatus(decision.value),
+            holdout_score=holdout_score,
+            holdout_baseline_score=holdout_baseline_score,
+            drift_scores=drift_scores,
+            activation_gate_passed=activation_gate_passed,
         )
         return AdapterEvaluationResult(
             adapter_id=adapter_id,
@@ -120,6 +171,10 @@ class AdapterEvaluator:
             regression=regression,
             status_before=status_before,
             status_after=status_after,
+            holdout_score=holdout_score,
+            holdout_baseline_score=holdout_baseline_score,
+            drift_scores=drift_scores,
+            activation_gate_passed=activation_gate_passed,
         )
 
     def _score_pair(
@@ -127,22 +182,49 @@ class AdapterEvaluator:
         candidate_provider: ModelProvider,
         baseline_provider: ModelProvider,
         eval_sets: list[EvalSet],
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, dict[str, float], dict[str, float]]:
         cases = [case for eval_set in eval_sets for case in eval_set.cases]
         if not cases:
-            return 0.0, 0.0
+            return 0.0, 0.0, {}, {}
         baseline_total = 0.0
         candidate_total = 0.0
-        for case in cases:
-            baseline_output = baseline_provider.generate(case.prompt)
-            if bool(getattr(baseline_provider, "last_fallback_used", False)):
-                raise ValueError("Baseline provider used fallback during evaluation")
-            candidate_output = candidate_provider.generate(case.prompt)
-            if bool(getattr(candidate_provider, "last_fallback_used", False)):
-                raise ValueError("Candidate provider used fallback during evaluation")
-            baseline_total += _output_score(baseline_output, case.expected)
-            candidate_total += _output_score(candidate_output, case.expected)
-        return baseline_total / len(cases), candidate_total / len(cases)
+        dimension_totals: dict[str, list[float]] = {}
+        baseline_dimension_totals: dict[str, list[float]] = {}
+        for eval_set in eval_sets:
+            dimension = _evaluation_dimension(eval_set.path)
+            for case in eval_set.cases:
+                baseline_output = baseline_provider.generate(case.prompt)
+                if bool(getattr(baseline_provider, "last_fallback_used", False)):
+                    raise ValueError(
+                        "Baseline provider used fallback during evaluation"
+                    )
+                candidate_output = candidate_provider.generate(case.prompt)
+                if bool(getattr(candidate_provider, "last_fallback_used", False)):
+                    raise ValueError(
+                        "Candidate provider used fallback during evaluation"
+                    )
+                baseline_case = _output_score(baseline_output, case.expected)
+                candidate_case = _output_score(candidate_output, case.expected)
+                baseline_total += baseline_case
+                candidate_total += candidate_case
+                if dimension is not None:
+                    baseline_dimension_totals.setdefault(dimension, []).append(
+                        baseline_case
+                    )
+                    dimension_totals.setdefault(dimension, []).append(candidate_case)
+        baseline_dimensions = {
+            key: sum(values) / len(values)
+            for key, values in baseline_dimension_totals.items()
+        }
+        candidate_dimensions = {
+            key: sum(values) / len(values) for key, values in dimension_totals.items()
+        }
+        return (
+            baseline_total / len(cases),
+            candidate_total / len(cases),
+            baseline_dimensions,
+            candidate_dimensions,
+        )
 
     def _decision(self, score: float) -> AdapterEvaluationDecision:
         if score >= self.settings.adapter_registry.trial_threshold:
@@ -165,11 +247,18 @@ class AdapterEvaluator:
         regression: bool,
         status_before: str,
         status_after: str,
+        holdout_score: float | None,
+        holdout_baseline_score: float | None,
+        drift_scores: dict[str, float],
+        activation_gate_passed: bool,
     ) -> Path:
         result_dir = self.settings.adapter_registry.eval_result_dir
         result_dir.mkdir(parents=True, exist_ok=True)
         created_at = datetime.now(UTC).isoformat()
-        result_path = result_dir / f"{_safe_filename(adapter_id)}-{_timestamp_slug(created_at)}.json"
+        result_path = (
+            result_dir
+            / f"{_safe_filename(adapter_id)}-{_timestamp_slug(created_at)}.json"
+        )
         payload: dict[str, Any] = {
             "adapter_id": adapter_id,
             "score": score,
@@ -181,6 +270,10 @@ class AdapterEvaluator:
             "decision": decision.value,
             "status_before": status_before,
             "status_after": status_after,
+            "holdout_score": holdout_score,
+            "holdout_baseline_score": holdout_baseline_score,
+            "drift_scores": drift_scores,
+            "activation_gate_passed": activation_gate_passed,
             "eval_sets": [str(eval_set.path) for eval_set in eval_sets],
             "case_count": sum(len(eval_set.cases) for eval_set in eval_sets),
             "created_at": created_at,
@@ -242,3 +335,33 @@ def _safe_filename(adapter_id: str) -> str:
 
 def _timestamp_slug(timestamp: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "", timestamp)
+
+
+def _evaluation_dimension(path: Path) -> str | None:
+    name = path.stem.casefold()
+    return next(
+        (item for item in ("identity", "value", "behavior", "holdout") if item in name),
+        None,
+    )
+
+
+def _load_lineage_holdout(path: Path) -> EvalSet:
+    if not path.is_file():
+        raise ValueError(f"Lineage holdout does not exist: {path}")
+    cases: list[EvalCase] = []
+    try:
+        for line in path.read_text("utf-8").splitlines():
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("Lineage holdout records must be objects")
+            cases.append(
+                EvalCase(
+                    prompt=str(value.get("prompt", value.get("input", ""))),
+                    expected=str(value.get("expected", value.get("output", ""))),
+                )
+            )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Lineage holdout is invalid JSONL: {path}") from exc
+    return EvalSet(path=path.with_name(f"holdout-{path.name}"), cases=cases)

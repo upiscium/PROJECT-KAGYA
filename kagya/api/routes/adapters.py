@@ -17,6 +17,7 @@ from kagya.api.dependencies import (
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.adapter import (
     AdapterEvaluateRequest,
+    AdapterCanaryRequest,
     AdapterEvaluateResponse,
     AdapterListResponse,
     AdapterResponse,
@@ -72,7 +73,10 @@ def adapter_provenance(
         raise HTTPException(status_code=404, detail=f"Unknown adapter: {adapter_id}")
     return {
         "adapter": asdict(entry),
-        "activation_history": [asdict(record) for record in manager.history(adapter_id)],
+        "lineage": [asdict(item) for item in registry.lineage(adapter_id)],
+        "activation_history": [
+            asdict(record) for record in manager.history(adapter_id)
+        ],
     }
 
 
@@ -87,9 +91,7 @@ def list_adapters(
         source="api.adapters.list",
         handler=registry.list,
     ).value
-    return AdapterListResponse(
-        adapters=[adapter_response(entry) for entry in entries]
-    )
+    return AdapterListResponse(adapters=[adapter_response(entry) for entry in entries])
 
 
 @router.post("/{adapter_id}/evaluate", response_model=AdapterEvaluateResponse)
@@ -225,6 +227,34 @@ def rollback_adapter(
     return AdapterActivationResponse.model_validate(record.__dict__)
 
 
+@router.post("/{adapter_id}/canary")
+def report_adapter_canary(
+    adapter_id: str,
+    request: AdapterCanaryRequest,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
+) -> dict:
+    current = manager.current()
+    if current.adapter_id != adapter_id:
+        raise HTTPException(status_code=400, detail="Adapter is not the active canary")
+    try:
+        rollback = execute_agent_event(
+            runtime,
+            AgentEventType.ADAPTER_UPDATE,
+            source="api.adapters.canary",
+            handler=lambda: manager.report_canary(success=request.success),
+            payload={"adapter_id": adapter_id, "success": request.success},
+        ).value
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "adapter_id": adapter_id,
+        "success": request.success,
+        "automatic_rollback": rollback is not None,
+        "rollback": None if rollback is None else asdict(rollback),
+    }
+
+
 @router.post("/{adapter_id}/reject", response_model=AdapterResponse)
 def reject_adapter(
     adapter_id: str,
@@ -269,6 +299,8 @@ def _evaluate_candidate(
             adapter_id,
             runtime_provider,
             deterministic_score=request.deterministic_score,
+            deterministic_dimensions=request.deterministic_dimensions,
+            deterministic_baselines=request.deterministic_baselines,
         )
     entry = registry.lookup(adapter_id)
     if entry is None:
@@ -346,5 +378,18 @@ def adapter_response(entry: AdapterEntry) -> AdapterResponse:
         notes=entry.notes,
         base_model_revision=entry.base_model_revision,
         adapter_hash=entry.adapter_hash,
+        parent_adapter_id=entry.parent_adapter_id,
+        parent_adapter_hash=entry.parent_adapter_hash,
         activation_sequence=entry.activation_sequence,
+        dataset_repetition_count=entry.dataset_repetition_count,
+        dataset_overlap_count=entry.dataset_overlap_count,
+        dataset_overlap_ratio=entry.dataset_overlap_ratio,
+        holdout_score=entry.holdout_score,
+        holdout_baseline_score=entry.holdout_baseline_score,
+        holdout_regression=entry.holdout_regression,
+        drift_scores=entry.drift_scores,
+        activation_gate_passed=entry.activation_gate_passed,
+        rollout_state=entry.rollout_state,
+        canary_failures=entry.canary_failures,
+        rollback_target_id=entry.rollback_target_id,
     )

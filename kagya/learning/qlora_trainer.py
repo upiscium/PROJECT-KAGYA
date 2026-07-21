@@ -12,7 +12,11 @@ from typing import Any
 from uuid import uuid4
 
 from kagya.config import Settings
-from kagya.learning.dream_dataset_generator import DreamDatasetRecord, format_training_text
+from kagya.learning.adapter_registry import AdapterRegistry
+from kagya.learning.dream_dataset_generator import (
+    DreamDatasetRecord,
+    format_training_text,
+)
 
 
 class QloraTrainingError(RuntimeError):
@@ -30,13 +34,19 @@ class QloraTrainingResult:
     dry_run: bool
     training_records: int
     artifact_path: Path | None = None
+    parent_adapter_id: str | None = None
+    parent_adapter_hash: str | None = None
+    adapter_hash: str | None = None
 
 
 class QloraTrainer:
     """Validate dream datasets and optionally run QLoRA training."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, registry: AdapterRegistry | None = None
+    ) -> None:
         self.settings = settings
+        self.registry = registry
 
     def train_bundle(self, bundle_path: Path) -> QloraTrainingResult:
         from kagya.training.artifacts import TrainingArtifactContract
@@ -48,15 +58,35 @@ class QloraTrainer:
             expected_processor_revision=self.settings.model.processor_revision,
         )
         if manifest.chat_template_version != "gemma-v1":
-            raise QloraTrainingError("chat_template_mismatch", manifest.chat_template_version)
-        if manifest.dataset_format_version != "dream-v2":
-            raise QloraTrainingError("dataset_version_mismatch", manifest.dataset_format_version)
-        if manifest.parent_adapter_id is not None:
             raise QloraTrainingError(
-                "parent_adapter_unsupported",
-                "continued training is disabled until parent adapter validation is implemented",
+                "chat_template_mismatch", manifest.chat_template_version
             )
-        return self.train(bundle_path / manifest.dataset_path)
+        if manifest.dataset_format_version != "dream-v2":
+            raise QloraTrainingError(
+                "dataset_version_mismatch", manifest.dataset_format_version
+            )
+        if manifest.parent_adapter_id is not None:
+            if self.registry is not None:
+                self.registry.validate_continuation(
+                    adapter_id=f"training:{manifest.job_id}",
+                    base_model=manifest.base_model_id,
+                    base_model_revision=manifest.base_model_revision,
+                    parent_adapter_id=manifest.parent_adapter_id,
+                    parent_adapter_hash=manifest.parent_adapter_hash,
+                )
+            if not self.settings.qlora.dry_run:
+                raise QloraTrainingError(
+                    "hardware_validation_required",
+                    "continued adapter loading remains gated by hardware validation issue #98",
+                )
+        result = self.train(bundle_path / manifest.dataset_path)
+        return QloraTrainingResult(
+            **{
+                **result.__dict__,
+                "parent_adapter_id": manifest.parent_adapter_id,
+                "parent_adapter_hash": manifest.parent_adapter_hash,
+            }
+        )
 
     def train(self, dataset_path: Path) -> QloraTrainingResult:
         records = self._load_dataset(dataset_path)
@@ -86,6 +116,7 @@ class QloraTrainer:
             dataset_hash=dataset_hash,
             dry_run=self.settings.qlora.dry_run,
             training_records=len(records),
+            adapter_hash=_hash_directory(adapter_path),
         )
 
     def _load_dataset(self, dataset_path: Path) -> list[DreamDatasetRecord]:
@@ -104,7 +135,9 @@ class QloraTrainer:
                         output=str(data["output"]),
                     )
                 except KeyError as exc:
-                    raise ValueError(f"Invalid dream dataset record at line {line_number}") from exc
+                    raise ValueError(
+                        f"Invalid dream dataset record at line {line_number}"
+                    ) from exc
                 format_training_text(record)
                 records.append(record)
         if not records:
@@ -119,7 +152,9 @@ class QloraTrainer:
         records: list[DreamDatasetRecord],
     ) -> None:
         manifest = self._training_manifest(True, dataset_path, dataset_hash, records)
-        with (adapter_path / "dry_run_manifest.json").open("w", encoding="utf-8") as manifest_file:
+        with (adapter_path / "dry_run_manifest.json").open(
+            "w", encoding="utf-8"
+        ) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
     def _run_training(
@@ -139,9 +174,7 @@ class QloraTrainer:
                 "chat_template_mismatch", "processor has no configured chat template"
             )
         if getattr(processor, "tokenizer", None) is None:
-            raise QloraTrainingError(
-                "tokenizer_mismatch", "processor has no tokenizer"
-            )
+            raise QloraTrainingError("tokenizer_mismatch", "processor has no tokenizer")
         model = deps["AutoModelForImageTextToText"].from_pretrained(
             self.settings.model.primary_id,
             revision=self.settings.model.revision,
@@ -179,16 +212,26 @@ class QloraTrainer:
             save_strategy="no",
             report_to=[],
         )
-        trainer = self._build_trainer(deps, model, processor, dataset, peft_config, training_args)
+        trainer = self._build_trainer(
+            deps, model, processor, dataset, peft_config, training_args
+        )
         try:
             output = trainer.train(resume_from_checkpoint=False)
         except Exception as exc:
-            if exc.__class__.__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower():
+            if (
+                exc.__class__.__name__ == "OutOfMemoryError"
+                or "out of memory" in str(exc).lower()
+            ):
                 raise QloraTrainingError("cuda_oom", str(exc)) from exc
             raise QloraTrainingError("training_failed", str(exc)) from exc
         metrics = getattr(output, "metrics", {}) if output is not None else {}
-        if any(isinstance(value, float) and not math.isfinite(value) for value in metrics.values()):
-            raise QloraTrainingError("non_finite_metrics", "training returned NaN or infinity")
+        if any(
+            isinstance(value, float) and not math.isfinite(value)
+            for value in metrics.values()
+        ):
+            raise QloraTrainingError(
+                "non_finite_metrics", "training returned NaN or infinity"
+            )
         trainer.save_model(str(adapter_path))
         self._write_training_manifest(
             adapter_path, dataset_path, dataset_hash, records, metrics=metrics
@@ -197,22 +240,31 @@ class QloraTrainer:
     def _validate_target_modules(self, model: Any) -> None:
         named_modules = getattr(model, "named_modules", None)
         if not callable(named_modules):
-            raise QloraTrainingError("target_module_mismatch", "model exposes no named modules")
+            raise QloraTrainingError(
+                "target_module_mismatch", "model exposes no named modules"
+            )
         available = {name.rsplit(".", 1)[-1] for name, _module in named_modules()}
         missing = set(self.settings.qlora.target_modules) - available
         if missing:
             raise QloraTrainingError(
-                "target_module_mismatch", "missing modules: " + ", ".join(sorted(missing))
+                "target_module_mismatch",
+                "missing modules: " + ", ".join(sorted(missing)),
             )
 
     def _load_training_dependencies(self) -> dict[str, Any]:
         try:
             from datasets import Dataset  # type: ignore[import-untyped]
             from peft import LoraConfig, prepare_model_for_kbit_training
-            from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+            from transformers import (
+                AutoModelForImageTextToText,
+                AutoProcessor,
+                BitsAndBytesConfig,
+            )
             from trl import SFTConfig, SFTTrainer
         except ImportError as exc:
-            raise RuntimeError("Non-dry-run QLoRA training dependencies are not installed") from exc
+            raise RuntimeError(
+                "Non-dry-run QLoRA training dependencies are not installed"
+            ) from exc
         return {
             "AutoModelForImageTextToText": AutoModelForImageTextToText,
             "AutoProcessor": AutoProcessor,
@@ -282,7 +334,9 @@ class QloraTrainer:
         manifest = self._training_manifest(False, dataset_path, dataset_hash, records)
         manifest["metrics"] = metrics
         manifest["environment"] = self._environment_metadata()
-        with (adapter_path / "training_manifest.json").open("w", encoding="utf-8") as manifest_file:
+        with (adapter_path / "training_manifest.json").open(
+            "w", encoding="utf-8"
+        ) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
     def _training_manifest(
@@ -345,4 +399,13 @@ def _hash_file(path: Path) -> str:
     with path.open("rb") as target_file:
         for chunk in iter(lambda: target_file.read(1024 * 1024), b""):
             hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _hash_directory(path: Path) -> str:
+    hasher = hashlib.sha256()
+    for item in sorted(path.rglob("*")):
+        if item.is_file():
+            hasher.update(item.relative_to(path).as_posix().encode())
+            hasher.update(item.read_bytes())
     return hasher.hexdigest()

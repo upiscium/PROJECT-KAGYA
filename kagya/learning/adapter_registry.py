@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import builtins
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,7 @@ class AdapterEntry:
     base_model_revision: str | None = None
     adapter_hash: str | None = None
     parent_adapter_id: str | None = None
+    parent_adapter_hash: str | None = None
     training_job_id: str | None = None
     training_node_id: str | None = None
     submitted_by_node_id: str | None = None
@@ -51,7 +53,21 @@ class AdapterEntry:
     worker_evaluation_path: str | None = None
     local_evaluation_path: str | None = None
     activation_sequence: int | None = None
-    schema_version: int = 2
+    evaluation_set_hashes: tuple[str, ...] = ()
+    evaluation_dataset_path: str | None = None
+    dataset_record_hashes: tuple[str, ...] = ()
+    dataset_repetition_count: int = 0
+    dataset_overlap_count: int = 0
+    dataset_overlap_ratio: float = 0.0
+    holdout_score: float | None = None
+    holdout_baseline_score: float | None = None
+    holdout_regression: bool = False
+    drift_scores: dict[str, float] | None = None
+    activation_gate_passed: bool = False
+    rollout_state: str = "candidate"
+    canary_failures: int = 0
+    rollback_target_id: str | None = None
+    schema_version: int = 3
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -77,6 +93,7 @@ class AdapterEntry:
             base_model_revision=_optional_str(data.get("base_model_revision")),
             adapter_hash=_optional_str(data.get("adapter_hash")),
             parent_adapter_id=_optional_str(data.get("parent_adapter_id")),
+            parent_adapter_hash=_optional_str(data.get("parent_adapter_hash")),
             training_job_id=_optional_str(data.get("training_job_id")),
             training_node_id=_optional_str(data.get("training_node_id")),
             submitted_by_node_id=_optional_str(data.get("submitted_by_node_id")),
@@ -89,6 +106,29 @@ class AdapterEntry:
                 if data.get("activation_sequence") is None
                 else int(data["activation_sequence"])
             ),
+            evaluation_set_hashes=tuple(
+                str(item) for item in data.get("evaluation_set_hashes", ())
+            ),
+            evaluation_dataset_path=_optional_str(data.get("evaluation_dataset_path")),
+            dataset_record_hashes=tuple(
+                str(item) for item in data.get("dataset_record_hashes", ())
+            ),
+            dataset_repetition_count=int(data.get("dataset_repetition_count", 0)),
+            dataset_overlap_count=int(data.get("dataset_overlap_count", 0)),
+            dataset_overlap_ratio=float(data.get("dataset_overlap_ratio", 0.0)),
+            holdout_score=_optional_float(data.get("holdout_score")),
+            holdout_baseline_score=_optional_float(data.get("holdout_baseline_score")),
+            holdout_regression=bool(data.get("holdout_regression", False)),
+            drift_scores={
+                str(key): float(value)
+                for key, value in data.get("drift_scores", {}).items()
+            }
+            if isinstance(data.get("drift_scores"), dict)
+            else None,
+            activation_gate_passed=bool(data.get("activation_gate_passed", False)),
+            rollout_state=str(data.get("rollout_state", "candidate")),
+            canary_failures=int(data.get("canary_failures", 0)),
+            rollback_target_id=_optional_str(data.get("rollback_target_id")),
             schema_version=int(data.get("schema_version", 1)),
         )
 
@@ -113,6 +153,7 @@ class AdapterRegistry:
         base_model_revision: str | None = None,
         adapter_hash: str | None = None,
         parent_adapter_id: str | None = None,
+        parent_adapter_hash: str | None = None,
         training_job_id: str | None = None,
         training_node_id: str | None = None,
         submitted_by_node_id: str | None = None,
@@ -120,6 +161,8 @@ class AdapterRegistry:
         training_manifest_path: str | None = None,
         worker_evaluation_path: str | None = None,
         local_evaluation_path: str | None = None,
+        evaluation_set_hashes: tuple[str, ...] = (),
+        evaluation_dataset_path: str | Path | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
@@ -133,6 +176,20 @@ class AdapterRegistry:
                 entry.training_job_id == training_job_id for entry in entries
             ):
                 raise ValueError(f"Training job already registered: {training_job_id}")
+            self._validate_lineage_locked(
+                entries,
+                adapter_id=adapter_id,
+                base_model=base_model or self.settings.model.primary_id,
+                base_model_revision=base_model_revision,
+                parent_adapter_id=parent_adapter_id,
+                parent_adapter_hash=parent_adapter_hash,
+            )
+            record_hashes, repetitions = _dataset_record_hashes(Path(dataset_path))
+            ancestor_hashes: set[str] = set()
+            if parent_adapter_id is not None:
+                for ancestor in self._lineage_locked(entries, parent_adapter_id):
+                    ancestor_hashes.update(ancestor.dataset_record_hashes)
+            overlap = len(set(record_hashes) & ancestor_hashes)
             now = _now_iso()
             entry = AdapterEntry(
                 adapter_id=adapter_id,
@@ -147,6 +204,7 @@ class AdapterRegistry:
                 base_model_revision=base_model_revision,
                 adapter_hash=adapter_hash,
                 parent_adapter_id=parent_adapter_id,
+                parent_adapter_hash=parent_adapter_hash,
                 training_job_id=training_job_id,
                 training_node_id=training_node_id,
                 submitted_by_node_id=submitted_by_node_id,
@@ -154,6 +212,18 @@ class AdapterRegistry:
                 training_manifest_path=training_manifest_path,
                 worker_evaluation_path=worker_evaluation_path,
                 local_evaluation_path=local_evaluation_path,
+                evaluation_set_hashes=evaluation_set_hashes,
+                evaluation_dataset_path=(
+                    None
+                    if evaluation_dataset_path is None
+                    else str(evaluation_dataset_path)
+                ),
+                dataset_record_hashes=record_hashes,
+                dataset_repetition_count=repetitions,
+                dataset_overlap_count=overlap,
+                dataset_overlap_ratio=overlap / len(set(record_hashes))
+                if record_hashes
+                else 0.0,
             )
             entries.append(entry)
             self._write_locked(entries)
@@ -169,11 +239,38 @@ class AdapterRegistry:
         with self.path.open("r", encoding="utf-8") as registry_file:
             data = json.load(registry_file)
         adapters = data.get("adapters", []) if isinstance(data, dict) else []
-        return [AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)]
+        return [
+            AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)
+        ]
 
     def lookup(self, adapter_id: str) -> AdapterEntry | None:
         with self._locked(exclusive=False):
             return self._lookup_locked(self._list_locked(), adapter_id)
+
+    def lineage(self, adapter_id: str) -> builtins.list[AdapterEntry]:
+        with self._locked(exclusive=False):
+            entries = self._list_locked()
+            self._require_locked(entries, adapter_id)
+            return self._lineage_locked(entries, adapter_id)
+
+    def validate_continuation(
+        self,
+        *,
+        adapter_id: str,
+        base_model: str,
+        base_model_revision: str | None,
+        parent_adapter_id: str | None,
+        parent_adapter_hash: str | None,
+    ) -> None:
+        with self._locked(exclusive=False):
+            self._validate_lineage_locked(
+                self._list_locked(),
+                adapter_id=adapter_id,
+                base_model=base_model,
+                base_model_revision=base_model_revision,
+                parent_adapter_id=parent_adapter_id,
+                parent_adapter_hash=parent_adapter_hash,
+            )
 
     def apply_evaluation(
         self,
@@ -182,12 +279,18 @@ class AdapterRegistry:
         score: float,
         result_path: str | Path,
         next_status: AdapterStatus | None = None,
+        holdout_score: float | None = None,
+        holdout_baseline_score: float | None = None,
+        drift_scores: dict[str, float] | None = None,
+        activation_gate_passed: bool | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
             if entry.status != AdapterStatus.CANDIDATE:
-                raise ValueError("Only candidate adapters can receive evaluation gating")
+                raise ValueError(
+                    "Only candidate adapters can receive evaluation gating"
+                )
             if next_status is None:
                 if score >= self.settings.adapter_registry.trial_threshold:
                     next_status = AdapterStatus.TRIAL_ACTIVE
@@ -207,6 +310,22 @@ class AdapterRegistry:
                 status=next_status,
                 eval_score=score,
                 eval_result_path=str(result_path),
+                holdout_score=holdout_score,
+                holdout_baseline_score=holdout_baseline_score,
+                holdout_regression=(
+                    holdout_score is not None
+                    and holdout_baseline_score is not None
+                    and holdout_score < holdout_baseline_score
+                ),
+                drift_scores=drift_scores,
+                activation_gate_passed=(
+                    next_status == AdapterStatus.TRIAL_ACTIVE
+                    if activation_gate_passed is None
+                    else activation_gate_passed
+                ),
+                rollout_state="shadow"
+                if next_status == AdapterStatus.TRIAL_ACTIVE
+                else next_status.value,
             )
 
     def approve(self, adapter_id: str, *, notes: str = "") -> AdapterEntry:
@@ -228,6 +347,16 @@ class AdapterRegistry:
             current_entries = self._list_locked()
             entry = self._require_locked(current_entries, adapter_id)
             self._ensure_transition(entry.status, AdapterStatus.ACTIVE)
+            if not entry.activation_gate_passed:
+                raise ValueError("Adapter evaluation regression gate has not passed")
+            previous_active = next(
+                (
+                    item.adapter_id
+                    for item in current_entries
+                    if item.status == AdapterStatus.ACTIVE
+                ),
+                None,
+            )
             entries = []
             activated: AdapterEntry | None = None
             now = _now_iso()
@@ -238,10 +367,16 @@ class AdapterRegistry:
                         status=AdapterStatus.ACTIVE,
                         updated_at=now,
                         activation_sequence=activation_sequence,
+                        rollout_state="canary",
+                        rollback_target_id=previous_active,
                     )
                     entries.append(activated)
                 elif existing.status == AdapterStatus.ACTIVE:
-                    entries.append(_copy_entry(existing, status=AdapterStatus.ARCHIVED, updated_at=now))
+                    entries.append(
+                        _copy_entry(
+                            existing, status=AdapterStatus.ARCHIVED, updated_at=now
+                        )
+                    )
                 else:
                     entries.append(existing)
             assert activated is not None
@@ -273,12 +408,16 @@ class AdapterRegistry:
                         status=AdapterStatus.ACTIVE,
                         updated_at=now,
                         activation_sequence=activation_sequence,
+                        rollout_state="stable",
                     )
                     entries.append(restored)
                 elif entry.status == AdapterStatus.ACTIVE:
                     entries.append(
                         _copy_entry(
-                            entry, status=AdapterStatus.ARCHIVED, updated_at=now
+                            entry,
+                            status=AdapterStatus.ARCHIVED,
+                            updated_at=now,
+                            rollout_state="rolled_back",
                         )
                     )
                 else:
@@ -293,10 +432,37 @@ class AdapterRegistry:
             self._ensure_transition(entry.status, status)
             return self._replace_locked(entries, adapter_id, status=status)
 
+    def record_canary(self, adapter_id: str, *, success: bool) -> AdapterEntry:
+        with self._locked(exclusive=True):
+            entries = self._list_locked()
+            entry = self._require_locked(entries, adapter_id)
+            if entry.status != AdapterStatus.ACTIVE or entry.rollout_state not in {
+                "canary",
+                "canary_failed",
+            }:
+                raise ValueError(
+                    "Only an active canary adapter can receive canary results"
+                )
+            return self._replace_locked(
+                entries,
+                adapter_id,
+                rollout_state=(
+                    "stable"
+                    if success
+                    else "canary_failed"
+                    if entry.canary_failures + 1
+                    >= self.settings.adapter_registry.canary_failure_limit
+                    else "canary"
+                ),
+                canary_failures=entry.canary_failures + (0 if success else 1),
+            )
+
     def _lookup_locked(
         self, entries: builtins.list[AdapterEntry], adapter_id: str
     ) -> AdapterEntry | None:
-        return next((entry for entry in entries if entry.adapter_id == adapter_id), None)
+        return next(
+            (entry for entry in entries if entry.adapter_id == adapter_id), None
+        )
 
     def _require_locked(
         self, entries: builtins.list[AdapterEntry], adapter_id: str
@@ -305,6 +471,54 @@ class AdapterRegistry:
         if entry is None:
             raise ValueError(f"Unknown adapter: {adapter_id}")
         return entry
+
+    def _lineage_locked(
+        self, entries: builtins.list[AdapterEntry], adapter_id: str
+    ) -> builtins.list[AdapterEntry]:
+        lineage: builtins.list[AdapterEntry] = []
+        seen: set[str] = set()
+        current_id: str | None = adapter_id
+        while current_id is not None:
+            if current_id in seen:
+                raise ValueError(f"Cyclic adapter lineage detected at: {current_id}")
+            seen.add(current_id)
+            current = self._lookup_locked(entries, current_id)
+            if current is None:
+                raise ValueError(f"Unknown adapter in lineage: {current_id}")
+            lineage.append(current)
+            current_id = current.parent_adapter_id
+        return lineage
+
+    def _validate_lineage_locked(
+        self,
+        entries: builtins.list[AdapterEntry],
+        *,
+        adapter_id: str,
+        base_model: str,
+        base_model_revision: str | None,
+        parent_adapter_id: str | None,
+        parent_adapter_hash: str | None,
+    ) -> None:
+        if (parent_adapter_id is None) != (parent_adapter_hash is None):
+            raise ValueError("Parent adapter ID and hash must be provided together")
+        if parent_adapter_id is None:
+            return
+        if parent_adapter_id == adapter_id:
+            raise ValueError("Cyclic adapter lineage is not allowed")
+        parent = self._lookup_locked(entries, parent_adapter_id)
+        if parent is None:
+            raise ValueError(f"Unknown parent adapter: {parent_adapter_id}")
+        if parent.adapter_hash != parent_adapter_hash:
+            raise ValueError("Parent adapter hash mismatch")
+        if parent.base_model != base_model:
+            raise ValueError("Parent adapter base model mismatch")
+        if parent.base_model_revision != base_model_revision:
+            raise ValueError("Parent adapter base revision mismatch")
+        if any(
+            item.adapter_id == adapter_id
+            for item in self._lineage_locked(entries, parent_adapter_id)
+        ):
+            raise ValueError("Cyclic adapter lineage is not allowed")
 
     def _replace_locked(
         self,
@@ -365,7 +579,10 @@ class AdapterRegistry:
 
     def _ensure_transition(self, current: AdapterStatus, target: AdapterStatus) -> None:
         allowed = {
-            AdapterStatus.CANDIDATE: {AdapterStatus.TRIAL_ACTIVE, AdapterStatus.REJECTED},
+            AdapterStatus.CANDIDATE: {
+                AdapterStatus.TRIAL_ACTIVE,
+                AdapterStatus.REJECTED,
+            },
             AdapterStatus.TRIAL_ACTIVE: {AdapterStatus.APPROVED},
             AdapterStatus.APPROVED: {AdapterStatus.ACTIVE},
             AdapterStatus.ACTIVE: {AdapterStatus.ARCHIVED},
@@ -373,7 +590,9 @@ class AdapterRegistry:
             AdapterStatus.ARCHIVED: set(),
         }
         if target not in allowed[current]:
-            raise ValueError(f"Invalid adapter status transition: {current} -> {target}")
+            raise ValueError(
+                f"Invalid adapter status transition: {current} -> {target}"
+            )
 
 
 def _copy_entry(entry: AdapterEntry, **updates: Any) -> AdapterEntry:
@@ -392,3 +611,21 @@ def _optional_float(value: Any) -> float | None:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _dataset_record_hashes(path: Path) -> tuple[tuple[str, ...], int]:
+    if not path.is_file():
+        return (), 0
+    hashes: list[str] = []
+    try:
+        for line in path.read_text("utf-8").splitlines():
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            normalized = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            hashes.append(hashlib.sha256(normalized.encode()).hexdigest())
+    except (OSError, json.JSONDecodeError):
+        return (), 0
+    return tuple(hashes), len(hashes) - len(set(hashes))

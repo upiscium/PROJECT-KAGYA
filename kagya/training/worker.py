@@ -334,6 +334,7 @@ class TrainingWorkerService:
                 base_model_id=manifest.base_model_id,
                 base_model_revision=manifest.base_model_revision,
                 parent_adapter_id=manifest.parent_adapter_id,
+                parent_adapter_hash=manifest.parent_adapter_hash,
             )
             trainer_manifest_path = result.adapter_path / "training_manifest.json"
             trainer_manifest = (
@@ -441,8 +442,7 @@ class TrainingWorkerService:
                 for job in jobs
             ),
             "jobs": [
-                {"job_id": job.job_id, "status": job.status.value}
-                for job in jobs
+                {"job_id": job.job_id, "status": job.status.value} for job in jobs
             ],
             "gpu": gpu,
         }
@@ -459,7 +459,11 @@ class TrainingWorkerService:
                 continue
             if datetime.fromisoformat(job.updated_at).timestamp() >= cutoff:
                 continue
-            for path in (Path(job.bundle_path), Path(job.work_path), Path(job.result_path)):
+            for path in (
+                Path(job.bundle_path),
+                Path(job.work_path),
+                Path(job.result_path),
+            ):
                 if path.is_dir():
                     shutil.rmtree(path)
                     removed.append(str(path))

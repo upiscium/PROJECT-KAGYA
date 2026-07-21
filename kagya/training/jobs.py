@@ -14,7 +14,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from kagya.config import Settings
-from kagya.learning.adapter_registry import AdapterRegistry
+from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry
 from kagya.learning.dream_dataset_generator import DreamDatasetRecord
 from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
 from kagya.memory import (
@@ -25,6 +25,7 @@ from kagya.memory import (
 )
 from kagya.models import ModelProvider
 from kagya.training.artifacts import (
+    AdapterLineageNode,
     TrainingArtifactContract,
     TrainingBundleManifest,
     sha256_bytes,
@@ -389,15 +390,18 @@ class MemoryConsolidator:
 
 
 class TrainingBundleBuilder:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, adapter_registry: AdapterRegistry | None = None
+    ) -> None:
         self.settings = settings
+        self.adapter_registry = adapter_registry
         self.contract = TrainingArtifactContract()
 
     def build(
         self, job: TrainingJob, episodes: tuple[EpisodicMemoryRecord, ...]
     ) -> Path:
         episodes = tuple(episode for episode in episodes if episode.training_included)
-        dataset = b"".join(
+        current_records = [
             (
                 json.dumps(
                     DreamDatasetRecord(
@@ -412,8 +416,39 @@ class TrainingBundleBuilder:
                 + "\n"
             ).encode()
             for episode in episodes
+        ]
+        parent = None
+        lineage: list[AdapterEntry] = []
+        if job.parent_adapter_id is not None:
+            if self.adapter_registry is None:
+                raise ValueError(
+                    "Adapter registry is required for continuation training"
+                )
+            parent = self.adapter_registry.lookup(job.parent_adapter_id)
+            if parent is None:
+                raise ValueError(f"Unknown parent adapter: {job.parent_adapter_id}")
+            lineage = self.adapter_registry.lineage(parent.adapter_id)
+        historical = _lineage_records(lineage)
+        historical_by_hash = {_canonical_record_hash(item): item for item in historical}
+        current_hashes = {_canonical_record_hash(item) for item in current_records}
+        available = sorted(
+            (digest, record)
+            for digest, record in historical_by_hash.items()
+            if digest not in current_hashes
         )
-        evaluation = b""
+        holdout_records = [
+            record
+            for index, (_digest, record) in enumerate(available)
+            if index % 2 == 0
+        ]
+        rehearsal_records = [
+            record
+            for index, (_digest, record) in enumerate(available)
+            if index % 2 == 1
+        ]
+        dataset_records = current_records + rehearsal_records
+        dataset = b"".join(dataset_records)
+        evaluation = b"".join(holdout_records)
         sequences = [
             episode.processing_sequence
             for episode in episodes
@@ -429,15 +464,31 @@ class TrainingBundleBuilder:
             base_model_revision=self.settings.model.revision,
             processor_revision=self.settings.model.processor_revision,
             parent_adapter_id=job.parent_adapter_id,
-            parent_adapter_hash=None,
+            parent_adapter_hash=None if parent is None else parent.adapter_hash,
+            lineage_adapter_ids=[item.adapter_id for item in lineage],
+            lineage=[
+                AdapterLineageNode(
+                    adapter_id=item.adapter_id,
+                    adapter_hash=item.adapter_hash or "",
+                    parent_adapter_id=item.parent_adapter_id,
+                    parent_adapter_hash=item.parent_adapter_hash,
+                    base_model_id=item.base_model,
+                    base_model_revision=item.base_model_revision or "",
+                )
+                for item in lineage
+            ],
             source_event_sequence_start=min(sequences, default=0),
             source_event_sequence_end=max(sequences, default=0),
             source_episode_ids=[episode.id for episode in episodes],
             source_decision_ids=[],
             dataset_hash=sha256_bytes(dataset),
-            dataset_record_count=len(episodes),
+            dataset_record_count=len(dataset_records),
             evaluation_set_hash=sha256_bytes(evaluation),
-            evaluation_record_count=0,
+            evaluation_record_count=len(holdout_records),
+            rehearsal_record_count=len(rehearsal_records),
+            repeated_record_count=len(dataset_records)
+            - len({_canonical_record_hash(item) for item in dataset_records}),
+            training_evaluation_overlap_count=0,
             chat_template_version="gemma-v1",
             dataset_format_version="dream-v2",
             qlora_hyperparameters={
@@ -493,11 +544,18 @@ class SleepCoordinator:
                 self._start_resume(job)
 
     def create_job(self, idempotency_key: str) -> TrainingJob:
+        list_adapters: Callable[[], list[Any]] = getattr(
+            self.adapter_registry, "list", lambda: []
+        )
+        active = next(
+            (entry for entry in list_adapters() if entry.status.value == "active"),
+            None,
+        )
         job, created = self.registry.create(
             idempotency_key=idempotency_key,
             base_model_id=self.settings.model.primary_id,
             base_model_revision=self.settings.model.revision,
-            parent_adapter_id=None,
+            parent_adapter_id=None if active is None else active.adapter_id,
             backend=self.settings.deployment.training.backend.value,
             processor_revision=self.settings.model.processor_revision,
         )
@@ -864,6 +922,26 @@ class SleepCoordinator:
                 dataset_path=result.dataset_path,
                 dataset_hash=result.dataset_hash,
                 base_model=self.settings.model.primary_id,
+                base_model_revision=self.settings.model.revision,
+                adapter_hash=result.adapter_hash,
+                parent_adapter_id=result.parent_adapter_id,
+                parent_adapter_hash=result.parent_adapter_hash,
+                evaluation_set_hashes=(
+                    (
+                        sha256_bytes(
+                            result.dataset_path.with_name(
+                                "evaluation_set.jsonl"
+                            ).read_bytes()
+                        ),
+                    )
+                    if result.dataset_path.with_name("evaluation_set.jsonl").is_file()
+                    else ()
+                ),
+                evaluation_dataset_path=(
+                    result.dataset_path.with_name("evaluation_set.jsonl")
+                    if result.dataset_path.with_name("evaluation_set.jsonl").is_file()
+                    else None
+                ),
                 notes=f"registered by {self.settings.deployment.training.backend.value} sleep job",
             )
         self.consolidator.complete(preparation, attempt_id)
@@ -872,6 +950,30 @@ class SleepCoordinator:
 
 class _Cancelled(Exception):
     pass
+
+
+def _lineage_records(lineage: list[Any]) -> list[bytes]:
+    records: list[bytes] = []
+    for entry in lineage:
+        path = Path(entry.dataset_path)
+        if path.is_file():
+            records.extend(
+                line + b"\n" for line in path.read_bytes().splitlines() if line.strip()
+            )
+    return records
+
+
+def _canonical_record_hash(record: bytes) -> str:
+    try:
+        normalized = json.dumps(
+            json.loads(record),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    except json.JSONDecodeError:
+        normalized = record.strip()
+    return sha256_bytes(normalized)
 
 
 def _now() -> str:

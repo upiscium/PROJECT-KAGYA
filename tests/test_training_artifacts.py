@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from kagya.training import (
+    AdapterLineageNode,
     TrainingArtifactContract,
     TrainingBundleManifest,
     TrainingResultManifest,
@@ -88,6 +89,48 @@ def test_bundle_rejects_symlink_and_revision_mismatch(tmp_path: Path) -> None:
     (path / "extra-link").symlink_to(path / "dataset.jsonl")
     with pytest.raises(ValueError, match="symlinks"):
         contract.validate_bundle(path)
+
+
+def test_bundle_lineage_rejects_unknown_cycle_hash_and_revision_before_training() -> (
+    None
+):
+    dataset = b"{}\n"
+    evaluation = b""
+    base = _bundle_manifest(dataset, evaluation)
+    parent = AdapterLineageNode(
+        adapter_id="parent",
+        adapter_hash="parent-hash",
+        base_model_id=base.base_model_id,
+        base_model_revision=base.base_model_revision,
+    )
+    valid = base.model_copy(
+        update={
+            "parent_adapter_id": "parent",
+            "parent_adapter_hash": "parent-hash",
+            "lineage_adapter_ids": ["parent"],
+            "lineage": [parent],
+        }
+    )
+    TrainingBundleManifest.model_validate(valid.model_dump())
+
+    invalid_nodes = (
+        [],
+        [parent.model_copy(update={"adapter_hash": "wrong"})],
+        [parent.model_copy(update={"base_model_revision": "wrong"})],
+        [
+            parent.model_copy(
+                update={
+                    "parent_adapter_id": "parent",
+                    "parent_adapter_hash": "parent-hash",
+                }
+            )
+        ],
+    )
+    for nodes in invalid_nodes:
+        with pytest.raises(ValidationError, match="lineage"):
+            TrainingBundleManifest.model_validate(
+                valid.model_copy(update={"lineage": nodes}).model_dump()
+            )
 
 
 def test_result_finalize_validate_and_reject_partial_or_unsafe_path(
