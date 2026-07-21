@@ -37,6 +37,8 @@ from kagya.runtime import (
     EmotionTimer,
     StateWAL,
     hash_snapshot,
+    SchedulerBudget,
+    SubjectScheduler,
 )
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
 from kagya.training import (
@@ -174,6 +176,26 @@ def get_state_wal(request: Request) -> StateWAL:
         wal = StateWAL(get_api_settings(request).agent_state_wal.path)
         request.app.state.state_wal = wal
     return wal
+
+
+def get_subject_scheduler(request: Request) -> SubjectScheduler:
+    scheduler = getattr(request.app.state, "subject_scheduler", None)
+    if scheduler is None:
+        runtime = get_agent_runtime(request)
+        settings = get_api_settings(request).autonomy
+        scheduler = SubjectScheduler(
+            runtime,
+            get_main_loop(request),
+            budget=SchedulerBudget(
+                max_events=settings.max_events_per_cycle,
+                max_inferences=settings.max_inferences_per_cycle,
+                max_wall_seconds=settings.max_wall_seconds_per_cycle,
+            ),
+            reevaluation_interval_seconds=settings.reevaluation_interval_seconds,
+            telemetry=get_operational_telemetry(request),
+        )
+        request.app.state.subject_scheduler = scheduler
+    return scheduler
 
 
 def _event_sequence(sequence: int | None) -> int:
@@ -384,6 +406,9 @@ def _replace_main_loop(
         telemetry=get_operational_telemetry(request),
     )
     request.app.state.main_loop = main_loop
+    scheduler = getattr(request.app.state, "subject_scheduler", None)
+    if scheduler is not None:
+        scheduler.main_loop = main_loop
     return main_loop
 
 

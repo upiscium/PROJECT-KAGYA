@@ -2034,6 +2034,44 @@ def admin_headers() -> dict[str, str]:
     return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
 
 
+def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "autonomy": settings.autonomy.model_copy(update={"enabled": False})
+        }
+    )
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/autonomy/status").status_code == 401
+        created = client.post(
+            "/api/autonomy/wake-ups",
+            headers=admin_headers(),
+            json={
+                "schedule_id": "api-operator-wake",
+                "kind": "operator",
+                "wake_at": "2020-01-01T00:00:00+00:00",
+            },
+        )
+        assert created.status_code == 200
+        scheduler = client.app.state.subject_scheduler
+        cycle = scheduler.run_cycle()
+        status_response = client.get(
+            "/api/autonomy/status", headers=admin_headers()
+        )
+
+    assert cycle.result.value == "processed"
+    assert status_response.status_code == 200
+    assert status_response.json()["pending_count"] == 0
+    snapshot = json.loads(settings.agent_state.path.read_text(encoding="utf-8"))
+    schedules = snapshot["extensions"]["subject_scheduler"]["schedules"]
+    assert schedules[0]["status"] == "completed"
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert {record.event_type for record in records} >= {
+        "autonomy_schedule",
+        "autonomy_wake",
+    }
+
+
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:
     for _ in range(100):
         response = client.get(f"/api/sleep/jobs/{job_id}", headers=admin_headers())

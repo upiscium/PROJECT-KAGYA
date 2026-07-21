@@ -53,6 +53,8 @@ class AgentEventType(StrEnum):
     ATTENTION_READ = "attention_read"
     ATTENTION_UPDATE = "attention_update"
     ATTENTION_COMPETE = "attention_compete"
+    AUTONOMY_SCHEDULE = "autonomy_schedule"
+    AUTONOMY_WAKE = "autonomy_wake"
 
 
 @dataclass(frozen=True)

@@ -133,6 +133,18 @@ _METRICS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "kagya_unresolved_decisions": (
         "gauge", (), "Current decisions awaiting outcome; not a speed measure.",
     ),
+    "kagya_autonomy_cycles_total": (
+        "counter", ("result",), "Autonomy cycles by bounded result category.",
+    ),
+    "kagya_autonomy_wakeups_total": (
+        "counter", ("outcome",), "Autonomy wake-ups processed or safely deferred.",
+    ),
+    "kagya_autonomy_pending_wakeups": (
+        "gauge", (), "Current pending persistent and derived wake-ups.",
+    ),
+    "kagya_autonomy_cycle_duration_seconds": (
+        "summary", (), "Autonomy cycle wall-clock duration.",
+    ),
     "kagya_storage_operation_seconds": (
         "summary", ("component", "operation", "status"),
         "Snapshot, journal, and telemetry persistence duration.",
@@ -161,6 +173,10 @@ _LABEL_VALUES: dict[tuple[str, str], set[str]] = {
     },
     ("kagya_storage_operation_seconds", "status"): {"success", "failure"},
     ("kagya_accelerator_memory_bytes", "kind"): {"allocated", "reserved"},
+    ("kagya_autonomy_cycles_total", "result"): {
+        "processed", "no_action", "budget_exhausted", "stopped",
+    },
+    ("kagya_autonomy_wakeups_total", "outcome"): {"processed", "deferred"},
 }
 
 
@@ -462,6 +478,7 @@ def _subsystem(event_type: str) -> str:
         "sleep": "sleep",
         "memory": "memory",
         "motivation": "goals",
+        "autonomy": "runtime",
     }.get(prefix, "runtime")
 
 
@@ -499,6 +516,7 @@ _KNOWN_EVENT_TYPES = {
     "experience_update", "belief_read", "belief_update", "motivation_read",
     "motivation_update", "motivation_reevaluate", "training_read",
     "training_update",
+    "autonomy_schedule", "autonomy_wake",
 }
 
 

@@ -141,6 +141,14 @@ agent_journal:
 agent_state_wal:
   path: .kagya/private/agent_state_wal.jsonl
 
+autonomy:
+  enabled: true
+  poll_interval_seconds: 1.0
+  reevaluation_interval_seconds: 300.0
+  max_events_per_cycle: 8
+  max_inferences_per_cycle: 1
+  max_wall_seconds_per_cycle: 5.0
+
 observability:
   enabled: true
   metrics_path: .kagya/operational_metrics.json

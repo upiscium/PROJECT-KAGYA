@@ -52,6 +52,17 @@ from kagya.runtime.working_memory import (
     working_memory_item,
 )
 from kagya.runtime.bootstrap import RemoteTrainingDispatcher, TrainingWorkerRuntime
+from kagya.runtime.autonomy import (
+    AutonomyLoop,
+    CycleResult,
+    SchedulerBudget,
+    SchedulerCycle,
+    SchedulerStatus,
+    ScheduleStatus,
+    SubjectScheduler,
+    WakeUpKind,
+    WakeUpSchedule,
+)
 from kagya.attention import (
     AttentionAction,
     AttentionCandidate,
@@ -70,6 +81,8 @@ __all__ = [
     "AgentRuntimeJournalError",
     "AgentRuntimeQueueFull",
     "AgentRuntimeStopped",
+    "AutonomyLoop",
+    "CycleResult",
     "current_agent_event",
     "AgentStateSnapshot",
     "AgentStateStore",
@@ -100,6 +113,10 @@ __all__ = [
     "StateWAL",
     "StateWalIntegrityError",
     "StateWalRecord",
+    "SchedulerBudget",
+    "SchedulerCycle",
+    "SchedulerStatus",
+    "ScheduleStatus",
     "SessionState",
     "SessionTurn",
     "RetentionReason",
@@ -113,4 +130,7 @@ __all__ = [
     "hash_snapshot",
     "RemoteTrainingDispatcher",
     "TrainingWorkerRuntime",
+    "SubjectScheduler",
+    "WakeUpKind",
+    "WakeUpSchedule",
 ]

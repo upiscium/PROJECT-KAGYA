@@ -1,0 +1,191 @@
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from kagya.motivation import GoalStatus
+from kagya.runtime import (
+    AgentRuntime,
+    AgentRuntimeStopped,
+    CycleResult,
+    EventJournal,
+    JournalLifecycle,
+    SchedulerBudget,
+    ScheduleStatus,
+    SubjectScheduler,
+    WakeUpKind,
+)
+
+
+class _GoalManager:
+    def __init__(self) -> None:
+        self.goals: dict[str, object] = {}
+
+    def list_goals(self) -> list[object]:
+        return list(self.goals.values())
+
+
+class _CommitmentStore:
+    commitments: dict[str, object] = {}
+
+    def list_commitments(self, status: object) -> list[object]:
+        return []
+
+
+class _DecisionStore:
+    records: dict[str, object] = {}
+
+    def list_records(self, status: object) -> list[object]:
+        return []
+
+
+class _MainLoop:
+    def __init__(self, extensions: dict[str, object] | None = None) -> None:
+        self.persistent_state = SimpleNamespace(extensions=extensions or {})
+        self.goal_manager = _GoalManager()
+        self.commitment_store = _CommitmentStore()
+        self.decision_store = _DecisionStore()
+        self.reevaluations = 0
+
+    def reevaluate_goals(self) -> list[object]:
+        self.reevaluations += 1
+        for goal in self.goal_manager.goals.values():
+            goal.status = GoalStatus.FAILED
+        return [SimpleNamespace(action=SimpleNamespace(value="defer"))]
+
+
+def _runtime(path: Path, initial_sequence: int = 0) -> tuple[AgentRuntime, EventJournal]:
+    journal = EventJournal(path)
+    runtime = AgentRuntime(
+        queue_capacity=8,
+        event_journal=journal,
+        initial_sequence=initial_sequence,
+        completion_hook=lambda event: "0" * 64,
+        failure_hook=lambda event, exc: "0" * 64,
+    )
+    runtime.start()
+    return runtime, journal
+
+
+def _scheduler(
+    runtime: AgentRuntime,
+    loop: _MainLoop,
+    *,
+    max_events: int = 2,
+    max_inferences: int = 1,
+) -> SubjectScheduler:
+    return SubjectScheduler(
+        runtime,
+        loop,
+        budget=SchedulerBudget(
+            max_events=max_events,
+            max_inferences=max_inferences,
+            max_wall_seconds=1.0,
+        ),
+        reevaluation_interval_seconds=60.0,
+    )
+
+
+def test_schedule_survives_restart_and_is_processed_once(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    loop = _MainLoop()
+    runtime, journal = _runtime(tmp_path / "journal.jsonl")
+    scheduler = _scheduler(runtime, loop)
+    scheduler.schedule(
+        WakeUpKind.OPERATOR, now, schedule_id="persistent-wake"
+    )
+    runtime.shutdown()
+
+    restarted_runtime, restarted_journal = _runtime(
+        tmp_path / "journal.jsonl", initial_sequence=1
+    )
+    restarted = _scheduler(restarted_runtime, loop)
+    first = restarted.run_cycle(now + timedelta(seconds=1))
+    second = restarted.run_cycle(now + timedelta(seconds=2))
+    restarted_runtime.shutdown()
+
+    assert first.result == CycleResult.PROCESSED
+    assert second.result == CycleResult.NO_ACTION
+    state = loop.persistent_state.extensions["subject_scheduler"]
+    assert state["schedules"][0]["status"] == ScheduleStatus.COMPLETED.value
+    wake_starts = [
+        record
+        for record in restarted_journal.verify()
+        if record.lifecycle == JournalLifecycle.STARTED
+        and record.event_type == "autonomy_wake"
+    ]
+    assert len(wake_starts) == 1
+    assert journal.verify()
+
+
+def test_duplicate_schedule_id_is_rejected(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    scheduler = _scheduler(runtime, _MainLoop())
+    now = datetime.now(UTC)
+    scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="same-id")
+
+    with pytest.raises(ValueError, match="already exists"):
+        scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="same-id")
+    runtime.shutdown()
+
+
+def test_cycle_stops_at_event_and_inference_budgets(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    scheduler = _scheduler(runtime, _MainLoop(), max_events=1, max_inferences=0)
+    now = datetime.now(UTC)
+    scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="blocked", estimated_inferences=1)
+    scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="pending")
+
+    blocked = scheduler.run_cycle(now)
+
+    assert blocked.result == CycleResult.BUDGET_EXHAUSTED
+    assert blocked.processed == 1
+    assert blocked.deferred == 1
+    runtime.shutdown()
+
+
+def test_idle_cycle_is_explicit_no_action_without_runtime_event(tmp_path: Path) -> None:
+    runtime, journal = _runtime(tmp_path / "journal.jsonl")
+    scheduler = _scheduler(runtime, _MainLoop())
+
+    cycle = scheduler.run_cycle(datetime.now(UTC))
+
+    assert cycle.result == CycleResult.NO_ACTION
+    assert journal.verify() == []
+    runtime.shutdown()
+
+
+def test_due_goal_deadline_is_reevaluated_through_runtime(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    runtime, journal = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    loop.goal_manager.goals["goal-1"] = SimpleNamespace(
+        goal_id="goal-1",
+        status=GoalStatus.ACTIVE,
+        deadline=(now - timedelta(seconds=1)).isoformat(),
+        needs_information=False,
+        updated_at=now.isoformat(),
+    )
+    scheduler = _scheduler(runtime, loop)
+
+    cycle = scheduler.run_cycle(now)
+
+    assert cycle.result == CycleResult.PROCESSED
+    assert loop.reevaluations == 1
+    assert any(
+        record.event_type == "autonomy_wake"
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in journal.verify()
+    )
+    runtime.shutdown()
+
+
+def test_shutdown_rejects_new_wakeups(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    scheduler = _scheduler(runtime, _MainLoop())
+    scheduler.stop_accepting()
+
+    with pytest.raises(AgentRuntimeStopped):
+        scheduler.schedule(WakeUpKind.OPERATOR, datetime.now(UTC))
+    runtime.shutdown()
