@@ -28,6 +28,7 @@ from kagya.api.routes import (
     system,
     training,
     values,
+    autonomy,
 )
 from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.config import NodeRole, Settings, get_settings, validate_deployment_hostname
@@ -49,6 +50,9 @@ from kagya.runtime import (
     StateWAL,
     StateWalIntegrityError,
     hash_snapshot,
+    AutonomyLoop,
+    SchedulerBudget,
+    SubjectScheduler,
 )
 
 
@@ -140,6 +144,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(beliefs.router)
         app.include_router(motivation.router)
         app.include_router(attention.router)
+        app.include_router(autonomy.router)
 
     return app
 
@@ -155,6 +160,10 @@ def _lifespan(settings: Settings):
         try:
             yield
         finally:
+            autonomy_loop = getattr(app.state, "autonomy_loop", None)
+            if autonomy_loop is not None:
+                autonomy_loop.shutdown()
+                app.state.autonomy_loop = None
             coordinator = getattr(app.state, "sleep_coordinator", None)
             if coordinator is not None:
                 coordinator.shutdown()
@@ -265,6 +274,26 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             telemetry=app.state.operational_telemetry,
         )
         app.state.agent_runtime.start()
+    if settings.autonomy.enabled and getattr(app.state, "autonomy_loop", None) is None:
+        autonomy_settings = settings.autonomy
+        app.state.subject_scheduler = SubjectScheduler(
+            app.state.agent_runtime,
+            app.state.main_loop,
+            budget=SchedulerBudget(
+                max_events=autonomy_settings.max_events_per_cycle,
+                max_inferences=autonomy_settings.max_inferences_per_cycle,
+                max_wall_seconds=autonomy_settings.max_wall_seconds_per_cycle,
+            ),
+            reevaluation_interval_seconds=(
+                autonomy_settings.reevaluation_interval_seconds
+            ),
+            telemetry=app.state.operational_telemetry,
+        )
+        app.state.autonomy_loop = AutonomyLoop(
+            app.state.subject_scheduler,
+            poll_interval_seconds=autonomy_settings.poll_interval_seconds,
+        )
+        app.state.autonomy_loop.start()
     if settings.appraisal.timer_enabled and getattr(app.state, "emotion_timer", None) is None:
         app.state.emotion_timer = EmotionTimer(
             app.state.agent_runtime,

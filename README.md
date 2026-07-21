@@ -215,6 +215,10 @@ Admin-token-protected observability exports are dependency-free:
 
 Metrics persist at `observability.metrics_path`; the newest `observability.max_traces` spans persist at `observability.traces_path`. `observability.max_series` is a hard series limit. Labels are fixed categorical dimensions: prompts, generated text, hidden thoughts, credentials, IDs, model paths, job names, and user metadata are never labels or span content. Unsafe trace identifiers are one-way hashed. Treat both files as operational state and retain them across service restarts for before/after comparison.
 
+The single-active `AutonomyLoop` restores versioned wake-ups from the subject snapshot and derives deadline/reassessment checks from Goals, Commitments, and unresolved Decisions. Each due occurrence is idempotently completed by `AgentRuntime` and the durable Journal. `autonomy.max_events_per_cycle`, `max_inferences_per_cycle`, and `max_wall_seconds_per_cycle` bound every cycle; excess work remains pending. An idle cycle returns `no_action` without model inference or a journal event. Shutdown stops new wake-ups before draining accepted runtime work.
+
+Admin operators can inspect `GET /api/autonomy/status` and create an internal wake-up with `POST /api/autonomy/wake-ups`. Action retry, outbox, sleep/consolidation, and operator wake-ups are signals only: the scheduler never invokes tools, sends outbox data, starts training, or performs any other external effect directly.
+
 Latency, queue depth, generation rate, memory retrieval, fallback/quarantine, storage, sleep, adapter, and runtime lifecycle metrics describe processing. `kagya_active_goals`, `kagya_unresolved_decisions`, and `kagya_attention_focus_items` describe current subjective state; do not interpret them as throughput or performance scores. RAM is sampled during export, and accelerator allocated/reserved memory is exported when CUDA is available.
 
 ### Split Training Worker Runbook

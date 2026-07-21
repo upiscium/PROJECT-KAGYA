@@ -83,6 +83,14 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Internal reevaluation creates intrinsic Goal proposals with `self/internal_state` origin and a structured motivation ID target. It does not auto-activate the Goal.
 - Goal completion satisfies and satiates the linked motivation; failure or abandonment weakens it; elapsed time decays active motivation. Repeated evidence reinforces Interest with increasing satiation, preventing unbounded growth.
 
+## Autonomous Wake-Ups
+
+- `SubjectScheduler` restores versioned wake-up occurrences from snapshot extensions and derives deadline or reassessment occurrences from Goals, Commitments, and unresolved Decisions. Stable occurrence IDs and durable completion markers prevent duplicate state transitions across restarts.
+- `AutonomyLoop` is a single timer producer. Every schedule mutation and due occurrence passes through `AgentRuntime`, then snapshot preparation and `EventJournal`; the timer thread never mutates authoritative state.
+- Event, inference, and wall-time budgets bound each cycle. Work beyond a budget remains pending, and an idle cycle explicitly returns `no_action` without inference or journal traffic.
+- Action timeout/retry, outbox deadline, sleep/consolidation, and operator wake-ups are internal signals only. The scheduler cannot invoke tools, deliver output, start training, or otherwise perform external effects.
+- Shutdown stops scheduler acceptance and joins the loop before the runtime drains its already accepted events.
+
 ## Versioning And Migration
 
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.

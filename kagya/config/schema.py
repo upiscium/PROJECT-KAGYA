@@ -269,6 +269,15 @@ class AgentStateWalSettings(StrictBaseModel):
     path: Path = Path(".kagya/private/agent_state_wal.jsonl")
 
 
+class AutonomySettings(StrictBaseModel):
+    enabled: bool = True
+    poll_interval_seconds: float = Field(default=1.0, gt=0.0)
+    reevaluation_interval_seconds: float = Field(default=300.0, gt=0.0)
+    max_events_per_cycle: int = Field(default=8, gt=0)
+    max_inferences_per_cycle: int = Field(default=1, ge=0)
+    max_wall_seconds_per_cycle: float = Field(default=5.0, gt=0.0)
+
+
 class ObservabilitySettings(StrictBaseModel):
     enabled: bool = True
     metrics_path: Path = Path(".kagya/operational_metrics.json")
@@ -367,6 +376,7 @@ class Settings(StrictBaseModel):
     agent_state_wal: AgentStateWalSettings = Field(
         default_factory=AgentStateWalSettings
     )
+    autonomy: AutonomySettings = Field(default_factory=AutonomySettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
