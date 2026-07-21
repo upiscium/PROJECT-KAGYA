@@ -15,6 +15,7 @@ from kagya.memory.memory_schema import (
     MemoryRecordType,
     MemoryRecordKind,
     SemanticMemoryRecord,
+    SemanticLifecycleStatus,
     ValidationStatus,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "MemoryRecordKind",
     "SentenceTransformerEmbeddingFunction",
     "SemanticMemoryRecord",
+    "SemanticLifecycleStatus",
     "ValidationStatus",
     "create_embedding_function",
 ]

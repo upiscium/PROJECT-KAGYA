@@ -14,6 +14,10 @@ from kagya.api.schemas.memory import (
     MemoryReviewRequest,
     MemorySearchResponse,
     SemanticMemoryResponse,
+    SemanticGraphResponse,
+    SemanticLifecycleRequest,
+    SemanticRelationshipRequest,
+    SemanticPolicyRequest,
 )
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
 from kagya.memory import MemoryLifecycleStatus, ValidationStatus
@@ -158,6 +162,135 @@ def archive_semantic(
     return semantic_response(record)
 
 
+@router.post("/semantic/{memory_id}/lifecycle", response_model=SemanticMemoryResponse)
+def update_semantic_lifecycle(
+    memory_id: str,
+    request: SemanticLifecycleRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> SemanticMemoryResponse:
+    operations = {
+        "archive": lambda: memory.archive_semantic(
+            memory_id, idempotency_key=request.idempotency_key
+        ),
+        "restore": lambda: memory.restore_semantic(
+            memory_id, idempotency_key=request.idempotency_key
+        ),
+        "forget": lambda: memory.forget_semantic(
+            memory_id, idempotency_key=request.idempotency_key
+        ),
+    }
+    operation = operations.get(request.action)
+    if operation is None:
+        raise HTTPException(
+            status_code=400, detail="Unsupported semantic lifecycle action"
+        )
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.MEMORY_UPDATE,
+            source=f"api.memory.semantic.{request.action}",
+            handler=operation,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+    return semantic_response(record)
+
+
+@router.delete("/semantic/{memory_id}", status_code=204)
+def delete_semantic(
+    memory_id: str,
+    idempotency_key: str,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> None:
+    deleted = execute_agent_event(
+        runtime,
+        AgentEventType.MEMORY_UPDATE,
+        source="api.memory.semantic.delete",
+        handler=lambda: memory.delete_semantic(
+            memory_id, idempotency_key=idempotency_key
+        ),
+    ).value
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+
+
+@router.post(
+    "/semantic/{memory_id}/relationships", response_model=SemanticMemoryResponse
+)
+def relate_semantic(
+    memory_id: str,
+    request: SemanticRelationshipRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> SemanticMemoryResponse:
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.MEMORY_UPDATE,
+            source="api.memory.semantic.relationship",
+            handler=lambda: memory.propose_semantic_relationship(
+                memory_id,
+                target_id=request.target_id,
+                relationship=request.relationship,
+                idempotency_key=request.idempotency_key,
+            ),
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return semantic_response(record)
+
+
+@router.get("/semantic/{memory_id}/graph", response_model=SemanticGraphResponse)
+def get_semantic_graph(
+    memory_id: str,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> SemanticGraphResponse:
+    records = execute_agent_event(
+        runtime,
+        AgentEventType.MEMORY_READ,
+        source="api.memory.semantic.graph",
+        handler=lambda: memory.semantic_graph(memory_id),
+    ).value
+    if not records:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+    return SemanticGraphResponse(records=[semantic_response(item) for item in records])
+
+
+@router.post("/semantic/{memory_id}/policy", response_model=SemanticMemoryResponse)
+def update_semantic_policy(
+    memory_id: str,
+    request: SemanticPolicyRequest,
+    memory: DualMemorySystem = Depends(get_memory_system),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> SemanticMemoryResponse:
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.MEMORY_UPDATE,
+            source="api.memory.semantic.policy",
+            handler=lambda: memory.update_semantic_policy(
+                memory_id,
+                idempotency_key=request.idempotency_key,
+                confidence=request.confidence,
+                validity=request.validity,
+                valid_from=request.valid_from,
+                valid_until=request.valid_until,
+                expires_at=request.expires_at,
+                decay_rate=request.decay_rate,
+            ),
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Semantic memory not found")
+    return semantic_response(record)
+
+
 @router.post("/semantic/{memory_id}/metadata", response_model=SemanticMemoryResponse)
 def update_semantic_metadata(
     memory_id: str,
@@ -238,4 +371,23 @@ def semantic_response(record: SemanticMemoryRecord) -> SemanticMemoryResponse:
         context_compatibility=record.context_compatibility,
         context_relation=record.context_relation,
         cross_context=record.cross_context,
+        schema_version=record.schema_version,
+        version=record.version,
+        content_hash=record.content_hash,
+        confidence=record.confidence,
+        effective_confidence=record.effective_confidence,
+        validity=record.validity,
+        valid_from=record.valid_from,
+        valid_until=record.valid_until,
+        expires_at=record.expires_at,
+        decay_rate=record.decay_rate,
+        last_confirmed_at=record.last_confirmed_at,
+        lifecycle_status=record.lifecycle_status.value,
+        supersedes_id=record.supersedes_id,
+        superseded_by_id=record.superseded_by_id,
+        corrected_by_id=record.corrected_by_id,
+        contradiction_ids=record.contradiction_ids,
+        source_feedback_ids=record.source_feedback_ids,
+        merge_candidate_ids=record.merge_candidate_ids,
+        audit_log=record.audit_log,
     )

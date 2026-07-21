@@ -887,6 +887,53 @@ def test_memory_api_archives_and_tags_records(tmp_path: Path) -> None:
     assert semantic_tagged.json()["tags"] == ["fact"]
 
 
+def test_semantic_lifecycle_graph_api_is_idempotent_and_admin_only(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    memory = client.app.state.memory_system
+    original = memory.save_semantic("original API fact")
+    correction = memory.save_semantic("corrected API fact", confidence=0.8)
+    payload = {
+        "target_id": original,
+        "relationship": "correction",
+        "idempotency_key": "api-correction-1",
+    }
+
+    assert (
+        client.post(
+            f"/api/memory/semantic/{correction}/relationships", json=payload
+        ).status_code
+        == 401
+    )
+    related = client.post(
+        f"/api/memory/semantic/{correction}/relationships",
+        headers=admin_headers(),
+        json=payload,
+    )
+    replay = client.post(
+        f"/api/memory/semantic/{correction}/relationships",
+        headers=admin_headers(),
+        json=payload,
+    )
+    graph = client.get(
+        f"/api/memory/semantic/{correction}/graph", headers=admin_headers()
+    )
+    forgotten = client.post(
+        f"/api/memory/semantic/{correction}/lifecycle",
+        headers=admin_headers(),
+        json={"action": "forget", "idempotency_key": "api-forget-1"},
+    )
+
+    assert related.status_code == 200
+    assert related.json()["supersedes_id"] == original
+    assert related.json()["confidence"] == 0.8
+    assert replay.json()["version"] == related.json()["version"]
+    assert {item["id"] for item in graph.json()["records"]} == {original, correction}
+    assert forgotten.json()["lifecycle_status"] == "forgotten"
+    assert memory.retrieve_context("corrected API fact").db2_results == []
+
+
 def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
     client = _client(tmp_path)
     assert client.get("/api/state/export").status_code == 401
@@ -2308,9 +2355,7 @@ def admin_headers() -> dict[str, str]:
 def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     settings = settings.model_copy(
-        update={
-            "autonomy": settings.autonomy.model_copy(update={"enabled": False})
-        }
+        update={"autonomy": settings.autonomy.model_copy(update={"enabled": False})}
     )
     with _client(tmp_path, settings=settings) as client:
         assert client.get("/api/autonomy/status").status_code == 401
@@ -2326,9 +2371,7 @@ def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> 
         assert created.status_code == 200
         scheduler = client.app.state.subject_scheduler
         cycle = scheduler.run_cycle()
-        status_response = client.get(
-            "/api/autonomy/status", headers=admin_headers()
-        )
+        status_response = client.get("/api/autonomy/status", headers=admin_headers())
 
     assert cycle.result.value == "processed"
     assert status_response.status_code == 200

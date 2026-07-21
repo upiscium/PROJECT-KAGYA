@@ -6,7 +6,7 @@ from kagya.experience import ExperienceAppraisal
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.motivation import GoalStatus
-from kagya.runtime import KagyaMainLoop
+from kagya.runtime import KagyaMainLoop, WorkingMemoryItem, WorkingMemoryKind
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -38,6 +38,25 @@ class ThinkOnlyPrimaryProvider(ThinkingDummyProvider):
         self.last_model_id = "fallback-model"
         self.last_fallback_used = True
         return self.fallback_response
+
+
+def test_inactive_semantic_working_memory_reference_is_not_rendered(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    semantic_id = memory.save_semantic("inactive semantic must stay private")
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    item = WorkingMemoryItem(
+        item_id=f"semantic:{semantic_id}",
+        kind=WorkingMemoryKind.SEMANTIC,
+        reference=f"semantic:{semantic_id}",
+    )
+
+    assert loop._resolve_working_memory(item) is not None
+    memory.forget_semantic(semantic_id, idempotency_key="forget-working-memory")
+
+    assert loop._resolve_working_memory(item) is None
 
 
 class InvalidLossThinkingProvider(ThinkingDummyProvider):

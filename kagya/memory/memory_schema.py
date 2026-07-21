@@ -36,6 +36,15 @@ class MemoryLifecycleStatus(StrEnum):
     CORRECTED = "corrected"
 
 
+class SemanticLifecycleStatus(StrEnum):
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    CORRECTED = "corrected"
+    EXPIRED = "expired"
+    FORGOTTEN = "forgotten"
+    SOURCE_REJECTED = "source_rejected"
+
+
 class ConsolidationStatus(StrEnum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -128,6 +137,25 @@ class SemanticMemoryRecord:
     context_compatibility: float = 0.0
     context_relation: str = "legacy_unknown"
     cross_context: bool = False
+    schema_version: int = 2
+    version: int = 1
+    content_hash: str = ""
+    confidence: float = 1.0
+    effective_confidence: float = 1.0
+    validity: str = "valid"
+    valid_from: str | None = None
+    valid_until: str | None = None
+    expires_at: str | None = None
+    decay_rate: float = 0.0
+    last_confirmed_at: str = ""
+    lifecycle_status: SemanticLifecycleStatus = SemanticLifecycleStatus.ACTIVE
+    supersedes_id: str | None = None
+    superseded_by_id: str | None = None
+    corrected_by_id: str | None = None
+    contradiction_ids: list[str] = field(default_factory=list)
+    source_feedback_ids: list[str] = field(default_factory=list)
+    merge_candidate_ids: list[str] = field(default_factory=list)
+    audit_log: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

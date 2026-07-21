@@ -117,6 +117,25 @@ export type SemanticMemory = {
   context_compatibility: number;
   context_relation: string;
   cross_context: boolean;
+  schema_version: number;
+  version: number;
+  content_hash: string;
+  confidence: number;
+  effective_confidence: number;
+  validity: string;
+  valid_from: string | null;
+  valid_until: string | null;
+  expires_at: string | null;
+  decay_rate: number;
+  last_confirmed_at: string;
+  lifecycle_status: string;
+  supersedes_id: string | null;
+  superseded_by_id: string | null;
+  corrected_by_id: string | null;
+  contradiction_ids: string[];
+  source_feedback_ids: string[];
+  merge_candidate_ids: string[];
+  audit_log: Array<{ event_id: string; operation: string; detail: Record<string, unknown>; idempotency_key: string | null; created_at: string }>;
 };
 
 export type MemorySearchResponse = { db1_results: EpisodeMemory[]; db2_results: SemanticMemory[] };
@@ -405,6 +424,10 @@ export const api = {
   reviewEpisodeMemory: (episodeId: string, body: MemoryReviewUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/review`, { method: "POST", body: JSON.stringify(body) }),
   archiveSemanticMemory: (memoryId: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
   updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
+  updateSemanticLifecycle: (memoryId: string, action: "archive" | "restore" | "forget", idempotencyKey: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/lifecycle`, { method: "POST", body: JSON.stringify({ action, idempotency_key: idempotencyKey }) }),
+  semanticGraph: (memoryId: string) => adminRequest<{ records: SemanticMemory[] }>(`/memory/semantic/${encodeURIComponent(memoryId)}/graph`),
+  relateSemanticMemory: (memoryId: string, targetId: string, relationship: "merge" | "contradiction" | "supersession" | "correction", idempotencyKey: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/relationships`, { method: "POST", body: JSON.stringify({ target_id: targetId, relationship, idempotency_key: idempotencyKey }) }),
+  updateSemanticPolicy: (memoryId: string, body: { confidence: number; validity: "valid" | "disputed" | "invalid"; valid_from?: string | null; valid_until?: string | null; expires_at?: string | null; decay_rate: number; idempotency_key: string }) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/policy`, { method: "POST", body: JSON.stringify(body) }),
   createSleepJob: (idempotency_key?: string) => adminRequest<TrainingJob>("/sleep/jobs", { method: "POST", body: JSON.stringify({ idempotency_key }) }),
   sleepJobs: () => adminRequest<TrainingJobListResponse>("/sleep/jobs"),
   cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
