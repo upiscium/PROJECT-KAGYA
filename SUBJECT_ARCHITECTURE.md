@@ -7,6 +7,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - `AgentRuntime` is the process-local ordering authority. API handlers submit typed events and do not mutate subject state from request threads.
 - `AgentStateStore` is the persistence authority for internal state. It writes atomic, fsynced snapshots after accepted events.
 - `EventJournal` is the durable audit and recovery-classification authority for event lifecycles. It records only allowlisted identifiers, sequence, lifecycle, and state hashes; it is not an event-sourced copy of private prompts or arbitrary handler inputs.
+- `StateWAL` is the separate private reconstruction authority. It stores versioned, validated whole-state replacement patches with pre/post hashes and a hash chain; it never stores handlers or event payloads.
 - `KagyaMainLoop` coordinates subsystem inputs and outputs. It is not an alternative state store.
 - The inference host is the authoritative subject in both standalone and future split deployments. Training workers must consume immutable artifacts and cannot mutate memory, emotion, values, goals, decisions, self-model state, or adapter activation directly.
 - Free-form hidden thoughts are not decision authority, capability evidence, or a training target. Public responses, agent-state snapshots, DecisionRecords, and new training datasets exclude them; legacy/internal episodic metadata remains behind the admin and retrieval privacy boundaries.
@@ -28,6 +29,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | --- | --- | --- | --- | --- |
 | Event runtime | Assign one causal processing sequence and serialize mutations | `last_processed_event_sequence` in `.kagya/agent_state.json` | Accepted `AgentEvent` | `tests/test_agent_runtime.py` |
 | Event journal | Persist accepted/started/prepared/terminal lifecycle and snapshot hash continuity | `.kagya/agent_journal.jsonl*` | Fsynced operator-safe lifecycle records | `tests/test_event_journal.py` |
+| State transition WAL | Deterministically reconstruct retained authoritative snapshots | `.kagya/private/agent_state_wal.jsonl` | Fsynced schema-v1 state replacement patches | `tests/test_state_wal.py` |
 | Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
 | Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
 | Experience integration | Bind an event, context, appraisal, subjective salience, and downstream references into one first-person unit | `extensions.experiences` | Structured Observation/interaction events; later reassessment requires evidence refs | `tests/test_experience_store.py` |
@@ -96,7 +98,9 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
 - Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.
 - Journal schema has no event payload field. Corrupt records, hash-chain breaks, sequence gaps, and snapshot hash mismatches fail closed at startup.
-- Redacted Journal records support audit and crash classification. Deterministic authoritative state replay requires separately versioned private transition commands or state patches and is not performed by arbitrary handler replay.
+- Redacted Journal records support audit and crash classification. The private WAL reconstructs snapshots by applying validated patches only; it never invokes original handlers, tools, network calls, notifications, training, Chroma, or adapter-registry operations.
+- `GET /api/state/reconstruct/{sequence}` and `POST /api/state/restore/{sequence}/dry-run` inspect retained state without mutation. `POST /api/state/restore/{sequence}` restores internal snapshot state as a new `state_point_in_time_restore` event; external stores remain unchanged and must be checked through their own provenance contracts.
+- WAL files are created mode `0600`, belong in encrypted private backups, and must never be exposed through the operator-safe Journal API. Unsupported schemas, corrupt records, private-field keys, sequence gaps, and pre/post hash mismatches fail closed.
 
 ## Verification
 

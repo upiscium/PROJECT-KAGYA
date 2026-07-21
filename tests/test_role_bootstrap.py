@@ -98,6 +98,9 @@ def _base_settings(tmp_path: Path) -> Settings:
             "agent_journal": settings.agent_journal.model_copy(
                 update={"path": tmp_path / "agent_journal.jsonl"}
             ),
+            "agent_state_wal": settings.agent_state_wal.model_copy(
+                update={"path": tmp_path / "private" / "agent_state_wal.jsonl"}
+            ),
             "observability": settings.observability.model_copy(
                 update={
                     "metrics_path": tmp_path / "metrics.json",

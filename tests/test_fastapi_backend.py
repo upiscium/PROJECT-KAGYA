@@ -18,6 +18,7 @@ from kagya.runtime import (
     AgentStateStore,
     EventJournal,
     JournalLifecycle,
+    StateWAL,
     hash_snapshot,
 )
 from kagya.tools import (
@@ -887,6 +888,48 @@ def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
         "optimal_loss": 1.0,
     }
     assert client.app.state.main_loop.session_state.turns == []
+
+
+def test_point_in_time_restore_is_new_event_without_external_replay(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        baseline = client.app.state.state_wal.reconstruct(0)
+        chat = client.post(
+            "/api/chat", json={"text": "external side effect", "attachments": []}
+        )
+        assert chat.status_code == 200
+        current = client.app.state.agent_state_store.last_snapshot
+        assert current is not None
+        current_hash = hash_snapshot(current)
+        memory_ids = list(client.app.state.memory_system.db1.get()["ids"])
+
+        reconstructed = client.get("/api/state/reconstruct/0", headers=admin_headers())
+        dry_run = client.post("/api/state/restore/0/dry-run", headers=admin_headers())
+
+        assert reconstructed.status_code == 200
+        assert reconstructed.json()["snapshot_hash"] == baseline.snapshot_hash
+        assert reconstructed.json()["external_side_effects_replayed"] is False
+        assert dry_run.status_code == 200
+        assert dry_run.json()["current_hash"] == current_hash
+        assert (
+            hash_snapshot(client.app.state.agent_state_store.last_snapshot)
+            == current_hash
+        )
+
+        restored = client.post("/api/state/restore/0", headers=admin_headers())
+
+        assert restored.status_code == 200
+        assert (
+            restored.json()["emotion_state"]
+            == baseline.snapshot.model_dump(mode="json")["emotion_state"]
+        )
+        assert client.app.state.memory_system.db1.get()["ids"] == memory_ids
+
+    records = StateWAL(settings.agent_state_wal.path).verify()
+    assert records[-1].event_type == AgentEventType.STATE_POINT_IN_TIME_RESTORE.value
+    assert records[-1].processing_sequence > baseline.sequence
 
 
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
@@ -1933,6 +1976,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "agent_journal": settings.agent_journal.model_copy(
                 update={"path": tmp_path / "agent_journal.jsonl"}
+            ),
+            "agent_state_wal": settings.agent_state_wal.model_copy(
+                update={"path": tmp_path / "private" / "agent_state_wal.jsonl"}
             ),
             "observability": settings.observability.model_copy(
                 update={

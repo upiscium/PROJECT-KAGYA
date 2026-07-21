@@ -22,6 +22,15 @@ from kagya.runtime.agent_state import (
     AgentStateStore,
     PersistentAgentState,
 )
+from kagya.runtime.state_wal import (
+    StateDiffEntry,
+    StateDryRun,
+    StatePatch,
+    StateReconstruction,
+    StateWAL,
+    StateWalIntegrityError,
+    StateWalRecord,
+)
 from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
 from kagya.runtime.context import (
     ContextFrame,
@@ -84,6 +93,13 @@ __all__ = [
     "JournalLifecycle",
     "JournalRecord",
     "PersistentAgentState",
+    "StateDiffEntry",
+    "StateDryRun",
+    "StatePatch",
+    "StateReconstruction",
+    "StateWAL",
+    "StateWalIntegrityError",
+    "StateWalRecord",
     "SessionState",
     "SessionTurn",
     "RetentionReason",

@@ -1,6 +1,6 @@
 """Administrative agent-state snapshot operations."""
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from kagya.api.dependencies import (
     execute_agent_event,
@@ -8,6 +8,7 @@ from kagya.api.dependencies import (
     get_agent_state_store,
     get_api_settings,
     get_main_loop,
+    get_state_wal,
     require_admin,
 )
 from kagya.config import Settings
@@ -16,6 +17,10 @@ from kagya.runtime import (
     AgentRuntime,
     AgentStateSnapshot,
     AgentStateStore,
+    StateDryRun,
+    StateReconstruction,
+    StateWAL,
+    StateWalIntegrityError,
 )
 from kagya.runtime.agent_state import default_agent_state_snapshot
 
@@ -92,6 +97,59 @@ def reset_snapshot(
         source="api.state.reset",
         handler=reset,
     )
+    return _current_snapshot(store)
+
+
+@router.get("/reconstruct/{sequence}", response_model=StateReconstruction)
+def reconstruct_snapshot(
+    sequence: int,
+    wal: StateWAL = Depends(get_state_wal),
+) -> StateReconstruction:
+    try:
+        return wal.reconstruct(sequence)
+    except StateWalIntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+
+
+@router.post("/restore/{sequence}/dry-run", response_model=StateDryRun)
+def dry_run_restore(
+    sequence: int,
+    store: AgentStateStore = Depends(get_agent_state_store),
+    wal: StateWAL = Depends(get_state_wal),
+) -> StateDryRun:
+    try:
+        return wal.dry_run(_current_snapshot(store), sequence)
+    except StateWalIntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+
+
+@router.post("/restore/{sequence}", response_model=AgentStateSnapshot)
+def restore_point_in_time(
+    sequence: int,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    store: AgentStateStore = Depends(get_agent_state_store),
+    wal: StateWAL = Depends(get_state_wal),
+) -> AgentStateSnapshot:
+    def restore() -> None:
+        target = wal.reconstruct(sequence)
+        store.restore_into(get_main_loop(request), target.snapshot)
+
+    try:
+        execute_agent_event(
+            runtime,
+            AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.point_in_time_restore",
+            handler=restore,
+        )
+    except StateWalIntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
     return _current_snapshot(store)
 
 

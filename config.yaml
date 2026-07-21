@@ -137,6 +137,10 @@ agent_journal:
   max_bytes: 10485760
   retained_files: 3
 
+# Authoritative patches are private state, unlike the operator-safe journal.
+agent_state_wal:
+  path: .kagya/private/agent_state_wal.jsonl
+
 observability:
   enabled: true
   metrics_path: .kagya/operational_metrics.json
@@ -161,6 +165,7 @@ api:
     reauthentication_paths:
       - /api/state/restore
       - /api/state/reset
+      - /api/state/restore/*
       - /api/sleep/jobs
       - /api/sleep/jobs/*
       - /api/sleep/cleanup

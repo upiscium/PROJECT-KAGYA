@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 import time
 
 import uvicorn
@@ -39,11 +40,14 @@ from kagya.runtime import (
     AgentRuntime,
     AgentEvent,
     AgentStateStore,
+    AgentStateSnapshot,
     EmotionTimer,
     EventJournal,
     KagyaMainLoop,
     RemoteTrainingDispatcher,
     TrainingWorkerRuntime,
+    StateWAL,
+    StateWalIntegrityError,
     hash_snapshot,
 )
 
@@ -87,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             runtime = getattr(app.state, "agent_runtime", None)
             journal = getattr(app.state, "event_journal", None)
+            state_wal = getattr(app.state, "state_wal", None)
             journal_ready = False
             if journal is not None:
                 try:
@@ -97,7 +102,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_ready = bool(
                 runtime is not None and runtime.is_alive and runtime.is_accepting
             )
-            checks = {"agent_runtime": runtime_ready, "journal": journal_ready}
+            wal_ready = False
+            if state_wal is not None:
+                try:
+                    state_wal.verify()
+                    wal_ready = True
+                except Exception:
+                    wal_ready = False
+            checks = {
+                "agent_runtime": runtime_ready,
+                "journal": journal_ready,
+                "state_wal": wal_ready,
+            }
             ready = all(checks.values())
         if not ready:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -181,6 +197,9 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             retained_files=settings.agent_journal.retained_files,
             telemetry=app.state.operational_telemetry,
         )
+    if getattr(app.state, "state_wal", None) is None:
+        app.state.state_wal = StateWAL(settings.agent_state_wal.path)
+    snapshot = _reconcile_state_wal(app, snapshot)
     app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
@@ -292,6 +311,7 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
         state_hash_before=before_hash,
         state_hash_after=after_hash,
     )
+    app.state.state_wal.append_transition(event, previous, candidate)
     try:
         saved = store.save(candidate)
         try:
@@ -315,10 +335,38 @@ def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
     if previous is None:
         raise RuntimeError("Agent state store has no previous snapshot")
     store.restore_into(app.state.main_loop, previous)
-    saved = store.save_failed_sequence(_event_sequence(event.processing_sequence))
-    if saved is None:
-        raise RuntimeError("Agent failure snapshot was not saved")
+    candidate = previous.model_copy(
+        update={
+            "saved_at": datetime.now(UTC),
+            "last_processed_event_sequence": _event_sequence(event.processing_sequence),
+        }
+    )
+    app.state.event_journal.prepared(
+        event,
+        state_hash_before=hash_snapshot(previous),
+        state_hash_after=hash_snapshot(candidate),
+    )
+    app.state.state_wal.append_transition(event, previous, candidate)
+    saved = store.save(candidate)
     return hash_snapshot(saved)
+
+
+def _reconcile_state_wal(
+    app: FastAPI, snapshot: AgentStateSnapshot
+) -> AgentStateSnapshot:
+    wal = app.state.state_wal
+    wal.bootstrap(snapshot)
+    latest = wal.reconstruct()
+    snapshot_hash = hash_snapshot(snapshot)
+    if latest.sequence == snapshot.last_processed_event_sequence:
+        if latest.snapshot_hash != snapshot_hash:
+            raise StateWalIntegrityError(
+                "snapshot and private state WAL hashes disagree"
+            )
+        return snapshot
+    if latest.sequence == snapshot.last_processed_event_sequence + 1:
+        return app.state.agent_state_store.save(latest.snapshot)
+    raise StateWalIntegrityError("snapshot and private state WAL sequences diverge")
 
 
 def _observe_subject_state(app: FastAPI) -> None:
