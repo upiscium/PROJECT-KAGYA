@@ -267,6 +267,7 @@ class AgentStateStore:
         main_loop.restore_decision_state()
         main_loop.restore_self_model_state()
         main_loop.restore_experience_state()
+        main_loop.restore_narrative_self_state()
         main_loop.restore_belief_state()
         main_loop.restore_attention_state()
         main_loop.restore_feedback_state()

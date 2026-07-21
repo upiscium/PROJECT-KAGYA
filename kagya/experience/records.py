@@ -134,7 +134,15 @@ class ExperienceRecord:
         if any(not key or value < 0 for key, value in self.value_revision_refs.items()):
             raise ValueError("value revision references must be non-negative")
         for kind, refs in self.result_refs.items():
-            if kind not in {"memory", "belief", "value", "goal", "self_model", "decision"}:
+            if kind not in {
+                "memory",
+                "belief",
+                "value",
+                "goal",
+                "self_model",
+                "decision",
+                "narrative",
+            }:
                 raise ValueError(f"Unsupported experience result kind: {kind}")
             _safe_codes(refs, "experience result reference")
         for timestamp in (self.created_at, self.updated_at):
@@ -184,12 +192,15 @@ class ExperienceStore:
 
     def list_records(self) -> list[ExperienceRecord]:
         return sorted(
-            self.records.values(), key=lambda item: (item.created_at, item.experience_id)
+            self.records.values(),
+            key=lambda item: (item.created_at, item.experience_id),
         )
 
     def latest_for_context(self, context_id: str) -> ExperienceRecord | None:
         candidates = [
-            record for record in self.records.values() if record.context_id == context_id
+            record
+            for record in self.records.values()
+            if record.context_id == context_id
         ]
         return max(
             candidates,
@@ -251,7 +262,15 @@ class ExperienceStore:
         current = self.get(experience_id)
         if not evidence_refs:
             raise ValueError("experience result links require evidence references")
-        if kind not in {"memory", "belief", "value", "goal", "self_model", "decision"}:
+        if kind not in {
+            "memory",
+            "belief",
+            "value",
+            "goal",
+            "self_model",
+            "decision",
+            "narrative",
+        }:
             raise ValueError(f"Unsupported experience result kind: {kind}")
         _safe_ref(reference, "experience result reference")
         existing = current.result_refs.get(kind, ())
@@ -388,7 +407,11 @@ def build_chat_experience(
 def _experience_metrics(
     appraisal: ExperienceAppraisal, prediction_error: float | None
 ) -> dict[str, Any]:
-    novelty = appraisal.novelty if appraisal.novelty_valid and appraisal.novelty is not None else 0.0
+    novelty = (
+        appraisal.novelty
+        if appraisal.novelty_valid and appraisal.novelty is not None
+        else 0.0
+    )
     affective_intensity = 0.6 * appraisal.arousal + 0.4 * abs(appraisal.valence)
     self_relevance = max(
         appraisal.social_relevance,
@@ -401,9 +424,7 @@ def _experience_metrics(
         1.0 - appraisal.certainty,
     )
     normalized_prediction_error = (
-        0.0
-        if prediction_error is None
-        else 1.0 - math.exp(-max(0.0, prediction_error))
+        0.0 if prediction_error is None else 1.0 - math.exp(-max(0.0, prediction_error))
     )
     subjective_salience = _clamp(
         0.3 * novelty
@@ -470,7 +491,8 @@ def _experience_from_json(payload: dict[str, Any]) -> ExperienceRecord:
     ):
         data[name] = tuple(data.get(name, ()))
     data["value_revision_refs"] = {
-        str(key): int(value) for key, value in data.get("value_revision_refs", {}).items()
+        str(key): int(value)
+        for key, value in data.get("value_revision_refs", {}).items()
     }
     data["result_refs"] = {
         str(key): tuple(value) for key, value in data.get("result_refs", {}).items()
