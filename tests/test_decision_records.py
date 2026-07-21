@@ -42,12 +42,13 @@ def test_candidate_comparison_tracks_contributions_and_selects_best() -> None:
     selected = record.considered_candidates[0]
     assert selected.value_contributions == {"honesty": 0.4}
     assert selected.appraisal_contributions == {"goal_progress": 0.3}
+    assert selected.metacognition_contributions == {}
     assert selected.total_score is not None
     assert record.active_goal_ids == ("goal-1",)
     assert record.adapter_id == "adapter-1"
     assert record.adapter_hash == "hash-1"
     assert record.activation_sequence == 7
-    assert record.schema_version == 7
+    assert record.schema_version == 8
 
 
 def test_no_op_defer_and_observation_are_regular_candidates() -> None:
@@ -56,6 +57,7 @@ def test_no_op_defer_and_observation_are_regular_candidates() -> None:
         ActionType.DEFER,
         ActionType.OBSERVE,
         ActionType.REQUEST_INFORMATION,
+        ActionType.DELEGATE,
     ):
         store = DecisionStore()
         fallback = _fallback_candidate(action_type=action_type)
@@ -174,6 +176,7 @@ def test_v1_record_migrates_without_self_model_contributions() -> None:
     del payload[0]["adapter_hash"]
     del payload[0]["activation_sequence"]
     del payload[0]["considered_candidates"][0]["self_model_contributions"]
+    payload[0]["considered_candidates"][0].pop("metacognition_contributions", None)
 
     restored = DecisionStore()
     restored.restore(payload)
@@ -183,6 +186,10 @@ def test_v1_record_migrates_without_self_model_contributions() -> None:
         == {}
     )
     assert restored.get("legacy").adapter_id is None
+    assert (
+        restored.get("legacy").considered_candidates[0].metacognition_contributions
+        == {}
+    )
 
 
 def test_schema_parser_rejects_free_form_reasoning_and_unknown_fields() -> None:

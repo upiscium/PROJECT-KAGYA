@@ -84,6 +84,7 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Operators can audit `GET /api/feedback`, create broader target feedback at `POST /api/feedback/admin`, append revisions at `POST /api/feedback/{id}/revisions`, and withdraw effects at `POST /api/feedback/{id}/withdraw`.
 - Every mutation requires an idempotency key. Feedback remains categorical and versioned: correction and expected-answer text becomes provenance-linked memory, never a free-form reward or hidden-thought update.
 - `do_not_remember`, negative quality/safety signals, and explicit training exclusion remove the target episode from retrieval/consolidation/training while preserving it for audit. Corrections supersede rather than delete the original memory. Withdrawal restores the prior lifecycle and training policy when the feedback owns those effects.
+- Operators can inspect evidence-backed pre/post Decision self-assessments at `GET /api/metacognition` and `GET /api/metacognition/assessments/{id}`. Confidence combines structured capability evidence with observed past accuracy; operator feedback is retained as explicit calibration provenance.
 - `api.admin_auth.enabled` defaults to `false`. In that mode the existing admin-token behavior is unchanged; Origin, session, role, CSRF, and re-authentication checks are not applied. This mode is private/loopback only and must not be exposed directly to the public internet.
 
 ### Optional Admin Identity
@@ -137,6 +138,8 @@ Authorized mutations append a hash-chained Journal audit record containing only 
 - Legacy configs without `deployment` are explicitly migrated to `standalone/all/local`; `just config-check` reports the migration note. Split configs never use that migration as an implicit topology fallback.
 
 Identity-changing state uses typed origin provenance. Admin `POST /api/goals` accepts external-request proposals only; it cannot declare a Goal intrinsic on the subject's behalf. Adoption is a separate subject event that records endorsement. Value update requests are retained as operator feedback/evidence and cannot spoof self-origin through a caller-provided source label. Legacy Goal, Commitment, Value, and identity-proposal records migrate as inherited and uncertain rather than self-originated.
+
+Metacognitive boundaries distinguish `unknown`, `uncertain`, `unable`, and `needs_help` and can steer explicitly scoped Decisions toward `request_information`, `defer`, `observe`, or `delegate`. Assessments record Self Model revisions, Narrative Self references, cognitive load, attention saturation, emotion influence, prediction/outcome evidence, and recurring error/bias hypotheses. Generated apologies, hidden thought, and model self-report are not accepted as competence or calibration authority.
 
 ## Multimodal Attachments
 
