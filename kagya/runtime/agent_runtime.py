@@ -29,6 +29,7 @@ class AgentEventType(StrEnum):
     STATE_SNAPSHOT = "state_snapshot"
     STATE_EXPORT = "state_export"
     STATE_RESTORE = "state_restore"
+    STATE_POINT_IN_TIME_RESTORE = "state_point_in_time_restore"
     STATE_RESET = "state_reset"
     CONTEXT_UPDATE = "context_update"
     EMOTION_TICK = "emotion_tick"

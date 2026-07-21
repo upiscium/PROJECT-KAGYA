@@ -200,6 +200,8 @@ Distributed training operations are available through admin-token-protected endp
 - `POST /api/sleep/cleanup` applies `sleep.artifact_retention_days` to terminal bundle/result/work artifacts. Imported ACTIVE and rollback adapter directories are outside this cleanup boundary.
 - `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
 - `GET /api/system/journal` returns admin-only, operator-safe durable event lifecycle records and hash continuity metadata. It never returns event payloads, prompts, generated text, attachments, credentials, or hidden thoughts.
+- `agent_state_wal.path` is a separate mode-`0600` private authoritative state log. Keep it with the state snapshot in encrypted backups; do not publish it as operational telemetry or an operator-safe Journal.
+- Admin-only `GET /api/state/reconstruct/{sequence}` and `POST /api/state/restore/{sequence}/dry-run` reconstruct and compare retained state without replaying side effects. `POST /api/state/restore/{sequence}` commits the selected state as a new runtime event; tools, network, notifications, training, Chroma, and adapter-registry operations are never replayed.
 
 ### Operational Observability
 

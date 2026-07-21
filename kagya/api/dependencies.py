@@ -35,6 +35,7 @@ from kagya.runtime import (
     AgentStateStore,
     KagyaMainLoop,
     EmotionTimer,
+    StateWAL,
     hash_snapshot,
 )
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
@@ -165,6 +166,14 @@ def get_agent_state_store(request: Request) -> AgentStateStore:
         )
         request.app.state.agent_state_store = store
     return store
+
+
+def get_state_wal(request: Request) -> StateWAL:
+    wal = getattr(request.app.state, "state_wal", None)
+    if wal is None:
+        wal = StateWAL(get_api_settings(request).agent_state_wal.path)
+        request.app.state.state_wal = wal
+    return wal
 
 
 def _event_sequence(sequence: int | None) -> int:
