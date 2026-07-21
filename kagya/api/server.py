@@ -19,6 +19,7 @@ from kagya.api.routes import (
     decisions,
     evaluations,
     experiences,
+    feedback,
     goals,
     memory,
     motivation,
@@ -145,6 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(motivation.router)
         app.include_router(attention.router)
         app.include_router(autonomy.router)
+        app.include_router(feedback.router)
 
     return app
 
@@ -196,9 +198,7 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
         app.state.agent_state_store = AgentStateStore(
             settings.agent_state.path, app.state.runtime_event_log
         )
-    snapshot = app.state.agent_state_store.load(
-        settings.emotion.baseline_surprisal
-    )
+    snapshot = app.state.agent_state_store.load(settings.emotion.baseline_surprisal)
     if getattr(app.state, "event_journal", None) is None:
         app.state.event_journal = EventJournal(
             settings.agent_journal.path,
@@ -212,7 +212,9 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
-    embedding_model = getattr(app.state.memory_system.embedding_function, "_get_model", None)
+    embedding_model = getattr(
+        app.state.memory_system.embedding_function, "_get_model", None
+    )
     if callable(embedding_model):
         embedding_model()
     if getattr(app.state, "adapter_registry", None) is None:
@@ -256,7 +258,9 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             provider,
             app.state.memory_system,
             adapter_id=None if active_adapter is None else active_adapter.adapter_id,
-            adapter_hash=None if active_adapter is None else active_adapter.adapter_hash,
+            adapter_hash=None
+            if active_adapter is None
+            else active_adapter.adapter_hash,
             activation_sequence=(
                 None if active_adapter is None else active_adapter.activation_sequence
             ),
@@ -294,7 +298,10 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             poll_interval_seconds=autonomy_settings.poll_interval_seconds,
         )
         app.state.autonomy_loop.start()
-    if settings.appraisal.timer_enabled and getattr(app.state, "emotion_timer", None) is None:
+    if (
+        settings.appraisal.timer_enabled
+        and getattr(app.state, "emotion_timer", None) is None
+    ):
         app.state.emotion_timer = EmotionTimer(
             app.state.agent_runtime,
             lambda elapsed: app.state.main_loop.advance_time(elapsed),
@@ -409,9 +416,7 @@ def _observe_subject_state(app: FastAPI) -> None:
         "kagya_unresolved_decisions",
         float(
             len(
-                loop.decision_store.list_records(
-                    status=DecisionStatus.AWAITING_OUTCOME
-                )
+                loop.decision_store.list_records(status=DecisionStatus.AWAITING_OUTCOME)
             )
         ),
     )

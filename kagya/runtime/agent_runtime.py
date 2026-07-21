@@ -15,7 +15,9 @@ from uuid import uuid4
 
 T = TypeVar("T")
 _STOP = object()
-_current_event: ContextVar[AgentEvent | None] = ContextVar("kagya_agent_event", default=None)
+_current_event: ContextVar[AgentEvent | None] = ContextVar(
+    "kagya_agent_event", default=None
+)
 
 
 class AgentEventType(StrEnum):
@@ -55,6 +57,8 @@ class AgentEventType(StrEnum):
     ATTENTION_COMPETE = "attention_compete"
     AUTONOMY_SCHEDULE = "autonomy_schedule"
     AUTONOMY_WAKE = "autonomy_wake"
+    FEEDBACK_READ = "feedback_read"
+    FEEDBACK_UPDATE = "feedback_update"
 
 
 @dataclass(frozen=True)
@@ -284,9 +288,7 @@ class AgentRuntime:
                     return
                 envelope = cast(_Envelope[Any], item)
                 self._sequence += 1
-                event = replace(
-                    envelope.event, processing_sequence=self._sequence
-                )
+                event = replace(envelope.event, processing_sequence=self._sequence)
                 can_deliver = envelope.future.set_running_or_notify_cancel()
                 if self._event_journal is not None:
                     try:
@@ -301,9 +303,7 @@ class AgentRuntime:
                         )
                         return
                 self._record(event, "started")
-                self._observe_telemetry(
-                    "event_started", event, self._queue.qsize()
-                )
+                self._observe_telemetry("event_started", event, self._queue.qsize())
                 event_token = _current_event.set(event)
                 try:
                     value = envelope.handler()
@@ -350,9 +350,7 @@ class AgentRuntime:
                                 )
                             self._event_journal.completed(event, snapshot_hash)
                     except Exception as exc:
-                        self._record(
-                            event, "failed", exception_type=type(exc).__name__
-                        )
+                        self._record(event, "failed", exception_type=type(exc).__name__)
                         if self._event_journal is None:
                             if can_deliver:
                                 envelope.future.set_exception(exc)

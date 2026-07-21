@@ -45,11 +45,14 @@ class DreamDatasetGenerator:
                 validation_status=episode.validation_status.value,
             )
             for episode in episodes
+            if episode.training_included
         ]
         dataset_path.parent.mkdir(parents=True, exist_ok=True)
         with dataset_path.open("x", encoding="utf-8") as dataset_file:
             for record in records:
-                dataset_file.write(json.dumps(record.to_json(), ensure_ascii=False) + "\n")
+                dataset_file.write(
+                    json.dumps(record.to_json(), ensure_ascii=False) + "\n"
+                )
         return records
 
 

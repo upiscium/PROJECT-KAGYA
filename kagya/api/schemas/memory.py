@@ -50,6 +50,10 @@ class EpisodeMemoryResponse(BaseModel):
     experience_id: str | None
     subjective_salience: float
     autobiographical_importance: float
+    supersedes_id: str | None
+    corrected_by_id: str | None
+    training_included: bool
+    training_exclusion_refs: list[str]
 
 
 class SemanticMemoryResponse(BaseModel):

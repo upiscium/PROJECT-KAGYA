@@ -116,7 +116,13 @@ class AgentStateSnapshot(_StateModel):
 
     @model_validator(mode="after")
     def reject_private_runtime_fields(self) -> "AgentStateSnapshot":
-        forbidden = {"hidden_thought", "prompt", "turns", "attachments", "event_payload"}
+        forbidden = {
+            "hidden_thought",
+            "prompt",
+            "turns",
+            "attachments",
+            "event_payload",
+        }
         if _contains_forbidden_key(self.model_dump(), forbidden):
             raise ValueError("snapshot contains a forbidden private runtime field")
         if self.saved_at.tzinfo is None:
@@ -166,7 +172,10 @@ class AgentStateStore:
                 raise UnsupportedStateVersion(version)
             snapshot = AgentStateSnapshot.model_validate(raw)
         except UnsupportedStateVersion as exc:
-            self._record("load_failed", {"reason": "unsupported_schema_version", "schema_version": exc.version})
+            self._record(
+                "load_failed",
+                {"reason": "unsupported_schema_version", "schema_version": exc.version},
+            )
             snapshot = default
         except json.JSONDecodeError:
             self._record("load_failed", {"reason": "json_decode_error"})
@@ -186,7 +195,12 @@ class AgentStateStore:
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as snapshot_file:
-                json.dump(validated.model_dump(mode="json"), snapshot_file, ensure_ascii=True, sort_keys=True)
+                json.dump(
+                    validated.model_dump(mode="json"),
+                    snapshot_file,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
                 snapshot_file.flush()
                 os.fsync(snapshot_file.fileno())
             os.replace(temporary_path, self.path)
@@ -212,7 +226,10 @@ class AgentStateStore:
                 optimal_loss=emotion.optimal_loss,
             ),
             working_memory=WorkingMemoryStateSnapshot(
-                items=[_working_memory_item_snapshot(item) for item in main_loop.working_memory.items],
+                items=[
+                    _working_memory_item_snapshot(item)
+                    for item in main_loop.working_memory.items
+                ],
                 metadata=state.working_memory_metadata,
                 extensions=state.working_memory_extensions,
             ),
@@ -227,7 +244,10 @@ class AgentStateStore:
                 extensions=state.identity_extensions,
             ),
             context_state=ContextStateSnapshot(
-                frames=[_context_frame_snapshot(frame) for frame in main_loop.context_registry.frames],
+                frames=[
+                    _context_frame_snapshot(frame)
+                    for frame in main_loop.context_registry.frames
+                ],
                 interlocutors=[
                     _interlocutor_snapshot(model)
                     for model in main_loop.context_registry.interlocutors
@@ -237,7 +257,9 @@ class AgentStateStore:
         )
 
     def restore_into(self, main_loop: Any, snapshot: AgentStateSnapshot) -> None:
-        main_loop.emotion_engine.state = EmotionState(**snapshot.emotion_state.model_dump())
+        main_loop.emotion_engine.state = EmotionState(
+            **snapshot.emotion_state.model_dump()
+        )
         main_loop.persistent_state = persistent_state_from_snapshot(snapshot)
         main_loop.restore_appraisal_state()
         main_loop.restore_value_state()
@@ -247,12 +269,19 @@ class AgentStateStore:
         main_loop.restore_experience_state()
         main_loop.restore_belief_state()
         main_loop.restore_attention_state()
+        main_loop.restore_feedback_state()
         main_loop.working_memory.restore(
-            [_working_memory_item_from_snapshot(item) for item in snapshot.working_memory.items]
+            [
+                _working_memory_item_from_snapshot(item)
+                for item in snapshot.working_memory.items
+            ]
         )
         main_loop._sync_belief_working_memory(None)
         main_loop.context_registry.restore(
-            tuple(_context_frame_from_snapshot(item) for item in snapshot.context_state.frames),
+            tuple(
+                _context_frame_from_snapshot(item)
+                for item in snapshot.context_state.frames
+            ),
             tuple(
                 _interlocutor_from_snapshot(item)
                 for item in snapshot.context_state.interlocutors
@@ -297,7 +326,9 @@ def default_agent_state_snapshot(baseline_surprisal: float) -> AgentStateSnapsho
     )
 
 
-def persistent_state_from_snapshot(snapshot: AgentStateSnapshot) -> PersistentAgentState:
+def persistent_state_from_snapshot(
+    snapshot: AgentStateSnapshot,
+) -> PersistentAgentState:
     return PersistentAgentState(
         working_memory_metadata=dict(snapshot.working_memory.metadata),
         working_memory_extensions=dict(snapshot.working_memory.extensions),
@@ -470,8 +501,7 @@ def _attribute_from_json(value: dict[str, Any]) -> InferredAttribute:
 def _contains_forbidden_key(value: Any, forbidden: set[str]) -> bool:
     if isinstance(value, dict):
         return any(
-            str(key).lower() in forbidden
-            or _contains_forbidden_key(item, forbidden)
+            str(key).lower() in forbidden or _contains_forbidden_key(item, forbidden)
             for key, item in value.items()
         )
     if isinstance(value, list):

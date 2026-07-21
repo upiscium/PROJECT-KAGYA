@@ -20,7 +20,9 @@ from kagya.memory import MemoryLifecycleStatus, ValidationStatus
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
-router = APIRouter(prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)])
+router = APIRouter(
+    prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)]
+)
 
 
 @router.get("/search", response_model=MemorySearchResponse)
@@ -212,6 +214,10 @@ def episode_response(record: EpisodicMemoryRecord) -> EpisodeMemoryResponse:
         experience_id=record.experience_id,
         subjective_salience=record.subjective_salience,
         autobiographical_importance=record.autobiographical_importance,
+        supersedes_id=record.supersedes_id,
+        corrected_by_id=record.corrected_by_id,
+        training_included=record.training_included,
+        training_exclusion_refs=record.training_exclusion_refs,
     )
 
 

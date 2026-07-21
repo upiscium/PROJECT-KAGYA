@@ -149,4 +149,47 @@ describe("ChatClient", () => {
     const secondRequest = JSON.parse(fetchMock.mock.calls[1][1].body as string);
     expect(secondRequest.context_id).toBe("ctx-stable");
   });
+
+  it("submits typed feedback with response provenance", async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          context_id: "ctx-feedback",
+          episode_id: "episode-feedback",
+          experience_id: "experience-feedback",
+          response: "Visible answer",
+          emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+          model: { model_id: "model", adapter_id: null, fallback_used: false },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          feedback_id: "feedback-1",
+          current_revision: 1,
+          revisions: [{ revision: 1, status: "active", signals: ["do_not_remember"], propagation: { training_disposition: "exclude", correction_memory_id: null } }],
+        }),
+      });
+    renderWithQuery();
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText("Visible answer");
+
+    await userEvent.selectOptions(screen.getByLabelText("Feedback type"), "do_not_remember");
+    await userEvent.click(screen.getByRole("button", { name: "Submit feedback" }));
+
+    expect(await screen.findByText("Feedback recorded")).toBeInTheDocument();
+    expect(fetchMock.mock.calls[1][0]).toBe("/api-proxy/feedback");
+    const feedbackRequest = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+    expect(feedbackRequest.target).toEqual({
+      target_type: "response",
+      target_id: "episode-feedback",
+      episode_id: "episode-feedback",
+      experience_id: "experience-feedback",
+      context_id: "ctx-feedback",
+    });
+    expect(feedbackRequest.signals).toEqual(["do_not_remember"]);
+    expect(feedbackRequest).not.toHaveProperty("reward");
+  });
 });

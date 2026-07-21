@@ -2,7 +2,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, errorMessage, type Attachment, type ChatResponse } from "@/lib/api";
+import { api, errorMessage, type Attachment, type ChatResponse, type FeedbackSignal } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Input, Textarea } from "@/components/ui/input";
@@ -11,6 +11,53 @@ import { EmotionMeter } from "@/components/emotion-meter";
 
 type AttachmentType = "image" | "audio" | "video";
 type ChatTurn = { role: "user" | "assistant"; content: string; attachments?: Attachment[]; result?: ChatResponse };
+
+const feedbackOptions: Array<{ value: FeedbackSignal; label: string }> = [
+  { value: "good", label: "Good response" },
+  { value: "bad", label: "Bad response" },
+  { value: "factual_error", label: "Factual error" },
+  { value: "style_problem", label: "Style problem" },
+  { value: "unsafe_behavior", label: "Unsafe behavior" },
+  { value: "remember", label: "Remember this" },
+  { value: "do_not_remember", label: "Do not remember" },
+  { value: "correction", label: "Correction" },
+  { value: "expected_answer", label: "Expected answer" },
+  { value: "exclude_from_training", label: "Exclude from training" },
+];
+
+function FeedbackControls({ result }: { result: ChatResponse }) {
+  const [signal, setSignal] = useState<FeedbackSignal>("good");
+  const [structuredText, setStructuredText] = useState("");
+  const feedback = useMutation({
+    mutationFn: () => api.feedback({
+      idempotency_key: `${result.episode_id}:${signal}:${crypto.randomUUID()}`,
+      target: {
+        target_type: "response",
+        target_id: result.episode_id,
+        episode_id: result.episode_id,
+        experience_id: result.experience_id,
+        context_id: result.context_id,
+      },
+      signals: [signal],
+      ...(signal === "correction" ? { correction: structuredText } : {}),
+      ...(signal === "expected_answer" ? { expected_answer: structuredText } : {}),
+    }),
+    onSuccess: () => setStructuredText(""),
+  });
+  const requiresText = signal === "correction" || signal === "expected_answer";
+
+  return (
+    <div className="metadata-row" aria-label="Structured response feedback">
+      <select aria-label="Feedback type" className="ui-input" value={signal} onChange={(event) => setSignal(event.target.value as FeedbackSignal)}>
+        {feedbackOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+      {requiresText ? <Input aria-label={signal === "correction" ? "Correction" : "Expected answer"} value={structuredText} onChange={(event) => setStructuredText(event.target.value)} placeholder={signal === "correction" ? "Corrected response" : "Expected answer"} /> : null}
+      <Button type="button" disabled={feedback.isPending || (requiresText && !structuredText.trim())} onClick={() => feedback.mutate()}>{feedback.isPending ? "Submitting" : "Submit feedback"}</Button>
+      {feedback.isSuccess ? <Badge data-tone="accent">Feedback recorded</Badge> : null}
+      {feedback.error ? <span className="error">{errorMessage(feedback.error)}</span> : null}
+    </div>
+  );
+}
 
 export function ChatClient() {
   const [message, setMessage] = useState("");
@@ -78,6 +125,7 @@ export function ChatClient() {
             <strong>{turn.role === "user" ? "You" : "KAGYA"}</strong>
             <p>{turn.content}</p>
             {turn.attachments?.length ? <p className="muted">Attachments: {turn.attachments.map((attachment) => attachment.name ?? attachment.url ?? attachment.type).join(", ")}</p> : null}
+            {turn.result ? <FeedbackControls result={turn.result} /> : null}
           </div>
         ))}
         {mutation.isPending ? (

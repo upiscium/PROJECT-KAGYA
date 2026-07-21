@@ -1017,9 +1017,9 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     assert revisions.json()["revisions"][0]["revision_diff"]["changed_fields"][
         "weight"
     ][0] == pytest.approx(0.8)
-    assert client.post(
-        "/api/values/updates", headers=headers, json=update
-    ).json() == {"updates": []}
+    assert client.post("/api/values/updates", headers=headers, json=update).json() == {
+        "updates": []
+    }
 
     frozen = client.post(
         "/api/values/care/freeze", headers=headers, json={"frozen": True}
@@ -1300,14 +1300,14 @@ def test_attention_admin_api_competes_and_controls_focus(tmp_path: Path) -> None
     assert refocused.status_code == 200
     assert refocused.json()["candidate_ids"] == [candidate_id]
     assert deferred.status_code == 200
-    resumed = client.post(
-        f"/api/attention/{candidate_id}/resume", headers=headers
-    )
+    resumed = client.post(f"/api/attention/{candidate_id}/resume", headers=headers)
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "available"
     final_state = client.get("/api/attention", headers=headers).json()
     candidate = next(
-        item for item in final_state["candidates"] if item["candidate_id"] == candidate_id
+        item
+        for item in final_state["candidates"]
+        if item["candidate_id"] == candidate_id
     )
     assert candidate["status"] == "available"
     serialized = json.dumps(final_state)
@@ -1481,8 +1481,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert value_snapshot["reassessments"][0]["decision_id"] == "decision-api-1"
     assert value_snapshot["reassessments"][0]["regret"] == pytest.approx(0.6)
     assert any(
-        item["decision_id"] == "decision-api-1"
-        for item in value_snapshot["evidence"]
+        item["decision_id"] == "decision-api-1" for item in value_snapshot["evidence"]
     )
 
     dataset = client.get("/api/decisions/dataset", headers=headers)
@@ -1915,6 +1914,249 @@ def test_admin_auth_allows_token_only_loopback_recovery(tmp_path: Path) -> None:
         response = client.post("/api/state/snapshot", headers=admin_headers())
 
     assert response.status_code == 200
+
+
+def test_structured_feedback_propagates_and_is_idempotent(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    chat = client.post(
+        "/api/chat", json={"text": "Paris is in Germany", "attachments": []}
+    ).json()
+    body = {
+        "idempotency_key": "feedback-operation-1",
+        "feedback_id": "feedback-api-1",
+        "target": {
+            "target_type": "response",
+            "target_id": chat["episode_id"],
+            "episode_id": chat["episode_id"],
+            "experience_id": chat["experience_id"],
+            "context_id": chat["context_id"],
+        },
+        "signals": ["factual_error", "correction", "do_not_remember"],
+        "correction": "Paris is in France.",
+    }
+
+    created = client.post("/api/feedback", json=body)
+    duplicate = client.post("/api/feedback", json=body)
+
+    assert created.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json() == created.json()
+    record = created.json()
+    assert record["current_revision"] == 1
+    current = record["revisions"][0]
+    assert current["target"]["target_id"] == chat["episode_id"]
+    assert current["target"]["experience_id"] == chat["experience_id"]
+    assert current["provenance"]["actor_type"] == "user"
+    assert current["provenance"]["event_id"]
+    assert current["propagation"]["training_disposition"] == "exclude"
+    assert current["propagation"]["value_evidence"]["status"] == "proposed"
+    assert "reward" not in json.dumps(record).lower()
+    assert "Paris is in France" not in json.dumps(record)
+
+    original = client.app.state.memory_system.get_episodic(chat["episode_id"])
+    correction_id = current["correction_memory_id"]
+    correction = client.app.state.memory_system.get_episodic(correction_id)
+    assert original is not None
+    assert original.lifecycle_status.value == "rejected"
+    assert original.training_included is False
+    assert original.corrected_by_id == correction_id
+    assert correction is not None
+    assert correction.response == "Paris is in France."
+    assert correction.supersedes_id == original.id
+    retrieved = client.app.state.memory_system.retrieve_context("Paris Germany")
+    assert original.id not in {item.id for item in retrieved.db1_results}
+
+    assert client.get("/api/feedback").status_code == 401
+    audited = client.get("/api/feedback", headers=admin_headers())
+    assert audited.status_code == 200
+    assert [item["feedback_id"] for item in audited.json()["feedback"]] == [
+        "feedback-api-1"
+    ]
+
+
+def test_feedback_revision_and_withdrawal_restore_owned_effects(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    chat = client.post(
+        "/api/chat", json={"text": "revise feedback", "attachments": []}
+    ).json()
+    created = client.post(
+        "/api/feedback",
+        json={
+            "idempotency_key": "feedback-create",
+            "feedback_id": "feedback-revise",
+            "target": {
+                "target_type": "response",
+                "target_id": chat["episode_id"],
+                "episode_id": chat["episode_id"],
+                "experience_id": chat["experience_id"],
+                "context_id": chat["context_id"],
+            },
+            "signals": ["bad", "exclude_from_training"],
+        },
+    )
+    assert created.status_code == 200
+
+    revised = client.post(
+        "/api/feedback/feedback-revise/revisions",
+        headers=admin_headers(),
+        json={
+            "idempotency_key": "feedback-revision",
+            "expected_revision": 1,
+            "signals": ["good", "remember"],
+        },
+    )
+    assert revised.status_code == 200
+    assert revised.json()["current_revision"] == 2
+    memory = client.app.state.memory_system.get_episodic(chat["episode_id"])
+    assert memory is not None
+    assert memory.lifecycle_status.value == "active"
+    assert memory.training_included is True
+
+    withdrawn = client.post(
+        "/api/feedback/feedback-revise/withdraw",
+        headers=admin_headers(),
+        json={
+            "idempotency_key": "feedback-withdrawal",
+            "expected_revision": 2,
+        },
+    )
+    duplicate = client.post(
+        "/api/feedback/feedback-revise/withdraw",
+        headers=admin_headers(),
+        json={
+            "idempotency_key": "feedback-withdrawal",
+            "expected_revision": 2,
+        },
+    )
+    assert withdrawn.status_code == 200
+    assert duplicate.json() == withdrawn.json()
+    assert withdrawn.json()["current_revision"] == 3
+    assert withdrawn.json()["revisions"][-1]["status"] == "withdrawn"
+    assert len(withdrawn.json()["revisions"]) == 3
+
+
+def test_public_feedback_enforces_response_provenance(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    first = client.post("/api/chat", json={"text": "first", "attachments": []}).json()
+    second = client.post("/api/chat", json={"text": "second", "attachments": []}).json()
+
+    response = client.post(
+        "/api/feedback",
+        json={
+            "idempotency_key": "cross-context",
+            "target": {
+                "target_type": "response",
+                "target_id": first["episode_id"],
+                "episode_id": first["episode_id"],
+                "experience_id": first["experience_id"],
+                "context_id": second["context_id"],
+            },
+            "signals": ["good"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert "does not own" in response.json()["detail"]
+
+
+def test_admin_feedback_updates_decision_outcome_value_proposal_and_dataset(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    decision = client.post(
+        "/api/decisions",
+        headers=admin_headers(),
+        json={
+            "decision_id": "feedback-decision",
+            "candidates": [
+                {
+                    "candidate_id": "defer",
+                    "candidate_type": "defer",
+                    "proposed_action": "Wait",
+                    "parameters": {},
+                    "prerequisites": [],
+                    "predicted_outcomes": [],
+                    "uncertainty": 0.0,
+                    "estimated_cost": 0.0,
+                    "estimated_risk": 0.0,
+                    "value_effects": {"honesty": 0.5},
+                    "appraisal_contributions": {},
+                }
+            ],
+        },
+    )
+    assert decision.status_code == 200
+
+    feedback = client.post(
+        "/api/feedback/admin",
+        headers=admin_headers(),
+        json={
+            "idempotency_key": "decision-feedback",
+            "feedback_id": "feedback-decision-outcome",
+            "target": {
+                "target_type": "decision",
+                "target_id": "feedback-decision",
+            },
+            "signals": ["bad", "exclude_from_training"],
+        },
+    )
+
+    assert feedback.status_code == 200
+    propagation = feedback.json()["revisions"][0]["propagation"]
+    assert propagation["decision_outcome_applied"] is True
+    assert propagation["prediction_error"] == pytest.approx(-0.75)
+    assert propagation["value_evidence"]["value_impacts"] == {
+        "honesty": pytest.approx(-0.375)
+    }
+    stored = client.get("/api/decisions", headers=admin_headers()).json()["decisions"][
+        0
+    ]
+    assert stored["actual_outcome"]["feedback_id"] == "feedback-decision-outcome"
+    assert stored["training_included"] is False
+    assert client.get("/api/decisions/dataset", headers=admin_headers()).json() == {
+        "records": []
+    }
+
+
+def test_feedback_ledger_survives_restart_without_correction_text_in_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as first_client:
+        chat = first_client.post(
+            "/api/chat", json={"text": "persistent feedback", "attachments": []}
+        ).json()
+        created = first_client.post(
+            "/api/feedback",
+            json={
+                "idempotency_key": "persistent-feedback-operation",
+                "feedback_id": "persistent-feedback",
+                "target": {
+                    "target_type": "response",
+                    "target_id": chat["episode_id"],
+                    "episode_id": chat["episode_id"],
+                    "experience_id": chat["experience_id"],
+                    "context_id": chat["context_id"],
+                },
+                "signals": ["correction"],
+                "correction": "Private corrected answer",
+            },
+        )
+        assert created.status_code == 200
+
+    snapshot = settings.agent_state.path.read_text(encoding="utf-8")
+    assert "persistent-feedback" in snapshot
+    assert "Private corrected answer" not in snapshot
+    assert "hidden_thought" not in snapshot
+    with _client(tmp_path, settings=settings) as restarted_client:
+        restored = restarted_client.get(
+            "/api/feedback/persistent-feedback", headers=admin_headers()
+        )
+
+    assert restored.status_code == 200
+    assert restored.json()["current_revision"] == 1
 
 
 def _client(

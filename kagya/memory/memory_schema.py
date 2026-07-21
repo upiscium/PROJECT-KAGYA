@@ -105,6 +105,8 @@ class EpisodicMemoryRecord:
     experience_id: str | None = None
     subjective_salience: float = 0.0
     autobiographical_importance: float = 0.0
+    training_included: bool = True
+    training_exclusion_refs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
