@@ -1959,10 +1959,16 @@ class KagyaMainLoop:
             exclusion_refs=((feedback_id,) if exclude else ()),
             reason_codes=tuple(item.value for item in signals),
         )
+        self.memory_system.reevaluate_semantics_for_feedback(
+            feedback_id, rejected=False
+        )
         return propagation, correction_id, expected_id
 
     def _withdraw_feedback_effects(self, revision: FeedbackRevision) -> None:
         propagation = revision.propagation
+        self.memory_system.reevaluate_semantics_for_feedback(
+            self._feedback_id_for_revision(revision), rejected=True
+        )
         if propagation.memory_id is not None and propagation.memory_before:
             before = propagation.memory_before
             self.memory_system.apply_feedback_policy(
@@ -2746,11 +2752,8 @@ class KagyaMainLoop:
             semantic = self.memory_system.get_semantic(
                 item.reference.removeprefix("semantic:")
             )
-            if (
-                semantic is None
-                or semantic.archived
-                or semantic.metadata.get("publication_status", "published")
-                != "published"
+            if semantic is None or not self.memory_system.semantic_is_retrievable(
+                semantic
             ):
                 return None
             return f"Stored semantic record (not an adopted belief): {semantic.text}"

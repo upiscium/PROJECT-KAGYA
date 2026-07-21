@@ -25,9 +25,10 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^state\/emotion$/ },
   { method: "GET", pattern: /^memory\/search$/ },
   { method: "GET", pattern: /^memory\/episodes\/[^/]+$/ },
-  { method: "GET", pattern: /^memory\/semantic\/[^/]+$/ },
+  { method: "GET", pattern: /^memory\/semantic\/[^/]+(?:\/graph)?$/ },
   { method: "POST", pattern: /^memory\/episodes\/[^/]+\/(archive|metadata)$/ },
-  { method: "POST", pattern: /^memory\/semantic\/[^/]+\/(archive|metadata)$/ },
+  { method: "POST", pattern: /^memory\/semantic\/[^/]+\/(archive|metadata|lifecycle|relationships|policy)$/ },
+  { method: "DELETE", pattern: /^memory\/semantic\/[^/]+$/ },
   { method: "POST", pattern: /^chat\/debug$/ },
   { method: "POST", pattern: /^sleep\/run$/ },
   { method: "GET", pattern: /^adapters$/ },
@@ -53,6 +54,10 @@ export async function GET(request: NextRequest, context: RouteContext) {
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
+  return proxyAdminRequest(request, context);
+}
+
+export async function DELETE(request: NextRequest, context: RouteContext) {
   return proxyAdminRequest(request, context);
 }
 

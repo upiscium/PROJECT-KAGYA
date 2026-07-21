@@ -343,6 +343,10 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 
 Episodic memories retain source event, processing sequence, provider/model identity, validation state, content hash, and generation-health metadata. Empty, repetitive, prompt-leaking, or non-finite generations are quarantined: operators can inspect and review them through the memory admin API, but normal retrieval and sleep learning exclude them.
 
+Semantic memory uses schema-versioned DB2 records. Normalized exact duplicates reuse one record and merge source provenance; merge proposals, contradictions, supersessions, and corrections retain inspectable lineage and an operation audit trail. Retrieval excludes archived, forgotten, expired, invalid, superseded, corrected, source-rejected, unpublished, and fully decayed records. Rejecting or archiving the last viable source episode automatically removes its derived semantic records from retrieval, and restoring source validity reevaluates them. Archive/restore is reversible cold storage, logical forgetting preserves audit history, and admin `DELETE /api/memory/semantic/{id}` is the separate irreversible physical deletion path. Existing DB2 records are backfilled to semantic schema version 2 when the memory system starts.
+
+Semantic records remain evidence-bearing memory, not accepted Beliefs. Belief adoption and retraction continue through the separate Belief store and APIs.
+
 Sleep consolidation uses an explicit pipeline version and attempt ID. A completed episode is not processed twice by the same pipeline version, datasets are written to immutable `dreams/runs/<attempt-id>/` paths, raw hidden thoughts are not copied into new datasets, and semantic memories remain staged until the adapter candidate is registered. Adapter registry mutations use an exclusive sidecar lock and atomic fsynced replacement. Real adapter evaluation runs paired baseline and candidate providers; a candidate that regresses against baseline is not promoted.
 
 ## Working Memory

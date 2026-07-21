@@ -18,6 +18,8 @@ export function MemoryClient() {
   const [query, setQuery] = useState("");
   const [submitted, setSubmitted] = useState("");
   const [tagInputs, setTagInputs] = useState<Record<string, string>>({});
+  const [relationshipTargets, setRelationshipTargets] = useState<Record<string, string>>({});
+  const [graphs, setGraphs] = useState<Record<string, SemanticMemory[]>>({});
   const queryClient = useQueryClient();
   const search = useQuery({
     queryKey: ["memory", submitted],
@@ -44,6 +46,23 @@ export function MemoryClient() {
       api.updateSemanticMemoryMetadata(id, { tags }),
     onSuccess: refreshMemory,
   });
+  const semanticLifecycle = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: "forget" }) =>
+      api.updateSemanticLifecycle(id, action, `${action}:${id}:${Date.now()}`),
+    onSuccess: refreshMemory,
+  });
+  const loadGraph = useMutation({
+    mutationFn: api.semanticGraph,
+    onSuccess: (result, id) => setGraphs((current) => ({ ...current, [id]: result.records })),
+  });
+  const relateSemantic = useMutation({
+    mutationFn: ({ id, targetId }: { id: string; targetId: string }) =>
+      api.relateSemanticMemory(id, targetId, "merge", `merge:${id}:${targetId}:${Date.now()}`),
+    onSuccess: (_result, variables) => {
+      setRelationshipTargets((current) => ({ ...current, [variables.id]: "" }));
+      refreshMemory();
+    },
+  });
 
   const addTag = (item: EpisodeMemory | SemanticMemory, kind: "episode" | "semantic") => {
     const value = (tagInputs[item.id] ?? "").trim();
@@ -62,10 +81,10 @@ export function MemoryClient() {
         <Button disabled={!query.trim()} type="submit">Search</Button>
       </form>
       {search.error ? <p className="error">{errorMessage(search.error)}</p> : null}
-      {archiveEpisode.error || archiveSemantic.error || updateEpisodeTags.error || updateSemanticTags.error ? (
+      {archiveEpisode.error || archiveSemantic.error || updateEpisodeTags.error || updateSemanticTags.error || semanticLifecycle.error || loadGraph.error || relateSemantic.error ? (
         <p className="error">
           {errorMessage(
-            archiveEpisode.error ?? archiveSemantic.error ?? updateEpisodeTags.error ?? updateSemanticTags.error,
+            archiveEpisode.error ?? archiveSemantic.error ?? updateEpisodeTags.error ?? updateSemanticTags.error ?? semanticLifecycle.error ?? loadGraph.error ?? relateSemantic.error,
           )}
         </p>
       ) : null}
@@ -94,6 +113,12 @@ export function MemoryClient() {
             <article key={item.id} className="record">
               <RecordHeader item={item} />
               <p>{item.text}</p>
+              <p className="muted">v{item.version} · {item.lifecycle_status} · confidence {item.effective_confidence.toFixed(2)}</p>
+              {item.supersedes_id ? <p className="muted">Supersedes: {item.supersedes_id}</p> : null}
+              {item.superseded_by_id ? <p className="muted">Superseded by: {item.superseded_by_id}</p> : null}
+              {item.corrected_by_id ? <p className="muted">Corrected by: {item.corrected_by_id}</p> : null}
+              {item.contradiction_ids.length ? <p className="muted">Contradicts: {item.contradiction_ids.join(", ")}</p> : null}
+              {item.merge_candidate_ids.length ? <p className="muted">Merge proposals: {item.merge_candidate_ids.join(", ")}</p> : null}
               <MemoryControls
                 item={item}
                 kind="semantic"
@@ -102,6 +127,13 @@ export function MemoryClient() {
                 onAddTag={() => addTag(item, "semantic")}
                 onArchive={() => archiveSemantic.mutate(item.id)}
               />
+              <div className="composer" aria-label={`semantic lifecycle for ${item.id}`}>
+                <Input value={relationshipTargets[item.id] ?? ""} onChange={(event) => setRelationshipTargets((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Related semantic ID" />
+                <Button type="button" disabled={!relationshipTargets[item.id]?.trim()} onClick={() => relateSemantic.mutate({ id: item.id, targetId: relationshipTargets[item.id].trim() })}>Propose merge</Button>
+                <Button type="button" onClick={() => loadGraph.mutate(item.id)}>Load lineage</Button>
+                <Button type="button" onClick={() => semanticLifecycle.mutate({ id: item.id, action: "forget" })}>Forget</Button>
+              </div>
+              {graphs[item.id]?.map((node) => <p className="muted" key={node.id}>{node.id}: {node.lifecycle_status} · {node.text}</p>)}
             </article>
           ))}
         </Card>
