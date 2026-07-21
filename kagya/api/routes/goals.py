@@ -50,6 +50,7 @@ class CommitmentRequest(BaseModel):
     deadline: datetime | None = None
     value_effects: dict[str, float] = Field(default_factory=dict)
     conflict_ids: list[str] = Field(default_factory=list)
+    interlocutor_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class CommitmentTransitionRequest(BaseModel):
@@ -253,6 +254,7 @@ def create_commitment(
                 commitment_id=body.commitment_id,
                 origin_actor=OriginActor.OPERATOR,
                 origin_source_ref="admin:commitment_request",
+                interlocutor_key=body.interlocutor_key,
             ),
             payload={"commitment_id": body.commitment_id},
             correlation_id=body.commitment_id,
