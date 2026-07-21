@@ -107,9 +107,13 @@ class DualMemorySystem:
         evaluator: MemoryEvaluator | None = None,
     ) -> None:
         self.settings = settings
-        self.embedding_function = embedding_function or create_embedding_function(settings)
+        self.embedding_function = embedding_function or create_embedding_function(
+            settings
+        )
         self.evaluator = evaluator or MemoryEvaluator()
-        self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
+        self.client = chromadb.PersistentClient(
+            path=str(settings.memory.persist_directory)
+        )
         db1_collection = _collection_name_for_embedding(
             settings.memory.db1_collection, self.embedding_function
         )
@@ -185,24 +189,28 @@ class DualMemorySystem:
             "experience_id": "",
             "subjective_salience": 0.0,
             "autobiographical_importance": 0.0,
-            "extra": json.dumps({
-                **(metadata or {}),
-                "generation_health": health.__dict__,
-                "provenance": {
-                    "source_event_id": source_event_id,
-                    "source": source,
-                    "source_channel": source_channel,
-                    "source_session_id": source_session_id,
-                    "processing_sequence": processing_sequence,
-                    "causation_id": causation_id,
-                    "correlation_id": correlation_id,
-                    "context_id": context_id,
-                    "provider": provider,
-                    "model_id": model_id,
-                    "model_revision": model_revision,
-                    "adapter_id": adapter_id,
-                },
-            }),
+            "training_included": True,
+            "training_exclusion_refs": "[]",
+            "extra": json.dumps(
+                {
+                    **(metadata or {}),
+                    "generation_health": health.__dict__,
+                    "provenance": {
+                        "source_event_id": source_event_id,
+                        "source": source,
+                        "source_channel": source_channel,
+                        "source_session_id": source_session_id,
+                        "processing_sequence": processing_sequence,
+                        "causation_id": causation_id,
+                        "correlation_id": correlation_id,
+                        "context_id": context_id,
+                        "provider": provider,
+                        "model_id": model_id,
+                        "model_revision": model_revision,
+                        "adapter_id": adapter_id,
+                    },
+                }
+            ),
         }
         self.db1.add(
             ids=[episode_id],
@@ -298,7 +306,8 @@ class DualMemorySystem:
                 record
                 for record in semantic
                 if not record.archived
-                and record.metadata.get("publication_status", "published") == "published"
+                and record.metadata.get("publication_status", "published")
+                == "published"
             ][: self.settings.memory.db2_top_k],
         )
 
@@ -317,7 +326,11 @@ class DualMemorySystem:
 
     def _get_unarchived_episodic_records(self) -> list[EpisodicMemoryRecord]:
         result = self.db1.get(where={"archived": False})
-        return [record for record in _episodic_records_from_get(result) if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE]
+        return [
+            record
+            for record in _episodic_records_from_get(result)
+            if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+        ]
 
     def review_episodic(
         self,
@@ -334,6 +347,96 @@ class DualMemorySystem:
         metadata["lifecycle_status"] = lifecycle_status.value
         self.db1.update(ids=[episode_id], metadatas=[metadata])
         return self.get_episodic(episode_id)
+
+    def apply_feedback_policy(
+        self,
+        episode_id: str,
+        *,
+        validation_status: ValidationStatus,
+        lifecycle_status: MemoryLifecycleStatus,
+        training_included: bool,
+        feedback_id: str,
+    ) -> EpisodicMemoryRecord:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadata = _first_metadata(result)
+        if metadata is None:
+            raise ValueError(f"Unknown episodic memory: {episode_id}")
+        refs = _loads_json_list(metadata.get("training_exclusion_refs"))
+        if training_included:
+            refs = [item for item in refs if item != feedback_id]
+        elif feedback_id not in refs:
+            refs.append(feedback_id)
+        metadata["validation_status"] = validation_status.value
+        metadata["lifecycle_status"] = lifecycle_status.value
+        metadata["training_included"] = not refs
+        metadata["training_exclusion_refs"] = json.dumps(refs)
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+        record = self.get_episodic(episode_id)
+        if record is None:
+            raise ValueError(f"Unknown episodic memory: {episode_id}")
+        return record
+
+    def save_feedback_correction(
+        self,
+        episode_id: str,
+        text: str,
+        *,
+        feedback_id: str,
+        kind: str,
+    ) -> str:
+        original = self.get_episodic(episode_id)
+        if original is None:
+            raise ValueError(f"Unknown episodic memory: {episode_id}")
+        correction_id = self.save_episodic(
+            original.user_input,
+            text,
+            source_event_id=f"{feedback_id}:{kind}",
+            source="explicit_feedback",
+            source_channel=original.source_channel,
+            source_session_id=original.source_session_id,
+            context_id=original.context_id,
+            provider="human_feedback",
+            model_id="not_applicable",
+            model_revision="not_applicable",
+            validation_status=ValidationStatus.VERIFIED,
+            metadata={
+                "feedback_id": feedback_id,
+                "feedback_content_kind": kind,
+                "supersedes_id": episode_id,
+            },
+        )
+        original_result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        original_metadata = _first_metadata(original_result)
+        correction_result = self.db1.get(ids=[correction_id], include=["metadatas"])
+        correction_metadata = _first_metadata(correction_result)
+        if original_metadata is None or correction_metadata is None:
+            raise ValueError("Feedback correction persistence failed")
+        original_metadata["corrected_by_id"] = correction_id
+        original_metadata["lifecycle_status"] = MemoryLifecycleStatus.CORRECTED.value
+        original_metadata["validation_status"] = ValidationStatus.DISPUTED.value
+        correction_metadata["supersedes_id"] = episode_id
+        self.db1.update(ids=[episode_id], metadatas=[original_metadata])
+        self.db1.update(ids=[correction_id], metadatas=[correction_metadata])
+        return correction_id
+
+    def withdraw_feedback_correction(self, episode_id: str, correction_id: str) -> None:
+        correction = self.db1.get(ids=[correction_id], include=["metadatas"])
+        correction_metadata = _first_metadata(correction)
+        if correction_metadata is not None:
+            correction_metadata["archived"] = True
+            correction_metadata["lifecycle_status"] = (
+                MemoryLifecycleStatus.SUPERSEDED.value
+            )
+            correction_metadata["training_included"] = False
+            self.db1.update(ids=[correction_id], metadatas=[correction_metadata])
+        original = self.db1.get(ids=[episode_id], include=["metadatas"])
+        original_metadata = _first_metadata(original)
+        if (
+            original_metadata is not None
+            and original_metadata.get("corrected_by_id") == correction_id
+        ):
+            original_metadata["corrected_by_id"] = ""
+            self.db1.update(ids=[episode_id], metadatas=[original_metadata])
 
     def set_consolidation_state(
         self,
@@ -460,7 +563,9 @@ def _load_sentence_transformer(model_id: str) -> Any:
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
-        raise RuntimeError("sentence-transformers is required for configured memory embeddings") from exc
+        raise RuntimeError(
+            "sentence-transformers is required for configured memory embeddings"
+        ) from exc
     return SentenceTransformer(model_id)
 
 
@@ -469,29 +574,43 @@ def _now_iso() -> str:
 
 
 def _episodic_document(user_input: str, response: str, hidden_thought: str) -> str:
-    return f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
+    return (
+        f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
+    )
 
 
-def _episodic_records_from_query(result: Mapping[str, Any]) -> list[EpisodicMemoryRecord]:
+def _episodic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[EpisodicMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     metadatas = _first_result_list(result.get("metadatas"))
-    return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
 
 
-def _semantic_records_from_query(result: Mapping[str, Any]) -> list[SemanticMemoryRecord]:
+def _semantic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[SemanticMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     documents = _first_result_list(result.get("documents"))
     metadatas = _first_result_list(result.get("metadatas"))
     return [
         _semantic_record_from_metadata(record_id, document or "", metadata or {})
-        for record_id, document, metadata in zip(ids, documents, metadatas, strict=False)
+        for record_id, document, metadata in zip(
+            ids, documents, metadatas, strict=False
+        )
     ]
 
 
 def _episodic_records_from_get(result: Mapping[str, Any]) -> list[EpisodicMemoryRecord]:
     ids = result.get("ids") or []
     metadatas = result.get("metadatas") or []
-    return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
 
 
 def _semantic_records_from_get(result: Mapping[str, Any]) -> list[SemanticMemoryRecord]:
@@ -500,7 +619,9 @@ def _semantic_records_from_get(result: Mapping[str, Any]) -> list[SemanticMemory
     metadatas = result.get("metadatas") or []
     return [
         _semantic_record_from_metadata(record_id, document or "", metadata or {})
-        for record_id, document, metadata in zip(ids, documents, metadatas, strict=False)
+        for record_id, document, metadata in zip(
+            ids, documents, metadatas, strict=False
+        )
     ]
 
 
@@ -514,7 +635,9 @@ def _first_semantic_from_get(result: Mapping[str, Any]) -> SemanticMemoryRecord 
     return records[0] if records else None
 
 
-def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> EpisodicMemoryRecord:
+def _episodic_record_from_metadata(
+    record_id: str, metadata: dict[str, Any]
+) -> EpisodicMemoryRecord:
     extra = _loads_json_dict(metadata.get("extra"))
     raw_provenance = extra.get("provenance")
     provenance: dict[str, Any] = (
@@ -544,7 +667,9 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         loss=loss,
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
-        record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))),
+        record_type=MemoryRecordType(
+            str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))
+        ),
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
         metadata=extra,
@@ -553,10 +678,22 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         schema_version=int(metadata.get("schema_version", 1)),
         input_kind=MemoryRecordKind.EXTERNAL_CLAIM,
         response_kind=MemoryRecordKind.GENERATED_RESPONSE,
-        validation_status=ValidationStatus(str(metadata.get("validation_status", ValidationStatus.UNVERIFIED.value))),
-        lifecycle_status=MemoryLifecycleStatus(str(metadata.get("lifecycle_status", default_lifecycle.value))),
+        validation_status=ValidationStatus(
+            str(metadata.get("validation_status", ValidationStatus.UNVERIFIED.value))
+        ),
+        lifecycle_status=MemoryLifecycleStatus(
+            str(metadata.get("lifecycle_status", default_lifecycle.value))
+        ),
         generation_health=health,
-        content_hash=str(metadata.get("content_hash", _content_hash(str(metadata.get("user_input", "")), str(metadata.get("response", ""))))),
+        content_hash=str(
+            metadata.get(
+                "content_hash",
+                _content_hash(
+                    str(metadata.get("user_input", "")),
+                    str(metadata.get("response", "")),
+                ),
+            )
+        ),
         dedup_key=str(metadata.get("dedup_key", "")),
         source_event_id=_optional_str(provenance.get("source_event_id")),
         source=str(provenance.get("source", "unknown")),
@@ -570,24 +707,39 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         model_id=str(provenance.get("model_id", "unknown")),
         model_revision=str(provenance.get("model_revision", "unknown")),
         adapter_id=_optional_str(provenance.get("adapter_id")),
-        consolidation_status=ConsolidationStatus(str(metadata.get("consolidation_status", ConsolidationStatus.PENDING.value))),
+        consolidation_status=ConsolidationStatus(
+            str(metadata.get("consolidation_status", ConsolidationStatus.PENDING.value))
+        ),
         consolidation_version=str(metadata.get("consolidation_version", "")),
-        consolidation_attempt_id=_optional_str(metadata.get("consolidation_attempt_id")),
+        consolidation_attempt_id=_optional_str(
+            metadata.get("consolidation_attempt_id")
+        ),
         experience_id=_optional_str(metadata.get("experience_id")),
         subjective_salience=float(metadata.get("subjective_salience", 0.0)),
         autobiographical_importance=float(
             metadata.get("autobiographical_importance", 0.0)
         ),
+        contradiction_ids=_loads_json_list(metadata.get("contradiction_ids")),
+        supersedes_id=_optional_str(metadata.get("supersedes_id")),
+        corrected_by_id=_optional_str(metadata.get("corrected_by_id")),
+        training_included=bool(metadata.get("training_included", True)),
+        training_exclusion_refs=_loads_json_list(
+            metadata.get("training_exclusion_refs")
+        ),
     )
 
 
-def _semantic_record_from_metadata(record_id: str, document: str, metadata: dict[str, Any]) -> SemanticMemoryRecord:
+def _semantic_record_from_metadata(
+    record_id: str, document: str, metadata: dict[str, Any]
+) -> SemanticMemoryRecord:
     extra = _loads_json_dict(metadata.get("extra"))
     return SemanticMemoryRecord(
         id=record_id,
         text=str(metadata.get("text", document)),
         source_episode_ids=_loads_json_list(metadata.get("source_episode_ids")),
-        record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))),
+        record_type=MemoryRecordType(
+            str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))
+        ),
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
         metadata=extra,
@@ -677,7 +829,7 @@ def _dedup_key(source_event_id: str | None, content_hash: str) -> str:
 
 
 def _optional_str(value: Any) -> str | None:
-    return None if value is None else str(value)
+    return None if value in {None, ""} else str(value)
 
 
 def _optional_int(value: Any) -> int | None:

@@ -201,9 +201,7 @@ class TrainingJobRegistry:
                 phase_durations_seconds=durations,
                 total_duration_seconds=max(
                     0.0,
-                    (
-                        now - datetime.fromisoformat(current.created_at)
-                    ).total_seconds(),
+                    (now - datetime.fromisoformat(current.created_at)).total_seconds(),
                 ),
                 **changes,
             )
@@ -382,6 +380,7 @@ class MemoryConsolidator:
             )
             and episode.validation_status == ValidationStatus.VERIFIED
             and episode.generation_health.healthy
+            and episode.training_included
             and not (
                 episode.consolidation_status == ConsolidationStatus.COMPLETED
                 and episode.consolidation_version == self.PIPELINE_VERSION
@@ -394,7 +393,10 @@ class TrainingBundleBuilder:
         self.settings = settings
         self.contract = TrainingArtifactContract()
 
-    def build(self, job: TrainingJob, episodes: tuple[EpisodicMemoryRecord, ...]) -> Path:
+    def build(
+        self, job: TrainingJob, episodes: tuple[EpisodicMemoryRecord, ...]
+    ) -> Path:
+        episodes = tuple(episode for episode in episodes if episode.training_included)
         dataset = b"".join(
             (
                 json.dumps(
@@ -557,7 +559,9 @@ class SleepCoordinator:
 
     def node_status(self) -> list[dict[str, Any]]:
         status = getattr(self.backend, "node_status", None)
-        return [status() if status is not None else {"reachable": True, "backend": "test"}]
+        return [
+            status() if status is not None else {"reachable": True, "backend": "test"}
+        ]
 
     def reconcile(self, job_id: str) -> TrainingJob:
         job = self.registry.get(job_id)
@@ -593,12 +597,9 @@ class SleepCoordinator:
             return self.registry.transition(
                 job_id,
                 TrainingJobStatus.FAILED,
-                failure_category=current.failure_category
-                or "remote_training_failed",
+                failure_category=current.failure_category or "remote_training_failed",
                 retryable=(
-                    current.retryable
-                    if current.retryable is not None
-                    else False
+                    current.retryable if current.retryable is not None else False
                 ),
                 error="remote training job failed",
                 stale=False,
@@ -809,9 +810,7 @@ class SleepCoordinator:
             self.registry.update(job_id, **metadata)
 
     def _is_stale(self, job: TrainingJob) -> bool:
-        reference = datetime.fromisoformat(
-            job.remote_last_contact or job.updated_at
-        )
+        reference = datetime.fromisoformat(job.remote_last_contact or job.updated_at)
         remote = self.settings.deployment.training.remote_worker
         threshold = (
             60.0

@@ -1,6 +1,6 @@
 """Integrated runtime main loop."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import time
 from typing import Any, Protocol
@@ -62,6 +62,21 @@ from kagya.experience import (
     ExperienceRecord,
     ExperienceStore,
     build_chat_experience,
+)
+from kagya.feedback import (
+    FeedbackPropagation,
+    FeedbackProvenance,
+    FeedbackRecord,
+    FeedbackRevision,
+    FeedbackSignal,
+    FeedbackStatus,
+    FeedbackStore,
+    FeedbackTarget,
+    FeedbackTargetType,
+    TrainingDisposition,
+    ValueEvidenceProposal,
+    feedback_fingerprint,
+    normalize_signals,
 )
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
@@ -229,6 +244,7 @@ class KagyaMainLoop:
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
         self.belief_store = BeliefStore()
+        self.feedback_store = FeedbackStore()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
@@ -238,6 +254,7 @@ class KagyaMainLoop:
         self.restore_experience_state()
         self.restore_belief_state()
         self.restore_attention_state()
+        self.restore_feedback_state()
 
     def chat(
         self,
@@ -388,12 +405,8 @@ class KagyaMainLoop:
             model_id = str(
                 getattr(self.provider, "last_model_id", self.settings.model.primary_id)
             )
-            fallback_used = bool(
-                getattr(self.provider, "last_fallback_used", False)
-            )
-            generation_duration = max(
-                time.perf_counter() - generation_started, 1e-9
-            )
+            fallback_used = bool(getattr(self.provider, "last_fallback_used", False))
+            generation_duration = max(time.perf_counter() - generation_started, 1e-9)
             metric_labels = {
                 "provider": self.settings.model.provider.lower(),
                 "fallback": str(fallback_used).lower(),
@@ -578,9 +591,7 @@ class KagyaMainLoop:
             emotion_update=emotion_update,
         )
 
-    def _metric(
-        self, method: str, name: str, value: float, **labels: str
-    ) -> None:
+    def _metric(self, method: str, name: str, value: float, **labels: str) -> None:
         if self.telemetry is None:
             return
         try:
@@ -675,7 +686,10 @@ class KagyaMainLoop:
                     dict.fromkeys(
                         (
                             f"motivation:{motivation.motivation_id}",
-                            *(f"experience:{item}" for item in motivation.related_experience_ids),
+                            *(
+                                f"experience:{item}"
+                                for item in motivation.related_experience_ids
+                            ),
                         )
                     )
                 ),
@@ -693,12 +707,16 @@ class KagyaMainLoop:
         active_goals = [
             goal
             for goal in self.goal_manager.list_goals()
-            if goal.status in {GoalStatus.ACTIVE, GoalStatus.CANDIDATE, GoalStatus.SUSPENDED}
+            if goal.status
+            in {GoalStatus.ACTIVE, GoalStatus.CANDIDATE, GoalStatus.SUSPENDED}
         ]
         goal_candidate_ids = {f"goal:{goal.goal_id}" for goal in active_goals}
         for goal in active_goals:
             commitment = active_commitments.get(goal.goal_id)
-            value_relevance = min(1.0, max((abs(item) for item in goal.value_effects.values()), default=0.0))
+            value_relevance = min(
+                1.0,
+                max((abs(item) for item in goal.value_effects.values()), default=0.0),
+            )
             self.attention_system.observe(
                 candidate_id=f"goal:{goal.goal_id}",
                 target_ref=f"goal:{goal.goal_id}",
@@ -707,7 +725,9 @@ class KagyaMainLoop:
                     ref
                     for ref in (
                         f"goal:{goal.goal_id}",
-                        None if goal.origin_value_id is None else f"value:{goal.origin_value_id}",
+                        None
+                        if goal.origin_value_id is None
+                        else f"value:{goal.origin_value_id}",
                     )
                     if ref is not None
                 ),
@@ -715,7 +735,9 @@ class KagyaMainLoop:
                 urgency=goal.urgency,
                 value_relevance=value_relevance,
                 commitment_cost=0.8 if commitment is not None else 0.0,
-                persistence=max(goal.priority, 0.8 if goal.status == GoalStatus.ACTIVE else 0.0),
+                persistence=max(
+                    goal.priority, 0.8 if goal.status == GoalStatus.ACTIVE else 0.0
+                ),
             )
         self.attention_system.synchronize_source(
             AttentionSource.GOAL, goal_candidate_ids
@@ -1517,6 +1539,481 @@ class KagyaMainLoop:
         self.decision_store.restore(payload if isinstance(payload, list) else [])
         self._persist_decision_state()
 
+    def restore_feedback_state(self) -> None:
+        payload = self.persistent_state.extensions.get("feedback")
+        self.feedback_store.restore(payload if isinstance(payload, dict) else None)
+        self._persist_feedback_state()
+
+    def _persist_feedback_state(self) -> None:
+        self.persistent_state.extensions["feedback"] = self.feedback_store.to_json()
+
+    def submit_feedback(
+        self,
+        *,
+        target: FeedbackTarget,
+        signals: tuple[FeedbackSignal, ...],
+        idempotency_key: str,
+        actor_type: str,
+        actor_id: str | None,
+        source: str,
+        correction: str | None = None,
+        expected_answer: str | None = None,
+        feedback_id: str | None = None,
+    ) -> FeedbackRecord:
+        normalized = normalize_signals(signals)
+        self._validate_feedback_content(normalized, correction, expected_answer)
+        fingerprint = feedback_fingerprint(
+            "create",
+            {
+                "feedback_id": feedback_id,
+                "target": asdict(target),
+                "signals": [item.value for item in normalized],
+                "correction": correction,
+                "expected_answer": expected_answer,
+                "actor_type": actor_type,
+            },
+        )
+        existing = self.feedback_store.idempotent_result(idempotency_key, fingerprint)
+        if existing is not None:
+            return existing
+        identifier = feedback_id or f"feedback-{uuid4()}"
+        if identifier in self.feedback_store.records:
+            raise ValueError(f"Feedback already exists: {identifier}")
+        self._validate_feedback_target(target)
+        revision = 1
+        propagation, correction_id, expected_id = self._propagate_feedback(
+            identifier,
+            revision,
+            target,
+            normalized,
+            correction=correction,
+            expected_answer=expected_answer,
+        )
+        record = self.feedback_store.create(
+            signals=normalized,
+            target=target,
+            provenance=self._feedback_provenance(actor_type, actor_id, source),
+            correction_memory_id=correction_id,
+            expected_answer_memory_id=expected_id,
+            propagation=propagation,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            feedback_id=identifier,
+        )
+        self._persist_feedback_state()
+        self._persist_decision_state()
+        return record
+
+    def revise_feedback(
+        self,
+        feedback_id: str,
+        *,
+        expected_revision: int,
+        signals: tuple[FeedbackSignal, ...],
+        idempotency_key: str,
+        actor_type: str,
+        actor_id: str | None,
+        source: str,
+        correction: str | None = None,
+        expected_answer: str | None = None,
+    ) -> FeedbackRecord:
+        normalized = normalize_signals(signals)
+        self._validate_feedback_content(normalized, correction, expected_answer)
+        fingerprint = feedback_fingerprint(
+            "revise",
+            {
+                "feedback_id": feedback_id,
+                "expected_revision": expected_revision,
+                "signals": [item.value for item in normalized],
+                "correction": correction,
+                "expected_answer": expected_answer,
+                "actor_type": actor_type,
+            },
+        )
+        existing = self.feedback_store.idempotent_result(idempotency_key, fingerprint)
+        if existing is not None:
+            return existing
+        current = self.feedback_store.get(feedback_id)
+        if current.current_revision != expected_revision:
+            raise ValueError(
+                f"Feedback revision conflict: expected {expected_revision}, "
+                f"current {current.current_revision}"
+            )
+        self._withdraw_feedback_effects(current.current)
+        propagation, correction_id, expected_id = self._propagate_feedback(
+            feedback_id,
+            expected_revision + 1,
+            current.current.target,
+            normalized,
+            correction=correction,
+            expected_answer=expected_answer,
+        )
+        record = self.feedback_store.revise(
+            feedback_id,
+            expected_revision=expected_revision,
+            signals=normalized,
+            target=current.current.target,
+            provenance=self._feedback_provenance(actor_type, actor_id, source),
+            correction_memory_id=correction_id,
+            expected_answer_memory_id=expected_id,
+            propagation=propagation,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        self._persist_feedback_state()
+        self._persist_decision_state()
+        return record
+
+    def withdraw_feedback(
+        self,
+        feedback_id: str,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        actor_type: str,
+        actor_id: str | None,
+        source: str,
+    ) -> FeedbackRecord:
+        fingerprint = feedback_fingerprint(
+            "withdraw",
+            {
+                "feedback_id": feedback_id,
+                "expected_revision": expected_revision,
+                "actor_type": actor_type,
+            },
+        )
+        existing = self.feedback_store.idempotent_result(idempotency_key, fingerprint)
+        if existing is not None:
+            return existing
+        current = self.feedback_store.get(feedback_id)
+        if current.current_revision != expected_revision:
+            raise ValueError(
+                f"Feedback revision conflict: expected {expected_revision}, "
+                f"current {current.current_revision}"
+            )
+        self._withdraw_feedback_effects(current.current)
+        propagation = FeedbackPropagation(
+            memory_id=current.current.propagation.memory_id,
+            correction_memory_id=None,
+            memory_before=current.current.propagation.memory_after,
+            memory_after=current.current.propagation.memory_before,
+            decision_id=current.current.propagation.decision_id,
+            decision_outcome_applied=False,
+            prediction_error=None,
+            value_evidence=None,
+            training_disposition=TrainingDisposition.INCLUDE,
+            exclusion_refs=(),
+            reason_codes=("feedback_withdrawn",),
+        )
+        record = self.feedback_store.revise(
+            feedback_id,
+            expected_revision=expected_revision,
+            signals=(),
+            target=current.current.target,
+            provenance=self._feedback_provenance(actor_type, actor_id, source),
+            correction_memory_id=None,
+            expected_answer_memory_id=None,
+            propagation=propagation,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            status=FeedbackStatus.WITHDRAWN,
+        )
+        self._persist_feedback_state()
+        self._persist_decision_state()
+        return record
+
+    def _propagate_feedback(
+        self,
+        feedback_id: str,
+        revision: int,
+        target: FeedbackTarget,
+        signals: tuple[FeedbackSignal, ...],
+        *,
+        correction: str | None,
+        expected_answer: str | None,
+    ) -> tuple[FeedbackPropagation, str | None, str | None]:
+        event = current_agent_event()
+        memory_id = self._feedback_memory_id(target)
+        before: dict[str, str] = {}
+        after: dict[str, str] = {}
+        correction_id: str | None = None
+        expected_id: str | None = None
+        exclude = bool(
+            set(signals)
+            & {
+                FeedbackSignal.BAD,
+                FeedbackSignal.FACTUAL_ERROR,
+                FeedbackSignal.STYLE_PROBLEM,
+                FeedbackSignal.UNSAFE_BEHAVIOR,
+                FeedbackSignal.DO_NOT_REMEMBER,
+                FeedbackSignal.EXCLUDE_FROM_TRAINING,
+            }
+        )
+        if memory_id is not None:
+            memory = self.memory_system.get_episodic(memory_id)
+            if memory is None:
+                raise ValueError(f"Unknown episodic memory: {memory_id}")
+            before = {
+                "validation_status": memory.validation_status.value,
+                "lifecycle_status": memory.lifecycle_status.value,
+                "training_included": str(memory.training_included).lower(),
+            }
+            validation = memory.validation_status
+            lifecycle = memory.lifecycle_status
+            if FeedbackSignal.DO_NOT_REMEMBER in signals:
+                validation = ValidationStatus.REJECTED
+                lifecycle = MemoryLifecycleStatus.REJECTED
+            elif (
+                FeedbackSignal.CORRECTION in signals
+                or FeedbackSignal.EXPECTED_ANSWER in signals
+                or FeedbackSignal.FACTUAL_ERROR in signals
+            ):
+                validation = ValidationStatus.DISPUTED
+                lifecycle = (
+                    MemoryLifecycleStatus.CORRECTED
+                    if correction
+                    else MemoryLifecycleStatus.QUARANTINED
+                )
+            elif set(signals) & {
+                FeedbackSignal.BAD,
+                FeedbackSignal.STYLE_PROBLEM,
+                FeedbackSignal.UNSAFE_BEHAVIOR,
+            }:
+                validation = ValidationStatus.DISPUTED
+                lifecycle = MemoryLifecycleStatus.QUARANTINED
+            elif FeedbackSignal.REMEMBER in signals:
+                lifecycle = MemoryLifecycleStatus.ACTIVE
+            if correction is not None:
+                correction_id = self.memory_system.save_feedback_correction(
+                    memory_id,
+                    correction,
+                    feedback_id=feedback_id,
+                    kind="correction",
+                )
+            if expected_answer is not None:
+                expected_id = self.memory_system.save_feedback_correction(
+                    memory_id,
+                    expected_answer,
+                    feedback_id=feedback_id,
+                    kind="expected_answer",
+                )
+            updated = self.memory_system.apply_feedback_policy(
+                memory_id,
+                validation_status=validation,
+                lifecycle_status=lifecycle,
+                training_included=not exclude,
+                feedback_id=feedback_id,
+            )
+            if FeedbackSignal.DO_NOT_REMEMBER in signals:
+                for linked_id in (correction_id, expected_id):
+                    if linked_id is not None:
+                        self.memory_system.apply_feedback_policy(
+                            linked_id,
+                            validation_status=ValidationStatus.REJECTED,
+                            lifecycle_status=MemoryLifecycleStatus.REJECTED,
+                            training_included=False,
+                            feedback_id=feedback_id,
+                        )
+            after = {
+                "validation_status": updated.validation_status.value,
+                "lifecycle_status": updated.lifecycle_status.value,
+                "training_included": str(updated.training_included).lower(),
+            }
+        decision_id = target.decision_id or (
+            target.target_id
+            if target.target_type == FeedbackTargetType.DECISION
+            else None
+        )
+        prediction_error: float | None = None
+        outcome_applied = False
+        if decision_id is not None and set(signals) & {
+            FeedbackSignal.GOOD,
+            FeedbackSignal.BAD,
+            FeedbackSignal.FACTUAL_ERROR,
+            FeedbackSignal.STYLE_PROBLEM,
+            FeedbackSignal.UNSAFE_BEHAVIOR,
+        }:
+            utility = self._feedback_utility(signals)
+            decision = self.decision_store.record_feedback_outcome(
+                decision_id,
+                utility=utility,
+                success=utility > 0.0,
+                feedback_id=feedback_id,
+                feedback_revision=revision,
+                observed_event_id=None if event is None else event.event_id,
+                observed_event_sequence=None
+                if event is None
+                else event.processing_sequence,
+            )
+            prediction_error = decision.prediction_error
+            outcome_applied = True
+        if decision_id is not None:
+            self.decision_store.set_training_policy(
+                decision_id, included=not exclude, feedback_id=feedback_id
+            )
+        direction = "supporting" if self._feedback_utility(signals) > 0 else "opposing"
+        value_impacts: dict[str, float] = {}
+        if decision_id is not None:
+            decision = self.decision_store.get(decision_id)
+            selected = next(
+                item.candidate
+                for item in decision.considered_candidates
+                if item.candidate.candidate_id == decision.selected_candidate_id
+            )
+            utility = self._feedback_utility(signals)
+            value_impacts = {
+                value_id: max(-1.0, min(1.0, effect * utility))
+                for value_id, effect in selected.value_effects.items()
+            }
+        value_proposal = (
+            None
+            if not set(signals)
+            & {
+                FeedbackSignal.GOOD,
+                FeedbackSignal.BAD,
+                FeedbackSignal.FACTUAL_ERROR,
+                FeedbackSignal.STYLE_PROBLEM,
+                FeedbackSignal.UNSAFE_BEHAVIOR,
+            }
+            else ValueEvidenceProposal(
+                proposal_id=f"feedback:{feedback_id}:{revision}",
+                direction=direction,
+                strength=abs(self._feedback_utility(signals)),
+                reason_codes=tuple(item.value for item in signals),
+                target_refs=(f"{target.target_type.value}:{target.target_id}",),
+                value_impacts=value_impacts,
+            )
+        )
+        propagation = FeedbackPropagation(
+            memory_id=memory_id,
+            correction_memory_id=correction_id or expected_id,
+            memory_before=before,
+            memory_after=after,
+            decision_id=decision_id,
+            decision_outcome_applied=outcome_applied,
+            prediction_error=prediction_error,
+            value_evidence=value_proposal,
+            training_disposition=(
+                TrainingDisposition.EXCLUDE if exclude else TrainingDisposition.INCLUDE
+            ),
+            exclusion_refs=((feedback_id,) if exclude else ()),
+            reason_codes=tuple(item.value for item in signals),
+        )
+        return propagation, correction_id, expected_id
+
+    def _withdraw_feedback_effects(self, revision: FeedbackRevision) -> None:
+        propagation = revision.propagation
+        if propagation.memory_id is not None and propagation.memory_before:
+            before = propagation.memory_before
+            self.memory_system.apply_feedback_policy(
+                propagation.memory_id,
+                validation_status=ValidationStatus(before["validation_status"]),
+                lifecycle_status=MemoryLifecycleStatus(before["lifecycle_status"]),
+                training_included=before.get("training_included", "true") == "true",
+                feedback_id=self._feedback_id_for_revision(revision),
+            )
+            for correction_id in (
+                revision.correction_memory_id,
+                revision.expected_answer_memory_id,
+            ):
+                if correction_id is not None:
+                    self.memory_system.withdraw_feedback_correction(
+                        propagation.memory_id, correction_id
+                    )
+        if propagation.decision_id is not None:
+            feedback_id = self._feedback_id_for_revision(revision)
+            self.decision_store.withdraw_feedback_outcome(
+                propagation.decision_id, feedback_id=feedback_id
+            )
+            self.decision_store.set_training_policy(
+                propagation.decision_id, included=True, feedback_id=feedback_id
+            )
+
+    def _feedback_id_for_revision(self, revision: FeedbackRevision) -> str:
+        for record in self.feedback_store.records.values():
+            if revision in record.revisions:
+                return record.feedback_id
+        raise ValueError("Feedback revision is not attached to a record")
+
+    def _validate_feedback_target(self, target: FeedbackTarget) -> None:
+        memory_id = self._feedback_memory_id(target)
+        if memory_id is not None:
+            memory = self.memory_system.get_episodic(memory_id)
+            if memory is None:
+                raise ValueError(f"Unknown episodic memory: {memory_id}")
+            if target.context_id is not None and memory.context_id != target.context_id:
+                raise ValueError("Feedback context does not own the target episode")
+            if (
+                target.experience_id is not None
+                and memory.experience_id != target.experience_id
+            ):
+                raise ValueError("Feedback experience does not own the target episode")
+        if target.target_type == FeedbackTargetType.DECISION:
+            self.decision_store.get(target.target_id)
+        if target.decision_id is not None:
+            self.decision_store.get(target.decision_id)
+        if target.target_type == FeedbackTargetType.CONTEXT:
+            if self.context_registry.get(target.target_id) is None:
+                raise ValueError(f"Unknown context: {target.target_id}")
+
+    @staticmethod
+    def _feedback_memory_id(target: FeedbackTarget) -> str | None:
+        if target.episode_id is not None:
+            return target.episode_id
+        if target.target_type in {
+            FeedbackTargetType.RESPONSE,
+            FeedbackTargetType.EPISODE,
+            FeedbackTargetType.MEMORY,
+        }:
+            return target.target_id
+        return None
+
+    @staticmethod
+    def _validate_feedback_content(
+        signals: tuple[FeedbackSignal, ...],
+        correction: str | None,
+        expected_answer: str | None,
+    ) -> None:
+        if FeedbackSignal.CORRECTION in signals and not correction:
+            raise ValueError("correction signal requires correction content")
+        if FeedbackSignal.EXPECTED_ANSWER in signals and not expected_answer:
+            raise ValueError("expected_answer signal requires expected answer content")
+        if correction is not None and FeedbackSignal.CORRECTION not in signals:
+            raise ValueError("Correction content requires the correction signal")
+        if (
+            expected_answer is not None
+            and FeedbackSignal.EXPECTED_ANSWER not in signals
+        ):
+            raise ValueError(
+                "Expected answer content requires the expected_answer signal"
+            )
+
+    @staticmethod
+    def _feedback_utility(signals: tuple[FeedbackSignal, ...]) -> float:
+        if FeedbackSignal.UNSAFE_BEHAVIOR in signals:
+            return -1.0
+        if FeedbackSignal.BAD in signals or FeedbackSignal.FACTUAL_ERROR in signals:
+            return -0.75
+        if FeedbackSignal.STYLE_PROBLEM in signals:
+            return -0.4
+        if FeedbackSignal.GOOD in signals:
+            return 1.0
+        return 0.0
+
+    @staticmethod
+    def _feedback_provenance(
+        actor_type: str, actor_id: str | None, source: str
+    ) -> FeedbackProvenance:
+        event = current_agent_event()
+        return FeedbackProvenance(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            source=source,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+            submitted_at=datetime.now(UTC).isoformat(),
+        )
+
     def _persist_decision_state(self) -> None:
         self.persistent_state.extensions["decision_records"] = (
             self.decision_store.to_json()
@@ -1999,7 +2496,9 @@ class KagyaMainLoop:
         if item.reference is None:
             return item.content
         if item.reference.startswith("episode:"):
-            episode = self.memory_system.get_episodic(item.reference.removeprefix("episode:"))
+            episode = self.memory_system.get_episodic(
+                item.reference.removeprefix("episode:")
+            )
             if (
                 episode is None
                 or episode.archived
@@ -2011,7 +2510,9 @@ class KagyaMainLoop:
                 f"User: {episode.user_input} | Assistant: {episode.response}"
             )
         if item.reference.startswith("semantic:"):
-            semantic = self.memory_system.get_semantic(item.reference.removeprefix("semantic:"))
+            semantic = self.memory_system.get_semantic(
+                item.reference.removeprefix("semantic:")
+            )
             if (
                 semantic is None
                 or semantic.archived

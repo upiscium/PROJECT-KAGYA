@@ -94,6 +94,8 @@ class ActualOutcome:
     observed_event_id: str | None
     observed_event_sequence: int | None
     recorded_at: str
+    feedback_id: str | None = None
+    feedback_revision: int | None = None
 
     def __post_init__(self) -> None:
         if not self.description:
@@ -128,6 +130,8 @@ class DecisionRecord:
     experience_refs: tuple[str, ...] = ()
     belief_revision_refs: dict[str, int] = field(default_factory=dict)
     value_tradeoff_refs: tuple[str, ...] = ()
+    training_included: bool = True
+    training_exclusion_refs: tuple[str, ...] = ()
     schema_version: int = 7
 
     def __post_init__(self) -> None:
@@ -328,6 +332,85 @@ class DecisionStore:
         self.records[decision_id] = updated
         return updated
 
+    def record_feedback_outcome(
+        self,
+        decision_id: str,
+        *,
+        utility: float,
+        success: bool,
+        feedback_id: str,
+        feedback_revision: int,
+        observed_event_id: str | None,
+        observed_event_sequence: int | None,
+    ) -> DecisionRecord:
+        record = self.get(decision_id)
+        if (
+            record.actual_outcome is not None
+            and record.actual_outcome.feedback_id != feedback_id
+        ):
+            raise ValueError("Decision already has an independent outcome")
+        selected = next(
+            item
+            for item in record.considered_candidates
+            if item.candidate.candidate_id == record.selected_candidate_id
+        )
+        outcome = ActualOutcome(
+            description="explicit_structured_feedback",
+            utility=utility,
+            success=success,
+            observed_event_id=observed_event_id,
+            observed_event_sequence=observed_event_sequence,
+            recorded_at=_now(),
+            feedback_id=feedback_id,
+            feedback_revision=feedback_revision,
+        )
+        updated = replace(
+            record,
+            status=DecisionStatus.RESOLVED,
+            actual_outcome=outcome,
+            prediction_error=utility - selected.predicted_utility,
+            updated_at=outcome.recorded_at,
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def withdraw_feedback_outcome(
+        self, decision_id: str, *, feedback_id: str
+    ) -> DecisionRecord:
+        record = self.get(decision_id)
+        if (
+            record.actual_outcome is None
+            or record.actual_outcome.feedback_id != feedback_id
+        ):
+            return record
+        updated = replace(
+            record,
+            status=DecisionStatus.AWAITING_OUTCOME,
+            actual_outcome=None,
+            prediction_error=None,
+            updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def set_training_policy(
+        self, decision_id: str, *, included: bool, feedback_id: str
+    ) -> DecisionRecord:
+        record = self.get(decision_id)
+        refs = tuple(
+            item for item in record.training_exclusion_refs if item != feedback_id
+        )
+        if not included:
+            refs = (*refs, feedback_id)
+        updated = replace(
+            record,
+            training_included=not refs,
+            training_exclusion_refs=refs,
+            updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
     def link_value_tradeoffs(
         self, decision_id: str, tradeoff_ids: tuple[str, ...]
     ) -> DecisionRecord:
@@ -374,7 +457,7 @@ class DecisionDatasetGenerator:
     ) -> list[DecisionDatasetRecord]:
         dataset: list[DecisionDatasetRecord] = []
         for record in records:
-            if record.status != DecisionStatus.RESOLVED:
+            if record.status != DecisionStatus.RESOLVED or not record.training_included:
                 continue
             selected = next(
                 item.candidate
@@ -560,6 +643,8 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data["experience_refs"] = tuple(data.get("experience_refs", ()))
     data.setdefault("belief_revision_refs", {})
     data["value_tradeoff_refs"] = tuple(data.get("value_tradeoff_refs", ()))
+    data.setdefault("training_included", True)
+    data["training_exclusion_refs"] = tuple(data.get("training_exclusion_refs", ()))
     data["schema_version"] = 7
     evaluations = []
     for raw in data.get("considered_candidates", ()):

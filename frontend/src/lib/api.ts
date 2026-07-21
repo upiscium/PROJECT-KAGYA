@@ -17,6 +17,24 @@ export type ChatResponse = {
   emotion: Emotion;
   model: ModelInfo;
 };
+export type FeedbackSignal = "good" | "bad" | "factual_error" | "style_problem" | "unsafe_behavior" | "remember" | "do_not_remember" | "correction" | "expected_answer" | "exclude_from_training";
+export type FeedbackResponse = {
+  feedback_id: string;
+  current_revision: number;
+  revisions: Array<{
+    revision: number;
+    status: "active" | "withdrawn";
+    signals: FeedbackSignal[];
+    propagation: { training_disposition: "include" | "exclude"; correction_memory_id: string | null };
+  }>;
+};
+export type FeedbackRequest = {
+  idempotency_key: string;
+  target: { target_type: "response"; target_id: string; episode_id: string; experience_id: string; context_id: string };
+  signals: FeedbackSignal[];
+  correction?: string;
+  expected_answer?: string;
+};
 
 export type RetrievedMemory = {
   db1_results: Array<{ id: string; user_input: string; response: string; record_type: string; context_id: string | null; semantic_relevance: number; context_compatibility: number; context_relation: string; cross_context: boolean }>;
@@ -77,6 +95,10 @@ export type EpisodeMemory = {
   experience_id: string | null;
   subjective_salience: number;
   autobiographical_importance: number;
+  supersedes_id: string | null;
+  corrected_by_id: string | null;
+  training_included: boolean;
+  training_exclusion_refs: string[];
 };
 
 export type SemanticMemory = {
@@ -360,6 +382,7 @@ function formatHttpError(status: number, statusText: string, detail: string): st
 
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
+  feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),

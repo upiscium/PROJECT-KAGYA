@@ -80,6 +80,10 @@ KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
 - Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
 - The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
 - Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
+- Chat responses accept typed feedback at `POST /api/feedback`. Public submissions must identify the response's episode, experience, and context; arbitrary memory, decision, and context targets are admin-only.
+- Operators can audit `GET /api/feedback`, create broader target feedback at `POST /api/feedback/admin`, append revisions at `POST /api/feedback/{id}/revisions`, and withdraw effects at `POST /api/feedback/{id}/withdraw`.
+- Every mutation requires an idempotency key. Feedback remains categorical and versioned: correction and expected-answer text becomes provenance-linked memory, never a free-form reward or hidden-thought update.
+- `do_not_remember`, negative quality/safety signals, and explicit training exclusion remove the target episode from retrieval/consolidation/training while preserving it for audit. Corrections supersede rather than delete the original memory. Withdrawal restores the prior lifecycle and training policy when the feedback owns those effects.
 - `api.admin_auth.enabled` defaults to `false`. In that mode the existing admin-token behavior is unchanged; Origin, session, role, CSRF, and re-authentication checks are not applied. This mode is private/loopback only and must not be exposed directly to the public internet.
 
 ### Optional Admin Identity
