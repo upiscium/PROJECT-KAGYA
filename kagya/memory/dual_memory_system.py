@@ -29,6 +29,11 @@ from kagya.memory.memory_schema import (
 )
 from kagya.memory.quality import assess_generation_health
 from kagya.models import ModelProvider
+from kagya.external_transaction import (
+    ExternalTransactionAudit,
+    ExternalTransactionRecord,
+    ExternalTransactionStatus,
+)
 
 
 class DeterministicEmbeddingFunction:
@@ -131,6 +136,8 @@ class DualMemorySystem:
             embedding_function=self.embedding_function,
             metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
+        self._external_failure_injector: Callable[[str, str], None] | None = None
+        self._backfill_episodic_transactions()
         self._backfill_semantic_records()
 
     def save_episodic(
@@ -158,7 +165,9 @@ class DualMemorySystem:
         model_revision: str = "unknown",
         adapter_id: str | None = None,
         validation_status: ValidationStatus = ValidationStatus.VERIFIED,
+        stage_external: bool = False,
     ) -> str:
+        _reject_private_transaction_metadata(metadata or {})
         health = generation_health or GenerationHealth()
         lifecycle = (
             MemoryLifecycleStatus.ACTIVE
@@ -172,6 +181,15 @@ class DualMemorySystem:
             return str(existing["ids"][0])
         episode_id = f"episode-{uuid4()}"
         created_at = _now_iso()
+        transaction_status = (
+            ExternalTransactionStatus.PENDING
+            if stage_external
+            else ExternalTransactionStatus.COMMITTED
+        )
+        if stage_external and (source_event_id is None or processing_sequence is None):
+            raise ValueError("staged external record requires event ID and sequence")
+        transaction_id = f"external-{episode_id}"
+        transaction_audit = [_external_audit_entry(1, transaction_status, "prepare")]
         record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
@@ -183,6 +201,16 @@ class DualMemorySystem:
             "archived": False,
             "created_at": created_at,
             "schema_version": 3,
+            "source_event_id": source_event_id or "",
+            "processing_sequence": processing_sequence
+            if processing_sequence is not None
+            else -1,
+            "external_transaction_id": transaction_id,
+            "external_transaction_schema_version": 1,
+            "external_transaction_revision": 1,
+            "external_transaction_status": transaction_status.value,
+            "external_transaction_updated_at": created_at,
+            "external_transaction_audit": json.dumps(transaction_audit),
             "lifecycle_status": lifecycle.value,
             "validation_status": validation_status.value,
             "content_hash": content_hash,
@@ -220,6 +248,152 @@ class DualMemorySystem:
             metadatas=[record_metadata],
         )
         return episode_id
+
+    def set_external_failure_injector(
+        self, injector: Callable[[str, str], None] | None
+    ) -> None:
+        """Install a deterministic boundary failure hook for verification."""
+
+        self._external_failure_injector = injector
+
+    def list_external_transactions(self) -> list[ExternalTransactionRecord]:
+        result = self.db1.get(include=["metadatas"])
+        records: list[ExternalTransactionRecord] = []
+        for episode_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            extra = _loads_json_dict(metadata.get("extra"))
+            provenance = extra.get("provenance")
+            provenance = provenance if isinstance(provenance, dict) else {}
+            status = ExternalTransactionStatus(
+                str(
+                    metadata.get(
+                        "external_transaction_status",
+                        ExternalTransactionStatus.COMMITTED.value,
+                    )
+                )
+            )
+            created_at = str(metadata.get("created_at", ""))
+            audit_values = _loads_json_dict_list(
+                metadata.get("external_transaction_audit")
+            )
+            records.append(
+                ExternalTransactionRecord(
+                    schema_version=_metadata_int(
+                        metadata.get("external_transaction_schema_version"), 1
+                    ),
+                    revision=_metadata_int(
+                        metadata.get("external_transaction_revision"), 1
+                    ),
+                    transaction_id=str(
+                        metadata.get(
+                            "external_transaction_id", f"external-{episode_id}"
+                        )
+                    ),
+                    artifact_type="episodic_chroma",
+                    artifact_id=str(episode_id),
+                    status=status,
+                    event_id=_optional_str(
+                        metadata.get("source_event_id")
+                        or provenance.get("source_event_id")
+                    ),
+                    processing_sequence=_external_sequence(
+                        metadata.get("processing_sequence"),
+                        provenance.get("processing_sequence"),
+                    ),
+                    source=str(provenance.get("source", "unknown")),
+                    causation_id=_optional_str(provenance.get("causation_id")),
+                    correlation_id=_optional_str(provenance.get("correlation_id")),
+                    created_at=created_at,
+                    updated_at=str(
+                        metadata.get("external_transaction_updated_at", created_at)
+                    ),
+                    audit=[
+                        ExternalTransactionAudit.model_validate(item)
+                        for item in audit_values
+                    ],
+                )
+            )
+        return records
+
+    def finalize_external_event(self, event_id: str, processing_sequence: int) -> int:
+        if self._external_failure_injector is not None:
+            self._external_failure_injector("finalize", event_id)
+        return self._transition_external_event(
+            event_id,
+            from_statuses={ExternalTransactionStatus.PENDING},
+            to_status=ExternalTransactionStatus.COMMITTED,
+            reason="snapshot_committed",
+            processing_sequence=processing_sequence,
+        )
+
+    def orphan_external_event(self, event_id: str, reason: str) -> int:
+        return self._transition_external_event(
+            event_id,
+            from_statuses={ExternalTransactionStatus.PENDING},
+            to_status=ExternalTransactionStatus.ORPHANED,
+            reason=reason,
+        )
+
+    def compensate_external_event(self, event_id: str, reason: str) -> int:
+        return self._transition_external_event(
+            event_id,
+            from_statuses={
+                ExternalTransactionStatus.PENDING,
+                ExternalTransactionStatus.ORPHANED,
+            },
+            to_status=ExternalTransactionStatus.COMPENSATED,
+            reason=reason,
+            quarantine=True,
+        )
+
+    def _transition_external_event(
+        self,
+        event_id: str,
+        *,
+        from_statuses: set[ExternalTransactionStatus],
+        to_status: ExternalTransactionStatus,
+        reason: str,
+        processing_sequence: int | None = None,
+        quarantine: bool = False,
+    ) -> int:
+        result = self.db1.get(
+            where={"source_event_id": event_id}, include=["metadatas"]
+        )
+        changed = 0
+        for episode_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            current = ExternalTransactionStatus(
+                str(metadata.get("external_transaction_status", "committed"))
+            )
+            if current == to_status:
+                continue
+            if current not in from_statuses:
+                continue
+            if (
+                processing_sequence is not None
+                and _metadata_int(metadata.get("processing_sequence"), -1)
+                != processing_sequence
+            ):
+                raise ValueError("external transaction processing sequence mismatch")
+            revision = (
+                _metadata_int(metadata.get("external_transaction_revision"), 1) + 1
+            )
+            metadata["external_transaction_status"] = to_status.value
+            metadata["external_transaction_revision"] = revision
+            metadata["external_transaction_updated_at"] = _now_iso()
+            audit = _loads_json_dict_list(metadata.get("external_transaction_audit"))
+            audit.append(_external_audit_entry(revision, to_status, reason))
+            metadata["external_transaction_audit"] = json.dumps(audit)
+            if quarantine:
+                metadata["lifecycle_status"] = MemoryLifecycleStatus.QUARANTINED.value
+                metadata["training_included"] = False
+            self.db1.update(ids=[str(episode_id)], metadatas=[metadata])
+            changed += 1
+        return changed
 
     def link_experience(
         self,
@@ -367,6 +541,8 @@ class DualMemorySystem:
                 record
                 for record in episodic
                 if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+                and record.external_transaction_status
+                == ExternalTransactionStatus.COMMITTED
             ][: self.settings.memory.db1_top_k],
             db2_results=[
                 _with_effective_confidence(record)
@@ -396,6 +572,8 @@ class DualMemorySystem:
             record
             for record in _episodic_records_from_get(result)
             if record.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+            and record.external_transaction_status
+            == ExternalTransactionStatus.COMMITTED
         ]
 
     def review_episodic(
@@ -996,6 +1174,35 @@ class DualMemorySystem:
             )
             self.db2.update(ids=[str(semantic_id)], metadatas=[metadata])
 
+    def _backfill_episodic_transactions(self) -> None:
+        result = self.db1.get(include=["metadatas"])
+        for episode_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            if "external_transaction_status" in metadata:
+                continue
+            created_at = str(metadata.get("created_at", "")) or _now_iso()
+            metadata.update(
+                {
+                    "external_transaction_id": f"external-{episode_id}",
+                    "external_transaction_schema_version": 1,
+                    "external_transaction_revision": 1,
+                    "external_transaction_status": ExternalTransactionStatus.COMMITTED.value,
+                    "external_transaction_updated_at": created_at,
+                    "external_transaction_audit": json.dumps(
+                        [
+                            _external_audit_entry(
+                                1,
+                                ExternalTransactionStatus.COMMITTED,
+                                "legacy_backfill",
+                            )
+                        ]
+                    ),
+                }
+            )
+            self.db1.update(ids=[str(episode_id)], metadatas=[metadata])
+
     def update_episodic_metadata(
         self,
         episode_id: str,
@@ -1226,6 +1433,20 @@ def _episodic_record_from_metadata(
         training_included=bool(metadata.get("training_included", True)),
         training_exclusion_refs=_loads_json_list(
             metadata.get("training_exclusion_refs")
+        ),
+        external_transaction_id=str(
+            metadata.get("external_transaction_id", f"external-{record_id}")
+        ),
+        external_transaction_status=ExternalTransactionStatus(
+            str(
+                metadata.get(
+                    "external_transaction_status",
+                    ExternalTransactionStatus.COMMITTED.value,
+                )
+            )
+        ),
+        external_transaction_revision=int(
+            metadata.get("external_transaction_revision", 1)
         ),
     )
 
@@ -1485,6 +1706,54 @@ def _optional_str(value: Any) -> str | None:
 
 def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _external_sequence(primary: Any, fallback: Any) -> int | None:
+    value = primary if primary not in {None, -1, "-1"} else fallback
+    return None if value is None else int(value)
+
+
+def _metadata_int(value: Any, default: int) -> int:
+    return default if value is None else int(str(value))
+
+
+def _external_audit_entry(
+    revision: int, status: ExternalTransactionStatus, reason: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "revision": revision,
+        "status": status.value,
+        "timestamp": _now_iso(),
+        "reason": reason,
+    }
+
+
+def _reject_private_transaction_metadata(value: Any) -> None:
+    forbidden = {
+        "attachmentbody",
+        "credential",
+        "credentials",
+        "hiddenthought",
+        "password",
+        "prompt",
+        "rawprompt",
+        "secret",
+        "token",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if any(marker in normalized for marker in forbidden):
+                raise ValueError(
+                    "private field is forbidden in external transaction metadata"
+                )
+            _reject_private_transaction_metadata(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_private_transaction_metadata(item)
 
 
 def _default_context_compatibility(

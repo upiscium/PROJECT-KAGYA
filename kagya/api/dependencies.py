@@ -37,6 +37,7 @@ from kagya.runtime import (
     AgentStateStore,
     KagyaMainLoop,
     EmotionTimer,
+    ExternalTransactionCoordinator,
     StateWAL,
     hash_snapshot,
     SchedulerBudget,
@@ -133,12 +134,18 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
                         _event_sequence(event.processing_sequence),
                     )
                 )
+                get_external_transaction_coordinator(request).finalize_event(
+                    event.event_id, _event_sequence(event.processing_sequence)
+                )
                 return hash_snapshot(saved)
 
             def persist_failed(event: AgentEvent, exception: Exception) -> str | None:
+                coordinator = get_external_transaction_coordinator(request)
+                coordinator.orphan_event(event.event_id, type(exception).__name__)
                 saved = store.save_failed_sequence(
                     _event_sequence(event.processing_sequence)
                 )
+                coordinator.compensate_event(event.event_id, type(exception).__name__)
                 return None if saved is None else hash_snapshot(saved)
 
             runtime = AgentRuntime(
@@ -510,6 +517,16 @@ def get_memory_system(request: Request) -> DualMemorySystem:
         memory = DualMemorySystem(get_api_settings(request))
         request.app.state.memory_system = memory
     return memory
+
+
+def get_external_transaction_coordinator(
+    request: Request,
+) -> ExternalTransactionCoordinator:
+    coordinator = getattr(request.app.state, "external_transaction_coordinator", None)
+    if coordinator is None:
+        coordinator = ExternalTransactionCoordinator([get_memory_system(request)])
+        request.app.state.external_transaction_coordinator = coordinator
+    return coordinator
 
 
 def get_adapter_registry(request: Request) -> AdapterRegistry:

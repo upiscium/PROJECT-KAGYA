@@ -13,6 +13,7 @@ from kagya.api.server import create_app
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
+from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import DummyProvider
 from kagya.motivation import MotivationKind, MotivationSource
 from kagya.runtime import (
@@ -1059,6 +1060,125 @@ def test_point_in_time_restore_is_new_event_without_external_replay(
     records = StateWAL(settings.agent_state_wal.path).verify()
     assert records[-1].event_type == AgentEventType.STATE_POINT_IN_TIME_RESTORE.value
     assert records[-1].processing_sequence > baseline.sequence
+
+
+def test_chat_external_saga_retries_finalize_and_exposes_safe_audit(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    failures = 0
+
+    def fail_twice(operation: str, event_id: str) -> None:
+        nonlocal failures
+        assert operation == "finalize"
+        assert event_id
+        failures += 1
+        if failures < 3:
+            raise RuntimeError("injected finalize failure")
+
+    client.app.state.memory_system.set_external_failure_injector(fail_twice)
+    chat = client.post(
+        "/api/chat", json={"text": "saga audit private text", "attachments": []}
+    )
+    audit = client.get("/api/state/external-transactions", headers=admin_headers())
+
+    assert chat.status_code == 200
+    assert failures == 3
+    episode = client.app.state.memory_system.get_episodic(chat.json()["episode_id"])
+    assert episode is not None
+    assert episode.external_transaction_status == ExternalTransactionStatus.COMMITTED
+    assert audit.status_code == 200
+    assert audit.json()[0]["schema_version"] == 1
+    assert audit.json()[0]["revision"] == 2
+    assert [entry["status"] for entry in audit.json()[0]["audit"]] == [
+        "pending",
+        "committed",
+    ]
+    assert "saga audit private text" not in audit.text
+    assert "hidden_thought" not in audit.text
+
+
+def test_internal_mutation_failure_compensates_unretrievable_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(tmp_path)
+
+    def fail_after_prepare(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected internal mutation failure")
+
+    monkeypatch.setattr(
+        client.app.state.memory_system, "link_experience", fail_after_prepare
+    )
+    response = client.post(
+        "/api/chat", json={"text": "must never be retrieved", "attachments": []}
+    )
+
+    assert response.status_code == 500
+    records = client.app.state.memory_system.list_external_transactions()
+    assert len(records) == 1
+    assert records[0].status == ExternalTransactionStatus.COMPENSATED
+    assert [entry.status for entry in records[0].audit] == [
+        ExternalTransactionStatus.PENDING,
+        ExternalTransactionStatus.ORPHANED,
+        ExternalTransactionStatus.COMPENSATED,
+    ]
+    assert (
+        client.app.state.memory_system.retrieve_context(
+            "must never be retrieved"
+        ).db1_results
+        == []
+    )
+
+
+def test_restart_reconciliation_finalizes_pending_chat_once(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as first:
+        first.app.state.memory_system.set_external_failure_injector(
+            lambda operation, event_id: (_ for _ in ()).throw(
+                RuntimeError("persistent injected finalize failure")
+            )
+        )
+        chat = first.post(
+            "/api/chat", json={"text": "restart recovery", "attachments": []}
+        )
+        assert chat.status_code == 200
+        pending = first.app.state.memory_system.get_episodic(chat.json()["episode_id"])
+        assert pending is not None
+        assert pending.external_transaction_status == ExternalTransactionStatus.PENDING
+        assert (
+            first.app.state.memory_system.retrieve_context(
+                "restart recovery"
+            ).db1_results
+            == []
+        )
+
+    with _client(tmp_path, settings=settings) as restarted:
+        recovered = restarted.app.state.memory_system.get_episodic(
+            chat.json()["episode_id"]
+        )
+        assert recovered is not None
+        assert (
+            recovered.external_transaction_status == ExternalTransactionStatus.COMMITTED
+        )
+        assert recovered.external_transaction_revision == 2
+        report = restarted.app.state.external_reconciliation
+        assert report.finalized == 1
+        diff = restarted.get(
+            "/api/state/restore/0/external-diff", headers=admin_headers()
+        )
+        assert diff.status_code == 200
+        assert diff.json()["effects"][0]["artifact_id"] == chat.json()["episode_id"]
+        assert diff.json()["external_side_effects_replayed"] is False
+        replay = restarted.post(
+            "/api/state/external-transactions/reconcile", headers=admin_headers()
+        )
+        assert replay.status_code == 200
+        assert replay.json() == {"finalized": 0, "compensated": 0, "retryable": 0}
+        unchanged = restarted.app.state.memory_system.get_episodic(
+            chat.json()["episode_id"]
+        )
+        assert unchanged is not None
+        assert unchanged.external_transaction_revision == 2
 
 
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:

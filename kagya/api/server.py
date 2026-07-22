@@ -53,6 +53,7 @@ from kagya.runtime import (
     AgentStateSnapshot,
     EmotionTimer,
     EventJournal,
+    ExternalTransactionCoordinator,
     KagyaMainLoop,
     RemoteTrainingDispatcher,
     TrainingWorkerRuntime,
@@ -226,6 +227,15 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
+    if getattr(app.state, "external_transaction_coordinator", None) is None:
+        app.state.external_transaction_coordinator = ExternalTransactionCoordinator(
+            [app.state.memory_system]
+        )
+    app.state.external_reconciliation = (
+        app.state.external_transaction_coordinator.reconcile(
+            app.state.event_journal.verify()
+        )
+    )
     embedding_model = getattr(
         app.state.memory_system.embedding_function, "_get_model", None
     )
@@ -380,6 +390,9 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
     app.state.state_wal.append_transition(event, previous, candidate)
     try:
         saved = store.save(candidate)
+        app.state.external_transaction_coordinator.finalize_event(
+            event.event_id, _event_sequence(event.processing_sequence)
+        )
         try:
             _observe_subject_state(app)
         except Exception:
@@ -397,6 +410,9 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
 
 def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
     store = app.state.agent_state_store
+    app.state.external_transaction_coordinator.orphan_event(
+        event.event_id, "internal_mutation_failed"
+    )
     previous = store.last_snapshot
     if previous is None:
         raise RuntimeError("Agent state store has no previous snapshot")
@@ -414,6 +430,9 @@ def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
     )
     app.state.state_wal.append_transition(event, previous, candidate)
     saved = store.save(candidate)
+    app.state.external_transaction_coordinator.compensate_event(
+        event.event_id, "internal_mutation_failed"
+    )
     return hash_snapshot(saved)
 
 

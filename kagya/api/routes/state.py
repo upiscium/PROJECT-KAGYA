@@ -7,6 +7,7 @@ from kagya.api.dependencies import (
     get_agent_runtime,
     get_agent_state_store,
     get_api_settings,
+    get_external_transaction_coordinator,
     get_main_loop,
     get_state_wal,
     require_admin,
@@ -17,6 +18,10 @@ from kagya.runtime import (
     AgentRuntime,
     AgentStateSnapshot,
     AgentStateStore,
+    ExternalReconciliationReport,
+    ExternalRestoreDiff,
+    ExternalTransactionCoordinator,
+    ExternalTransactionRecord,
     StateDryRun,
     StateReconstruction,
     StateWAL,
@@ -125,6 +130,45 @@ def dry_run_restore(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
+
+
+@router.get("/external-transactions", response_model=list[ExternalTransactionRecord])
+def external_transaction_audit(
+    coordinator: ExternalTransactionCoordinator = Depends(
+        get_external_transaction_coordinator
+    ),
+) -> list[ExternalTransactionRecord]:
+    return coordinator.records()
+
+
+@router.post(
+    "/external-transactions/reconcile",
+    response_model=ExternalReconciliationReport,
+)
+def reconcile_external_transactions(
+    request: Request,
+    coordinator: ExternalTransactionCoordinator = Depends(
+        get_external_transaction_coordinator
+    ),
+) -> ExternalReconciliationReport:
+    return coordinator.reconcile(request.app.state.event_journal.verify())
+
+
+@router.get("/restore/{sequence}/external-diff", response_model=ExternalRestoreDiff)
+def external_restore_diff(
+    sequence: int,
+    wal: StateWAL = Depends(get_state_wal),
+    coordinator: ExternalTransactionCoordinator = Depends(
+        get_external_transaction_coordinator
+    ),
+) -> ExternalRestoreDiff:
+    try:
+        wal.reconstruct(sequence)
+    except StateWalIntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+    return coordinator.restore_diff(sequence)
 
 
 @router.post("/restore/{sequence}", response_model=AgentStateSnapshot)

@@ -541,6 +541,7 @@ class KagyaMainLoop:
                 model_revision=str(getattr(self.provider, "model_revision", "unknown")),
                 adapter_id=None if fallback_used else self.adapter_id,
                 validation_status=ValidationStatus.UNVERIFIED,
+                stage_external=event is not None,
             )
             experience = self.experience_store.integrate(
                 build_chat_experience(

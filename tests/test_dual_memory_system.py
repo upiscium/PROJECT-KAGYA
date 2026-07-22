@@ -16,6 +16,10 @@ from kagya.memory import (
 )
 from kagya.models import DummyProvider
 from kagya.memory.memory_evaluator import MemoryEvaluator
+from kagya.external_transaction import (
+    ExternalTransactionCoordinator,
+    ExternalTransactionStatus,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -463,6 +467,93 @@ def test_same_event_and_content_is_deduplicated(tmp_path: Path) -> None:
 
     assert second == first
     assert distinct != first
+
+
+def test_staged_episode_is_hidden_until_idempotent_finalize(tmp_path: Path) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic(
+        "staged private input",
+        "staged response",
+        source_event_id="event-staged",
+        processing_sequence=7,
+        source="api.chat",
+        stage_external=True,
+    )
+
+    assert memory.retrieve_context("staged private input").db1_results == []
+    pending = memory.get_episodic(episode_id)
+    assert pending is not None
+    assert pending.external_transaction_status == ExternalTransactionStatus.PENDING
+
+    assert memory.finalize_external_event("event-staged", 7) == 1
+    assert memory.finalize_external_event("event-staged", 7) == 0
+
+    committed = memory.get_episodic(episode_id)
+    assert committed is not None
+    assert committed.external_transaction_status == ExternalTransactionStatus.COMMITTED
+    assert committed.external_transaction_revision == 2
+    assert [
+        item.id for item in memory.retrieve_context("staged private input").db1_results
+    ] == [episode_id]
+
+
+def test_orphan_compensation_quarantines_and_privacy_metadata_is_rejected(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic(
+        "orphan input",
+        "orphan response",
+        source_event_id="event-orphan",
+        processing_sequence=8,
+        stage_external=True,
+    )
+
+    assert memory.orphan_external_event("event-orphan", "mutation_failed") == 1
+    orphaned = memory.get_episodic(episode_id)
+    assert orphaned is not None
+    assert orphaned.external_transaction_status == ExternalTransactionStatus.ORPHANED
+    assert memory.compensate_external_event("event-orphan", "mutation_failed") == 1
+    assert memory.compensate_external_event("event-orphan", "mutation_failed") == 0
+
+    compensated = memory.get_episodic(episode_id)
+    assert compensated is not None
+    assert (
+        compensated.external_transaction_status == ExternalTransactionStatus.COMPENSATED
+    )
+    assert compensated.lifecycle_status == MemoryLifecycleStatus.QUARANTINED
+    assert memory.retrieve_context("orphan input").db1_results == []
+
+    with pytest.raises(ValueError, match="private field"):
+        memory.save_episodic("private", "response", metadata={"api_token": "secret"})
+
+
+def test_reconciliation_preserves_failure_intent_across_snapshot_crash_window(
+    tmp_path: Path,
+) -> None:
+    memory = _memory(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic(
+        "crash window",
+        "response",
+        source_event_id="event-crash-window",
+        processing_sequence=9,
+        stage_external=True,
+    )
+    memory.orphan_external_event("event-crash-window", "handler_failed")
+
+    class RecoveredOutcome:
+        event_id = "event-crash-window"
+        lifecycle = "recovery_classified"
+        processing_sequence = 9
+        failure_category = "committed_before_crash"
+
+    report = ExternalTransactionCoordinator([memory]).reconcile([RecoveredOutcome()])
+
+    record = memory.get_episodic(episode_id)
+    assert record is not None
+    assert record.external_transaction_status == ExternalTransactionStatus.COMPENSATED
+    assert report.compensated == 1
+    assert memory.retrieve_context("crash window").db1_results == []
 
 
 def test_retrieval_keeps_semantic_and_context_scores_separate(tmp_path: Path) -> None:
