@@ -310,6 +310,14 @@ def test_durable_completion_failure_fails_stops_runtime() -> None:
 
 def test_handler_failure_is_durably_recorded_and_runtime_continues() -> None:
     journal = RecordingJournal()
+    entered = Event()
+    release = Event()
+
+    def fail_after_release() -> None:
+        entered.set()
+        assert release.wait(timeout=1)
+        raise ValueError("expected")
+
     runtime = AgentRuntime(
         queue_capacity=2,
         event_journal=journal,
@@ -321,11 +329,13 @@ def test_handler_failure_is_durably_recorded_and_runtime_continues() -> None:
     failed = runtime.submit(
         AgentEventType.CHAT,
         source="test",
-        handler=lambda: _raise(ValueError("expected")),
+        handler=fail_after_release,
     )
+    assert entered.wait(timeout=1)
     succeeded = runtime.submit(
         AgentEventType.CHAT, source="test", handler=lambda: "next"
     )
+    release.set()
 
     with pytest.raises(ValueError, match="expected"):
         failed.result(timeout=1)
@@ -333,8 +343,8 @@ def test_handler_failure_is_durably_recorded_and_runtime_continues() -> None:
     runtime.shutdown()
     assert journal.lifecycle == [
         "accepted",
-        "accepted",
         "started",
+        "accepted",
         "failed",
         "started",
         "completed",
