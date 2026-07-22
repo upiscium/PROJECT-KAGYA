@@ -255,6 +255,7 @@ class SubjectScheduler:
                     return self._process(item, remaining_goals)
 
                 event_type = {
+                    WakeUpKind.MOTIVATION_REEVALUATION: AgentEventType.INTRINSIC_GOAL_PROPOSE,
                     WakeUpKind.INTRINSIC_DELIBERATION: AgentEventType.INTRINSIC_GOAL_DELIBERATE,
                     WakeUpKind.PLAN_GENERATION: AgentEventType.PLAN_GENERATE,
                     WakeUpKind.INTRINSIC_ADOPTION: AgentEventType.INTRINSIC_GOAL_ADOPT,

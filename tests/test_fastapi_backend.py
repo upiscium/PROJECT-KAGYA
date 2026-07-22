@@ -2783,7 +2783,13 @@ def test_started_autonomy_loop_executes_motivation_through_wal(
         and record.lifecycle == JournalLifecycle.COMPLETED
         for record in journal
     )
+    assert any(
+        record.event_type == "intrinsic_goal_propose"
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in journal
+    )
     assert any(record.event_type == "autonomy_wake" for record in wal)
+    assert any(record.event_type == "intrinsic_goal_propose" for record in wal)
     snapshot = json.loads(settings.agent_state.path.read_text(encoding="utf-8"))
     assert any(
         item["kind"] == "motivation_reevaluation"
