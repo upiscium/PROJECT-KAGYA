@@ -260,6 +260,11 @@ class ToolRegistrySettings(StrictBaseModel):
     audit_path: Path
 
 
+class ActionExecutionSettings(StrictBaseModel):
+    document_root: Path = Path(".kagya/documents")
+    calendar_path: Path = Path(".kagya/calendar.json")
+
+
 class AgentStateSettings(StrictBaseModel):
     path: Path = Path(".kagya/agent_state.json")
 
@@ -376,6 +381,7 @@ class Settings(StrictBaseModel):
     qlora: QloraSettings
     adapter_registry: AdapterRegistrySettings
     tools: ToolRegistrySettings
+    actions: ActionExecutionSettings = Field(default_factory=ActionExecutionSettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     agent_journal: AgentJournalSettings = Field(default_factory=AgentJournalSettings)
     agent_state_wal: AgentStateWalSettings = Field(

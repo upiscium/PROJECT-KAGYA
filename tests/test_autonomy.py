@@ -211,6 +211,46 @@ def test_idle_cycle_is_explicit_no_action_without_runtime_event(tmp_path: Path) 
     runtime.shutdown()
 
 
+def test_due_action_timeout_is_processed_once_through_runtime(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    runtime, journal = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+
+    class _Actions:
+        calls = 0
+
+        def list_intents(self) -> list[object]:
+            return [
+                SimpleNamespace(
+                    intent_id="intent-1",
+                    status=SimpleNamespace(value="approved"),
+                    deadline_at=now,
+                    retry_at=None,
+                )
+            ] if self.calls == 0 else []
+
+        def timeout(self, intent_id: str) -> object:
+            assert intent_id == "intent-1"
+            self.calls += 1
+            return SimpleNamespace(status=SimpleNamespace(value="failed"))
+
+    loop.action_execution = _Actions()
+    scheduler = _scheduler(runtime, loop)
+
+    first = scheduler.run_cycle(now)
+    second = scheduler.run_cycle(now + timedelta(seconds=1))
+    runtime.shutdown()
+
+    assert first.result == CycleResult.PROCESSED
+    assert second.result == CycleResult.NO_ACTION
+    assert loop.action_execution.calls == 1
+    assert any(
+        record.event_type == "autonomy_wake"
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in journal.verify()
+    )
+
+
 def test_due_goal_deadline_is_reevaluated_through_runtime(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     runtime, journal = _runtime(tmp_path / "journal.jsonl")

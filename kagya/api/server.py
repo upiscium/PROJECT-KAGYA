@@ -9,7 +9,9 @@ import uvicorn
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
+from kagya.actions import ActionExecutionLayer
 from kagya.api.routes import (
+    actions,
     adapters,
     attention,
     beliefs,
@@ -145,6 +147,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(goals.commitment_router)
         app.include_router(plans.router)
         app.include_router(decisions.router)
+        app.include_router(actions.router)
         app.include_router(self_model.router)
         app.include_router(experiences.router)
         app.include_router(beliefs.router)
@@ -275,6 +278,13 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             telemetry=app.state.operational_telemetry,
         )
     app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
+    action_settings = settings.actions
+    app.state.action_execution = ActionExecutionLayer(
+        app.state.main_loop,
+        document_root=action_settings.document_root,
+        calendar_path=action_settings.calendar_path,
+    )
+    app.state.main_loop.action_execution = app.state.action_execution
     if getattr(app.state, "agent_runtime", None) is None:
         app.state.agent_runtime = AgentRuntime(
             queue_capacity=settings.api.agent_queue_capacity,

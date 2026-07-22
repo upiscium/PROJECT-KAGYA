@@ -289,6 +289,7 @@ class KagyaMainLoop:
         self.belief_store = BeliefStore()
         self.feedback_store = FeedbackStore()
         self.metacognition = Metacognition()
+        self.action_execution: Any | None = None
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
@@ -3581,6 +3582,21 @@ class KagyaMainLoop:
         self._persist_self_model_state()
         self._persist_decision_state()
         self._persist_metacognition_state()
+        return record
+
+    def record_decision_compensation(
+        self, decision_id: str, *, receipt_id: str
+    ) -> DecisionRecord:
+        event = current_agent_event()
+        record = self.decision_store.record_compensation(
+            decision_id,
+            receipt_id=receipt_id,
+            observed_event_id=None if event is None else event.event_id,
+            observed_event_sequence=None
+            if event is None
+            else event.processing_sequence,
+        )
+        self._persist_decision_state()
         return record
 
     def _metacognitive_candidate_scores(

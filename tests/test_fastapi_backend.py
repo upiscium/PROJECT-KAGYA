@@ -2645,6 +2645,12 @@ def _settings(tmp_path: Path) -> Settings:
                     "audit_path": tmp_path / "tool_audit.jsonl",
                 }
             ),
+            "actions": settings.actions.model_copy(
+                update={
+                    "document_root": tmp_path / "documents",
+                    "calendar_path": tmp_path / "calendar.json",
+                }
+            ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
             ),
@@ -2896,6 +2902,121 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
         "plan_generate",
         "intrinsic_goal_adopt",
     }
+
+
+def test_action_api_approval_execution_receipts_and_wal_replay(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={"autonomy": settings.autonomy.model_copy(update={"enabled": False})}
+    )
+    candidate = {
+        "candidate_id": "notify",
+        "candidate_type": "internal",
+        "proposed_action": "Queue local notification",
+        "parameters": {
+            "action": {
+                "tool_name": "local_notification_enqueue",
+                "arguments": {
+                    "channel": "local",
+                    "title": "Review",
+                    "body": "Please review the result",
+                },
+            }
+        },
+        "prerequisites": [],
+        "predicted_outcomes": [
+            {
+                "outcome_id": "queued",
+                "description": "Notification queued",
+                "probability": 1.0,
+                "utility": 1.0,
+            }
+        ],
+        "uncertainty": 0.0,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.1,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    fallback = {
+        **candidate,
+        "candidate_id": "fallback",
+        "candidate_type": "no_op",
+        "proposed_action": "Do nothing",
+        "parameters": {},
+        "predicted_outcomes": [
+            {
+                "outcome_id": "idle",
+                "description": "No action",
+                "probability": 1.0,
+                "utility": -1.0,
+            }
+        ],
+        "estimated_risk": 0.0,
+    }
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/actions/intents").status_code == 401
+        decision = client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-action-decision",
+                "candidates": [candidate, fallback],
+            },
+        )
+        assert decision.status_code == 200
+        created = client.post(
+            "/api/actions/intents",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-action-decision",
+                "idempotency_key": "api-notification-1",
+            },
+        )
+        assert created.status_code == 200
+        intent = created.json()
+        assert intent["status"] == "awaiting_approval"
+        blocked = client.post(
+            f"/api/actions/intents/{intent['intent_id']}/execute",
+            headers=admin_headers(),
+        )
+        assert blocked.status_code == 409
+        approved = client.post(
+            f"/api/actions/intents/{intent['intent_id']}/approval",
+            headers=admin_headers(),
+            json={"approved": True, "reason": "operator reviewed preview"},
+        )
+        assert approved.status_code == 200
+        executed = client.post(
+            f"/api/actions/intents/{intent['intent_id']}/execute",
+            headers=admin_headers(),
+        )
+        assert executed.status_code == 200
+        assert executed.json()["status"] == "succeeded"
+        payload = client.get(
+            "/api/actions/receipts", headers=admin_headers()
+        ).json()
+        assert len(payload["receipts"]) == len(payload["observations"]) == 1
+        assert (
+            payload["receipts"][0]["observation_id"]
+            == payload["observations"][0]["observation_id"]
+        )
+
+    wal_types = {
+        record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
+    }
+    assert {"action_intent", "action_approval", "action_execute"}.issubset(wal_types)
+    with _client(tmp_path, settings=settings) as restarted:
+        intents = restarted.get(
+            "/api/actions/intents", headers=admin_headers()
+        ).json()["intents"]
+        receipts = restarted.get(
+            "/api/actions/receipts", headers=admin_headers()
+        ).json()["receipts"]
+        assert len(intents) == len(receipts) == 1
+        assert intents[0]["status"] == "succeeded"
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

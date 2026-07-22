@@ -458,6 +458,27 @@ class SubjectScheduler:
                     decision.decision_id,
                 )
             )
+        action_execution = getattr(self.main_loop, "action_execution", None)
+        if action_execution is not None:
+            for intent in action_execution.list_intents():
+                if intent.status.value == "approved":
+                    schedules.append(
+                        self._derived(
+                            f"action-timeout:{intent.intent_id}:{intent.deadline_at.isoformat()}",
+                            WakeUpKind.ACTION_TIMEOUT,
+                            intent.deadline_at,
+                            intent.intent_id,
+                        )
+                    )
+                elif intent.status.value == "retry_pending" and intent.retry_at is not None:
+                    schedules.append(
+                        self._derived(
+                            f"action-retry:{intent.intent_id}:{intent.retry_at.isoformat()}",
+                            WakeUpKind.ACTION_RETRY,
+                            intent.retry_at,
+                            intent.intent_id,
+                        )
+                    )
         plan_store = getattr(self.main_loop, "plan_store", None)
         if plan_store is not None:
             for plan in plan_store.list_plans():
@@ -680,6 +701,12 @@ class SubjectScheduler:
             else:
                 self.main_loop.timeout_plan_step(plan_id, step_id)
                 outcome = "step_timed_out"
+        elif schedule.kind in {WakeUpKind.ACTION_TIMEOUT, WakeUpKind.ACTION_RETRY}:
+            execution = getattr(self.main_loop, "action_execution", None)
+            if execution is None:
+                raise ValueError("Action execution layer is unavailable")
+            updated = execution.timeout(schedule.target_id or "")
+            outcome = updated.status.value
         elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
             _, goals = self.main_loop.reevaluate_motivation(
                 max_goal_proposals=goal_budget
