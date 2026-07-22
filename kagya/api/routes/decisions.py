@@ -38,6 +38,9 @@ class ActionCandidateRequest(_RequestModel):
     estimated_risk: float = Field(ge=0.0, le=1.0)
     value_effects: dict[str, float] = Field(default_factory=dict)
     appraisal_contributions: dict[str, float] = Field(default_factory=dict)
+    plan_id: str | None = None
+    plan_revision: int | None = Field(default=None, ge=1)
+    step_id: str | None = None
 
     def to_domain(self) -> ActionCandidate:
         return ActionCandidate(
@@ -47,13 +50,17 @@ class ActionCandidateRequest(_RequestModel):
             parameters=self.parameters,
             prerequisites=tuple(self.prerequisites),
             predicted_outcomes=tuple(
-                PredictedOutcome(**item.model_dump()) for item in self.predicted_outcomes
+                PredictedOutcome(**item.model_dump())
+                for item in self.predicted_outcomes
             ),
             uncertainty=self.uncertainty,
             estimated_cost=self.estimated_cost,
             estimated_risk=self.estimated_risk,
             value_effects=self.value_effects,
             appraisal_contributions=self.appraisal_contributions,
+            plan_id=self.plan_id,
+            plan_revision=self.plan_revision,
+            step_id=self.step_id,
         )
 
 

@@ -16,6 +16,7 @@ class WorkingMemoryKind(StrEnum):
     EMOTION = "emotion"
     SELF_MODEL = "self_model"
     BELIEF = "belief"
+    STEP = "step"
 
 
 class RetentionReason(StrEnum):
@@ -27,6 +28,7 @@ class RetentionReason(StrEnum):
     REACTIVATED = "reactivated"
     RELEVANT_SELF_MODEL = "relevant_self_model"
     ESTABLISHED_BELIEF = "established_belief"
+    ACTIONABLE_STEP = "actionable_step"
 
 
 @dataclass(frozen=True)
@@ -133,13 +135,18 @@ class WorkingMemory:
             RetentionReason.CURRENT_EMOTION,
             RetentionReason.RELEVANT_SELF_MODEL,
             RetentionReason.ESTABLISHED_BELIEF,
+            RetentionReason.ACTIONABLE_STEP,
         }
         if self._score(item) < 0.15 and item.retention_reason not in protected:
             return
         existing = self._items.get(item.item_id)
         if existing is None and item.reference is not None:
             existing = next(
-                (candidate for candidate in self._items.values() if candidate.reference == item.reference),
+                (
+                    candidate
+                    for candidate in self._items.values()
+                    if candidate.reference == item.reference
+                ),
                 None,
             )
         if existing is not None:
@@ -168,6 +175,7 @@ class WorkingMemory:
             RetentionReason.CURRENT_EMOTION,
             RetentionReason.RELEVANT_SELF_MODEL,
             RetentionReason.ESTABLISHED_BELIEF,
+            RetentionReason.ACTIONABLE_STEP,
         }
         updated: dict[str, WorkingMemoryItem] = {}
         for item in self._items.values():
@@ -205,7 +213,9 @@ class WorkingMemory:
         decisions: list[WorkingMemoryDecision] = []
         token_count = 0
         for item in ranked:
-            rendered = item.content or (resolver(item) if resolver is not None else None)
+            rendered = item.content or (
+                resolver(item) if resolver is not None else None
+            )
             compatibility, relation = context_score(item)
             score = (
                 self._score(item)
@@ -235,9 +245,7 @@ class WorkingMemory:
                             cross_context=cross_context,
                         )
                     )
-                    self._items[item.item_id] = replace(
-                        item, last_accessed_at=_now()
-                    )
+                    self._items[item.item_id] = replace(item, last_accessed_at=_now())
                 else:
                     reasons.append("token_capacity")
             decisions.append(
@@ -287,7 +295,9 @@ class WorkingMemory:
             lowest = min(self._items.values(), key=self._rank_key)
             del self._items[lowest.item_id]
 
-    def _rank_key(self, item: WorkingMemoryItem) -> tuple[float, datetime, datetime, str]:
+    def _rank_key(
+        self, item: WorkingMemoryItem
+    ) -> tuple[float, datetime, datetime, str]:
         return (
             self._score(item),
             item.last_accessed_at,
@@ -305,6 +315,7 @@ class WorkingMemory:
             RetentionReason.REACTIVATED: 0.1,
             RetentionReason.RELEVANT_SELF_MODEL: 0.3,
             RetentionReason.ESTABLISHED_BELIEF: 0.25,
+            RetentionReason.ACTIONABLE_STEP: 0.4,
         }.get(item.retention_reason, 0.0)
         return 0.6 * item.activation + 0.4 * item.salience + bonus
 
@@ -354,7 +365,11 @@ def _attention_bonus(
 ) -> float:
     if not attention_refs:
         return 0.0
-    return 0.45 if item.item_id in attention_refs or item.reference in attention_refs else 0.0
+    return (
+        0.45
+        if item.item_id in attention_refs or item.reference in attention_refs
+        else 0.0
+    )
 
 
 def _now() -> datetime:

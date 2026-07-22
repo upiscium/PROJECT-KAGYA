@@ -38,6 +38,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
 | Value system | Maintain context-aware, protected, rate-limited values with supporting/opposing evidence, conflicts, trade-offs, and revision diffs | `identity.values` | Experience evidence and Decision outcomes; operator commands remain evidence and cannot replace a core Value directly | `tests/test_value_system.py` |
 | Goal manager | Maintain candidates, active/suspended goals, dependencies, deadlines, and transition reasons | `motivation.active_goals`; decisions under motivation extensions | Explicit proposals, value-aware adoption, internal reevaluation events | `tests/test_goal_manager.py` |
+| Plan and Step lifecycle | Decompose active Goals into strict revisioned dependency DAGs and expose only current actionable Steps | `motivation.extensions.plans` through snapshot and private WAL | Schema-valid candidates, operator revisions, expected observations, and typed evidence references | `tests/test_planning.py`, `tests/test_fastapi_backend.py` |
 | Motivation dynamics | Form persistent Drive, Interest, Desire, Aversion, and bounded intrinsic Goal proposals | `motivation.extensions.dynamics` | Repeated Experience signals, explicit conflict links, elapsed time, and Goal outcomes | `tests/test_motivation_dynamics.py` |
 | Commitment store | Distinguish promises from intrinsic and external-request goals | `motivation.commitments` | Explicit commitment lifecycle events | `tests/test_goal_manager.py`, `tests/test_fastapi_backend.py` |
 | Decision store | Track candidates, predictions, contributions, selection, outcome, and prediction error in one record | `extensions.decision_records` | Schema-constrained candidates and later outcome events | `tests/test_decision_records.py` |
@@ -51,15 +52,16 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 1. An event enters `AgentRuntime` and receives a processing sequence.
 2. Working memory selects relevant context, including active goals, commitments, and candidate-relevant self-model facts.
 3. Appraisal and emotion provide structured current-state signals.
-4. `ValueSystem`, `GoalManager`, and `SelfModel` contribute separate scores to schema-validated `ActionCandidate` records.
-5. Metacognition records a pre-Decision assessment and may steer explicitly scoped choices toward no-op, defer, observation, request-information, or delegation when evidence, competence, or current cognitive quality is insufficient.
-6. `DecisionStore` records all considered candidates, contributions, the selected regular or fallback choice, selection confidence, and the pre-assessment reference.
-7. The DecisionRecord freezes the origin IDs and revisions of active Goals and referenced Values, plus structured Value trade-offs, so later explanation cannot rewrite their authority source.
-8. A later event appends the actual outcome and prediction error to the same `DecisionRecord`; bounded Value reassessment records use that outcome as evidence without allowing one-event reversal.
-9. A post-Decision assessment compares prediction with outcome, updates past-accuracy calibration, records operator feedback provenance, and forms evidence-linked recurring failure or optimism-bias hypotheses only after repeated observations.
-10. Only resolved records whose selected action declared the relevant capability can update capability confidence. Recurring hypotheses are reflected as revisable Narrative Self limitation claims rather than authoritative generated prose.
-11. The completion hook atomically snapshots the resulting subject state.
-12. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
+4. An active Goal may own one active versioned Plan. Only `ready` Steps whose dependencies are complete enter Working Memory and may produce a Plan-linked, schema-validated `ActionCandidate`; no tool is executed by the planning layer.
+5. `ValueSystem`, `GoalManager`, and `SelfModel` contribute separate scores to schema-validated `ActionCandidate` records.
+6. Metacognition records a pre-Decision assessment and may steer explicitly scoped choices toward no-op, defer, observation, request-information, or delegation when evidence, competence, or current cognitive quality is insufficient.
+7. `DecisionStore` records all considered candidates, contributions, the selected regular or fallback choice, selection confidence, and the pre-assessment reference.
+8. The DecisionRecord freezes the origin IDs and revisions of active Goals and referenced Values, plus structured Value trade-offs, so later explanation cannot rewrite their authority source.
+9. A later event appends the actual outcome and prediction error to the same `DecisionRecord`; bounded Value reassessment records use that outcome as evidence without allowing one-event reversal.
+10. A post-Decision assessment compares prediction with outcome, updates past-accuracy calibration, records operator feedback provenance, and forms evidence-linked recurring failure or optimism-bias hypotheses only after repeated observations.
+11. Only resolved records whose selected action declared the relevant capability can update capability confidence. Recurring hypotheses are reflected as revisable Narrative Self limitation claims rather than authoritative generated prose.
+12. The completion hook atomically snapshots the resulting subject state.
+13. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
 
 ## Experience Integration
 
@@ -89,6 +91,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 ## Autonomous Wake-Ups
 
 - `SubjectScheduler` restores versioned wake-up occurrences from snapshot extensions and derives deadline or reassessment occurrences from Goals, Commitments, and unresolved Decisions. Stable occurrence IDs and durable completion markers prevent duplicate state transitions across restarts.
+- Step retry and timeout wake-ups are derived from persisted Step state. They may only advance lifecycle state through `AgentRuntime`; rollback remains a structured candidate and is never executed by the scheduler.
 - `AutonomyLoop` is a single timer producer. Every schedule mutation and due occurrence passes through `AgentRuntime`, then snapshot preparation and `EventJournal`; the timer thread never mutates authoritative state.
 - Event, inference, and wall-time budgets bound each cycle. Work beyond a budget remains pending, and an idle cycle explicitly returns `no_action` without inference or journal traffic.
 - Action timeout/retry, outbox deadline, sleep/consolidation, and operator wake-ups are internal signals only. The scheduler cannot invoke tools, deliver output, start training, or otherwise perform external effects.
@@ -97,7 +100,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 ## Versioning And Migration
 
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
-- Values, goals, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
+- Values, goals, Plans, Steps, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
 - Legacy flat and v1 Value snapshots migrate to evidence-aware Value schema v2/record schema v3. Goal records migrate to schema v3, DecisionRecords to schema v8, and Self Model state to schema v2 at subsystem restore boundaries.
 - Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
 
@@ -106,6 +109,8 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Public `POST /api/chat` exposes only the response, opaque episode/Experience/context IDs, emotion, and model metadata.
 - Debug, state, memory, Experience, Belief, value, goal, commitment, decision, self-model, and metacognition inspection require `X-KAGYA-Admin-Token`.
 - Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
+- Plan ingestion and operator replan endpoints accept strict schema-v1 JSON only. Plan state stores action/condition/observation/verification codes and typed parameters or evidence references, never raw model prose, prompts, hidden reasoning, tool output, or executable handlers.
+- `GET /api/plans` and `GET /api/plans/candidates` inspect current structured state. Plan creation, revision, activation, Step start/completion/failure, and abandonment are admin-only runtime events committed to the snapshot, Journal, and private WAL.
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.
 - Snapshot validation rejects prompts, hidden thoughts, conversation turns, attachments, and raw event payloads.
 - Journal schema has no event payload field. Corrupt records, hash-chain breaks, sequence gaps, and snapshot hash mismatches fail closed at startup.
