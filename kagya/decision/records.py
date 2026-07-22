@@ -16,6 +16,7 @@ class ActionType(StrEnum):
     DEFER = "defer"
     OBSERVE = "observe"
     REQUEST_INFORMATION = "request_information"
+    DELEGATE = "delegate"
 
 
 class DecisionStatus(StrEnum):
@@ -82,6 +83,7 @@ class CandidateEvaluation:
     value_contributions: dict[str, float]
     appraisal_contributions: dict[str, float]
     self_model_contributions: dict[str, float]
+    metacognition_contributions: dict[str, float]
     total_score: float | None
     reasons: tuple[str, ...]
 
@@ -133,12 +135,14 @@ class DecisionRecord:
     training_included: bool = True
     training_exclusion_refs: tuple[str, ...] = ()
     narrative_self_refs: tuple[str, ...] = ()
-    schema_version: int = 7
+    metacognition_pre_assessment_id: str | None = None
+    metacognition_post_assessment_id: str | None = None
+    schema_version: int = 8
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7}:
+        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -168,6 +172,9 @@ ValueEvaluator = Callable[[dict[str, dict[str, float]]], dict[str, dict[str, flo
 SelfModelEvaluator = Callable[
     [tuple[ActionCandidate, ...]], dict[str, dict[str, float]]
 ]
+MetacognitionEvaluator = Callable[
+    [tuple[ActionCandidate, ...]], dict[str, dict[str, float]]
+]
 
 
 class DecisionStore:
@@ -187,6 +194,7 @@ class DecisionStore:
         satisfied_prerequisites: set[str] | None = None,
         value_evaluator: ValueEvaluator | None = None,
         self_model_evaluator: SelfModelEvaluator | None = None,
+        metacognition_evaluator: MetacognitionEvaluator | None = None,
         decision_id: str | None = None,
         adapter_id: str | None = None,
         adapter_hash: str | None = None,
@@ -195,6 +203,7 @@ class DecisionStore:
         experience_refs: tuple[str, ...] = (),
         belief_revision_refs: dict[str, int] | None = None,
         narrative_self_refs: tuple[str, ...] = (),
+        metacognition_pre_assessment_id: str | None = None,
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -213,6 +222,7 @@ class DecisionStore:
                 ActionType.DEFER,
                 ActionType.OBSERVE,
                 ActionType.REQUEST_INFORMATION,
+                ActionType.DELEGATE,
             }
             for item in candidate_values
         ):
@@ -233,12 +243,18 @@ class DecisionStore:
             if self_model_evaluator is not None
             else {}
         )
+        metacognition_contributions = (
+            metacognition_evaluator(candidate_values)
+            if metacognition_evaluator is not None
+            else {}
+        )
         evaluations = tuple(
             _evaluate_candidate(
                 candidate,
                 satisfied_prerequisites or set(),
                 value_contributions.get(candidate.candidate_id, {}),
                 self_model_contributions.get(candidate.candidate_id, {}),
+                metacognition_contributions.get(candidate.candidate_id, {}),
             )
             for candidate in candidate_values
         )
@@ -278,6 +294,7 @@ class DecisionStore:
             experience_refs=experience_refs,
             belief_revision_refs=dict(belief_revision_refs or {}),
             narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
+            metacognition_pre_assessment_id=metacognition_pre_assessment_id,
         )
         self.records[identifier] = record
         return record
@@ -428,6 +445,30 @@ class DecisionStore:
         self.records[decision_id] = updated
         return updated
 
+    def link_post_assessment(
+        self, decision_id: str, assessment_id: str
+    ) -> DecisionRecord:
+        if not assessment_id:
+            raise ValueError("Metacognitive assessment ID must not be empty")
+        record = self.get(decision_id)
+        updated = replace(
+            record,
+            metacognition_post_assessment_id=assessment_id,
+            updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def clear_post_assessment(self, decision_id: str) -> DecisionRecord:
+        record = self.get(decision_id)
+        updated = replace(
+            record,
+            metacognition_post_assessment_id=None,
+            updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
     def restore(self, payloads: Iterable[dict[str, Any]]) -> None:
         restored: dict[str, DecisionRecord] = {}
         for payload in payloads:
@@ -481,6 +522,8 @@ class DecisionDatasetGenerator:
                         "adapter_hash": record.adapter_hash,
                         "activation_sequence": record.activation_sequence,
                         "narrative_self_refs": list(record.narrative_self_refs),
+                        "metacognition_pre_assessment_id": record.metacognition_pre_assessment_id,
+                        "metacognition_post_assessment_id": record.metacognition_post_assessment_id,
                         "candidates": [
                             asdict(item.candidate)
                             for item in record.considered_candidates
@@ -547,6 +590,7 @@ def _evaluate_candidate(
     satisfied_prerequisites: set[str],
     value_contributions: dict[str, float],
     self_model_contributions: dict[str, float],
+    metacognition_contributions: dict[str, float],
 ) -> CandidateEvaluation:
     missing = tuple(
         item for item in candidate.prerequisites if item not in satisfied_prerequisites
@@ -562,6 +606,7 @@ def _evaluate_candidate(
             value_contributions=dict(value_contributions),
             appraisal_contributions=dict(candidate.appraisal_contributions),
             self_model_contributions=dict(self_model_contributions),
+            metacognition_contributions=dict(metacognition_contributions),
             total_score=None,
             reasons=("prerequisites_missing", *missing),
         )
@@ -570,6 +615,7 @@ def _evaluate_candidate(
         + sum(value_contributions.values())
         + 0.25 * sum(candidate.appraisal_contributions.values())
         + sum(self_model_contributions.values())
+        + sum(metacognition_contributions.values())
         - 0.25 * candidate.uncertainty
         - 0.25 * candidate.estimated_cost
         - 0.5 * candidate.estimated_risk
@@ -581,6 +627,7 @@ def _evaluate_candidate(
         value_contributions=dict(value_contributions),
         appraisal_contributions=dict(candidate.appraisal_contributions),
         self_model_contributions=dict(self_model_contributions),
+        metacognition_contributions=dict(metacognition_contributions),
         total_score=total,
         reasons=(
             "prerequisites_satisfied",
@@ -588,6 +635,7 @@ def _evaluate_candidate(
             "value_contributions_scored",
             "appraisal_contributions_scored",
             "self_model_contributions_scored",
+            "metacognition_contributions_scored",
             "cost_risk_uncertainty_applied",
         ),
     )
@@ -650,7 +698,9 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data.setdefault("training_included", True)
     data["training_exclusion_refs"] = tuple(data.get("training_exclusion_refs", ()))
     data["narrative_self_refs"] = tuple(data.get("narrative_self_refs", ()))
-    data["schema_version"] = 7
+    data.setdefault("metacognition_pre_assessment_id", None)
+    data.setdefault("metacognition_post_assessment_id", None)
+    data["schema_version"] = 8
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)
@@ -658,6 +708,9 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
         item["reasons"] = tuple(item.get("reasons", ()))
         item["self_model_contributions"] = dict(
             item.get("self_model_contributions", {})
+        )
+        item["metacognition_contributions"] = dict(
+            item.get("metacognition_contributions", {})
         )
         evaluations.append(CandidateEvaluation(**item))
     data["considered_candidates"] = tuple(evaluations)

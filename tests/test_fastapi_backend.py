@@ -1581,6 +1581,15 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         "optimal_loss",
     }
     assert record["considered_candidates"][0]["value_contributions"]["honesty"] > 0
+    assert record["metacognition_pre_assessment_id"]
+    assert record["metacognition_post_assessment_id"] is None
+    assert client.get("/api/metacognition").status_code == 401
+    pre_assessment = client.get(
+        f"/api/metacognition/assessments/{record['metacognition_pre_assessment_id']}",
+        headers=headers,
+    )
+    assert pre_assessment.status_code == 200
+    assert pre_assessment.json()["phase"] == "pre_decision"
 
     awaiting = client.get(
         "/api/decisions", headers=headers, params={"status": "awaiting_outcome"}
@@ -1599,6 +1608,11 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert resolved.json()["status"] == "resolved"
     assert resolved.json()["prediction_error"] == pytest.approx(-0.6)
     assert resolved.json()["actual_outcome"]["observed_event_id"]
+    assert resolved.json()["metacognition_post_assessment_id"]
+    metacognition = client.get("/api/metacognition", headers=headers)
+    assert metacognition.status_code == 200
+    assert metacognition.json()["observations"][0]["decision_id"] == "decision-api-1"
+    assert "hidden_thought" not in json.dumps(metacognition.json())
     value_snapshot = client.get("/api/values", headers=headers).json()
     assert value_snapshot["reassessments"][0]["decision_id"] == "decision-api-1"
     assert value_snapshot["reassessments"][0]["regret"] == pytest.approx(0.6)
@@ -1744,6 +1758,9 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     assert risky_score["self_model_contributions"] == {
         "limitation:no-remote": -0.5,
         "uncertainty:unknown-remote-state": pytest.approx(-0.32),
+    }
+    assert risky_score["metacognition_contributions"] == {
+        "metacognition:recommended_action": -0.75
     }
     self_items = [
         item

@@ -273,6 +273,7 @@ class AgentStateStore:
         main_loop.restore_belief_state()
         main_loop.restore_attention_state()
         main_loop.restore_feedback_state()
+        main_loop.restore_metacognition_state()
         main_loop.working_memory.restore(
             [
                 _working_memory_item_from_snapshot(item)

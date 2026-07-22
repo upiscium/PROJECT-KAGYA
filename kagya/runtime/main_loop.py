@@ -37,6 +37,7 @@ from kagya.cognition import (
 from kagya.config import Settings
 from kagya.decision import (
     ActionCandidate,
+    ActionType,
     DecisionDatasetGenerator,
     DecisionDatasetRecord,
     DecisionRecord,
@@ -89,6 +90,7 @@ from kagya.feedback import (
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.memory.quality import assess_generation_health
+from kagya.metacognition import CognitiveQuality, Metacognition
 from kagya.models import ModelProvider
 from kagya.motivation import (
     Commitment,
@@ -256,6 +258,7 @@ class KagyaMainLoop:
         self.narrative_self = NarrativeSelf()
         self.belief_store = BeliefStore()
         self.feedback_store = FeedbackStore()
+        self.metacognition = Metacognition()
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
@@ -267,6 +270,7 @@ class KagyaMainLoop:
         self.restore_belief_state()
         self.restore_attention_state()
         self.restore_feedback_state()
+        self.restore_metacognition_state()
 
     def chat(
         self,
@@ -1692,6 +1696,13 @@ class KagyaMainLoop:
     def _persist_feedback_state(self) -> None:
         self.persistent_state.extensions["feedback"] = self.feedback_store.to_json()
 
+    def restore_metacognition_state(self) -> None:
+        self.metacognition.restore(self.persistent_state.extensions.get("metacognition"))
+        self._persist_metacognition_state()
+
+    def _persist_metacognition_state(self) -> None:
+        self.persistent_state.extensions["metacognition"] = self.metacognition.to_json()
+
     def submit_feedback(
         self,
         *,
@@ -1747,6 +1758,7 @@ class KagyaMainLoop:
         )
         self._persist_feedback_state()
         self._persist_decision_state()
+        self._persist_metacognition_state()
         return record
 
     def revise_feedback(
@@ -1807,6 +1819,7 @@ class KagyaMainLoop:
         )
         self._persist_feedback_state()
         self._persist_decision_state()
+        self._persist_metacognition_state()
         return record
 
     def withdraw_feedback(
@@ -1865,6 +1878,7 @@ class KagyaMainLoop:
         )
         self._persist_feedback_state()
         self._persist_decision_state()
+        self._persist_metacognition_state()
         return record
 
     def _propagate_feedback(
@@ -1990,6 +2004,7 @@ class KagyaMainLoop:
                 if event is None
                 else event.processing_sequence,
             )
+            decision = self._apply_metacognitive_outcome(decision)
             prediction_error = decision.prediction_error
             outcome_applied = True
         if decision_id is not None:
@@ -2076,6 +2091,9 @@ class KagyaMainLoop:
             self.decision_store.withdraw_feedback_outcome(
                 propagation.decision_id, feedback_id=feedback_id
             )
+            self.decision_store.clear_post_assessment(propagation.decision_id)
+            self.metacognition.withdraw_outcome(propagation.decision_id)
+            self._sync_metacognitive_narrative()
             self.decision_store.set_training_policy(
                 propagation.decision_id, included=True, feedback_id=feedback_id
             )
@@ -2230,6 +2248,32 @@ class KagyaMainLoop:
             )
             for candidate in candidates
         ]
+        identifier = decision_id or str(uuid4())
+        narrative_refs = tuple(
+            f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
+            for claim_id in narrative_claim_ids
+        )
+        pre_assessment = self.metacognition.assess_pre(
+            identifier,
+            relationship_candidates,
+            self_model=self.self_model.state,
+            narrative_self_refs=narrative_refs,
+            cognitive_load=min(
+                1.0, len(self.working_memory.items) / self.working_memory.item_capacity
+            ),
+            attention_saturation=min(
+                1.0,
+                len(self.attention_system.focus.candidate_ids)
+                / self.attention_system.capacity,
+            ),
+            emotion_valence=emotion.valence,
+            emotion_arousal=emotion.arousal,
+            quality_provenance_refs=(
+                f"working-memory:occupancy:{len(self.working_memory.items)}",
+                f"attention-focus@{self.attention_system.focus.revision}",
+                "emotion:current",
+            ),
+        )
         record = self.decision_store.create(
             relationship_candidates,
             triggering_event_id=None if event is None else event.event_id,
@@ -2273,10 +2317,8 @@ class KagyaMainLoop:
             belief_revision_refs={
                 belief.belief_id: belief.revision for belief in active_beliefs
             },
-            narrative_self_refs=tuple(
-                f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
-                for claim_id in narrative_claim_ids
-            ),
+            narrative_self_refs=narrative_refs,
+            metacognition_pre_assessment_id=pre_assessment.assessment_id,
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"
@@ -2288,7 +2330,10 @@ class KagyaMainLoop:
                 options, context_id=context_id
             ),
             self_model_evaluator=self.self_model.evaluate_candidates,
-            decision_id=decision_id,
+            metacognition_evaluator=lambda values: self._metacognitive_candidate_scores(
+                values, pre_assessment.recommended_action
+            ),
+            decision_id=identifier,
         )
         decision_scores = self.value_system.evaluate(
             {
@@ -2316,6 +2361,7 @@ class KagyaMainLoop:
             )
         self._sync_self_model_working_memory(candidates)
         self._persist_decision_state()
+        self._persist_metacognition_state()
         return record
 
     def correct_relationship(
@@ -2392,6 +2438,7 @@ class KagyaMainLoop:
             if event is None
             else event.processing_sequence,
         )
+        record = self._apply_metacognitive_outcome(record)
         proposals = self.value_system.proposals_from_decision_outcome(record)
         updates = self.value_system.apply(proposals)
         self.value_system.record_reassessment(record, updates)
@@ -2399,7 +2446,128 @@ class KagyaMainLoop:
         self._sync_self_references()
         self._persist_self_model_state()
         self._persist_decision_state()
+        self._persist_metacognition_state()
         return record
+
+    def _metacognitive_candidate_scores(
+        self, candidates: tuple[ActionCandidate, ...], recommended_action: ActionType
+    ) -> dict[str, dict[str, float]]:
+        scores: dict[str, dict[str, float]] = {
+            candidate.candidate_id: {} for candidate in candidates
+        }
+        for candidate in candidates:
+            contribution = 0.0
+            if candidate.candidate_type == recommended_action:
+                contribution = 0.75
+            elif recommended_action.value in {
+                "defer",
+                "request_information",
+                "delegate",
+                "observe",
+            } and candidate.candidate_type.value in {"respond", "internal"}:
+                contribution = -0.75
+            scores.setdefault(candidate.candidate_id, {})[
+                "metacognition:recommended_action"
+            ] = contribution
+        return scores
+
+    def _current_cognitive_quality(self) -> CognitiveQuality:
+        emotion = self.emotion_engine.state
+        return self.metacognition.current_quality(
+            cognitive_load=min(
+                1.0, len(self.working_memory.items) / self.working_memory.item_capacity
+            ),
+            attention_saturation=min(
+                1.0,
+                len(self.attention_system.focus.candidate_ids)
+                / self.attention_system.capacity,
+            ),
+            emotion_valence=emotion.valence,
+            emotion_arousal=emotion.arousal,
+            provenance_refs=(
+                f"working-memory:occupancy:{len(self.working_memory.items)}",
+                f"attention-focus@{self.attention_system.focus.revision}",
+                "emotion:current",
+            ),
+        )
+
+    def _apply_metacognitive_outcome(self, record: DecisionRecord) -> DecisionRecord:
+        if record.metacognition_pre_assessment_id is None:
+            return record
+        selected = next(
+            item.candidate
+            for item in record.considered_candidates
+            if item.candidate.candidate_id == record.selected_candidate_id
+        )
+        capability_ids = _string_values(selected.parameters.get("capability_ids"))
+        if record.actual_outcome is not None and not record.actual_outcome.success:
+            for capability_id in capability_ids:
+                current = self.self_model.state.capabilities.get(capability_id)
+                self.self_model.update_capability_from_decision(
+                    capability_id,
+                    capability_id if current is None else current.description,
+                    record,
+                    tags=_string_values(selected.parameters.get("topic_tags")),
+                )
+        assessment = self.metacognition.assess_post(
+            record,
+            self_model_revision=self.self_model.state.revision,
+            cognitive_quality=self._current_cognitive_quality(),
+        )
+        record = self.decision_store.link_post_assessment(
+            record.decision_id, assessment.assessment_id
+        )
+        self._sync_metacognitive_narrative()
+        self._persist_self_model_state()
+        self._persist_narrative_self_state()
+        return record
+
+    def _sync_metacognitive_narrative(self) -> None:
+        claim_prefix = "narrative:metacognitive-hypothesis:"
+        active_claim_ids = {
+            f"narrative:{item.hypothesis_id}"
+            for item in self.metacognition.hypotheses.values()
+        }
+        for claim in tuple(self.narrative_self.claims.values()):
+            if (
+                claim.claim_id.startswith(claim_prefix)
+                and claim.claim_id not in active_claim_ids
+                and claim.status != IdentityClaimStatus.REVISED
+            ):
+                self.narrative_self.revise_claim(
+                    claim.claim_id,
+                    confidence=min(claim.confidence, 0.49),
+                    reason_code="metacognitive_hypothesis_retired",
+                    counterevidence_refs=("metacognition:outcome-withdrawn-or-revised",),
+                    status=IdentityClaimStatus.REVISED,
+                )
+        for hypothesis in self.metacognition.hypotheses.values():
+            claim_id = f"narrative:{hypothesis.hypothesis_id}"
+            current = self.narrative_self.claims.get(claim_id)
+            if current is None:
+                self.narrative_self.propose_claim(
+                    kind=IdentityClaimKind.LIMITATION,
+                    statement=f"Recurring {hypothesis.hypothesis_code} in {hypothesis.scope_id}",
+                    polarity=-1,
+                    theme_codes=(hypothesis.scope_id, hypothesis.hypothesis_code),
+                    confidence=hypothesis.confidence,
+                    stability=0.4,
+                    evidence_refs=hypothesis.evidence_refs,
+                    related_decision_refs=tuple(
+                        ref.split(":", 2)[1] for ref in hypothesis.evidence_refs
+                    ),
+                    claim_id=claim_id,
+                )
+            elif set(hypothesis.evidence_refs) - set(current.evidence_refs):
+                self.narrative_self.revise_claim(
+                    claim_id,
+                    confidence=hypothesis.confidence,
+                    reason_code="metacognitive_outcome_update",
+                    evidence_refs=tuple(
+                        ref for ref in hypothesis.evidence_refs if ref not in current.evidence_refs
+                    ),
+                    status=IdentityClaimStatus.HYPOTHESIS,
+                )
 
     def decision_dataset(self) -> list[DecisionDatasetRecord]:
         return DecisionDatasetGenerator().generate(
