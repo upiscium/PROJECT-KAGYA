@@ -6,6 +6,7 @@ import pytest
 from kagya.motivation import (
     CommitmentStatus,
     CommitmentStore,
+    CommitmentFulfillability,
     GoalDecisionAction,
     GoalManager,
     GoalStatus,
@@ -316,7 +317,7 @@ def test_v1_goal_migrates_without_claiming_self_origin() -> None:
     )
 
     restored = manager.get("legacy-goal")
-    assert restored.schema_version == 3
+    assert restored.schema_version == 4
     assert restored.identity_origin.actor == OriginActor.INHERITED
     assert restored.identity_origin.endorsement == EndorsementStatus.UNCERTAIN
 
@@ -341,7 +342,7 @@ def test_v1_commitment_migrates_without_claiming_self_origin() -> None:
     )
 
     restored = store.get("legacy-promise")
-    assert restored.schema_version == 2
+    assert restored.schema_version == 3
     assert restored.identity_origin.actor == OriginActor.INHERITED
     assert restored.identity_origin.endorsement == EndorsementStatus.UNCERTAIN
 
@@ -370,17 +371,58 @@ def test_commitment_store_records_fulfillment_release_and_breach() -> None:
         assert commitment.transitions[-1].reason == "resolved"
 
 
-def test_commitment_store_rejects_unendorsed_external_origin() -> None:
+def test_commitment_store_keeps_unendorsed_external_origin_proposed() -> None:
     store = CommitmentStore()
 
-    with pytest.raises(ValueError, match="requires endorsed"):
-        store.create(
-            commitment_id="unendorsed",
-            description="External request",
-            related_goal_id="goal",
-            identity_origin=new_identity_origin(
-                OriginActor.USER,
-                OriginInputKind.REQUEST,
-                source_ref="context:one",
-            ),
-        )
+    proposed = store.request(
+        commitment_id="unendorsed",
+        description="External request",
+        beneficiary="user:one",
+        scope="Provide a report",
+        identity_origin=new_identity_origin(
+            OriginActor.USER,
+            OriginInputKind.REQUEST,
+            source_ref="context:one",
+        ),
+    )
+
+    assert proposed.status == CommitmentStatus.PROPOSED
+    assert proposed.identity_origin.endorsement == EndorsementStatus.PENDING
+    assert proposed.related_goal_id is None
+
+
+def test_commitment_acceptance_preserves_conflicts_and_survives_round_trip() -> None:
+    store = CommitmentStore()
+    proposed = store.request(
+        commitment_id="promise",
+        description="Deliver a careful answer",
+        beneficiary="user:one",
+        scope="One reviewed answer",
+        cost=0.4,
+        burden=0.7,
+        fulfillability=CommitmentFulfillability.AT_RISK,
+        fulfillability_reason="Limited time",
+        related_desire_ids=("desire-help",),
+        conflicting_desire_ids=("desire-rest",),
+        conflicting_value_ids=("accuracy",),
+    )
+
+    accepted = store.accept(
+        proposed.commitment_id,
+        acceptance_ref="subject_accepts_after_review",
+        related_goal_id="intention:promise",
+        event_id="event-accept",
+        event_sequence=2,
+    )
+    restored = CommitmentStore()
+    restored.restore(json.loads(json.dumps(store.to_json())))
+    commitment = restored.get("promise")
+
+    assert accepted.status == CommitmentStatus.ACTIVE
+    assert commitment.acceptance_ref == "subject_accepts_after_review"
+    assert commitment.related_desire_ids == ("desire-help",)
+    assert {item.subject_ref for item in commitment.unresolved_conflicts} == {
+        "desire-rest",
+        "accuracy",
+    }
+    assert commitment.burden == 0.7

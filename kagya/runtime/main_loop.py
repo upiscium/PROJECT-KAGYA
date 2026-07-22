@@ -44,6 +44,7 @@ from kagya.decision import (
     DecisionRecord,
     DecisionStatus,
     DecisionStore,
+    PredictedOutcome,
     parse_candidate_output,
     schema_candidate_prompt,
 )
@@ -94,7 +95,10 @@ from kagya.memory.quality import assess_generation_health
 from kagya.metacognition import CognitiveQuality, Metacognition
 from kagya.models import ModelProvider
 from kagya.motivation import (
+    ACCEPTED_COMMITMENT_STATUSES,
     Commitment,
+    CommitmentFulfillability,
+    CommitmentLifecycleAction,
     CommitmentStatus,
     CommitmentStore,
     Goal,
@@ -565,9 +569,8 @@ class KagyaMainLoop:
                 experience,
                 active_commitment_refs=tuple(
                     f"commitment:{item.commitment_id}"
-                    for item in self.commitment_store.list_commitments(
-                        CommitmentStatus.ACTIVE
-                    )
+                    for item in self.commitment_store.list_commitments()
+                    if item.status in ACCEPTED_COMMITMENT_STATUSES
                 ),
                 event_id=event_id,
                 event_sequence=event_sequence,
@@ -807,7 +810,8 @@ class KagyaMainLoop:
         )
         active_commitments = {
             item.related_goal_id: item
-            for item in self.commitment_store.list_commitments(CommitmentStatus.ACTIVE)
+            for item in self.commitment_store.list_commitments()
+            if item.status in ACCEPTED_COMMITMENT_STATUSES
         }
         active_goals = [
             goal
@@ -847,13 +851,18 @@ class KagyaMainLoop:
         self.attention_system.synchronize_source(
             AttentionSource.GOAL, goal_candidate_ids
         )
-        active_commitment_records = self.commitment_store.list_commitments(
-            CommitmentStatus.ACTIVE
-        )
+        active_commitment_records = self.commitment_store.list_commitments()
+        active_commitment_records = [
+            item
+            for item in active_commitment_records
+            if item.status in ACCEPTED_COMMITMENT_STATUSES
+        ]
         commitment_candidate_ids = {
             f"commitment:{item.commitment_id}" for item in active_commitment_records
         }
         for commitment in active_commitment_records:
+            if commitment.related_goal_id is None:
+                continue
             self.attention_system.observe(
                 candidate_id=f"commitment:{commitment.commitment_id}",
                 target_ref=f"commitment:{commitment.commitment_id}",
@@ -1317,6 +1326,7 @@ class KagyaMainLoop:
         conflict_ids: tuple[str, ...] = (),
         deadline: str | None = None,
         value_effects: dict[str, float] | None = None,
+        related_desire_ids: tuple[str, ...] = (),
         needs_information: bool = False,
         goal_id: str | None = None,
     ) -> Goal:
@@ -1387,6 +1397,7 @@ class KagyaMainLoop:
                 | ({origin_value_id} if origin_value_id is not None else set())
             },
             narrative_self_refs=narrative_refs,
+            related_desire_ids=related_desire_ids,
             needs_information=needs_information,
             goal_id=goal_id,
         )
@@ -1633,9 +1644,8 @@ class KagyaMainLoop:
             value_scores=self._goal_value_scores(),
             active_commitment_ids=(
                 item.commitment_id
-                for item in self.commitment_store.list_commitments(
-                    CommitmentStatus.ACTIVE
-                )
+                for item in self.commitment_store.list_commitments()
+                if item.status in ACCEPTED_COMMITMENT_STATUSES
             ),
         )
 
@@ -1643,13 +1653,17 @@ class KagyaMainLoop:
         self,
         *,
         description: str,
-        priority: float = 0.7,
-        urgency: float = 0.7,
-        expected_utility: float = 0.7,
-        confidence: float = 0.8,
         deadline: str | None = None,
-        value_effects: dict[str, float] | None = None,
-        conflict_ids: tuple[str, ...] = (),
+        beneficiary: str = "self",
+        scope: str | None = None,
+        cost: float = 0.0,
+        burden: float = 0.0,
+        fulfillability: CommitmentFulfillability = CommitmentFulfillability.UNKNOWN,
+        fulfillability_reason: str | None = None,
+        related_desire_ids: tuple[str, ...] = (),
+        conflicting_desire_ids: tuple[str, ...] = (),
+        conflicting_value_ids: tuple[str, ...] = (),
+        conflicting_commitment_ids: tuple[str, ...] = (),
         commitment_id: str | None = None,
         origin_actor: OriginActor | None = None,
         origin_source_ref: str | None = None,
@@ -1663,47 +1677,269 @@ class KagyaMainLoop:
                 raise ValueError("Commitment deadline must include a timezone")
             if parsed_deadline <= datetime.now(UTC):
                 raise ValueError("Commitment deadline has expired")
+        for desire_id in (*related_desire_ids, *conflicting_desire_ids):
+            motivation = self.motivation_dynamics.get(desire_id)
+            if motivation.kind.value != "desire":
+                raise ValueError(f"Motivation is not a Desire: {desire_id}")
+        for value_id in conflicting_value_ids:
+            self.value_system.get(value_id)
+        for other_id in conflicting_commitment_ids:
+            self.commitment_store.get(other_id)
+        identity_origin = new_identity_origin(
+            origin_actor or OriginActor.SELF,
+            OriginInputKind.REQUEST
+            if origin_actor not in {None, OriginActor.SELF}
+            else OriginInputKind.INTERNAL_STATE,
+            source_ref=origin_source_ref or "runtime:commitment_proposal",
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        relationship_refs: tuple[str, ...] = ()
+        if interlocutor_key is not None:
+            relationship = self.relationship_store.ensure_interlocutor(interlocutor_key)
+            relationship_refs = (f"relationship:{relationship.relationship_id}",)
+        commitment = self.commitment_store.request(
+            description=description,
+            beneficiary=beneficiary,
+            scope=scope or description,
+            origin_event_id=None if event is None else event.event_id,
+            identity_origin=identity_origin,
+            deadline=deadline,
+            cost=cost,
+            burden=burden,
+            fulfillability=fulfillability,
+            fulfillability_reason=fulfillability_reason,
+            related_desire_ids=related_desire_ids,
+            relationship_refs=relationship_refs,
+            conflicting_desire_ids=conflicting_desire_ids,
+            conflicting_value_ids=conflicting_value_ids,
+            conflicting_commitment_ids=conflicting_commitment_ids,
+            commitment_id=identifier,
+        )
+        self._persist_motivation_state()
+        return commitment
+
+    def accept_commitment(
+        self,
+        commitment_id: str,
+        *,
+        self_endorsement: str,
+        priority: float = 0.7,
+        urgency: float = 0.7,
+        expected_utility: float = 0.7,
+        confidence: float = 0.8,
+        value_effects: dict[str, float] | None = None,
+        conflict_ids: tuple[str, ...] = (),
+    ) -> Commitment:
+        event = current_agent_event()
+        commitment = self.commitment_store.get(commitment_id)
+        if commitment.status != CommitmentStatus.PROPOSED:
+            raise ValueError("Only proposed commitments can be accepted")
+        if commitment.deadline is not None and datetime.fromisoformat(
+            commitment.deadline
+        ) <= datetime.now(UTC):
+            raise ValueError("Commitment deadline has expired")
+        commitment.identity_origin.endorse(
+            self_endorsement,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        interlocutor_key = None
+        if commitment.relationship_refs:
+            relationship_id = commitment.relationship_refs[0].removeprefix(
+                "relationship:"
+            )
+            relationship = self.relationship_store.get(relationship_id)
+            interlocutor_key = relationship.interlocutor_keys[0]
         goal = self.propose_goal(
             goal_type=GoalType.COMMITMENT,
-            description=description,
-            structured_target=(
-                None
-                if interlocutor_key is None
-                else {"interlocutor_key": interlocutor_key}
-            ),
-            origin_actor=origin_actor,
-            origin_input_kind=OriginInputKind.REQUEST,
-            origin_source_ref=origin_source_ref,
+            description=commitment.description,
+            structured_target={
+                "commitment_id": commitment_id,
+                **(
+                    {}
+                    if interlocutor_key is None
+                    else {"interlocutor_key": interlocutor_key}
+                ),
+            },
+            origin_actor=commitment.identity_origin.actor,
+            origin_input_kind=commitment.identity_origin.input_kind,
+            origin_source_ref=commitment.identity_origin.source_ref,
             priority=priority,
             urgency=urgency,
             expected_utility=expected_utility,
             confidence=confidence,
             conflict_ids=conflict_ids,
-            deadline=deadline,
+            deadline=commitment.deadline,
             value_effects=value_effects,
-            goal_id=f"commitment:{identifier}",
+            related_desire_ids=commitment.related_desire_ids,
+            goal_id=f"commitment:{commitment_id}",
         )
         self.adopt_goal(goal.goal_id)
-        adopted_goal = self.goal_manager.get(goal.goal_id)
-        if adopted_goal.status != GoalStatus.ACTIVE:
-            raise ValueError("Commitment goal was not endorsed for activation")
-        commitment = self.commitment_store.create(
-            description=description,
+        if self.goal_manager.get(goal.goal_id).status != GoalStatus.ACTIVE:
+            raise ValueError("Commitment intention was not endorsed for activation")
+        accepted = self.commitment_store.accept(
+            commitment_id,
+            acceptance_ref=self_endorsement,
             related_goal_id=goal.goal_id,
-            origin_event_id=None if event is None else event.event_id,
-            identity_origin=adopted_goal.identity_origin,
-            deadline=deadline,
-            commitment_id=identifier,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
         )
+        if interlocutor_key is not None:
+            self.relationship_store.link_commitment(
+                interlocutor_key, f"commitment:{commitment_id}"
+            )
         self._sync_self_references()
         self._persist_self_model_state()
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
-        if interlocutor_key is not None:
-            self.relationship_store.link_commitment(
-                interlocutor_key, f"commitment:{commitment.commitment_id}"
+        return accepted
+
+    def reassess_commitment(
+        self,
+        commitment_id: str,
+        *,
+        fulfillability: CommitmentFulfillability,
+        reason: str,
+    ) -> Commitment:
+        event = current_agent_event()
+        current = self.commitment_store.get(commitment_id)
+        decision_ref = None
+        unresolved_decision = any(
+            (record := self.decision_store.records.get(ref.removeprefix("decision:")))
+            is not None
+            and record.status == DecisionStatus.AWAITING_OUTCOME
+            for ref in current.decision_refs
+        )
+        if (
+            fulfillability == CommitmentFulfillability.IMPOSSIBLE
+            and not unresolved_decision
+        ):
+            candidates = [
+                ActionCandidate(
+                    candidate_id=f"commitment:{commitment_id}:renegotiate",
+                    candidate_type=ActionType.RESPOND,
+                    proposed_action="renegotiate_commitment",
+                    parameters={"commitment_id": commitment_id},
+                    prerequisites=(),
+                    predicted_outcomes=(
+                        PredictedOutcome(
+                            outcome_id="revised_terms",
+                            description="Beneficiary agrees to revised terms",
+                            probability=0.6,
+                            utility=0.6,
+                        ),
+                    ),
+                    uncertainty=0.4,
+                    estimated_cost=0.3,
+                    estimated_risk=0.2,
+                    value_effects={},
+                    appraisal_contributions={"accountability": 0.7},
+                ),
+                ActionCandidate(
+                    candidate_id=f"commitment:{commitment_id}:notify",
+                    candidate_type=ActionType.RESPOND,
+                    proposed_action="notify_beneficiary_of_impossibility",
+                    parameters={"commitment_id": commitment_id},
+                    prerequisites=(),
+                    predicted_outcomes=(
+                        PredictedOutcome(
+                            outcome_id="beneficiary_informed",
+                            description="Beneficiary receives timely notice",
+                            probability=0.9,
+                            utility=0.4,
+                        ),
+                    ),
+                    uncertainty=0.1,
+                    estimated_cost=0.1,
+                    estimated_risk=0.1,
+                    value_effects={},
+                    appraisal_contributions={"accountability": 0.8},
+                ),
+                ActionCandidate(
+                    candidate_id=f"commitment:{commitment_id}:defer",
+                    candidate_type=ActionType.DEFER,
+                    proposed_action="defer_for_new_evidence",
+                    parameters={"commitment_id": commitment_id},
+                    prerequisites=(),
+                    predicted_outcomes=(),
+                    uncertainty=0.8,
+                    estimated_cost=0.4,
+                    estimated_risk=0.8,
+                    value_effects={},
+                    appraisal_contributions={"accountability": -0.5},
+                ),
+            ]
+            decision = self.create_decision(
+                candidates,
+                decision_id=f"commitment-impossible:{commitment_id}:{uuid4()}",
             )
-        return self.commitment_store.get(commitment.commitment_id)
+            decision_ref = f"decision:{decision.decision_id}"
+        updated = self.commitment_store.reassess(
+            commitment_id,
+            fulfillability=fulfillability,
+            reason=reason,
+            decision_ref=decision_ref,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        return updated
+
+    def renegotiate_commitment(
+        self,
+        commitment_id: str,
+        *,
+        reason: str,
+        proposed_scope: str | None = None,
+        proposed_deadline: str | None = None,
+    ) -> Commitment:
+        event = current_agent_event()
+        updated = self.commitment_store.renegotiate(
+            commitment_id,
+            reason=reason,
+            proposed_scope=proposed_scope,
+            proposed_deadline=proposed_deadline,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        return updated
+
+    def repair_commitment(
+        self,
+        commitment_id: str,
+        *,
+        reason: str,
+        evidence_refs: tuple[str, ...],
+    ) -> Commitment:
+        event = current_agent_event()
+        current = self.commitment_store.get(commitment_id)
+        if current.status != CommitmentStatus.BREACHED:
+            raise ValueError("Only breached commitments can be repaired")
+        updated = self.commitment_store.record_accountability(
+            commitment_id,
+            action=CommitmentLifecycleAction.REPAIR,
+            reason=reason,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self.relationship_store.transition_commitment(
+            f"commitment:{commitment_id}",
+            status="repaired",
+            evidence_ref=evidence_refs[0],
+        )
+        self.narrative_self.record_commitment_event(
+            f"commitment:{commitment_id}",
+            kind="repair",
+            description=reason,
+            evidence_refs=evidence_refs,
+            relationship_refs=current.relationship_refs,
+        )
+        self._persist_narrative_self_state()
+        self._persist_motivation_state()
+        return updated
 
     def transition_commitment(
         self,
@@ -1713,11 +1949,19 @@ class KagyaMainLoop:
         reason: str,
         outcome: str | None = None,
     ) -> Commitment:
-        if status == CommitmentStatus.ACTIVE:
-            raise ValueError("Commitment is already active")
+        if status not in {
+            CommitmentStatus.FULFILLED,
+            CommitmentStatus.RELEASED,
+            CommitmentStatus.BREACHED,
+        }:
+            raise ValueError("Use the dedicated commitment lifecycle operation")
         event = current_agent_event()
         commitment = self.commitment_store.get(commitment_id)
-        goal = self.goal_manager.goals.get(commitment.related_goal_id)
+        goal = (
+            None
+            if commitment.related_goal_id is None
+            else self.goal_manager.goals.get(commitment.related_goal_id)
+        )
         if goal is not None and goal.status not in {
             GoalStatus.COMPLETED,
             GoalStatus.ABANDONED,
@@ -1748,6 +1992,15 @@ class KagyaMainLoop:
             status=status.value,
             evidence_ref=f"commitment:{commitment_id}:{status.value}",
         )
+        if status == CommitmentStatus.BREACHED:
+            self.narrative_self.record_commitment_event(
+                f"commitment:{commitment_id}",
+                kind="breach",
+                description=reason,
+                evidence_refs=(f"commitment:{commitment_id}:breached",),
+                relationship_refs=commitment.relationship_refs,
+            )
+            self._persist_narrative_self_state()
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
         return commitment
@@ -1799,7 +2052,8 @@ class KagyaMainLoop:
                 item
                 for item in self.commitment_store.commitments.values()
                 if item.related_goal_id == goal.goal_id
-                and item.status == CommitmentStatus.ACTIVE
+                and item.status
+                in {CommitmentStatus.ACTIVE, CommitmentStatus.RENEGOTIATING}
             ),
             None,
         )
@@ -1824,6 +2078,15 @@ class KagyaMainLoop:
             status=mapped.value,
             evidence_ref=f"commitment:{commitment.commitment_id}:{mapped.value}",
         )
+        if mapped == CommitmentStatus.BREACHED:
+            self.narrative_self.record_commitment_event(
+                f"commitment:{commitment.commitment_id}",
+                kind="breach",
+                description=reason,
+                evidence_refs=(f"commitment:{commitment.commitment_id}:breached",),
+                relationship_refs=commitment.relationship_refs,
+            )
+            self._persist_narrative_self_state()
 
     def _sync_motivation_working_memory(self) -> None:
         self._sync_plan_goal_statuses()
@@ -1845,7 +2108,7 @@ class KagyaMainLoop:
                 self.working_memory.forget(item_id)
         for commitment in self.commitment_store.commitments.values():
             item_id = f"commitment:{commitment.commitment_id}"
-            if commitment.status == CommitmentStatus.ACTIVE:
+            if commitment.status in ACCEPTED_COMMITMENT_STATUSES:
                 self.working_memory.admit(
                     working_memory_item(
                         item_id=item_id,
@@ -3128,6 +3391,7 @@ class KagyaMainLoop:
             commitment_refs=(
                 commitment.commitment_id
                 for commitment in self.commitment_store.commitments.values()
+                if commitment.status != CommitmentStatus.PROPOSED
             ),
             value_revision_refs={
                 value.value_id: value.revision
@@ -3277,7 +3541,7 @@ class KagyaMainLoop:
             self.commitment_store.to_json(),
             kind=WorkingMemoryKind.COMMITMENT,
             reason=RetentionReason.ACTIVE_COMMITMENT,
-            required_status=CommitmentStatus.ACTIVE.value,
+            required_status={status.value for status in ACCEPTED_COMMITMENT_STATUSES},
         )
         unresolved = self.persistent_state.working_memory_metadata.get(
             "unresolved_items", []
@@ -3295,10 +3559,18 @@ class KagyaMainLoop:
         *,
         kind: WorkingMemoryKind,
         reason: RetentionReason,
-        required_status: str | None = None,
+        required_status: str | set[str] | None = None,
     ) -> None:
         for entry in entries:
-            if required_status is not None and entry.get("status") != required_status:
+            allowed_statuses = (
+                {required_status}
+                if isinstance(required_status, str)
+                else required_status
+            )
+            if (
+                allowed_statuses is not None
+                and entry.get("status") not in allowed_statuses
+            ):
                 continue
             entry_id = entry.get("id", entry.get("goal_id", entry.get("commitment_id")))
             content = entry.get("content", entry.get("description", entry.get("text")))

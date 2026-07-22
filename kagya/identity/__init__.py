@@ -31,6 +31,7 @@ from kagya.identity.narrative_self import (
     IdentityClaimStatus,
     NarrativeChapter,
     NarrativeSelection,
+    NarrativeCommitmentEvent,
     NarrativeSelf,
     UnresolvedSelfConflict,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "KnownLimitation",
     "NarrativeChapter",
     "NarrativeSelection",
+    "NarrativeCommitmentEvent",
     "NarrativeSelf",
     "OriginActor",
     "OriginInputKind",

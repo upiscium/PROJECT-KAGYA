@@ -434,6 +434,9 @@ class RelationshipStore:
                 )
             elif status == "fulfilled":
                 changes["repair_refs"] = _unique((*current.repair_refs, evidence_ref))
+            elif status == "repaired":
+                changes["unresolved_matter_refs"] = unresolved
+                changes["repair_refs"] = _unique((*current.repair_refs, evidence_ref))
             updated.append(
                 self._revise(
                     current,

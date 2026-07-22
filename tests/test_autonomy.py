@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from kagya.motivation import GoalStatus
+from kagya.motivation import (
+    CommitmentFulfillability,
+    CommitmentStatus,
+    GoalStatus,
+)
 from kagya.runtime import (
     AgentRuntime,
     AgentRuntimeStopped,
@@ -27,10 +31,15 @@ class _GoalManager:
 
 
 class _CommitmentStore:
-    commitments: dict[str, object] = {}
+    def __init__(self) -> None:
+        self.commitments: dict[str, object] = {}
 
     def list_commitments(self, status: object) -> list[object]:
-        return []
+        return [
+            item
+            for item in self.commitments.values()
+            if getattr(item, "status", None) == status
+        ]
 
 
 class _DecisionStore:
@@ -47,12 +56,25 @@ class _MainLoop:
         self.commitment_store = _CommitmentStore()
         self.decision_store = _DecisionStore()
         self.reevaluations = 0
+        self.commitment_reevaluations = 0
 
     def reevaluate_goals(self) -> list[object]:
         self.reevaluations += 1
         for goal in self.goal_manager.goals.values():
             goal.status = GoalStatus.FAILED
         return [SimpleNamespace(action=SimpleNamespace(value="defer"))]
+
+    def reassess_commitment(
+        self,
+        commitment_id: str,
+        *,
+        fulfillability: CommitmentFulfillability,
+        reason: str,
+    ) -> None:
+        assert commitment_id in self.commitment_store.commitments
+        assert fulfillability == CommitmentFulfillability.AT_RISK
+        assert reason
+        self.commitment_reevaluations += 1
 
 
 def _runtime(path: Path, initial_sequence: int = 0) -> tuple[AgentRuntime, EventJournal]:
@@ -178,6 +200,27 @@ def test_due_goal_deadline_is_reevaluated_through_runtime(tmp_path: Path) -> Non
         and record.lifecycle == JournalLifecycle.COMPLETED
         for record in journal.verify()
     )
+    runtime.shutdown()
+
+
+def test_at_risk_commitment_is_reevaluated_through_runtime(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    loop.commitment_store.commitments["promise-1"] = SimpleNamespace(
+        commitment_id="promise-1",
+        status=CommitmentStatus.ACTIVE,
+        deadline=None,
+        fulfillability=CommitmentFulfillability.AT_RISK,
+        fulfillability_reason="resource availability changed",
+        updated_at=(now - timedelta(seconds=61)).isoformat(),
+    )
+    scheduler = _scheduler(runtime, loop)
+
+    cycle = scheduler.run_cycle(now)
+
+    assert cycle.result == CycleResult.PROCESSED
+    assert loop.commitment_reevaluations == 1
     runtime.shutdown()
 
 

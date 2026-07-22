@@ -1,13 +1,16 @@
 """Structured autobiographical continuity and revisable identity claims."""
 
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 from uuid import uuid4
 
-from kagya.experience import ExperienceRecord
+if TYPE_CHECKING:
+    from kagya.experience import ExperienceRecord
 
 
 class IdentityClaimKind(StrEnum):
@@ -178,6 +181,25 @@ class NarrativeSelection:
     rendered_items: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class NarrativeCommitmentEvent:
+    event_id: str
+    commitment_ref: str
+    kind: str
+    description: str
+    evidence_refs: tuple[str, ...]
+    relationship_refs: tuple[str, ...]
+    created_at: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"breach", "repair"}:
+            raise ValueError("Narrative commitment event must be breach or repair")
+        if not all((self.event_id, self.commitment_ref, self.description)):
+            raise ValueError("Narrative commitment event fields must not be empty")
+        if not self.evidence_refs:
+            raise ValueError("Narrative commitment event requires evidence")
+
+
 class NarrativeSelf:
     """Durable, inspectable autobiography independent of generated prose."""
 
@@ -192,6 +214,7 @@ class NarrativeSelf:
         self.continuity_links: dict[str, ContinuityLink] = {}
         self.conflicts: dict[str, UnresolvedSelfConflict] = {}
         self.future_self: dict[str, FutureSelfProjection] = {}
+        self.commitment_events: dict[str, NarrativeCommitmentEvent] = {}
         self._experience_index: dict[str, str] = {}
 
     def observe_experience(
@@ -522,6 +545,27 @@ class NarrativeSelf:
         except KeyError as exc:
             raise ValueError(f"Unknown identity claim: {claim_id}") from exc
 
+    def record_commitment_event(
+        self,
+        commitment_ref: str,
+        *,
+        kind: str,
+        description: str,
+        evidence_refs: tuple[str, ...],
+        relationship_refs: tuple[str, ...] = (),
+    ) -> NarrativeCommitmentEvent:
+        event = NarrativeCommitmentEvent(
+            event_id=f"narrative-commitment-{uuid4()}",
+            commitment_ref=commitment_ref,
+            kind=kind,
+            description=description,
+            evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+            relationship_refs=tuple(dict.fromkeys(relationship_refs)),
+            created_at=_now(),
+        )
+        self.commitment_events[event.event_id] = event
+        return event
+
     def to_json(self) -> dict[str, Any]:
         return {
             "schema_version": self.SCHEMA_VERSION,
@@ -534,6 +578,9 @@ class NarrativeSelf:
             ],
             "unresolved_conflicts": [asdict(item) for item in self.conflicts.values()],
             "future_self": [asdict(item) for item in self.future_self.values()],
+            "commitment_events": [
+                asdict(item) for item in self.commitment_events.values()
+            ],
         }
 
     def restore(self, payload: object) -> None:
@@ -544,6 +591,7 @@ class NarrativeSelf:
             self.continuity_links = {}
             self.conflicts = {}
             self.future_self = {}
+            self.commitment_events = {}
             self._experience_index = {}
             return
         if payload.get("schema_version") != self.SCHEMA_VERSION:
@@ -561,6 +609,16 @@ class NarrativeSelf:
         projections = [
             _future_from_json(item) for item in payload.get("future_self", [])
         ]
+        commitment_events = [
+            NarrativeCommitmentEvent(
+                **{
+                    **item,
+                    "evidence_refs": tuple(item.get("evidence_refs", ())),
+                    "relationship_refs": tuple(item.get("relationship_refs", ())),
+                }
+            )
+            for item in payload.get("commitment_events", [])
+        ]
         _require_unique(episodes, "episode_id")
         _require_unique(chapters, "chapter_id")
         _require_unique(claims, "claim_id")
@@ -571,6 +629,7 @@ class NarrativeSelf:
         self.continuity_links = {item.link_id: item for item in links}
         self.conflicts = {item.conflict_id: item for item in conflicts}
         self.future_self = {item.projection_id: item for item in projections}
+        self.commitment_events = {item.event_id: item for item in commitment_events}
         self._experience_index = {
             experience_id: episode.episode_id
             for episode in episodes
