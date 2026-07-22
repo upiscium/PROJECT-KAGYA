@@ -539,13 +539,15 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
                     remote, settings.sleep.training_artifact_directory
                 )
             else:
-                backend = LocalTrainingBackend(QloraTrainer(settings))
+                backend = LocalTrainingBackend(
+                    QloraTrainer(settings, get_adapter_registry(request))
+                )
             coordinator = SleepCoordinator(
                 settings,
                 MemoryConsolidator(
                     settings, get_memory_system(request), get_model_provider(request)
                 ),
-                TrainingBundleBuilder(settings),
+                TrainingBundleBuilder(settings, get_adapter_registry(request)),
                 TrainingJobRegistry(settings.sleep.job_registry_path),
                 backend,
                 get_adapter_registry(request),

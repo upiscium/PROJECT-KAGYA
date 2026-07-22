@@ -39,7 +39,9 @@ class AdapterRuntimeManager:
         registry: AdapterRegistry,
         *,
         provider_loader: Callable[[AdapterEntry | None], ModelProvider],
-        runtime_switch: Callable[[ModelProvider, AdapterEntry | None, int | None], None],
+        runtime_switch: Callable[
+            [ModelProvider, AdapterEntry | None, int | None], None
+        ],
         runtime_snapshot: Callable[[], RuntimeAdapterState],
         history_path: Path,
     ) -> None:
@@ -181,6 +183,20 @@ class AdapterRuntimeManager:
         self._append(record)
         return record
 
+    def report_canary(self, *, success: bool) -> AdapterActivationRecord | None:
+        current = self.runtime_snapshot()
+        if current.adapter_id is None:
+            raise ValueError("No active adapter canary")
+        entry = self.registry.record_canary(current.adapter_id, success=success)
+        if success:
+            return None
+        if (
+            entry.canary_failures
+            < self.registry.settings.adapter_registry.canary_failure_limit
+        ):
+            return None
+        return self.rollback()
+
     def current(self) -> RuntimeAdapterState:
         state = self.runtime_snapshot()
         active = self._active_entry()
@@ -206,7 +222,11 @@ class AdapterRuntimeManager:
 
     def _active_entry(self) -> AdapterEntry | None:
         return next(
-            (entry for entry in self.registry.list() if entry.status == AdapterStatus.ACTIVE),
+            (
+                entry
+                for entry in self.registry.list()
+                if entry.status == AdapterStatus.ACTIVE
+            ),
             None,
         )
 
@@ -219,7 +239,10 @@ class AdapterRuntimeManager:
         )
         with temporary.open("x", encoding="utf-8") as output:
             json.dump(
-                {"schema_version": 1, "activations": [asdict(item) for item in records]},
+                {
+                    "schema_version": 1,
+                    "activations": [asdict(item) for item in records],
+                },
                 output,
                 sort_keys=True,
             )

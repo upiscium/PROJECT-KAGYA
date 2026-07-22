@@ -38,7 +38,9 @@ class SleepCycleManager:
         self.memory_system = memory_system
         self.model_provider = model_provider
         self.adapter_registry = adapter_registry
-        self.dream_dataset_generator = dream_dataset_generator or DreamDatasetGenerator()
+        self.dream_dataset_generator = (
+            dream_dataset_generator or DreamDatasetGenerator()
+        )
         self.qlora_trainer = qlora_trainer or QloraTrainer(settings)
 
     def run(self) -> SleepCycleResult:
@@ -88,6 +90,8 @@ class SleepCycleManager:
                 dataset_path=training_result.dataset_path,
                 dataset_hash=training_result.dataset_hash,
                 base_model=self.settings.model.primary_id,
+                base_model_revision=self.settings.model.revision,
+                adapter_hash=training_result.adapter_hash,
                 notes="registered by sleep cycle dry-run"
                 if training_result.dry_run
                 else "registered by sleep cycle",
@@ -121,7 +125,9 @@ class SleepCycleManager:
     def select_high_emotion_episodes(self) -> list[EpisodicMemoryRecord]:
         episodes = self.memory_system._get_unarchived_episodic_records()
         threshold = self.settings.sleep.min_emotion_score
-        selected = [episode for episode in episodes if _is_high_emotion(episode, threshold)]
+        selected = [
+            episode for episode in episodes if _is_high_emotion(episode, threshold)
+        ]
         selected = [
             episode
             for episode in selected
@@ -134,7 +140,9 @@ class SleepCycleManager:
         ]
         return selected[: self.settings.sleep.max_episodes_per_cycle]
 
-    def _generate_semantic_texts(self, episodes: list[EpisodicMemoryRecord]) -> list[str]:
+    def _generate_semantic_texts(
+        self, episodes: list[EpisodicMemoryRecord]
+    ) -> list[str]:
         semantic_texts: list[str] = []
         for episode in episodes:
             semantic_text = self.model_provider.generate(
@@ -146,4 +154,6 @@ class SleepCycleManager:
 
 
 def _is_high_emotion(episode: EpisodicMemoryRecord, threshold: float) -> bool:
-    return episode.emotion_arousal > threshold or abs(episode.emotion_valence) > threshold
+    return (
+        episode.emotion_arousal > threshold or abs(episode.emotion_valence) > threshold
+    )

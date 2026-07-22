@@ -156,10 +156,24 @@ export type Adapter = {
   notes: string;
   base_model_revision: string | null;
   adapter_hash: string | null;
+  parent_adapter_id: string | null;
+  parent_adapter_hash: string | null;
   activation_sequence: number | null;
+  dataset_repetition_count: number;
+  dataset_overlap_count: number;
+  dataset_overlap_ratio: number;
+  holdout_score: number | null;
+  holdout_baseline_score: number | null;
+  holdout_regression: boolean;
+  drift_scores: Record<string, number> | null;
+  activation_gate_passed: boolean;
+  rollout_state: string;
+  canary_failures: number;
+  rollback_target_id: string | null;
 };
 
 export type AdapterListResponse = { adapters: Adapter[] };
+export type AdapterProvenance = { adapter: Adapter; lineage: Adapter[]; activation_history: AdapterActivationResponse[] };
 export type AdapterEvaluateResponse = { adapter_id: string; score: number; decision: string; result_path: string; status: string };
 export type AdapterActivationResponse = { action: string; adapter_id: string | null; adapter_hash: string | null; previous_adapter_id: string | null; previous_adapter_hash: string | null; activation_sequence: number };
 export type AdapterRuntimeState = { base_model: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null };
@@ -422,6 +436,7 @@ export const api = {
   reconcileSleepJobs: () => adminRequest<{ jobs: TrainingJob[]; orphan_result_job_ids: string[]; orphan_remote_job_ids: string[] }>("/sleep/reconcile", { method: "POST" }),
   cleanupSleepArtifacts: () => adminRequest<{ removed: string[]; remote_removed: string[]; retention_days: number }>("/sleep/cleanup", { method: "POST" }),
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
+  adapterProvenance: (adapterId: string) => adminRequest<AdapterProvenance>(`/adapters/${encodeURIComponent(adapterId)}/provenance`),
   adapterRuntime: () => adminRequest<AdapterRuntimeState>("/adapters/runtime"),
   evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),
   trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),

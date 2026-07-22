@@ -19,6 +19,15 @@ class _ArtifactModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AdapterLineageNode(_ArtifactModel):
+    adapter_id: str = Field(min_length=1)
+    adapter_hash: str = Field(min_length=1)
+    parent_adapter_id: str | None = None
+    parent_adapter_hash: str | None = None
+    base_model_id: str = Field(min_length=1)
+    base_model_revision: str = Field(min_length=1)
+
+
 class TrainingBundleManifest(_ArtifactModel):
     schema_version: Literal[1] = 1
     job_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
@@ -31,6 +40,8 @@ class TrainingBundleManifest(_ArtifactModel):
     processor_revision: str = Field(min_length=1)
     parent_adapter_id: str | None = None
     parent_adapter_hash: str | None = None
+    lineage_adapter_ids: list[str] = Field(default_factory=list)
+    lineage: list[AdapterLineageNode] = Field(default_factory=list)
     source_event_sequence_start: int = Field(ge=0)
     source_event_sequence_end: int = Field(ge=0)
     source_episode_ids: list[str] = Field(default_factory=list)
@@ -41,6 +52,9 @@ class TrainingBundleManifest(_ArtifactModel):
     evaluation_set_path: Literal["evaluation_set.jsonl"] = "evaluation_set.jsonl"
     evaluation_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     evaluation_record_count: int = Field(ge=0)
+    rehearsal_record_count: int = Field(default=0, ge=0)
+    repeated_record_count: int = Field(default=0, ge=0)
+    training_evaluation_overlap_count: int = Field(default=0, ge=0)
     chat_template_version: str = Field(min_length=1)
     dataset_format_version: str = Field(min_length=1)
     qlora_hyperparameters: dict[str, int | float | str | bool]
@@ -52,7 +66,42 @@ class TrainingBundleManifest(_ArtifactModel):
             raise ValueError("source event sequence range is reversed")
         if (self.parent_adapter_id is None) != (self.parent_adapter_hash is None):
             raise ValueError("parent adapter ID and hash must be provided together")
+        self._validate_lineage()
         return self
+
+    def _validate_lineage(self) -> None:
+        if self.parent_adapter_id is None:
+            if self.lineage:
+                raise ValueError("base training bundle cannot contain adapter lineage")
+            return
+        nodes = {node.adapter_id: node for node in self.lineage}
+        if len(nodes) != len(self.lineage):
+            raise ValueError("adapter lineage contains duplicate nodes")
+        current_id: str | None = self.parent_adapter_id
+        expected_hash = self.parent_adapter_hash
+        seen: set[str] = set()
+        while current_id is not None:
+            if current_id in seen:
+                raise ValueError("adapter lineage contains a cycle")
+            seen.add(current_id)
+            node = nodes.get(current_id)
+            if node is None:
+                raise ValueError(
+                    f"adapter lineage contains unknown parent: {current_id}"
+                )
+            if node.adapter_hash != expected_hash:
+                raise ValueError("adapter lineage parent hash mismatch")
+            if (
+                node.base_model_id != self.base_model_id
+                or node.base_model_revision != self.base_model_revision
+            ):
+                raise ValueError("adapter lineage base model revision mismatch")
+            if (node.parent_adapter_id is None) != (node.parent_adapter_hash is None):
+                raise ValueError("adapter lineage parent ID/hash pair is incomplete")
+            current_id = node.parent_adapter_id
+            expected_hash = node.parent_adapter_hash
+        if seen != set(nodes):
+            raise ValueError("adapter lineage contains disconnected nodes")
 
 
 class TrainingResultManifest(_ArtifactModel):
@@ -68,6 +117,7 @@ class TrainingResultManifest(_ArtifactModel):
     base_model_id: str = Field(min_length=1)
     base_model_revision: str = Field(min_length=1)
     parent_adapter_id: str | None = None
+    parent_adapter_hash: str | None = None
     training_metrics_path: Literal["training_metrics.json"] = "training_metrics.json"
     evaluation_path: Literal["evaluation.json"] = "evaluation.json"
     failure_category: str | None = None
@@ -77,7 +127,9 @@ class TrainingResultManifest(_ArtifactModel):
     def validate_status_fields(self) -> "TrainingResultManifest":
         if self.status == "succeeded":
             if self.candidate_adapter_id is None or self.candidate_adapter_hash is None:
-                raise ValueError("successful result requires candidate adapter ID and hash")
+                raise ValueError(
+                    "successful result requires candidate adapter ID and hash"
+                )
             if self.failure_category is not None or self.error is not None:
                 raise ValueError("successful result cannot contain failure fields")
         elif self.failure_category is None:
@@ -123,6 +175,7 @@ class TrainingArtifactContract:
         expected_model_revision: str | None = None,
         expected_processor_revision: str | None = None,
         expected_parent_adapter_id: str | None | object = _UNSET,
+        expected_parent_adapter_hash: str | None | object = _UNSET,
     ) -> TrainingBundleManifest:
         self._validate_tree(path, exact_files=self.BUNDLE_FILES)
         manifest = TrainingBundleManifest.model_validate(
@@ -135,7 +188,10 @@ class TrainingArtifactContract:
             raise ValueError("bundle dataset hash mismatch")
         if sha256_bytes(evaluation) != manifest.evaluation_set_hash:
             raise ValueError("bundle evaluation hash mismatch")
-        if expected_model_id is not None and manifest.base_model_id != expected_model_id:
+        if (
+            expected_model_id is not None
+            and manifest.base_model_id != expected_model_id
+        ):
             raise ValueError("bundle base model ID mismatch")
         if (
             expected_model_revision is not None
@@ -152,6 +208,13 @@ class TrainingArtifactContract:
             and manifest.parent_adapter_id != expected_parent_adapter_id
         ):
             raise ValueError("bundle parent adapter mismatch")
+        if (
+            expected_parent_adapter_hash is not _UNSET
+            and manifest.parent_adapter_hash != expected_parent_adapter_hash
+        ):
+            raise ValueError("bundle parent adapter hash mismatch")
+        if _record_hashes(dataset) & _record_hashes(evaluation):
+            raise ValueError("bundle training and evaluation datasets overlap")
         return manifest
 
     def finalize_result(
@@ -166,7 +229,10 @@ class TrainingArtifactContract:
         adapter_files = adapter_files or {}
         if manifest.status == "succeeded" and not adapter_files:
             raise ValueError("successful result requires adapter files")
-        if manifest.status == "succeeded" and sha256_file_map(adapter_files) != manifest.candidate_adapter_hash:
+        if (
+            manifest.status == "succeeded"
+            and sha256_file_map(adapter_files) != manifest.candidate_adapter_hash
+        ):
             raise ValueError("candidate adapter hash does not match adapter payload")
         files = {
             "result.json": _json_bytes(manifest.model_dump(mode="json")),
@@ -192,6 +258,7 @@ class TrainingArtifactContract:
         expected_model_id: str | None = None,
         expected_model_revision: str | None = None,
         expected_parent_adapter_id: str | None | object = _UNSET,
+        expected_parent_adapter_hash: str | None | object = _UNSET,
     ) -> TrainingResultManifest:
         self._validate_tree(path)
         required = {
@@ -203,7 +270,9 @@ class TrainingArtifactContract:
         actual = _relative_files(path)
         if not required.issubset(actual):
             raise ValueError("training result is incomplete")
-        manifest = TrainingResultManifest.model_validate(_read_json(path / "result.json"))
+        manifest = TrainingResultManifest.model_validate(
+            _read_json(path / "result.json")
+        )
         if manifest.status == "succeeded" and not any(
             item.startswith("adapter/") for item in actual
         ):
@@ -228,9 +297,15 @@ class TrainingArtifactContract:
             raise ValueError("result candidate adapter hash mismatch")
         if expected_job_id is not None and manifest.job_id != expected_job_id:
             raise ValueError("result job ID mismatch")
-        if expected_attempt_id is not None and manifest.attempt_id != expected_attempt_id:
+        if (
+            expected_attempt_id is not None
+            and manifest.attempt_id != expected_attempt_id
+        ):
             raise ValueError("result attempt ID mismatch")
-        if expected_model_id is not None and manifest.base_model_id != expected_model_id:
+        if (
+            expected_model_id is not None
+            and manifest.base_model_id != expected_model_id
+        ):
             raise ValueError("result base model ID mismatch")
         if (
             expected_model_revision is not None
@@ -242,6 +317,11 @@ class TrainingArtifactContract:
             and manifest.parent_adapter_id != expected_parent_adapter_id
         ):
             raise ValueError("result parent adapter mismatch")
+        if (
+            expected_parent_adapter_hash is not _UNSET
+            and manifest.parent_adapter_hash != expected_parent_adapter_hash
+        ):
+            raise ValueError("result parent adapter hash mismatch")
         return manifest
 
     def _atomic_finalize(
@@ -293,6 +373,24 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _record_hashes(content: bytes) -> set[str]:
+    hashes: set[str] = set()
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            normalized = json.dumps(
+                json.loads(line),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        except json.JSONDecodeError:
+            normalized = line.strip()
+        hashes.add(sha256_bytes(normalized))
+    return hashes
+
+
 def sha256_file_map(files: dict[str, bytes]) -> str:
     canonical = b"".join(
         _safe_relative_path(relative).as_posix().encode()
@@ -306,7 +404,11 @@ def sha256_file_map(files: dict[str, bytes]) -> str:
 
 def _safe_relative_path(value: str) -> PurePosixPath:
     path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
         raise ValueError("artifact path is unsafe")
     return path
 

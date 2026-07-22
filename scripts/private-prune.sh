@@ -128,6 +128,11 @@ active_ids = {
     and entry.get("adapter_id")
 }
 rollback_ids = set()
+rollback_ids.update(
+    str(entry.get("rollback_target_id"))
+    for entry in entries
+    if isinstance(entry, dict) and entry.get("rollback_target_id")
+)
 current_ids = active_ids if active_ids else {None}
 for active_id in current_ids:
     for record in reversed(records):

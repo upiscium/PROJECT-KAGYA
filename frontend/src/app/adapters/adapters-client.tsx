@@ -34,7 +34,12 @@ export function AdaptersClient() {
 }
 
 function AdapterRow({ adapter, busy, onAction }: { adapter: Adapter; busy: boolean; onAction: (action: Action) => void }) {
-  return <article className="record"><h3>{adapter.adapter_id}</h3><p className="mono">{adapter.path}</p><p>Score: {adapter.eval_score ?? "n/a"}</p><div className="action-row">{actions.map((item) => <Button key={item} disabled={busy} onClick={() => onAction(item)}>{item}</Button>)}</div></article>;
+  return <article className="record"><h3>{adapter.adapter_id}</h3><p className="mono">{adapter.path}</p><p>Parent: {adapter.parent_adapter_id ?? "base model"}</p><p>Rollout: {adapter.rollout_state} · gate {adapter.activation_gate_passed ? "passed" : "pending"}</p><p>Dataset overlap: {adapter.dataset_overlap_count} ({Math.round(adapter.dataset_overlap_ratio * 100)}%) · repeats {adapter.dataset_repetition_count}</p><p>Holdout: {adapter.holdout_score ?? "n/a"}{adapter.holdout_regression ? " (regression)" : ""}</p><p>Drift: {formatDrift(adapter.drift_scores)}</p><p>Score: {adapter.eval_score ?? "n/a"}</p><a href={`/admin-proxy/adapters/${encodeURIComponent(adapter.adapter_id)}/provenance`} target="_blank" rel="noreferrer">Export provenance</a><div className="action-row">{actions.map((item) => <Button key={item} disabled={busy} onClick={() => onAction(item)}>{item}</Button>)}</div></article>;
+}
+
+function formatDrift(scores: Record<string, number> | null): string {
+  if (!scores || Object.keys(scores).length === 0) return "n/a";
+  return Object.entries(scores).map(([name, score]) => `${name} ${score.toFixed(3)}`).join(", ");
 }
 
 function groupByStatus(adapters: Adapter[]): Record<string, Adapter[]> {

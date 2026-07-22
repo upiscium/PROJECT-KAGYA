@@ -1,6 +1,7 @@
 """Transport-independent training artifact contracts."""
 
 from kagya.training.artifacts import (
+    AdapterLineageNode,
     TrainingArtifactContract,
     TrainingBundleManifest,
     TrainingResultManifest,
@@ -28,6 +29,7 @@ from kagya.training.worker import (
 )
 
 __all__ = [
+    "AdapterLineageNode",
     "TrainingArtifactContract",
     "TrainingBundleManifest",
     "TrainingResultManifest",

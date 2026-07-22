@@ -58,6 +58,7 @@ class CandidateArtifactImporter:
             expected_model_revision=self.settings.model.revision,
             expected_processor_revision=self.settings.model.processor_revision,
             expected_parent_adapter_id=result.parent_adapter_id,
+            expected_parent_adapter_hash=result.parent_adapter_hash,
         )
         if result.status != "succeeded" or result.candidate_adapter_id is None:
             raise ValueError("only successful training results can be imported")
@@ -82,7 +83,9 @@ class CandidateArtifactImporter:
         existing = self._existing(result.job_id, adapter_hash)
         if existing is not None:
             return existing
-        attempt = self._record(result.job_id, result.candidate_adapter_id, adapter_hash, "validating")
+        attempt = self._record(
+            result.job_id, result.candidate_adapter_id, adapter_hash, "validating"
+        )
         final_path = self.import_root / result.candidate_adapter_id
         staging = self.import_root / f".{result.candidate_adapter_id}.{uuid4()}.tmp"
         try:
@@ -103,6 +106,7 @@ class CandidateArtifactImporter:
                     base_model_revision=result.base_model_revision,
                     adapter_hash=adapter_hash,
                     parent_adapter_id=result.parent_adapter_id,
+                    parent_adapter_hash=result.parent_adapter_hash,
                     training_job_id=result.job_id,
                     training_node_id=result.worker_node_id,
                     submitted_by_node_id=bundle.submitter_node_id,
@@ -115,6 +119,10 @@ class CandidateArtifactImporter:
                     worker_evaluation_path=str(
                         (result_path / result.evaluation_path).resolve()
                     ),
+                    evaluation_set_hashes=(bundle.evaluation_set_hash,),
+                    evaluation_dataset_path=(
+                        bundle_path / bundle.evaluation_set_path
+                    ).resolve(),
                     notes="validated local import from TrainingResult",
                 )
             except ValueError:
@@ -132,11 +140,19 @@ class CandidateArtifactImporter:
 
     def _existing(self, job_id: str, adapter_hash: str) -> AdapterEntry | None:
         by_job = next(
-            (entry for entry in self.registry.list() if entry.training_job_id == job_id),
+            (
+                entry
+                for entry in self.registry.list()
+                if entry.training_job_id == job_id
+            ),
             None,
         )
         by_hash = next(
-            (entry for entry in self.registry.list() if entry.adapter_hash == adapter_hash),
+            (
+                entry
+                for entry in self.registry.list()
+                if entry.adapter_hash == adapter_hash
+            ),
             None,
         )
         if by_job is None and by_hash is None:
@@ -147,7 +163,9 @@ class CandidateArtifactImporter:
 
     def validate_entry(self, entry: AdapterEntry) -> None:
         path = Path(entry.path)
-        if not path.is_absolute() or not path.is_relative_to(self.import_root.resolve()):
+        if not path.is_absolute() or not path.is_relative_to(
+            self.import_root.resolve()
+        ):
             raise ValueError("registry adapter path is not a local imported artifact")
         files = {
             (Path("adapter") / item.relative_to(path)).as_posix(): item.read_bytes()
@@ -205,7 +223,9 @@ class _AttemptLock:
             self.attempts = []
         else:
             raw = json.loads(self.path.read_text("utf-8"))
-            self.attempts = [AdapterImportAttempt(**item) for item in raw.get("attempts", [])]
+            self.attempts = [
+                AdapterImportAttempt(**item) for item in raw.get("attempts", [])
+            ]
         return self.attempts
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -213,7 +233,10 @@ class _AttemptLock:
             temporary = self.path.with_name(f".{self.path.name}.{uuid4()}.tmp")
             temporary.write_text(
                 json.dumps(
-                    {"schema_version": 1, "attempts": [asdict(item) for item in self.attempts]},
+                    {
+                        "schema_version": 1,
+                        "attempts": [asdict(item) for item in self.attempts],
+                    },
                     sort_keys=True,
                 ),
                 "utf-8",
