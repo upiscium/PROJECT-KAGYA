@@ -31,6 +31,16 @@ from kagya.runtime.state_wal import (
     StateWalIntegrityError,
     StateWalRecord,
 )
+from kagya.external_transaction import (
+    ExternalArtifactStore,
+    ExternalReconciliationReport,
+    ExternalRestoreDiff,
+    ExternalRestoreEffect,
+    ExternalTransactionAudit,
+    ExternalTransactionCoordinator,
+    ExternalTransactionRecord,
+    ExternalTransactionStatus,
+)
 from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
 from kagya.runtime.context import (
     ContextFrame,
@@ -94,6 +104,14 @@ __all__ = [
     "AttentionSource",
     "AttentionSystem",
     "EventJournal",
+    "ExternalArtifactStore",
+    "ExternalReconciliationReport",
+    "ExternalRestoreDiff",
+    "ExternalRestoreEffect",
+    "ExternalTransactionAudit",
+    "ExternalTransactionCoordinator",
+    "ExternalTransactionRecord",
+    "ExternalTransactionStatus",
     "ChatResult",
     "ContextFrame",
     "ContextRegistry",

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from kagya.external_transaction import ExternalTransactionStatus
+
 
 class MemoryRecordType(StrEnum):
     EPISODIC_LOG = "episodic_log"
@@ -116,6 +118,11 @@ class EpisodicMemoryRecord:
     autobiographical_importance: float = 0.0
     training_included: bool = True
     training_exclusion_refs: list[str] = field(default_factory=list)
+    external_transaction_id: str = ""
+    external_transaction_status: ExternalTransactionStatus = (
+        ExternalTransactionStatus.COMMITTED
+    )
+    external_transaction_revision: int = 1
 
 
 @dataclass(frozen=True)
