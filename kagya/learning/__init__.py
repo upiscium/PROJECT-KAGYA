@@ -1,13 +1,37 @@
 """Learning and adapter lifecycle helpers for PROJECT-KAGYA."""
 
-from kagya.learning.adapter_evaluator import AdapterEvaluationDecision, AdapterEvaluationResult, AdapterEvaluator
+from kagya.learning.adapter_evaluator import (
+    AdapterEvaluationDecision,
+    AdapterEvaluationResult,
+    AdapterEvaluator,
+)
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
 from kagya.learning.adapter_runtime import (
     AdapterActivationRecord,
     AdapterRuntimeManager,
     RuntimeAdapterState,
 )
-from kagya.learning.dream_dataset_generator import DreamDatasetGenerator, DreamDatasetRecord, format_training_text
+from kagya.learning.behavioral_evaluation import (
+    BehavioralDimension,
+    BehavioralEvaluator,
+    BehavioralEvaluatorSpec,
+    BehavioralInvariant,
+    BehavioralScenario,
+    BehavioralTrace,
+    ExternalObservation,
+    HardGate,
+    InvariantKind,
+    PublicBehaviorClass,
+    ReproducibilityMetadata,
+    StateTransition,
+    TransitionExpectation,
+    TransitionKind,
+)
+from kagya.learning.dream_dataset_generator import (
+    DreamDatasetGenerator,
+    DreamDatasetRecord,
+    format_training_text,
+)
 from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
 from kagya.learning.qlora_trainer import (
     QloraTrainer,
@@ -26,15 +50,29 @@ __all__ = [
     "AdapterActivationRecord",
     "RuntimeAdapterState",
     "AdapterStatus",
+    "BehavioralDimension",
+    "BehavioralEvaluator",
+    "BehavioralEvaluatorSpec",
+    "BehavioralInvariant",
+    "BehavioralScenario",
+    "BehavioralTrace",
     "DreamDatasetGenerator",
     "DreamDatasetRecord",
     "EvalCase",
     "EvalSet",
+    "ExternalObservation",
+    "HardGate",
+    "InvariantKind",
     "QloraTrainer",
     "QloraTrainingError",
     "QloraTrainingResult",
+    "PublicBehaviorClass",
+    "ReproducibilityMetadata",
     "SleepCycleManager",
     "SleepCycleResult",
+    "StateTransition",
+    "TransitionExpectation",
+    "TransitionKind",
     "format_training_text",
     "load_eval_sets",
 ]
