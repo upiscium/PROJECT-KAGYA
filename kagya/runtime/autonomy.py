@@ -8,7 +8,7 @@ from enum import StrEnum
 from threading import Event, RLock, Thread
 import time
 from typing import Any, Callable, Protocol
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -41,6 +41,9 @@ class WakeUpKind(StrEnum):
     DECISION_OUTCOME = "decision_outcome"
     ACTION_TIMEOUT = "action_timeout"
     ACTION_RETRY = "action_retry"
+    ACTION_DECISION = "action_decision"
+    ACTION_INTENT = "action_intent"
+    ACTION_EXECUTION = "action_execution"
     OUTBOX_DEADLINE = "outbox_deadline"
     SLEEP_CONSOLIDATION = "sleep_consolidation"
     OPERATOR = "operator"
@@ -75,7 +78,7 @@ class WakeUpSchedule(BaseModel):
     schedule_id: str = Field(min_length=1, max_length=256)
     kind: WakeUpKind
     wake_at: datetime
-    target_id: str | None = Field(default=None, max_length=256)
+    target_id: str | None = Field(default=None, max_length=512)
     status: ScheduleStatus = ScheduleStatus.PENDING
     estimated_inferences: int = Field(default=0, ge=0)
     created_at: datetime
@@ -259,6 +262,10 @@ class SubjectScheduler:
                     WakeUpKind.INTRINSIC_DELIBERATION: AgentEventType.INTRINSIC_GOAL_DELIBERATE,
                     WakeUpKind.PLAN_GENERATION: AgentEventType.PLAN_GENERATE,
                     WakeUpKind.INTRINSIC_ADOPTION: AgentEventType.INTRINSIC_GOAL_ADOPT,
+                    WakeUpKind.ACTION_DECISION: AgentEventType.DECISION_UPDATE,
+                    WakeUpKind.ACTION_INTENT: AgentEventType.ACTION_INTENT,
+                    WakeUpKind.ACTION_EXECUTION: AgentEventType.ACTION_EXECUTE,
+                    WakeUpKind.ACTION_RETRY: AgentEventType.ACTION_EXECUTE,
                 }.get(schedule.kind, AgentEventType.AUTONOMY_WAKE)
                 outcome = self.runtime.execute(
                     event_type,
@@ -460,8 +467,41 @@ class SubjectScheduler:
             )
         action_execution = getattr(self.main_loop, "action_execution", None)
         if action_execution is not None:
+            intents = action_execution.list_intents()
+            for decision in self.main_loop.decision_store.list_records(
+                DecisionStatus.AWAITING_OUTCOME
+            ):
+                selected = next(
+                    item.candidate
+                    for item in decision.considered_candidates
+                    if item.candidate.candidate_id == decision.selected_candidate_id
+                )
+                if (
+                    set(selected.parameters) == {"action"}
+                    and isinstance(selected.parameters["action"], dict)
+                    and not any(
+                        item.provenance.decision_id == decision.decision_id
+                        for item in intents
+                    )
+                ):
+                    schedules.append(
+                        self._derived(
+                            f"action-intent:{decision.decision_id}",
+                            WakeUpKind.ACTION_INTENT,
+                            datetime.fromisoformat(decision.updated_at),
+                            decision.decision_id,
+                        )
+                    )
             for intent in action_execution.list_intents():
                 if intent.status.value == "approved":
+                    schedules.append(
+                        self._derived(
+                            f"action-execution:{intent.intent_id}:{intent.updated_at.isoformat()}",
+                            WakeUpKind.ACTION_EXECUTION,
+                            intent.updated_at,
+                            intent.intent_id,
+                        )
+                    )
                     schedules.append(
                         self._derived(
                             f"action-timeout:{intent.intent_id}:{intent.deadline_at.isoformat()}",
@@ -487,6 +527,36 @@ class SubjectScheduler:
                 for definition in plan.current_revision.steps:
                     state = plan.step_state(definition.step_id)
                     target = f"{plan.plan_id}/{definition.step_id}"
+                    candidate = self.main_loop.plan_store.action_candidate(
+                        plan.plan_id, definition.step_id
+                    ) if state.status == StepStatus.READY else None
+                    governed_action = (
+                        candidate is not None
+                        and set(candidate.parameters) == {"action"}
+                        and isinstance(candidate.parameters["action"], dict)
+                        and set(candidate.parameters["action"])
+                        == {"tool_name", "arguments"}
+                    )
+                    has_decision = any(
+                        candidate.candidate.plan_id == plan.plan_id
+                        and candidate.candidate.plan_revision == plan.revision
+                        and candidate.candidate.step_id == definition.step_id
+                        for decision in self.main_loop.decision_store.list_records()
+                        for candidate in decision.considered_candidates
+                    )
+                    if (
+                        action_execution is not None
+                        and governed_action
+                        and not has_decision
+                    ):
+                        schedules.append(
+                            self._derived(
+                                f"action-decision:{uuid5(NAMESPACE_URL, target)}",
+                                WakeUpKind.ACTION_DECISION,
+                                plan.updated_at,
+                                target,
+                            )
+                        )
                     if (
                         state.status == StepStatus.WAITING_RETRY
                         and state.retry_at is not None
@@ -701,6 +771,29 @@ class SubjectScheduler:
             else:
                 self.main_loop.timeout_plan_step(plan_id, step_id)
                 outcome = "step_timed_out"
+        elif schedule.kind == WakeUpKind.ACTION_DECISION:
+            target = schedule.target_id or ""
+            if "/" not in target:
+                raise ValueError("Invalid action Decision target")
+            plan_id, step_id = target.split("/", 1)
+            decision = self.main_loop.create_plan_action_decision(plan_id, step_id)
+            outcome = f"decision_created:{decision.decision_id}"
+        elif schedule.kind == WakeUpKind.ACTION_INTENT:
+            execution = getattr(self.main_loop, "action_execution", None)
+            if execution is None:
+                raise ValueError("Action execution layer is unavailable")
+            decision_id = schedule.target_id or ""
+            intent = execution.create_from_decision(
+                decision_id,
+                idempotency_key=f"decision-action:{decision_id}",
+            )
+            outcome = intent.status.value
+        elif schedule.kind == WakeUpKind.ACTION_EXECUTION:
+            execution = getattr(self.main_loop, "action_execution", None)
+            if execution is None:
+                raise ValueError("Action execution layer is unavailable")
+            updated = execution.execute(schedule.target_id or "")
+            outcome = updated.status.value
         elif schedule.kind in {WakeUpKind.ACTION_TIMEOUT, WakeUpKind.ACTION_RETRY}:
             execution = getattr(self.main_loop, "action_execution", None)
             if execution is None:

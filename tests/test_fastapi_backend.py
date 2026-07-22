@@ -2874,6 +2874,35 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
         assert adopted.status.value == "active"
         assert adopted.endorsement_provenance_refs
         assert loop.plan_store.list_plans(goal_id=goal_id)[0].status.value == "active"
+        scheduler.run_cycle(now + timedelta(seconds=3))
+        scheduler.run_cycle(now + timedelta(seconds=4))
+        scheduler.run_cycle(now + timedelta(seconds=5))
+        plan = loop.plan_store.list_plans(goal_id=goal_id)[0]
+        assert plan.status.value == "completed"
+        assert loop.goal_manager.get(goal_id).status.value == "completed"
+        decision = next(
+            item
+            for item in loop.decision_store.list_records()
+            if any(
+                candidate.candidate.plan_id == plan.plan_id
+                and candidate.candidate.step_id == "observe_progress"
+                for candidate in item.considered_candidates
+            )
+        )
+        selected = next(
+            item.candidate
+            for item in decision.considered_candidates
+            if item.candidate.candidate_id == decision.selected_candidate_id
+        )
+        assert selected.plan_id == plan.plan_id
+        assert decision.status.value == "resolved"
+        action_state = client.app.state.action_execution
+        intents = action_state.list_intents()
+        assert len(intents) == 1
+        assert intents[0].provenance.decision_id == decision.decision_id
+        assert intents[0].status.value == "succeeded"
+        assert len(action_state.list_receipts()) == 1
+        assert len(action_state.list_observations()) == 1
         inspection = client.get("/api/goals", headers=admin_headers()).json()
         assert inspection["intrinsic_deliberations"][-1]["action"] == "endorse"
         no_goal = client.post("/api/motivation/reevaluate", headers=admin_headers())
@@ -2901,6 +2930,9 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
         "intrinsic_goal_deliberate",
         "plan_generate",
         "intrinsic_goal_adopt",
+        "decision_update",
+        "action_intent",
+        "action_execute",
     }
 
 

@@ -211,7 +211,7 @@ def test_idle_cycle_is_explicit_no_action_without_runtime_event(tmp_path: Path) 
     runtime.shutdown()
 
 
-def test_due_action_timeout_is_processed_once_through_runtime(tmp_path: Path) -> None:
+def test_due_action_execution_is_processed_once_through_runtime(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     runtime, journal = _runtime(tmp_path / "journal.jsonl")
     loop = _MainLoop()
@@ -224,15 +224,16 @@ def test_due_action_timeout_is_processed_once_through_runtime(tmp_path: Path) ->
                 SimpleNamespace(
                     intent_id="intent-1",
                     status=SimpleNamespace(value="approved"),
-                    deadline_at=now,
+                    updated_at=now,
+                    deadline_at=now + timedelta(seconds=60),
                     retry_at=None,
                 )
             ] if self.calls == 0 else []
 
-        def timeout(self, intent_id: str) -> object:
+        def execute(self, intent_id: str) -> object:
             assert intent_id == "intent-1"
             self.calls += 1
-            return SimpleNamespace(status=SimpleNamespace(value="failed"))
+            return SimpleNamespace(status=SimpleNamespace(value="succeeded"))
 
     loop.action_execution = _Actions()
     scheduler = _scheduler(runtime, loop)
@@ -245,7 +246,7 @@ def test_due_action_timeout_is_processed_once_through_runtime(tmp_path: Path) ->
     assert second.result == CycleResult.NO_ACTION
     assert loop.action_execution.calls == 1
     assert any(
-        record.event_type == "autonomy_wake"
+        record.event_type == "action_execute"
         and record.lifecycle == JournalLifecycle.COMPLETED
         for record in journal.verify()
     )

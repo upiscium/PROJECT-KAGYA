@@ -492,6 +492,10 @@ class ActionExecutionLayer:
         started_clock = self.monotonic()
         receipt_id = str(uuid4())
         attempt = intent.attempts + 1
+        if intent.provenance.plan_id is not None and intent.provenance.step_id is not None:
+            self.main_loop.start_action_plan_step(
+                intent.provenance.plan_id, intent.provenance.step_id
+            )
         try:
             result = self._invoke(intent, arguments)
             duration = self.monotonic() - started_clock
@@ -565,6 +569,17 @@ class ActionExecutionLayer:
             observations=(*state.observations, observation),
             verifications=(*state.verifications, verification),
         )
+        if (
+            valid
+            and intent.provenance.plan_id is not None
+            and intent.provenance.step_id is not None
+        ):
+            self.main_loop.record_action_plan_observation(
+                intent.provenance.plan_id,
+                intent.provenance.step_id,
+                observation_id,
+                intent.tool_name,
+            )
         self._resolve_decision(updated, valid, verification.reason)
         return updated
 
