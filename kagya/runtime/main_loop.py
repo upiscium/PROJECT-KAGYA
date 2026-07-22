@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+import json
 import time
 from typing import Any, Protocol
 from uuid import uuid4
@@ -108,6 +109,15 @@ from kagya.motivation import (
     MotivationStatus,
 )
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.planning import (
+    PLAN_STATE_KEY,
+    EvidenceReference,
+    Plan,
+    PlanCandidate,
+    PlanStatus,
+    PlanStore,
+    StepStatus,
+)
 from kagya.relationship import RelationshipState, RelationshipStore
 from kagya.runtime.session_state import SessionState
 from kagya.runtime.agent_state import PersistentAgentState
@@ -245,6 +255,7 @@ class KagyaMainLoop:
             max_total_update_per_event=settings.values.max_total_update_per_event,
         )
         self.goal_manager = GoalManager()
+        self.plan_store = PlanStore()
         self.commitment_store = CommitmentStore()
         self.motivation_dynamics = MotivationDynamics()
         self.attention_system = AttentionSystem(
@@ -1218,6 +1229,9 @@ class KagyaMainLoop:
             decisions if isinstance(decisions, list) else [],
         )
         self.commitment_store.restore(self.persistent_state.commitments)
+        self.plan_store.restore(
+            self.persistent_state.motivation_extensions.get(PLAN_STATE_KEY)
+        )
         self.motivation_dynamics.restore(
             self.persistent_state.motivation_extensions.get("dynamics")
         )
@@ -1231,6 +1245,9 @@ class KagyaMainLoop:
         )
         self.persistent_state.motivation_extensions["dynamics"] = (
             self.motivation_dynamics.to_json()
+        )
+        self.persistent_state.motivation_extensions[PLAN_STATE_KEY] = (
+            self.plan_store.to_json()
         )
 
     def reevaluate_motivation(self) -> tuple[MotivationEpisode, list[Goal]]:
@@ -1405,6 +1422,12 @@ class KagyaMainLoop:
         reason: str,
         outcome: str | None = None,
     ) -> Goal:
+        if status == GoalStatus.COMPLETED:
+            plans = self.plan_store.list_plans(goal_id=goal_id)
+            if plans and not any(plan.status == PlanStatus.COMPLETED for plan in plans):
+                raise ValueError(
+                    "Goal cannot complete before its Plan success condition"
+                )
         event = current_agent_event()
         goal = self.goal_manager.transition(
             goal_id,
@@ -1427,6 +1450,159 @@ class KagyaMainLoop:
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
         return goal
+
+    def create_plan(self, candidate: PlanCandidate, *, actor_id: str) -> Plan:
+        goal = self.goal_manager.get(candidate.goal_id)
+        if goal.status in {
+            GoalStatus.COMPLETED,
+            GoalStatus.FAILED,
+            GoalStatus.ABANDONED,
+        }:
+            raise ValueError("Terminal Goal cannot receive a Plan")
+        plan = self.plan_store.create(candidate, actor_id=actor_id)
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def activate_plan(self, plan_id: str) -> Plan:
+        plan = self.plan_store.get(plan_id)
+        if self.goal_manager.get(plan.goal_id).status != GoalStatus.ACTIVE:
+            raise ValueError("Plan activation requires an active Goal")
+        event = current_agent_event()
+        plan = self.plan_store.activate(
+            plan_id,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def revise_plan(
+        self,
+        plan_id: str,
+        candidate: PlanCandidate,
+        *,
+        expected_revision: int,
+        reason_code: str,
+        actor_id: str,
+    ) -> Plan:
+        event = current_agent_event()
+        plan = self.plan_store.revise(
+            plan_id,
+            candidate,
+            expected_revision=expected_revision,
+            reason_code=reason_code,
+            actor_id=actor_id,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def start_plan_step(self, plan_id: str, step_id: str) -> Plan:
+        self._require_active_plan_goal(plan_id)
+        event = current_agent_event()
+        plan = self.plan_store.start_step(
+            plan_id,
+            step_id,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def complete_plan_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        evidence: tuple[EvidenceReference, ...],
+    ) -> Plan:
+        self._require_active_plan_goal(plan_id)
+        event = current_agent_event()
+        plan = self.plan_store.complete_step(
+            plan_id,
+            step_id,
+            evidence,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        if plan.status == PlanStatus.COMPLETED:
+            goal = self.goal_manager.get(plan.goal_id)
+            if goal.status != GoalStatus.ACTIVE:
+                raise ValueError("Completed Plan is inconsistent with Goal lifecycle")
+            self.transition_goal(
+                plan.goal_id,
+                GoalStatus.COMPLETED,
+                reason="plan_success_condition_verified",
+                outcome=f"plan:{plan.plan_id}@{plan.revision}",
+            )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def fail_plan_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        *,
+        reason_code: str,
+        evidence: tuple[EvidenceReference, ...] = (),
+    ) -> Plan:
+        self._require_active_plan_goal(plan_id)
+        event = current_agent_event()
+        plan = self.plan_store.fail_step(
+            plan_id,
+            step_id,
+            reason_code=reason_code,
+            evidence=evidence,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
+
+    def retry_plan_step(self, plan_id: str, step_id: str) -> Plan:
+        return self.start_plan_step(plan_id, step_id)
+
+    def timeout_plan_step(self, plan_id: str, step_id: str) -> Plan:
+        event = current_agent_event()
+        reference = (
+            f"event:{event.event_id}"
+            if event is not None
+            else f"step:{step_id}:timeout"
+        )
+        return self.fail_plan_step(
+            plan_id,
+            step_id,
+            reason_code="step_timeout",
+            evidence=(
+                EvidenceReference(
+                    reference=reference,
+                    evidence_type="failure",
+                    observation_code="step_timeout",
+                ),
+            ),
+        )
+
+    def abandon_plan(
+        self,
+        plan_id: str,
+        evidence: tuple[EvidenceReference, ...],
+    ) -> Plan:
+        event = current_agent_event()
+        plan = self.plan_store.abandon(
+            plan_id,
+            evidence,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        self._sync_plan_working_memory()
+        return plan
 
     def reevaluate_goals(self) -> list[GoalDecision]:
         event = current_agent_event()
@@ -1650,6 +1826,7 @@ class KagyaMainLoop:
         )
 
     def _sync_motivation_working_memory(self) -> None:
+        self._sync_plan_goal_statuses()
         for goal in self.goal_manager.goals.values():
             item_id = f"goal:{goal.goal_id}"
             if goal.status == GoalStatus.ACTIVE:
@@ -1682,6 +1859,62 @@ class KagyaMainLoop:
                 )
             else:
                 self.working_memory.forget(item_id)
+        self._sync_plan_working_memory()
+
+    def _require_active_plan_goal(self, plan_id: str) -> None:
+        plan = self.plan_store.get(plan_id)
+        if self.goal_manager.get(plan.goal_id).status != GoalStatus.ACTIVE:
+            raise ValueError("Step lifecycle requires an active Goal")
+
+    def _sync_plan_goal_statuses(self) -> None:
+        event = current_agent_event()
+        event_id = None if event is None else event.event_id
+        event_sequence = None if event is None else event.processing_sequence
+        for plan in self.plan_store.list_plans():
+            goal = self.goal_manager.get(plan.goal_id)
+            if plan.status == PlanStatus.ACTIVE and goal.status != GoalStatus.ACTIVE:
+                self.plan_store.pause(
+                    plan.plan_id,
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                )
+            elif plan.status == PlanStatus.PAUSED and goal.status == GoalStatus.ACTIVE:
+                self.plan_store.resume(
+                    plan.plan_id,
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                )
+
+    def _sync_plan_working_memory(self) -> None:
+        for item in self.working_memory.items:
+            if item.kind == WorkingMemoryKind.STEP:
+                self.working_memory.forget(item.item_id)
+        for plan, step, _state in self.plan_store.actionable_steps():
+            self.working_memory.admit(
+                working_memory_item(
+                    item_id=f"plan-step:{plan.plan_id}:{step.step_id}",
+                    kind=WorkingMemoryKind.STEP,
+                    content=json.dumps(
+                        {
+                            "plan_id": plan.plan_id,
+                            "plan_revision": plan.revision,
+                            "step_id": step.step_id,
+                            "action_type": step.action_type.value,
+                            "action_code": step.action_code,
+                            "expected_observation": (
+                                step.expected_observation.observation_code
+                            ),
+                            "verification": step.verification.verification_code,
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    activation=1.0,
+                    salience=1.0,
+                    retention_reason=RetentionReason.ACTIONABLE_STEP,
+                    source="runtime.plan_store",
+                )
+            )
 
     def restore_decision_state(self) -> None:
         payload = self.persistent_state.extensions.get("decision_records", [])
@@ -1697,7 +1930,9 @@ class KagyaMainLoop:
         self.persistent_state.extensions["feedback"] = self.feedback_store.to_json()
 
     def restore_metacognition_state(self) -> None:
-        self.metacognition.restore(self.persistent_state.extensions.get("metacognition"))
+        self.metacognition.restore(
+            self.persistent_state.extensions.get("metacognition")
+        )
         self._persist_metacognition_state()
 
     def _persist_metacognition_state(self) -> None:
@@ -2197,6 +2432,8 @@ class KagyaMainLoop:
         decision_id: str | None = None,
     ) -> DecisionRecord:
         event = current_agent_event()
+        for candidate in candidates:
+            self.plan_store.validate_candidate(candidate)
         if context_id is not None and self.context_registry.get(context_id) is None:
             raise ValueError(f"Unknown context: {context_id}")
         completed_goals = {
@@ -2204,6 +2441,13 @@ class KagyaMainLoop:
             for goal in self.goal_manager.goals.values()
             if goal.status == GoalStatus.COMPLETED
         }
+        completed_steps = {
+            f"step:{plan.plan_id}:{plan.revision}:{state.step_id}:completed"
+            for plan in self.plan_store.list_plans()
+            for state in plan.step_states
+            if state.status == StepStatus.COMPLETED
+        }
+        satisfied_prerequisites = set(satisfied_prerequisites or ()) | completed_steps
         emotion = self.emotion_engine.state
         source_experience = (
             None
@@ -2419,6 +2663,12 @@ class KagyaMainLoop:
         raw = self.provider.generate(schema_candidate_prompt(situation))
         return parse_candidate_output(raw)
 
+    def current_plan_candidates(self) -> list[ActionCandidate]:
+        return [
+            self.plan_store.action_candidate(plan.plan_id, step.step_id)
+            for plan, step, _state in self.plan_store.actionable_steps()
+        ]
+
     def record_decision_outcome(
         self,
         decision_id: str,
@@ -2538,7 +2788,9 @@ class KagyaMainLoop:
                     claim.claim_id,
                     confidence=min(claim.confidence, 0.49),
                     reason_code="metacognitive_hypothesis_retired",
-                    counterevidence_refs=("metacognition:outcome-withdrawn-or-revised",),
+                    counterevidence_refs=(
+                        "metacognition:outcome-withdrawn-or-revised",
+                    ),
                     status=IdentityClaimStatus.REVISED,
                 )
         for hypothesis in self.metacognition.hypotheses.values():
@@ -2564,7 +2816,9 @@ class KagyaMainLoop:
                     confidence=hypothesis.confidence,
                     reason_code="metacognitive_outcome_update",
                     evidence_refs=tuple(
-                        ref for ref in hypothesis.evidence_refs if ref not in current.evidence_refs
+                        ref
+                        for ref in hypothesis.evidence_refs
+                        if ref not in current.evidence_refs
                     ),
                     status=IdentityClaimStatus.HYPOTHESIS,
                 )

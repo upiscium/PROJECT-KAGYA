@@ -280,6 +280,7 @@ class AgentStateStore:
                 for item in snapshot.working_memory.items
             ]
         )
+        main_loop._sync_motivation_working_memory()
         main_loop._sync_belief_working_memory(None)
         main_loop.context_registry.restore(
             tuple(
