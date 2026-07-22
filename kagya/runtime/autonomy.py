@@ -21,6 +21,13 @@ from kagya.motivation import (
     IntrinsicGoalStatus,
 )
 from kagya.planning import PlanStatus, StepStatus
+from kagya.outbox import (
+    AcknowledgmentStatus,
+    DeliveryStatus,
+    OutboxMessageKind,
+    OutboxReferences,
+    OutboxUrgency,
+)
 from kagya.runtime.agent_runtime import (
     AgentEventType,
     AgentRuntime,
@@ -585,6 +592,21 @@ class SubjectScheduler:
                             )
                         )
         schedules.extend(self._derived_motivation_schedules())
+        outbox = getattr(self.main_loop, "outbox", None)
+        if outbox is not None:
+            for message in outbox.list_messages():
+                if (
+                    message.delivery_status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED}
+                    and message.acknowledgment_status == AcknowledgmentStatus.UNACKNOWLEDGED
+                ):
+                    schedules.append(
+                        self._derived(
+                            f"outbox-delivery:{message.message_id}:{message.not_before.isoformat()}",
+                            WakeUpKind.OUTBOX_DEADLINE,
+                            message.not_before,
+                            message.message_id,
+                        )
+                    )
         return schedules
 
     def _derived_motivation_schedules(self) -> list[WakeUpSchedule]:
@@ -839,6 +861,13 @@ class SubjectScheduler:
                 schedule.target_id or ""
             )
             outcome = decision.action.value
+        elif schedule.kind == WakeUpKind.OUTBOX_DEADLINE:
+            outbox = getattr(self.main_loop, "outbox", None)
+            if outbox is None:
+                raise ValueError("Proactive outbox is unavailable")
+            outcome = "delivered" if outbox.deliver() else "deferred"
+
+        self._enqueue_outcome(schedule, outcome)
 
         completed = schedule.model_copy(
             update={
@@ -908,7 +937,59 @@ class SubjectScheduler:
             return False
         if schedule.kind == WakeUpKind.MOTIVATION_DECAY:
             return False
+        if schedule.kind == WakeUpKind.OUTBOX_DEADLINE:
+            outbox = getattr(self.main_loop, "outbox", None)
+            if outbox is None:
+                return False
+            message = outbox.get(schedule.target_id or "")
+            return message.delivery_status in {
+                DeliveryStatus.PENDING,
+                DeliveryStatus.FAILED,
+            }
         return False
+
+    def _enqueue_outcome(self, schedule: WakeUpSchedule, outcome: str) -> None:
+        outbox = getattr(self.main_loop, "outbox", None)
+        target = schedule.target_id
+        if outbox is None or target is None or schedule.kind == WakeUpKind.OUTBOX_DEADLINE:
+            return
+        kind: OutboxMessageKind | None = None
+        title = "Subject state update"
+        body = f"Scheduled {schedule.kind.value} work completed with outcome {outcome}."
+        urgency = OutboxUrgency.NORMAL
+        references = OutboxReferences()
+        if schedule.kind == WakeUpKind.NEEDS_INFORMATION:
+            kind = OutboxMessageKind.QUESTION
+            title = "Information needed for goal"
+            body = "Additional information is needed before this goal can continue."
+            references = OutboxReferences(goal_id=target)
+        elif schedule.kind in {WakeUpKind.GOAL_DEADLINE, WakeUpKind.GOAL_REEVALUATION}:
+            kind = OutboxMessageKind.GOAL_STATE
+            title = "Goal state changed"
+            references = OutboxReferences(goal_id=target)
+        elif schedule.kind == WakeUpKind.COMMITMENT_DEADLINE:
+            kind = OutboxMessageKind.COMMITMENT_DEADLINE
+            title = "Commitment deadline reached"
+            urgency = OutboxUrgency.HIGH
+            references = OutboxReferences(commitment_id=target)
+        elif schedule.kind == WakeUpKind.COMMITMENT_REEVALUATION:
+            kind = OutboxMessageKind.RENEGOTIATION
+            title = "Commitment needs renegotiation"
+            urgency = OutboxUrgency.HIGH
+            references = OutboxReferences(commitment_id=target)
+        elif schedule.kind == WakeUpKind.PLAN_GENERATION:
+            kind = OutboxMessageKind.LONG_TASK_COMPLETE
+            title = "Plan generation completed"
+            references = OutboxReferences(goal_id=target)
+        if kind is not None:
+            outbox.enqueue(
+                kind,
+                title=title,
+                body=body,
+                deduplication_key=f"scheduler:{schedule.schedule_id}:{outcome}",
+                references=references,
+                urgency=urgency,
+            )
 
     def _finish_cycle(
         self,

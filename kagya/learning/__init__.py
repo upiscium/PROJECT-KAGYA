@@ -27,6 +27,7 @@ from kagya.learning.behavioral_evaluation import (
     StateTransition,
     TransitionExpectation,
     TransitionKind,
+    proactive_outbox_scenarios,
 )
 from kagya.learning.dream_dataset_generator import (
     DreamDatasetGenerator,
@@ -77,4 +78,5 @@ __all__ = [
     "TransitionKind",
     "format_training_text",
     "load_eval_sets",
+    "proactive_outbox_scenarios",
 ]

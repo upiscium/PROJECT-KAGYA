@@ -154,6 +154,11 @@ autonomy:
   max_inferences_per_cycle: 1
   max_wall_seconds_per_cycle: 5.0
 
+outbox:
+  quiet_hours_start: 22
+  quiet_hours_end: 7
+  max_deliveries_per_hour: 12
+
 observability:
   enabled: true
   metrics_path: .kagya/operational_metrics.json

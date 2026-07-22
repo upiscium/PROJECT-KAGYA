@@ -75,6 +75,11 @@ class AgentEventType(StrEnum):
     ACTION_EXECUTE = "action_execute"
     ACTION_CANCEL = "action_cancel"
     ACTION_COMPENSATE = "action_compensate"
+    OUTBOX_READ = "outbox_read"
+    OUTBOX_ENQUEUE = "outbox_enqueue"
+    OUTBOX_DELIVER = "outbox_deliver"
+    OUTBOX_RESPONSE = "outbox_response"
+    OUTBOX_FAILURE = "outbox_failure"
 
 
 @dataclass(frozen=True)

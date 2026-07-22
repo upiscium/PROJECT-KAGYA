@@ -358,6 +358,33 @@ export type Belief = {
 };
 export type BeliefListResponse = { beliefs: Belief[] };
 export type MotivationState = { schema_version: number; records: Array<Record<string, unknown>>; episodes: Array<Record<string, unknown>> };
+export type OutboxMessage = {
+  schema_version: 1;
+  message_id: string;
+  revision: number;
+  kind: "question" | "approval_request" | "commitment_deadline" | "goal_state" | "action_result" | "anomaly" | "renegotiation" | "long_task_complete";
+  title: string;
+  body: string;
+  context_id: string | null;
+  interlocutor_id: string | null;
+  references: { event_id: string | null; goal_id: string | null; plan_id: string | null; decision_id: string | null; action_id: string | null; commitment_id: string | null };
+  urgency: "low" | "normal" | "high" | "critical";
+  not_before: string;
+  expires_at: string | null;
+  channel: "local";
+  privacy_class: "public" | "interlocutor" | "operator";
+  delivery_status: "pending" | "delivered" | "failed" | "expired" | "cancelled";
+  acknowledgment_status: "unacknowledged" | "read" | "replied" | "approved" | "rejected";
+  deduplication_key: string;
+  created_at: string;
+  updated_at: string;
+  delivered_at: string | null;
+  acknowledged_at: string | null;
+  attempts: Array<{ attempt: number; attempted_at: string; status: "delivered" | "failed"; failure_code: string | null }>;
+  responses: Array<{ response_id: string; kind: string; actor_id: string; received_at: string; text: string | null; event_id: string | null; event_sequence: number | null }>;
+  last_failure_code: string | null;
+};
+export type OutboxMessageListResponse = { messages: OutboxMessage[] };
 
 export class ApiError extends Error {
   constructor(
@@ -492,4 +519,7 @@ export const api = {
   experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
   beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
   motivation: () => adminRequest<MotivationState>("/motivation"),
+  outboxMessages: () => adminRequest<OutboxMessageListResponse>("/outbox/messages"),
+  deliverOutbox: () => adminRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),
+  respondToOutbox: (messageId: string, kind: "read" | "reply" | "approval" | "reject", text?: string) => adminRequest<OutboxMessage>(`/outbox/messages/${encodeURIComponent(messageId)}/responses`, { method: "POST", body: JSON.stringify({ kind, text }) }),
 };

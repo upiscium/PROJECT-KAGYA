@@ -265,6 +265,12 @@ class ActionExecutionSettings(StrictBaseModel):
     calendar_path: Path = Path(".kagya/calendar.json")
 
 
+class OutboxSettings(StrictBaseModel):
+    quiet_hours_start: int = Field(default=22, ge=0, le=23)
+    quiet_hours_end: int = Field(default=7, ge=0, le=23)
+    max_deliveries_per_hour: int = Field(default=12, gt=0, le=1000)
+
+
 class AgentStateSettings(StrictBaseModel):
     path: Path = Path(".kagya/agent_state.json")
 
@@ -382,6 +388,7 @@ class Settings(StrictBaseModel):
     adapter_registry: AdapterRegistrySettings
     tools: ToolRegistrySettings
     actions: ActionExecutionSettings = Field(default_factory=ActionExecutionSettings)
+    outbox: OutboxSettings = Field(default_factory=OutboxSettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     agent_journal: AgentJournalSettings = Field(default_factory=AgentJournalSettings)
     agent_state_wal: AgentStateWalSettings = Field(

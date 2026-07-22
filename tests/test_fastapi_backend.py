@@ -2941,7 +2941,12 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
 ) -> None:
     settings = _settings(tmp_path)
     settings = settings.model_copy(
-        update={"autonomy": settings.autonomy.model_copy(update={"enabled": False})}
+        update={
+            "autonomy": settings.autonomy.model_copy(update={"enabled": False}),
+            "outbox": settings.outbox.model_copy(
+                update={"quiet_hours_start": 0, "quiet_hours_end": 0}
+            ),
+        }
     )
     candidate = {
         "candidate_id": "notify",
@@ -3015,10 +3020,20 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             headers=admin_headers(),
         )
         assert blocked.status_code == 409
+        assert client.get("/api/outbox/messages").status_code == 401
+        approval_message = client.get(
+            "/api/outbox/messages", headers=admin_headers()
+        ).json()["messages"][0]
+        assert approval_message["kind"] == "approval_request"
+        assert approval_message["references"]["action_id"] == intent["intent_id"]
+        delivered = client.post(
+            "/api/outbox/deliveries", headers=admin_headers()
+        )
+        assert delivered.status_code == 200
         approved = client.post(
-            f"/api/actions/intents/{intent['intent_id']}/approval",
+            f"/api/outbox/messages/{approval_message['message_id']}/responses",
             headers=admin_headers(),
-            json={"approved": True, "reason": "operator reviewed preview"},
+            json={"kind": "approval", "text": "operator reviewed preview"},
         )
         assert approved.status_code == 200
         executed = client.post(
@@ -3039,7 +3054,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
     wal_types = {
         record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
     }
-    assert {"action_intent", "action_approval", "action_execute"}.issubset(wal_types)
+    assert {"action_intent", "outbox_response", "action_execute"}.issubset(wal_types)
     with _client(tmp_path, settings=settings) as restarted:
         intents = restarted.get(
             "/api/actions/intents", headers=admin_headers()
@@ -3049,6 +3064,13 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         ).json()["receipts"]
         assert len(intents) == len(receipts) == 1
         assert intents[0]["status"] == "succeeded"
+        outbox_messages = restarted.get(
+            "/api/outbox/messages", headers=admin_headers()
+        ).json()["messages"]
+        assert any(item["kind"] == "action_result" for item in outbox_messages)
+        assert next(
+            item for item in outbox_messages if item["kind"] == "approval_request"
+        )["acknowledgment_status"] == "approved"
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

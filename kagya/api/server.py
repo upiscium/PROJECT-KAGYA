@@ -36,6 +36,7 @@ from kagya.api.routes import (
     training,
     values,
     autonomy,
+    outbox,
 )
 from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.config import NodeRole, Settings, get_settings, validate_deployment_hostname
@@ -44,6 +45,7 @@ from kagya.learning import AdapterRegistry, AdapterStatus
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
 from kagya.motivation import GoalStatus
+from kagya.outbox import Outbox
 from kagya.runtime import (
     AgentRuntime,
     AgentEvent,
@@ -158,6 +160,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(feedback.router)
         app.include_router(metacognition.router)
         app.include_router(relationships.router)
+        app.include_router(outbox.router)
 
     return app
 
@@ -278,6 +281,15 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             telemetry=app.state.operational_telemetry,
         )
     app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
+    outbox_settings = settings.outbox
+    app.state.outbox = Outbox(
+        app.state.main_loop,
+        quiet_hours_start=outbox_settings.quiet_hours_start,
+        quiet_hours_end=outbox_settings.quiet_hours_end,
+        max_deliveries_per_hour=outbox_settings.max_deliveries_per_hour,
+        event_recorder=app.state.runtime_event_log,
+    )
+    app.state.main_loop.outbox = app.state.outbox
     action_settings = settings.actions
     app.state.action_execution = ActionExecutionLayer(
         app.state.main_loop,

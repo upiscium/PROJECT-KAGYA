@@ -21,6 +21,7 @@ from kagya.decision import (
     PredictedOutcome,
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
+from kagya.outbox import DeliveryStatus, Outbox
 
 
 class _Loop:
@@ -126,6 +127,7 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     tmp_path: Path,
 ) -> None:
     loop = _Loop()
+    loop.outbox = Outbox(loop, quiet_hours_start=0, quiet_hours_end=0)
     _decision(
         loop,
         "decision-notify",
@@ -152,6 +154,10 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
     assert len(state.notifications) == 1
     assert state.notifications[0]["status"] == "queued"
+    assert len(loop.outbox.list_messages()) == 2
+    assert next(
+        item for item in loop.outbox.list_messages() if item.kind.value == "approval_request"
+    ).acknowledgment_status.value == "approved"
 
     restored = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -165,6 +171,9 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
     assert compensated.status == IntentStatus.COMPENSATED
     assert state.notifications[0]["status"] == "cancelled"
+    assert next(
+        item for item in loop.outbox.list_messages() if item.title == "Review"
+    ).delivery_status == DeliveryStatus.CANCELLED
     assert state.receipts[-1].status == ReceiptStatus.COMPENSATED
     assert state.receipts[-1].compensation_of == completed.receipt_id
     outcome = loop.decision_store.get("decision-notify").actual_outcome

@@ -14,6 +14,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from kagya.decision import DecisionStatus
+from kagya.outbox import (
+    OutboxMessageKind,
+    OutboxReferences,
+    OutboxUrgency,
+    PrivacyClass,
+)
 from kagya.runtime.agent_runtime import current_agent_event
 
 
@@ -434,6 +440,15 @@ class ActionExecutionLayer:
                 requested_at=now,
             ))
         self._save(state.model_copy(update={"intents": (*state.intents, intent), "approvals": approvals}))
+        if approval_id is not None:
+            self._enqueue_outbox(
+                OutboxMessageKind.APPROVAL_REQUEST,
+                title="Action approval required",
+                body=f"Review the bounded {tool_name} action before execution.",
+                deduplication_key=f"action-approval:{intent_id}",
+                intent=intent,
+                urgency=OutboxUrgency.HIGH,
+            )
         return intent
 
     def resolve_approval(
@@ -462,6 +477,17 @@ class ActionExecutionLayer:
         self._replace(state, updated, approvals=approvals)
         if not approved:
             self._resolve_decision(updated, False, "action_rejected")
+        outbox = getattr(self.main_loop, "outbox", None)
+        if outbox is not None:
+            event = current_agent_event()
+            outbox.respond_to_action_approval(
+                intent_id,
+                approved=approved,
+                actor_id=actor_id,
+                text=reason,
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            )
         return updated
 
     def execute(self, intent_id: str) -> ActionIntent:
@@ -581,6 +607,15 @@ class ActionExecutionLayer:
                 intent.tool_name,
             )
         self._resolve_decision(updated, valid, verification.reason)
+        if intent.tool_name != "local_notification_enqueue":
+            self._enqueue_outbox(
+                OutboxMessageKind.ACTION_RESULT,
+                title="Action completed" if valid else "Action verification failed",
+                body=f"The {intent.tool_name} action {'completed successfully' if valid else 'failed result verification'}.",
+                deduplication_key=f"action-result:{intent.intent_id}:{updated.revision}",
+                intent=updated,
+                urgency=OutboxUrgency.NORMAL if valid else OutboxUrgency.HIGH,
+            )
         return updated
 
     def cancel(self, intent_id: str) -> ActionIntent:
@@ -655,6 +690,9 @@ class ActionExecutionLayer:
             receipts=(*state.receipts, receipt),
             notifications=notifications,
         )
+        outbox = getattr(self.main_loop, "outbox", None)
+        if outbox is not None:
+            outbox.cancel(f"local-notification:{intent.idempotency_key}")
         record_compensation = getattr(
             self.main_loop, "record_decision_compensation", None
         )
@@ -704,6 +742,13 @@ class ActionExecutionLayer:
                 "created_at": self.clock().isoformat(),
             }
             self._save(state.model_copy(update={"notifications": (*state.notifications, notification)}))
+            self._enqueue_outbox(
+                OutboxMessageKind.ACTION_RESULT,
+                title=str(arguments["title"]),
+                body=str(arguments["body"]),
+                deduplication_key=f"local-notification:{intent.idempotency_key}",
+                intent=intent,
+            )
             return {"notification_id": notification["notification_id"], "status": "queued"}
         raise ActionPolicyError("Tool is not allowlisted")
 
@@ -836,7 +881,43 @@ class ActionExecutionLayer:
         self._replace(state, updated, receipts=(*state.receipts, receipt))
         if not retryable:
             self._resolve_decision(updated, False, f"action_{code}")
+        self._enqueue_outbox(
+            OutboxMessageKind.ANOMALY,
+            title="Action retry scheduled" if retryable else "Action failed",
+            body=f"The {intent.tool_name} action failed with code {code}.",
+            deduplication_key=f"action-failure:{intent.intent_id}:{updated.revision}",
+            intent=updated,
+            urgency=OutboxUrgency.HIGH,
+        )
         return updated
+
+    def _enqueue_outbox(
+        self,
+        kind: OutboxMessageKind,
+        *,
+        title: str,
+        body: str,
+        deduplication_key: str,
+        intent: ActionIntent,
+        urgency: OutboxUrgency = OutboxUrgency.NORMAL,
+    ) -> None:
+        outbox = getattr(self.main_loop, "outbox", None)
+        if outbox is None:
+            return
+        outbox.enqueue(
+            kind,
+            title=title,
+            body=body,
+            deduplication_key=deduplication_key,
+            references=OutboxReferences(
+                event_id=intent.provenance.triggering_event_id,
+                plan_id=intent.provenance.plan_id,
+                decision_id=intent.provenance.decision_id,
+                action_id=intent.intent_id,
+            ),
+            urgency=urgency,
+            privacy_class=PrivacyClass.OPERATOR,
+        )
 
     def _fail(self, intent: ActionIntent, code: str, status: ReceiptStatus) -> ActionIntent:
         now = self.clock()
@@ -855,6 +936,14 @@ class ActionExecutionLayer:
         state = self._state()
         self._replace(state, updated, receipts=(*state.receipts, receipt))
         self._resolve_decision(updated, False, f"action_{code}")
+        self._enqueue_outbox(
+            OutboxMessageKind.ANOMALY,
+            title="Action failed",
+            body=f"The {intent.tool_name} action failed with code {code}.",
+            deduplication_key=f"action-failure:{intent.intent_id}:{updated.revision}",
+            intent=updated,
+            urgency=OutboxUrgency.HIGH,
+        )
         return updated
 
     def _receipt(
