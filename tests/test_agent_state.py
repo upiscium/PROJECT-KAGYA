@@ -49,6 +49,7 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     loop.context_registry.register_interlocutor(
         InterlocutorModel(identity_key="person-1")
     )
+    relationship = loop.relationship_store.ensure_interlocutor("person-1")
     loop.surprisal_calculator.measure("", "target", model_key="dummy:model")
     loop._persist_appraisal_state()
     store = AgentStateStore(tmp_path / "agent_state.json")
@@ -73,6 +74,10 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.context_registry.get("ctx-one") is not None
     assert restored_loop.context_registry.get("ctx-one").status.value == "suspended"
     assert restored_loop.context_registry.interlocutors[0].identity_key == "person-1"
+    assert (
+        restored_loop.relationship_store.for_interlocutor("person-1").relationship_id
+        == relationship.relationship_id
+    )
     assert restored_loop.surprisal_calculator.history["dummy:model"].count == 1
 
 

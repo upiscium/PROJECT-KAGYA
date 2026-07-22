@@ -138,6 +138,14 @@ Authorized mutations append a hash-chained Journal audit record containing only 
 
 Identity-changing state uses typed origin provenance. Admin `POST /api/goals` accepts external-request proposals only; it cannot declare a Goal intrinsic on the subject's behalf. Adoption is a separate subject event that records endorsement. Value update requests are retained as operator feedback/evidence and cannot spoof self-origin through a caller-provided source label. Legacy Goal, Commitment, Value, and identity-proposal records migrate as inherited and uncertain rather than self-originated.
 
+## Relationship Continuity
+
+Each stable `interlocutor_key` maps to one versioned subjective Relationship across contexts. Relationship state keeps trust, familiarity, closeness, and caution as independent bounded axes, alongside perceived role, expectations, boundaries, reciprocity, shared Experience references, commitments, unresolved matters, conflict/repair history, uncertainty, and revisions. The other person's reported values and beliefs remain under `other_values` and `other_beliefs`; they are never copied into the subject's Value or Belief stores.
+
+Experience-derived changes require two consistent observations before an axis moves and each accepted observation is capped at `0.08`. A new alias also requires two independent evidence references and cannot be attached when it already belongs to another Relationship. This deliberately favors a missed merge over combining two people. Operators can inspect `GET /api/relationships`, correct a Relationship with `POST /api/relationships/{id}/corrections`, attach a corroborated alias with `POST /api/relationships/{id}/aliases`, and split an alias with `POST /api/relationships/{id}/split`. All routes require admin authorization and all mutations preserve evidence-linked revision history.
+
+Relationship state is part of the authoritative agent snapshot. Current relationship caution and uncertainty affect appraisal and Emotion; continuity summaries carry relationship-linked Goals, Commitments, and unresolved matters into later contexts; relationship-targeted Goals receive a bounded reciprocity/trust/caution adjustment; and Decision candidates retain explicit relationship appraisal contributions. Relationship APIs and snapshots contain structured references and state only, never chat text, prompts, hidden thoughts, or raw memory content.
+
 ## Multimodal Attachments
 
 The first real multimodal milestone supports one local image attachment for capable Transformers image-text models.

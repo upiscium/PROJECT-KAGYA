@@ -99,6 +99,7 @@ class InterlocutorSnapshot(_StateModel):
 class ContextStateSnapshot(_StateModel):
     frames: list[ContextFrameSnapshot] = Field(default_factory=list)
     interlocutors: list[InterlocutorSnapshot] = Field(default_factory=list)
+    relationships: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentStateSnapshot(_StateModel):
@@ -252,6 +253,7 @@ class AgentStateStore:
                     _interlocutor_snapshot(model)
                     for model in main_loop.context_registry.interlocutors
                 ],
+                relationships=main_loop.relationship_store.to_json(),
             ),
             extensions=state.extensions,
         )
@@ -288,6 +290,7 @@ class AgentStateStore:
                 for item in snapshot.context_state.interlocutors
             ),
         )
+        main_loop.relationship_store.restore(snapshot.context_state.relationships)
 
     def save_failed_sequence(self, sequence: int) -> AgentStateSnapshot | None:
         if self.last_snapshot is None:

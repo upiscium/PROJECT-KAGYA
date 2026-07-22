@@ -1,6 +1,6 @@
 """Integrated runtime main loop."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import time
 from typing import Any, Protocol
@@ -106,6 +106,7 @@ from kagya.motivation import (
     MotivationStatus,
 )
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.relationship import RelationshipState, RelationshipStore
 from kagya.runtime.session_state import SessionState
 from kagya.runtime.agent_state import PersistentAgentState
 from kagya.runtime.agent_runtime import current_agent_event
@@ -251,6 +252,7 @@ class KagyaMainLoop:
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
         self.experience_store = ExperienceStore()
+        self.relationship_store = RelationshipStore()
         self.narrative_self = NarrativeSelf()
         self.belief_store = BeliefStore()
         self.feedback_store = FeedbackStore()
@@ -284,6 +286,7 @@ class KagyaMainLoop:
         previous_default_context_id = self.default_context_id
         previous_calibration = self.surprisal_calculator.export_history()
         previous_experience_state = self.experience_store.to_json()
+        previous_relationship_state = self.relationship_store.to_json()
         previous_motivation_state = self.motivation_dynamics.to_json()
         previous_narrative_state = self.narrative_self.to_json()
         current_context = self._resolve_context(
@@ -333,16 +336,32 @@ class KagyaMainLoop:
             self.surprisal_calculator.restore_history(previous_calibration)
             raise
         try:
+            relationship_influence = self.relationship_store.influence(
+                current_context.participant_ids
+            )
             appraisal = self.appraiser.assess(
                 loss_measurement,
                 AppraisalSignals(
                     controllability=self.settings.appraisal.default_controllability
                     if loss_measurement.valid
                     else 0.5,
-                    certainty=self.settings.appraisal.default_certainty
-                    if loss_measurement.valid
-                    else 0.2,
-                    social_relevance=0.5 if current_context.participant_ids else 0.0,
+                    certainty=min(
+                        self.settings.appraisal.default_certainty
+                        if loss_measurement.valid
+                        else 0.2,
+                        relationship_influence.certainty,
+                    )
+                    if relationship_influence.relationship_refs
+                    else (
+                        self.settings.appraisal.default_certainty
+                        if loss_measurement.valid
+                        else 0.2
+                    ),
+                    threat=relationship_influence.threat,
+                    social_relevance=max(
+                        0.5 if current_context.participant_ids else 0.0,
+                        relationship_influence.social_relevance,
+                    ),
                     effort_cost=min(
                         1.0,
                         len(user_input.encode("utf-8"))
@@ -391,6 +410,9 @@ class KagyaMainLoop:
                 working_memory_view,
                 current_context=current_context,
                 attachments=attachments or [],
+                relationship_context=self._relationship_prompt_context(
+                    current_context.participant_ids
+                ),
             )
             generation_started = time.perf_counter()
             try:
@@ -522,6 +544,32 @@ class KagyaMainLoop:
                 )
             )
             self._persist_experience_state()
+            event_id = None if event is None else event.event_id
+            event_sequence = None if event is None else event.processing_sequence
+            relationships = self.relationship_store.observe_experience(
+                experience,
+                active_commitment_refs=tuple(
+                    f"commitment:{item.commitment_id}"
+                    for item in self.commitment_store.list_commitments(
+                        CommitmentStatus.ACTIVE
+                    )
+                ),
+                event_id=event_id,
+                event_sequence=event_sequence,
+            )
+            for relationship in relationships:
+                experience = self.experience_store.link_result(
+                    experience.experience_id,
+                    kind="relationship",
+                    reference=(
+                        f"relationship:{relationship.relationship_id}@"
+                        f"{relationship.revision}"
+                    ),
+                    evidence_refs=(f"experience:{experience.experience_id}",),
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                )
+            self._persist_experience_state()
             narrative_episode = self.narrative_self.observe_experience(experience)
             if narrative_episode is not None:
                 experience = self.experience_store.link_result(
@@ -588,6 +636,7 @@ class KagyaMainLoop:
             self._persist_appraisal_state()
             self.experience_store.restore(previous_experience_state)
             self._persist_experience_state()
+            self.relationship_store.restore(previous_relationship_state)
             self.motivation_dynamics.restore(previous_motivation_state)
             self._persist_motivation_state()
             self.narrative_self.restore(previous_narrative_state)
@@ -1256,6 +1305,22 @@ class KagyaMainLoop:
         if value_effects:
             self.value_system.evaluate({"goal_proposal": value_effects})
         target = structured_target or {}
+        relationship = self._relationship_for_target(target)
+        if relationship is not None:
+            expected_utility = max(
+                0.0,
+                min(
+                    1.0,
+                    expected_utility
+                    + 0.1
+                    * (
+                        relationship.reciprocity
+                        + relationship.axes.trust
+                        - relationship.axes.caution
+                        - 0.5
+                    ),
+                ),
+            )
         narrative_selection = self.narrative_self.select_relevant(
             theme_codes=_string_values(target.get("theme_codes"))
             + _string_values(target.get("topic_tags")),
@@ -1408,6 +1473,7 @@ class KagyaMainLoop:
         commitment_id: str | None = None,
         origin_actor: OriginActor | None = None,
         origin_source_ref: str | None = None,
+        interlocutor_key: str | None = None,
     ) -> Commitment:
         event = current_agent_event()
         identifier = commitment_id or str(uuid4())
@@ -1420,6 +1486,11 @@ class KagyaMainLoop:
         goal = self.propose_goal(
             goal_type=GoalType.COMMITMENT,
             description=description,
+            structured_target=(
+                None
+                if interlocutor_key is None
+                else {"interlocutor_key": interlocutor_key}
+            ),
             origin_actor=origin_actor,
             origin_input_kind=OriginInputKind.REQUEST,
             origin_source_ref=origin_source_ref,
@@ -1448,6 +1519,10 @@ class KagyaMainLoop:
         self._persist_self_model_state()
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
+        if interlocutor_key is not None:
+            self.relationship_store.link_commitment(
+                interlocutor_key, f"commitment:{commitment.commitment_id}"
+            )
         return self.commitment_store.get(commitment.commitment_id)
 
     def transition_commitment(
@@ -1487,6 +1562,11 @@ class KagyaMainLoop:
             outcome=outcome,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
+        )
+        self.relationship_store.transition_commitment(
+            f"commitment:{commitment_id}",
+            status=status.value,
+            evidence_ref=f"commitment:{commitment_id}:{status.value}",
         )
         self._sync_motivation_working_memory()
         self._persist_motivation_state()
@@ -1558,6 +1638,11 @@ class KagyaMainLoop:
             outcome=outcome,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
+        )
+        self.relationship_store.transition_commitment(
+            f"commitment:{commitment.commitment_id}",
+            status=mapped.value,
+            evidence_ref=f"commitment:{commitment.commitment_id}:{mapped.value}",
         )
 
     def _sync_motivation_working_memory(self) -> None:
@@ -2121,8 +2206,32 @@ class KagyaMainLoop:
                 ).claim_ids
             )
         )
+        decision_context = (
+            None if context_id is None else self.context_registry.get(context_id)
+        )
+        relationship_influence = self.relationship_store.influence(
+            () if decision_context is None else decision_context.participant_ids
+        )
+        relationship_candidates = [
+            replace(
+                candidate,
+                appraisal_contributions={
+                    **candidate.appraisal_contributions,
+                    "relationship_caution": -relationship_influence.threat
+                    * candidate.estimated_risk,
+                    "relationship_reciprocity": (
+                        relationship_influence.expected_reciprocity - 0.5
+                    )
+                    * (1.0 - candidate.estimated_risk)
+                    if candidate.candidate_type.value
+                    in {"respond", "request_information"}
+                    else 0.0,
+                },
+            )
+            for candidate in candidates
+        ]
         record = self.decision_store.create(
-            candidates,
+            relationship_candidates,
             triggering_event_id=None if event is None else event.event_id,
             triggering_event_sequence=None
             if event is None
@@ -2208,6 +2317,57 @@ class KagyaMainLoop:
         self._sync_self_model_working_memory(candidates)
         self._persist_decision_state()
         return record
+
+    def correct_relationship(
+        self,
+        relationship_id: str,
+        *,
+        reason: str,
+        evidence_refs: tuple[str, ...],
+        **updates: Any,
+    ) -> RelationshipState:
+        event = current_agent_event()
+        return self.relationship_store.correct(
+            relationship_id,
+            reason=reason,
+            evidence_refs=evidence_refs,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+            **updates,
+        )
+
+    def _relationship_for_target(
+        self, target: dict[str, Any]
+    ) -> RelationshipState | None:
+        key = target.get("interlocutor_key")
+        return (
+            self.relationship_store.for_interlocutor(key)
+            if isinstance(key, str)
+            else None
+        )
+
+    def _relationship_prompt_context(
+        self, interlocutor_keys: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        lines: list[str] = []
+        for key in interlocutor_keys:
+            state = self.relationship_store.for_interlocutor(key)
+            if state is None:
+                continue
+            lines.append(
+                "- "
+                f"relationship={state.relationship_id}@{state.revision}; "
+                f"trust={state.axes.trust:.3f}; familiarity={state.axes.familiarity:.3f}; "
+                f"closeness={state.axes.closeness:.3f}; caution={state.axes.caution:.3f}; "
+                f"reciprocity={state.reciprocity:.3f}; uncertainty={state.uncertainty:.3f}"
+            )
+            if state.commitment_refs:
+                lines.append("- commitments: " + ", ".join(state.commitment_refs))
+            if state.unresolved_matter_refs:
+                lines.append(
+                    "- unresolved: " + ", ".join(state.unresolved_matter_refs[-5:])
+                )
+        return tuple(lines)
 
     def generate_decision_candidates(self, situation: str) -> list[ActionCandidate]:
         raw = self.provider.generate(schema_candidate_prompt(situation))
@@ -2620,6 +2780,8 @@ class KagyaMainLoop:
             self.context_registry.register_interlocutor(
                 InterlocutorModel(identity_key=interlocutor_key)
             )
+        if interlocutor_key is not None:
+            self.relationship_store.ensure_interlocutor(interlocutor_key)
         return frame
 
     def _admit_runtime_context(

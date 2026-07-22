@@ -142,6 +142,7 @@ class ExperienceRecord:
                 "self_model",
                 "decision",
                 "narrative",
+                "relationship",
             }:
                 raise ValueError(f"Unsupported experience result kind: {kind}")
             _safe_codes(refs, "experience result reference")
@@ -270,6 +271,7 @@ class ExperienceStore:
             "self_model",
             "decision",
             "narrative",
+            "relationship",
         }:
             raise ValueError(f"Unsupported experience result kind: {kind}")
         _safe_ref(reference, "experience result reference")

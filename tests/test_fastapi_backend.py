@@ -131,6 +131,52 @@ def test_experience_api_exposes_structured_state_without_chat_content(
     assert "hidden_thought" not in serialized
 
 
+def test_relationship_api_is_admin_only_versioned_and_private(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    chat = client.post(
+        "/api/chat",
+        json={
+            "text": "private relationship evidence",
+            "attachments": [],
+            "interlocutor_key": "person-one",
+        },
+    ).json()
+
+    assert client.get("/api/relationships").status_code == 401
+    listed = client.get("/api/relationships", headers=admin_headers())
+    relationship = listed.json()["relationships"][0]
+    corrected = client.post(
+        f"/api/relationships/{relationship['relationship_id']}/corrections",
+        headers=admin_headers(),
+        json={
+            "reason": "operator_review",
+            "evidence_refs": [f"experience:{chat['experience_id']}"],
+            "perceived_role": {
+                "value": "collaborator",
+                "confidence": 0.7,
+                "evidence_refs": [f"experience:{chat['experience_id']}"],
+            },
+            "other_values": {
+                "privacy": {
+                    "value": "important",
+                    "confidence": 0.6,
+                    "evidence_refs": [f"experience:{chat['experience_id']}"],
+                }
+            },
+        },
+    )
+
+    assert listed.status_code == 200
+    assert corrected.status_code == 200
+    assert corrected.json()["revision"] == relationship["revision"] + 1
+    assert corrected.json()["other_values"]["privacy"]["value"] == "important"
+    serialized = json.dumps(corrected.json())
+    assert "private relationship evidence" not in serialized
+    assert "Visible API answer" not in serialized
+    assert "hidden_thought" not in serialized
+    assert "prompt" not in serialized
+
+
 def test_narrative_self_api_is_admin_only_and_returns_structured_state(
     tmp_path: Path,
 ) -> None:
