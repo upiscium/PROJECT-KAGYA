@@ -141,6 +141,14 @@ Identity-changing state uses typed origin provenance. Admin `POST /api/goals` ac
 
 Active Goals can be decomposed through the admin-only `/api/plans` API into strict schema-v1 Plans and Steps. Plans retain immutable revision snapshots and operator change reasons; reject unknown dependencies, dependency cycles, unknown/private fields, and raw model prose; and require expected-observation evidence before Step or Goal completion. Retry, timeout, verification, and rollback policies are structured state only. The scheduler never executes a tool or rollback. Only dependency-ready Steps enter Working Memory or become Plan-linked ActionCandidates, and all lifecycle changes persist through `AgentRuntime`, the authoritative snapshot, and the private state WAL for restart recovery.
 
+## Responsibility Model
+
+Desire, Intention, and Commitment are separate durable layers. Desire remains a decaying `MotivationRecord`; an adopted Goal is an Intention that can reference the Desires that prompted it; a Commitment is an accepted responsibility whose lifetime is independent of those Desires. Desire decay or loss therefore never releases, fulfills, or breaches an accepted Commitment.
+
+`POST /api/commitments` records an external proposal only. It stores typed origin, beneficiary, scope, deadline, cost, burden, fulfillability, Relationship references, and unresolved Desire/Value/Commitment conflicts, but it cannot create a Goal or active Commitment. `POST /api/commitments/{id}/accept` requires a separate explicit self-endorsement and creates the linked Intention. Acceptance, fulfillability reassessment, renegotiation, fulfillment, release, breach, repair, and accountability evidence remain in append-only lifecycle records.
+
+An impossible fulfillability reassessment retains the Commitment and creates a structured Decision containing at least `renegotiate_commitment` and `notify_beneficiary_of_impossibility` options; it does not silently abandon the responsibility. At-risk or impossible commitments receive Scheduler reevaluation wake-ups. Breach and repair evidence updates linked Relationship conflict/repair history and Narrative Self commitment events. Admin lifecycle routes are `POST /api/commitments/{id}/reassess`, `/renegotiate`, `/transition`, and `/repair`; inspection remains protected by the admin token.
+
 ## Metacognition
 
 Metacognitive boundaries distinguish `unknown`, `uncertain`, `unable`, and `needs_help` and can steer explicitly scoped Decisions toward `request_information`, `defer`, `observe`, or `delegate`. Assessments record Self Model revisions, Narrative Self references, cognitive load, attention saturation, emotion influence, prediction/outcome evidence, and recurring error/bias hypotheses. Generated apologies, hidden thought, and model self-report are not accepted as competence or calibration authority.

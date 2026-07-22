@@ -100,12 +100,20 @@ def test_counterevidence_and_round_trip_preserve_revision_history() -> None:
         reason_code="missed_commitment",
         counterevidence_refs=("decision:failed",),
     )
+    commitment_event = narrative.record_commitment_event(
+        "commitment:one",
+        kind="breach",
+        description="A responsibility was not fulfilled",
+        evidence_refs=("decision:failed",),
+        relationship_refs=("relationship:one",),
+    )
     restored = NarrativeSelf()
     restored.restore(json.loads(json.dumps(narrative.to_json())))
 
     assert revised.status == IdentityClaimStatus.CONTESTED
     assert revised.counterevidence_refs == ("decision:failed",)
     assert restored.get_claim("reliable") == revised
+    assert restored.commitment_events[commitment_event.event_id] == commitment_event
 
 
 def test_value_change_and_failure_are_preserved_as_turning_points() -> None:

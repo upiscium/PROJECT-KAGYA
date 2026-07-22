@@ -12,7 +12,12 @@ from kagya.api.dependencies import (
     get_main_loop,
     require_admin,
 )
-from kagya.motivation import CommitmentStatus, GoalStatus, GoalType
+from kagya.motivation import (
+    CommitmentFulfillability,
+    CommitmentStatus,
+    GoalStatus,
+    GoalType,
+)
 from kagya.identity import OriginActor
 from kagya.runtime import AgentEventType, AgentRuntime
 
@@ -43,14 +48,44 @@ class GoalTransitionRequest(BaseModel):
 class CommitmentRequest(BaseModel):
     commitment_id: str | None = Field(default=None, min_length=1)
     description: str = Field(min_length=1)
+    deadline: datetime | None = None
+    interlocutor_key: str | None = Field(default=None, min_length=1, max_length=200)
+    beneficiary: str = Field(default="self", min_length=1, max_length=200)
+    scope: str | None = Field(default=None, min_length=1, max_length=2000)
+    cost: float = Field(default=0.0, ge=0.0, le=1.0)
+    burden: float = Field(default=0.0, ge=0.0, le=1.0)
+    fulfillability: CommitmentFulfillability = CommitmentFulfillability.UNKNOWN
+    fulfillability_reason: str | None = Field(default=None, min_length=1)
+    related_desire_ids: list[str] = Field(default_factory=list)
+    conflicting_desire_ids: list[str] = Field(default_factory=list)
+    conflicting_value_ids: list[str] = Field(default_factory=list)
+    conflicting_commitment_ids: list[str] = Field(default_factory=list)
+
+
+class CommitmentAcceptanceRequest(BaseModel):
+    self_endorsement: str = Field(min_length=1, max_length=160)
     priority: float = Field(default=0.7, ge=0.0, le=1.0)
     urgency: float = Field(default=0.7, ge=0.0, le=1.0)
     expected_utility: float = Field(default=0.7, ge=0.0, le=1.0)
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
-    deadline: datetime | None = None
     value_effects: dict[str, float] = Field(default_factory=dict)
     conflict_ids: list[str] = Field(default_factory=list)
-    interlocutor_key: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class CommitmentReassessmentRequest(BaseModel):
+    fulfillability: CommitmentFulfillability
+    reason: str = Field(min_length=1)
+
+
+class CommitmentRenegotiationRequest(BaseModel):
+    reason: str = Field(min_length=1)
+    proposed_scope: str | None = Field(default=None, min_length=1)
+    proposed_deadline: datetime | None = None
+
+
+class CommitmentRepairRequest(BaseModel):
+    reason: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(min_length=1)
 
 
 class CommitmentTransitionRequest(BaseModel):
@@ -244,13 +279,17 @@ def create_commitment(
             source="api.commitments.create",
             handler=lambda: main_loop.create_commitment(
                 description=body.description,
-                priority=body.priority,
-                urgency=body.urgency,
-                expected_utility=body.expected_utility,
-                confidence=body.confidence,
                 deadline=_deadline(body.deadline),
-                value_effects=body.value_effects,
-                conflict_ids=tuple(body.conflict_ids),
+                beneficiary=body.beneficiary,
+                scope=body.scope,
+                cost=body.cost,
+                burden=body.burden,
+                fulfillability=body.fulfillability,
+                fulfillability_reason=body.fulfillability_reason,
+                related_desire_ids=tuple(body.related_desire_ids),
+                conflicting_desire_ids=tuple(body.conflicting_desire_ids),
+                conflicting_value_ids=tuple(body.conflicting_value_ids),
+                conflicting_commitment_ids=tuple(body.conflicting_commitment_ids),
                 commitment_id=body.commitment_id,
                 origin_actor=OriginActor.OPERATOR,
                 origin_source_ref="admin:commitment_request",
@@ -264,6 +303,116 @@ def create_commitment(
     return asdict(commitment)
 
 
+@commitment_router.post("/{commitment_id}/accept")
+def accept_commitment(
+    commitment_id: str,
+    body: CommitmentAcceptanceRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        commitment = execute_agent_event(
+            runtime,
+            AgentEventType.GOAL_UPDATE,
+            source="api.commitments.accept",
+            handler=lambda: main_loop.accept_commitment(
+                commitment_id,
+                self_endorsement=body.self_endorsement,
+                priority=body.priority,
+                urgency=body.urgency,
+                expected_utility=body.expected_utility,
+                confidence=body.confidence,
+                value_effects=body.value_effects,
+                conflict_ids=tuple(body.conflict_ids),
+            ),
+            payload={"commitment_id": commitment_id},
+            correlation_id=commitment_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return asdict(commitment)
+
+
+@commitment_router.post("/{commitment_id}/reassess")
+def reassess_commitment(
+    commitment_id: str,
+    body: CommitmentReassessmentRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        commitment = execute_agent_event(
+            runtime,
+            AgentEventType.GOAL_UPDATE,
+            source="api.commitments.reassess",
+            handler=lambda: main_loop.reassess_commitment(
+                commitment_id,
+                fulfillability=body.fulfillability,
+                reason=body.reason,
+            ),
+            payload={"commitment_id": commitment_id},
+            correlation_id=commitment_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return asdict(commitment)
+
+
+@commitment_router.post("/{commitment_id}/renegotiate")
+def renegotiate_commitment(
+    commitment_id: str,
+    body: CommitmentRenegotiationRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        commitment = execute_agent_event(
+            runtime,
+            AgentEventType.GOAL_UPDATE,
+            source="api.commitments.renegotiate",
+            handler=lambda: main_loop.renegotiate_commitment(
+                commitment_id,
+                reason=body.reason,
+                proposed_scope=body.proposed_scope,
+                proposed_deadline=_deadline(body.proposed_deadline),
+            ),
+            payload={"commitment_id": commitment_id},
+            correlation_id=commitment_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return asdict(commitment)
+
+
+@commitment_router.post("/{commitment_id}/repair")
+def repair_commitment(
+    commitment_id: str,
+    body: CommitmentRepairRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        commitment = execute_agent_event(
+            runtime,
+            AgentEventType.GOAL_UPDATE,
+            source="api.commitments.repair",
+            handler=lambda: main_loop.repair_commitment(
+                commitment_id,
+                reason=body.reason,
+                evidence_refs=tuple(body.evidence_refs),
+            ),
+            payload={"commitment_id": commitment_id},
+            correlation_id=commitment_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return asdict(commitment)
+
+
 @commitment_router.post("/{commitment_id}/transition")
 def transition_commitment(
     commitment_id: str,
@@ -271,8 +420,12 @@ def transition_commitment(
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
-    if body.status == CommitmentStatus.ACTIVE:
-        raise HTTPException(status_code=409, detail="Commitment is already active")
+    if body.status in {
+        CommitmentStatus.PROPOSED,
+        CommitmentStatus.ACTIVE,
+        CommitmentStatus.RENEGOTIATING,
+    }:
+        raise HTTPException(status_code=409, detail="Use the dedicated lifecycle route")
     main_loop = get_main_loop(request)
     try:
         commitment = execute_agent_event(

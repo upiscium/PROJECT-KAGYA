@@ -1303,20 +1303,81 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
         for item in client.app.state.main_loop.working_memory.items
     )
 
+    desire = client.app.state.main_loop.motivation_dynamics.observe_future_self_gap(
+        "future-help",
+        gap=0.8,
+        uncertainty=0.2,
+    )
     commitment = client.post(
         "/api/commitments",
         headers=headers,
         json={
             "commitment_id": "promise-1",
             "description": "Provide a follow-up",
-            "value_effects": {"care": 0.5},
+            "beneficiary": "user:one",
+            "scope": "Provide one follow-up response",
+            "burden": 0.4,
+            "interlocutor_key": "user:one",
+            "related_desire_ids": [desire.motivation_id],
         },
     )
     assert commitment.status_code == 200
-    assert commitment.json()["status"] == "active"
+    assert commitment.json()["status"] == "proposed"
     assert commitment.json()["identity_origin"]["actor"] == "operator"
-    assert commitment.json()["identity_origin"]["endorsement"] == "endorsed"
+    assert commitment.json()["identity_origin"]["endorsement"] == "pending"
+    assert (
+        "promise-1" not in client.app.state.main_loop.self_model.state.commitment_refs
+    )
+    assert "commitment:promise-1" not in client.app.state.main_loop.goal_manager.goals
+    accepted = client.post(
+        "/api/commitments/promise-1/accept",
+        headers=headers,
+        json={
+            "self_endorsement": "reviewed_scope_and_accepted",
+            "value_effects": {"care": 0.5},
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "active"
+    assert accepted.json()["acceptance_ref"] == "reviewed_scope_and_accepted"
+    assert accepted.json()["identity_origin"]["endorsement"] == "endorsed"
     assert "promise-1" in client.app.state.main_loop.self_model.state.commitment_refs
+    client.app.state.main_loop.decay_motivation(100.0)
+    assert (
+        client.app.state.main_loop.commitment_store.get("promise-1").status.value
+        == "active"
+    )
+
+    impossible = client.post(
+        "/api/commitments/promise-1/reassess",
+        headers=headers,
+        json={
+            "fulfillability": "impossible",
+            "reason": "required resource unavailable",
+        },
+    )
+    assert impossible.status_code == 200
+    decision_ref = impossible.json()["decision_refs"][-1]
+    decision_id = decision_ref.removeprefix("decision:")
+    decision = client.app.state.main_loop.decision_store.get(decision_id)
+    assert {
+        item.candidate.proposed_action for item in decision.considered_candidates
+    } >= {"renegotiate_commitment", "notify_beneficiary_of_impossibility"}
+    renegotiated = client.post(
+        "/api/commitments/promise-1/renegotiate",
+        headers=headers,
+        json={
+            "reason": "scope cannot be fulfilled",
+            "proposed_scope": "Notify the beneficiary and agree new terms",
+        },
+    )
+    assert renegotiated.status_code == 200
+    assert renegotiated.json()["status"] == "renegotiating"
+    assert renegotiated.json()["scope"] == "Provide one follow-up response"
+    assert (
+        renegotiated.json()["proposed_scope"]
+        == "Notify the beneficiary and agree new terms"
+    )
     fulfilled = client.post(
         "/api/commitments/promise-1/transition",
         headers=headers,
@@ -1331,6 +1392,52 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     related_goal = client.app.state.main_loop.goal_manager.get("commitment:promise-1")
     assert related_goal.goal_type.value == "commitment"
     assert related_goal.status.value == "completed"
+
+    breached = client.post(
+        "/api/commitments",
+        headers=headers,
+        json={
+            "commitment_id": "promise-breach",
+            "description": "Send an update",
+            "beneficiary": "user:one",
+            "interlocutor_key": "user:one",
+        },
+    )
+    assert breached.json()["status"] == "proposed"
+    assert (
+        client.post(
+            "/api/commitments/promise-breach/accept",
+            headers=headers,
+            json={"self_endorsement": "accepted_update_responsibility"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/commitments/promise-breach/transition",
+            headers=headers,
+            json={"status": "breached", "reason": "update omitted"},
+        ).status_code
+        == 200
+    )
+    repaired = client.post(
+        "/api/commitments/promise-breach/repair",
+        headers=headers,
+        json={
+            "reason": "late update sent and acknowledged",
+            "evidence_refs": ["experience:repair-1"],
+        },
+    )
+    assert repaired.status_code == 200
+    assert repaired.json()["accountability"][-1]["action"] == "repair"
+    relationship = client.app.state.main_loop.relationship_store.for_interlocutor(
+        "user:one"
+    )
+    assert "experience:repair-1" in relationship.repair_refs
+    assert {
+        item.kind
+        for item in client.app.state.main_loop.narrative_self.commitment_events.values()
+    } >= {"breach", "repair"}
 
     expired_commitment = client.post(
         "/api/commitments",

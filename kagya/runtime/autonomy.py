@@ -13,7 +13,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.decision import DecisionStatus
-from kagya.motivation import CommitmentStatus, GoalStatus
+from kagya.motivation import CommitmentFulfillability, CommitmentStatus, GoalStatus
 from kagya.planning import PlanStatus, StepStatus
 from kagya.runtime.agent_runtime import (
     AgentEventType,
@@ -29,6 +29,7 @@ SCHEDULER_STATE_KEY = "subject_scheduler"
 class WakeUpKind(StrEnum):
     GOAL_DEADLINE = "goal_deadline"
     COMMITMENT_DEADLINE = "commitment_deadline"
+    COMMITMENT_REEVALUATION = "commitment_reevaluation"
     GOAL_REEVALUATION = "goal_reevaluation"
     NEEDS_INFORMATION = "needs_information"
     DECISION_OUTCOME = "decision_outcome"
@@ -355,15 +356,34 @@ class SubjectScheduler:
                         goal.goal_id,
                     )
                 )
-        for commitment in self.main_loop.commitment_store.list_commitments(
-            CommitmentStatus.ACTIVE
-        ):
+        commitments = [
+            *self.main_loop.commitment_store.list_commitments(CommitmentStatus.ACTIVE),
+            *self.main_loop.commitment_store.list_commitments(
+                CommitmentStatus.RENEGOTIATING
+            ),
+        ]
+        for commitment in commitments:
             if commitment.deadline is not None:
                 schedules.append(
                     self._derived(
                         f"commitment-deadline:{commitment.commitment_id}:{commitment.deadline}",
                         WakeUpKind.COMMITMENT_DEADLINE,
                         datetime.fromisoformat(commitment.deadline),
+                        commitment.commitment_id,
+                    )
+                )
+            if commitment.fulfillability in {
+                CommitmentFulfillability.AT_RISK,
+                CommitmentFulfillability.IMPOSSIBLE,
+            }:
+                wake_at = datetime.fromisoformat(commitment.updated_at) + timedelta(
+                    seconds=self.reevaluation_interval_seconds
+                )
+                schedules.append(
+                    self._derived(
+                        f"commitment-reevaluation:{commitment.commitment_id}:{wake_at.isoformat()}",
+                        WakeUpKind.COMMITMENT_REEVALUATION,
+                        wake_at,
                         commitment.commitment_id,
                     )
                 )
@@ -455,13 +475,31 @@ class SubjectScheduler:
             commitment = self.main_loop.commitment_store.commitments.get(
                 schedule.target_id or ""
             )
-            if commitment is not None and commitment.status == CommitmentStatus.ACTIVE:
+            if commitment is not None and commitment.status in {
+                CommitmentStatus.ACTIVE,
+                CommitmentStatus.RENEGOTIATING,
+            }:
                 self.main_loop.transition_commitment(
                     commitment.commitment_id,
                     CommitmentStatus.BREACHED,
                     reason="deadline_expired",
                 )
                 outcome = "commitment_breached"
+        elif schedule.kind == WakeUpKind.COMMITMENT_REEVALUATION:
+            commitment = self.main_loop.commitment_store.commitments.get(
+                schedule.target_id or ""
+            )
+            if commitment is not None and commitment.status in {
+                CommitmentStatus.ACTIVE,
+                CommitmentStatus.RENEGOTIATING,
+            }:
+                self.main_loop.reassess_commitment(
+                    commitment.commitment_id,
+                    fulfillability=commitment.fulfillability,
+                    reason=commitment.fulfillability_reason
+                    or "scheduled_fulfillability_reassessment",
+                )
+                outcome = "commitment_reevaluated"
         elif schedule.kind == WakeUpKind.DECISION_OUTCOME:
             decision = self.main_loop.decision_store.records.get(
                 schedule.target_id or ""
@@ -529,6 +567,23 @@ class SubjectScheduler:
             goal = self.main_loop.goal_manager.goals.get(schedule.target_id or "")
             return goal is not None and (
                 goal.status == GoalStatus.SUSPENDED or goal.needs_information
+            )
+        if schedule.kind == WakeUpKind.COMMITMENT_REEVALUATION:
+            commitment = self.main_loop.commitment_store.commitments.get(
+                schedule.target_id or ""
+            )
+            return (
+                commitment is not None
+                and commitment.status
+                in {
+                    CommitmentStatus.ACTIVE,
+                    CommitmentStatus.RENEGOTIATING,
+                }
+                and commitment.fulfillability
+                in {
+                    CommitmentFulfillability.AT_RISK,
+                    CommitmentFulfillability.IMPOSSIBLE,
+                }
             )
         return False
 
