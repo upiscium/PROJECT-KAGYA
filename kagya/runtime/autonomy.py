@@ -18,6 +18,7 @@ from kagya.motivation import (
     CommitmentStatus,
     GoalStatus,
     MotivationStatus,
+    IntrinsicGoalStatus,
 )
 from kagya.planning import PlanStatus, StepStatus
 from kagya.runtime.agent_runtime import (
@@ -47,6 +48,9 @@ class WakeUpKind(StrEnum):
     STEP_TIMEOUT = "step_timeout"
     MOTIVATION_REEVALUATION = "motivation_reevaluation"
     MOTIVATION_DECAY = "motivation_decay"
+    INTRINSIC_DELIBERATION = "intrinsic_deliberation"
+    PLAN_GENERATION = "plan_generation"
+    INTRINSIC_ADOPTION = "intrinsic_adoption"
 
 
 class ScheduleStatus(StrEnum):
@@ -250,8 +254,13 @@ class SubjectScheduler:
                 ) -> tuple[str, int]:
                     return self._process(item, remaining_goals)
 
+                event_type = {
+                    WakeUpKind.INTRINSIC_DELIBERATION: AgentEventType.INTRINSIC_GOAL_DELIBERATE,
+                    WakeUpKind.PLAN_GENERATION: AgentEventType.PLAN_GENERATE,
+                    WakeUpKind.INTRINSIC_ADOPTION: AgentEventType.INTRINSIC_GOAL_ADOPT,
+                }.get(schedule.kind, AgentEventType.AUTONOMY_WAKE)
                 outcome = self.runtime.execute(
-                    AgentEventType.AUTONOMY_WAKE,
+                    event_type,
                     source="scheduler.wake",
                     handler=process,
                     payload={
@@ -341,6 +350,40 @@ class SubjectScheduler:
                 GoalStatus.FAILED,
             }:
                 continue
+            intrinsic_status = getattr(goal, "intrinsic_status", None)
+            if intrinsic_status in {
+                IntrinsicGoalStatus.PROPOSAL,
+                IntrinsicGoalStatus.DEFERRED,
+            }:
+                wake_at = (
+                    datetime.fromisoformat(goal.updated_at)
+                    if intrinsic_status == IntrinsicGoalStatus.PROPOSAL
+                    else datetime.fromisoformat(goal.updated_at)
+                    + timedelta(seconds=self.reevaluation_interval_seconds)
+                )
+                schedules.append(
+                    self._derived(
+                        f"intrinsic-deliberation:{goal.goal_id}:{wake_at.isoformat()}",
+                        WakeUpKind.INTRINSIC_DELIBERATION,
+                        wake_at,
+                        goal.goal_id,
+                    )
+                )
+            elif intrinsic_status == IntrinsicGoalStatus.ENDORSED:
+                plans = self.main_loop.plan_store.list_plans(goal_id=goal.goal_id)
+                intrinsic_kind = (
+                    WakeUpKind.PLAN_GENERATION
+                    if not plans
+                    else WakeUpKind.INTRINSIC_ADOPTION
+                )
+                schedules.append(
+                    self._derived(
+                        f"{intrinsic_kind.value}:{goal.goal_id}:{goal.updated_at}",
+                        intrinsic_kind,
+                        datetime.fromisoformat(goal.updated_at),
+                        goal.goal_id,
+                    )
+                )
             if goal.deadline is not None:
                 schedules.append(
                     self._derived(
@@ -510,7 +553,9 @@ class SubjectScheduler:
                     add(f"self-conflict:{conflict.conflict_id}", conflict.created_at)
             for projection in narrative.future_self.values():
                 if projection.gap > 0.0:
-                    add(f"future-self:{projection.projection_id}", projection.updated_at)
+                    add(
+                        f"future-self:{projection.projection_id}", projection.updated_at
+                    )
 
         relationships = getattr(self.main_loop, "relationship_store", None)
         if relationships is not None:
@@ -562,9 +607,7 @@ class SubjectScheduler:
             created_at=wake_at,
         )
 
-    def _process(
-        self, schedule: WakeUpSchedule, goal_budget: int
-    ) -> tuple[str, int]:
+    def _process(self, schedule: WakeUpSchedule, goal_budget: int) -> tuple[str, int]:
         stored = self._stored_schedules()
         current = next(
             (item for item in stored if item.schedule_id == schedule.schedule_id), None
@@ -662,6 +705,19 @@ class SubjectScheduler:
                     record.motivation_id, elapsed
                 )
                 outcome = "decayed" if updated is not None else "no_action"
+        elif schedule.kind == WakeUpKind.INTRINSIC_DELIBERATION:
+            decision = self.main_loop.deliberate_intrinsic_goal(
+                schedule.target_id or ""
+            )
+            outcome = decision.action.value
+        elif schedule.kind == WakeUpKind.PLAN_GENERATION:
+            self.main_loop.generate_intrinsic_plan(schedule.target_id or "")
+            outcome = "plan_generated"
+        elif schedule.kind == WakeUpKind.INTRINSIC_ADOPTION:
+            decision = self.main_loop.activate_endorsed_intrinsic_goal(
+                schedule.target_id or ""
+            )
+            outcome = decision.action.value
 
         completed = schedule.model_copy(
             update={

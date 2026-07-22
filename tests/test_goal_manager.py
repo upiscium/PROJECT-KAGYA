@@ -11,6 +11,8 @@ from kagya.motivation import (
     GoalManager,
     GoalStatus,
     GoalType,
+    IntrinsicGoalAction,
+    IntrinsicGoalStatus,
 )
 from kagya.identity import (
     EndorsementStatus,
@@ -65,6 +67,61 @@ def test_goal_rejects_unknown_dependency_and_conflict_references() -> None:
             description="Invalid conflict",
             conflict_ids=("missing",),
         )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        (IntrinsicGoalAction.DEFER, IntrinsicGoalStatus.DEFERRED),
+        (IntrinsicGoalAction.REJECT, IntrinsicGoalStatus.REJECTED),
+    ],
+)
+def test_intrinsic_deliberation_records_non_adoption_outcomes(
+    action: IntrinsicGoalAction,
+    expected: IntrinsicGoalStatus,
+) -> None:
+    manager = GoalManager()
+    manager.propose(
+        goal_id="intrinsic-proposal",
+        goal_type=GoalType.INTRINSIC,
+        description="Consider a self-generated direction",
+        motivation_revision_ref="motivation:one@2",
+    )
+    manager.begin_intrinsic_deliberation("intrinsic-proposal")
+
+    record = manager.resolve_intrinsic_deliberation(
+        "intrinsic-proposal",
+        action=action,
+        score=0.1,
+        factor_scores={"motivation": 0.6, "information": -1.0},
+        reason_codes=("structured_multi_factor_deliberation",),
+        provenance_refs=("motivation:one@2", "self-model:1"),
+        value_revision_refs={"care": 3},
+        self_model_revision=1,
+        attention_revision=4,
+        relationship_revision_refs={},
+        event_id="deliberation-event",
+        event_sequence=8,
+    )
+
+    assert record.action == action
+    assert manager.get("intrinsic-proposal").intrinsic_status == expected
+    assert manager.get("intrinsic-proposal").status == GoalStatus.CANDIDATE
+
+
+def test_abandonment_closes_intrinsic_lifecycle() -> None:
+    manager = GoalManager()
+    manager.propose(
+        goal_id="intrinsic-proposal",
+        goal_type=GoalType.INTRINSIC,
+        description="Direction no longer pursued",
+    )
+
+    abandoned = manager.transition(
+        "intrinsic-proposal", GoalStatus.ABANDONED, reason="motivation_withdrawn"
+    )
+
+    assert abandoned.intrinsic_status == IntrinsicGoalStatus.ABANDONED
 
 
 def test_higher_priority_conflict_suspends_active_goal_with_reason() -> None:

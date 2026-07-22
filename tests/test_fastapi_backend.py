@@ -1608,8 +1608,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert belief_context.status_code == 200
     assert (
         '- Belief: "The decision context is current; '
-        'status=established; confidence=0.900"'
-        in belief_context.json()["prompt"]
+        'status=established; confidence=0.900"' in belief_context.json()["prompt"]
     )
     assert "The decision context is current" in belief_context.json()["prompt"]
     goal = client.post(
@@ -2442,9 +2441,7 @@ def test_dataset_governance_browser_is_admin_only_and_supports_diff(
         client.app.state.dataset_governance = store
 
         assert client.get("/api/training/datasets").status_code == 401
-        listing = client.get(
-            "/api/training/datasets", headers=admin_headers()
-        )
+        listing = client.get("/api/training/datasets", headers=admin_headers())
         detail = client.get(
             f"/api/training/datasets/{second.revision}", headers=admin_headers()
         )
@@ -2773,9 +2770,7 @@ def test_started_autonomy_loop_executes_motivation_through_wal(
 
         cycle = client.app.state.subject_scheduler.run_cycle(
             datetime.now(UTC)
-            + timedelta(
-                seconds=settings.autonomy.reevaluation_interval_seconds + 1
-            )
+            + timedelta(seconds=settings.autonomy.reevaluation_interval_seconds + 1)
         )
 
         assert cycle.inferences == 0
@@ -2800,6 +2795,101 @@ def test_started_autonomy_loop_executes_motivation_through_wal(
         )
         assert restored.related_goal_ids
         assert restarted.app.state.subject_scheduler.status().pending_count > 0
+
+
+def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={"autonomy": settings.autonomy.model_copy(update={"enabled": False})}
+    )
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post(
+            "/api/chat",
+            json={"text": "novel intrinsic topic one", "attachments": []},
+        ).json()
+        for text in ("novel intrinsic topic two", "novel intrinsic topic three"):
+            assert (
+                client.post(
+                    "/api/chat",
+                    json={
+                        "text": text,
+                        "attachments": [],
+                        "context_id": first["context_id"],
+                    },
+                ).status_code
+                == 200
+            )
+        loop = client.app.state.main_loop
+        loop.working_memory.restore([])
+        loop.attention_system.candidates.clear()
+        loop.attention_system.compete()
+
+        generated = client.post("/api/motivation/reevaluate", headers=admin_headers())
+        assert generated.status_code == 200
+        goal_id = generated.json()["goals"][0]["goal_id"]
+        proposal = next(
+            item
+            for item in client.get("/api/goals", headers=admin_headers()).json()[
+                "goals"
+            ]
+            if item["goal_id"] == goal_id
+        )
+        assert proposal["intrinsic_status"] == "proposal"
+        assert proposal["identity_origin"]["endorsement"] == "pending"
+        assert (
+            client.post(
+                f"/api/goals/{goal_id}/adopt", headers=admin_headers()
+            ).status_code
+            == 409
+        )
+
+        assert (
+            client.get("/api/autonomy/status", headers=admin_headers()).status_code
+            == 200
+        )
+        scheduler = client.app.state.subject_scheduler
+        now = datetime.now(UTC) + timedelta(seconds=1)
+        scheduler.run_cycle(now)
+        assert loop.goal_manager.get(goal_id).intrinsic_status.value == "endorsed"
+        scheduler.run_cycle(now + timedelta(seconds=1))
+        assert loop.plan_store.list_plans(goal_id=goal_id)[0].status.value == "draft"
+        scheduler.run_cycle(now + timedelta(seconds=2))
+
+        adopted = loop.goal_manager.get(goal_id)
+        assert adopted.intrinsic_status.value == "active"
+        assert adopted.status.value == "active"
+        assert adopted.endorsement_provenance_refs
+        assert loop.plan_store.list_plans(goal_id=goal_id)[0].status.value == "active"
+        inspection = client.get("/api/goals", headers=admin_headers()).json()
+        assert inspection["intrinsic_deliberations"][-1]["action"] == "endorse"
+        no_goal = client.post("/api/motivation/reevaluate", headers=admin_headers())
+        assert no_goal.json()["goals"] == []
+        assert (
+            client.get("/api/goals", headers=admin_headers()).json()[
+                "intrinsic_deliberations"
+            ][-1]["action"]
+            == "no_goal"
+        )
+
+    snapshot = AgentStateStore(settings.agent_state.path).load(1.0)
+    persisted_goal = next(
+        item for item in snapshot.motivation.active_goals if item["goal_id"] == goal_id
+    )
+    assert persisted_goal["intrinsic_status"] == "active"
+    wal = StateWAL(settings.agent_state_wal.path)
+    assert wal.reconstruct().snapshot_hash == hash_snapshot(snapshot)
+    event_types = {
+        record.event_type
+        for record in EventJournal(settings.agent_journal.path).verify()
+    }
+    assert event_types >= {
+        "intrinsic_goal_propose",
+        "intrinsic_goal_deliberate",
+        "plan_generate",
+        "intrinsic_goal_adopt",
+    }
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

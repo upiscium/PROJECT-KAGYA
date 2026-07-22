@@ -15,11 +15,12 @@ from kagya.api.dependencies import (
 from kagya.motivation import (
     CommitmentFulfillability,
     CommitmentStatus,
+    GoalDecision,
     GoalStatus,
     GoalType,
 )
 from kagya.identity import OriginActor
-from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.runtime import AgentEventType, AgentRuntime, KagyaMainLoop
 
 
 class GoalProposalRequest(BaseModel):
@@ -115,6 +116,9 @@ def inspect_goals(
     payload: dict[str, object] = {
         "goals": main_loop.goal_manager.goals_json(),
         "decisions": main_loop.goal_manager.decisions_json(),
+        "intrinsic_deliberations": (
+            main_loop.goal_manager.intrinsic_deliberations_json()
+        ),
     }
     return execute_agent_event(
         runtime,
@@ -194,7 +198,7 @@ def adopt_goal(
             runtime,
             AgentEventType.GOAL_UPDATE,
             source="api.goals.adopt",
-            handler=lambda: main_loop.adopt_goal(goal_id),
+            handler=lambda: _adopt_operator_goal(main_loop, goal_id),
             payload={"goal_id": goal_id},
             correlation_id=goal_id,
         ).value
@@ -451,3 +455,12 @@ def transition_commitment(
 
 def _deadline(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
+
+
+def _adopt_operator_goal(main_loop: KagyaMainLoop, goal_id: str) -> GoalDecision:
+    goal = main_loop.goal_manager.get(goal_id)
+    if goal.goal_type == GoalType.INTRINSIC:
+        raise ValueError(
+            "Intrinsic goals are deliberated and adopted only by the subject scheduler"
+        )
+    return main_loop.adopt_goal(goal_id)
