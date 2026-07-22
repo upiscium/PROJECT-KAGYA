@@ -15,6 +15,7 @@ const navItems = [
   ["Debug", "/debug"],
   ["Memory", "/memory"],
   ["Sleep", "/sleep"],
+  ["Datasets", "/datasets"],
   ["Adapters", "/adapters"],
   ["Evaluations", "/evaluations"],
 ];

@@ -10,6 +10,7 @@ from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord
 from kagya.memory import ConsolidationStatus, ValidationStatus
 from kagya.models import ModelProvider
+from kagya.training.dataset_governance import DatasetGovernanceStore, DatasetSplit
 
 
 @dataclass(frozen=True)
@@ -66,8 +67,20 @@ class SleepCycleManager:
         )
         try:
             semantic_texts = self._generate_semantic_texts(episodes)
-            self.dream_dataset_generator.generate(episodes, dataset_path)
-            training_result = self.qlora_trainer.train(dataset_path)
+            governed = DatasetGovernanceStore(
+                self.settings.sleep.training_artifact_directory / "datasets"
+            ).create_from_episodes(episodes, source_job_id=attempt_id)
+            dataset = governed.split_bytes(DatasetSplit.TRAIN)
+            if not dataset:
+                raise ValueError("Governed dataset has no eligible training records")
+            dataset_path.parent.mkdir(parents=True, exist_ok=True)
+            with dataset_path.open("xb") as output:
+                output.write(dataset)
+            training_result = self.qlora_trainer.train(
+                dataset_path,
+                dataset_revision=governed.revision,
+                dataset_manifest_hash=governed.manifest_hash,
+            )
             semantic_ids = [
                 self.memory_system.save_semantic(
                     text,
@@ -133,6 +146,7 @@ class SleepCycleManager:
             for episode in selected
             if episode.validation_status == ValidationStatus.VERIFIED
             and episode.generation_health.healthy
+            and episode.training_included
             and not (
                 episode.consolidation_status == ConsolidationStatus.COMPLETED
                 and episode.consolidation_version == "sleep-v2"
