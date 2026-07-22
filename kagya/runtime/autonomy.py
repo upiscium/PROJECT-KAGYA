@@ -13,7 +13,12 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.decision import DecisionStatus
-from kagya.motivation import CommitmentFulfillability, CommitmentStatus, GoalStatus
+from kagya.motivation import (
+    CommitmentFulfillability,
+    CommitmentStatus,
+    GoalStatus,
+    MotivationStatus,
+)
 from kagya.planning import PlanStatus, StepStatus
 from kagya.runtime.agent_runtime import (
     AgentEventType,
@@ -40,6 +45,8 @@ class WakeUpKind(StrEnum):
     OPERATOR = "operator"
     STEP_RETRY = "step_retry"
     STEP_TIMEOUT = "step_timeout"
+    MOTIVATION_REEVALUATION = "motivation_reevaluation"
+    MOTIVATION_DECAY = "motivation_decay"
 
 
 class ScheduleStatus(StrEnum):
@@ -225,6 +232,8 @@ class SubjectScheduler:
 
         processed = 0
         inferences = 0
+        dynamics = getattr(self.main_loop, "motivation_dynamics", None)
+        goal_budget = getattr(dynamics, "max_goal_proposals_per_cycle", 0)
         for schedule in due:
             if (
                 processed >= self.budget.max_events
@@ -235,10 +244,13 @@ class SubjectScheduler:
                 continue
             try:
 
-                def process(item: WakeUpSchedule = schedule) -> str:
-                    return self._process(item)
+                def process(
+                    item: WakeUpSchedule = schedule,
+                    remaining_goals: int = goal_budget,
+                ) -> tuple[str, int]:
+                    return self._process(item, remaining_goals)
 
-                self.runtime.execute(
+                outcome = self.runtime.execute(
                     AgentEventType.AUTONOMY_WAKE,
                     source="scheduler.wake",
                     handler=process,
@@ -248,11 +260,12 @@ class SubjectScheduler:
                     },
                     causation_id=schedule.causation_id,
                     correlation_id=schedule.schedule_id,
-                )
+                ).value
             except (AgentRuntimeQueueFull, AgentRuntimeStopped):
                 break
             processed += 1
             inferences += schedule.estimated_inferences
+            goal_budget = max(0, goal_budget - outcome[1])
         deferred = len(due) - processed
         result = CycleResult.BUDGET_EXHAUSTED if deferred else CycleResult.PROCESSED
         return self._finish_cycle(
@@ -436,6 +449,106 @@ class SubjectScheduler:
                                 target,
                             )
                         )
+        schedules.extend(self._derived_motivation_schedules())
+        return schedules
+
+    def _derived_motivation_schedules(self) -> list[WakeUpSchedule]:
+        schedules: list[WakeUpSchedule] = []
+
+        def add(target: str, changed_at: str, *, suffix: str = "") -> None:
+            wake_at = datetime.fromisoformat(changed_at) + timedelta(
+                seconds=self.reevaluation_interval_seconds
+            )
+            schedules.append(
+                self._derived(
+                    f"motivation-reevaluation:{target}:{changed_at}{suffix}",
+                    WakeUpKind.MOTIVATION_REEVALUATION,
+                    wake_at,
+                    target,
+                )
+            )
+
+        dynamics = getattr(self.main_loop, "motivation_dynamics", None)
+        if dynamics is None:
+            return schedules
+        for record in dynamics.list_records():
+            if record.status != MotivationStatus.ACTIVE:
+                continue
+            review_at = (
+                datetime.fromisoformat(record.next_review_at)
+                if record.next_review_at is not None
+                else datetime.fromisoformat(record.updated_at)
+                + timedelta(seconds=self.reevaluation_interval_seconds)
+            )
+            schedules.append(
+                self._derived(
+                    f"motivation-reevaluation:{record.motivation_id}:{review_at.isoformat()}",
+                    WakeUpKind.MOTIVATION_REEVALUATION,
+                    review_at,
+                    record.target_ref,
+                )
+            )
+            decay_at = datetime.fromisoformat(record.updated_at) + timedelta(
+                seconds=self.reevaluation_interval_seconds
+            )
+            schedules.append(
+                self._derived(
+                    f"motivation-decay:{record.motivation_id}:{decay_at.isoformat()}",
+                    WakeUpKind.MOTIVATION_DECAY,
+                    decay_at,
+                    record.motivation_id,
+                )
+            )
+
+        narrative = getattr(self.main_loop, "narrative_self", None)
+        if narrative is not None:
+            for episode in narrative.episodes.values():
+                if episode.unresolved_tension >= 0.4:
+                    add(f"narrative:{episode.episode_id}", episode.created_at)
+            for conflict in narrative.conflicts.values():
+                if conflict.resolved_at is None:
+                    add(f"self-conflict:{conflict.conflict_id}", conflict.created_at)
+            for projection in narrative.future_self.values():
+                if projection.gap > 0.0:
+                    add(f"future-self:{projection.projection_id}", projection.updated_at)
+
+        relationships = getattr(self.main_loop, "relationship_store", None)
+        if relationships is not None:
+            for relationship in relationships.list_relationships():
+                if (
+                    relationship.unresolved_matter_refs
+                    or relationship.conflict_refs
+                    or relationship.commitment_refs
+                ):
+                    add(
+                        f"relationship:{relationship.relationship_id}",
+                        relationship.updated_at,
+                    )
+
+        values = getattr(self.main_loop, "value_system", None)
+        if values is not None:
+            for tradeoff in values.tradeoffs:
+                if not tradeoff.conflict_names:
+                    continue
+                for value_id in tradeoff.value_ids:
+                    add(
+                        f"value:{value_id}",
+                        tradeoff.created_at,
+                        suffix=f":{tradeoff.tradeoff_id}",
+                    )
+
+        self_model = getattr(self.main_loop, "self_model", None)
+        if self_model is not None:
+            for limitation in self_model.state.known_limitations.values():
+                add(
+                    f"limitation:{limitation.limitation_id}",
+                    self_model.state.updated_at,
+                )
+            for uncertainty in self_model.state.epistemic_uncertainties.values():
+                add(
+                    f"uncertainty:{uncertainty.uncertainty_id}",
+                    self_model.state.updated_at,
+                )
         return schedules
 
     def _derived(
@@ -449,17 +562,20 @@ class SubjectScheduler:
             created_at=wake_at,
         )
 
-    def _process(self, schedule: WakeUpSchedule) -> str:
+    def _process(
+        self, schedule: WakeUpSchedule, goal_budget: int
+    ) -> tuple[str, int]:
         stored = self._stored_schedules()
         current = next(
             (item for item in stored if item.schedule_id == schedule.schedule_id), None
         )
         if current is not None and current.status != ScheduleStatus.PENDING:
-            return "already_processed"
+            return "already_processed", 0
         if current is None:
             stored.append(schedule)
 
         outcome = "no_action"
+        generated_goals = 0
         if schedule.kind in {
             WakeUpKind.GOAL_DEADLINE,
             WakeUpKind.GOAL_REEVALUATION,
@@ -520,6 +636,32 @@ class SubjectScheduler:
             else:
                 self.main_loop.timeout_plan_step(plan_id, step_id)
                 outcome = "step_timed_out"
+        elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
+            _, goals = self.main_loop.reevaluate_motivation(
+                max_goal_proposals=goal_budget
+            )
+            self.main_loop.schedule_motivation_reviews(
+                max(self.clock(), schedule.wake_at)
+                + timedelta(seconds=self.reevaluation_interval_seconds)
+            )
+            generated_goals = len(goals)
+            outcome = "reevaluated" if goals else "no_action"
+        elif schedule.kind == WakeUpKind.MOTIVATION_DECAY:
+            record = self.main_loop.motivation_dynamics.records.get(
+                schedule.target_id or ""
+            )
+            if record is not None and record.status == MotivationStatus.ACTIVE:
+                elapsed = max(
+                    self.reevaluation_interval_seconds / 3600.0,
+                    (
+                        self.clock() - datetime.fromisoformat(record.updated_at)
+                    ).total_seconds()
+                    / 3600.0,
+                )
+                updated = self.main_loop.decay_motivation_record(
+                    record.motivation_id, elapsed
+                )
+                outcome = "decayed" if updated is not None else "no_action"
 
         completed = schedule.model_copy(
             update={
@@ -549,7 +691,7 @@ class SubjectScheduler:
                 )
             )
         self._save_schedules(stored)
-        return outcome
+        return outcome, generated_goals
 
     def _should_recheck(self, schedule: WakeUpSchedule) -> bool:
         if schedule.kind == WakeUpKind.DECISION_OUTCOME:
@@ -585,6 +727,10 @@ class SubjectScheduler:
                     CommitmentFulfillability.IMPOSSIBLE,
                 }
             )
+        if schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
+            return False
+        if schedule.kind == WakeUpKind.MOTIVATION_DECAY:
+            return False
         return False
 
     def _finish_cycle(

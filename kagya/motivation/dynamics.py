@@ -63,6 +63,7 @@ class MotivationRecord:
     status: MotivationStatus
     created_at: str
     updated_at: str
+    next_review_at: str | None = None
     revision: int = 0
     revisions: tuple[MotivationRevision, ...] = ()
     schema_version: int = 1
@@ -80,6 +81,11 @@ class MotivationRecord:
             raise ValueError("motivation decay must be finite and positive")
         if self.evidence_count <= 0 or self.revision < 0:
             raise ValueError("motivation evidence count must be positive")
+        if (
+            self.next_review_at is not None
+            and datetime.fromisoformat(self.next_review_at).tzinfo is None
+        ):
+            raise ValueError("motivation next review must include a timezone")
 
     def to_json(self) -> dict[str, Any]:
         return _json_value(asdict(self))
@@ -218,6 +224,87 @@ class MotivationDynamics:
             value_ids=related_value_ids,
         )
 
+    def observe_structured_signal(
+        self,
+        kind: MotivationKind,
+        source: MotivationSource,
+        target_ref: str,
+        *,
+        signal: float,
+        uncertainty: float,
+        source_refs: tuple[str, ...],
+        value_ids: tuple[str, ...] = (),
+    ) -> MotivationRecord:
+        """Record durable structured evidence without model interpretation."""
+        _unit(signal, "motivation signal")
+        _unit(uncertainty, "motivation uncertainty")
+        evidence_refs = tuple(dict.fromkeys(source_refs))
+        if not evidence_refs:
+            raise ValueError("structured motivation requires evidence references")
+        existing = next(
+            (
+                record
+                for record in self.records.values()
+                if record.source == source
+                and record.target_ref == target_ref
+                and record.status == MotivationStatus.ACTIVE
+            ),
+            None,
+        )
+        if existing is None:
+            now = _now()
+            record = MotivationRecord(
+                motivation_id=f"motivation-{uuid4()}",
+                kind=kind,
+                source=source,
+                target_ref=target_ref,
+                source_refs=evidence_refs,
+                strength=min(1.0, 0.35 + 0.4 * signal),
+                persistence=max(0.4, signal),
+                satiation=0.0,
+                uncertainty=uncertainty,
+                decay_per_hour=0.05,
+                conflict_ids=(),
+                related_value_ids=tuple(dict.fromkeys(value_ids)),
+                related_experience_ids=(),
+                related_goal_ids=(),
+                evidence_count=len(evidence_refs),
+                status=MotivationStatus.ACTIVE,
+                created_at=now,
+                updated_at=now,
+            )
+            self.records[record.motivation_id] = record
+            return record
+        novel_refs = tuple(
+            reference
+            for reference in evidence_refs
+            if reference not in existing.source_refs
+        )
+        novel_values = tuple(
+            value_id
+            for value_id in value_ids
+            if value_id not in existing.related_value_ids
+        )
+        if not novel_refs and not novel_values:
+            return existing
+        updated = self._revise(
+            existing,
+            replace(
+                existing,
+                source_refs=(*existing.source_refs, *novel_refs),
+                related_value_ids=(*existing.related_value_ids, *novel_values),
+                strength=max(existing.strength, min(1.0, 0.35 + 0.4 * signal)),
+                persistence=max(existing.persistence, signal, 0.4),
+                uncertainty=min(existing.uncertainty, uncertainty),
+                evidence_count=existing.evidence_count + len(novel_refs),
+                updated_at=_now(),
+            ),
+            "structured_evidence",
+            novel_refs,
+        )
+        self.records[existing.motivation_id] = updated
+        return updated
+
     def register_conflict(self, left_id: str, right_id: str) -> None:
         if left_id == right_id:
             raise ValueError("motivation cannot conflict with itself")
@@ -246,7 +333,14 @@ class MotivationDynamics:
             (f"motivation:{left_id}",),
         )
 
-    def goal_candidates(self) -> tuple[list[GoalFormationCandidate], tuple[str, ...]]:
+    def goal_candidates(
+        self, max_candidates: int | None = None
+    ) -> tuple[list[GoalFormationCandidate], tuple[str, ...]]:
+        limit = self.max_goal_proposals_per_cycle
+        if max_candidates is not None:
+            if max_candidates < 0:
+                raise ValueError("goal candidate limit must not be negative")
+            limit = min(limit, max_candidates)
         eligible = [
             record
             for record in self.records.values()
@@ -270,7 +364,7 @@ class MotivationDynamics:
                 held.add(record.motivation_id)
                 held.update(blocking)
                 continue
-            if len(selected) >= self.max_goal_proposals_per_cycle:
+            if len(selected) >= limit:
                 break
             selected.append(_goal_candidate(record))
         return selected, tuple(sorted(held))
@@ -343,6 +437,52 @@ class MotivationDynamics:
             updated_records.append(updated)
         return updated_records
 
+    def decay_record(
+        self, motivation_id: str, elapsed_hours: float
+    ) -> MotivationRecord | None:
+        if not math.isfinite(elapsed_hours) or elapsed_hours <= 0.0:
+            raise ValueError("elapsed hours must be finite and positive")
+        current = self.get(motivation_id)
+        if current.status != MotivationStatus.ACTIVE:
+            return None
+        strength = max(0.0, current.strength - current.decay_per_hour * elapsed_hours)
+        satiation = max(0.0, current.satiation - 0.05 * elapsed_hours)
+        status = MotivationStatus.DECAYED if strength < 0.1 else current.status
+        updated = self._revise(
+            current,
+            replace(
+                current,
+                strength=strength,
+                satiation=satiation,
+                status=status,
+                updated_at=_now(),
+            ),
+            "time_decay",
+            (),
+        )
+        self.records[motivation_id] = updated
+        return updated
+
+    def schedule_next_reviews(self, review_at: datetime) -> list[MotivationRecord]:
+        if review_at.tzinfo is None:
+            raise ValueError("motivation review time must include a timezone")
+        updated_records: list[MotivationRecord] = []
+        for current in list(self.records.values()):
+            if current.status != MotivationStatus.ACTIVE:
+                continue
+            review_value = review_at.isoformat()
+            if current.next_review_at == review_value:
+                continue
+            updated = self._revise(
+                current,
+                replace(current, next_review_at=review_value),
+                "review_scheduled",
+                (),
+            )
+            self.records[current.motivation_id] = updated
+            updated_records.append(updated)
+        return updated_records
+
     def record_episode(
         self,
         *,
@@ -351,14 +491,20 @@ class MotivationDynamics:
         generated_goal_ids: tuple[str, ...],
         event_id: str | None,
         event_sequence: int | None,
+        budget: int | None = None,
     ) -> MotivationEpisode:
+        resolved_budget = self.max_goal_proposals_per_cycle
+        if budget is not None:
+            if budget < 0:
+                raise ValueError("motivation episode budget must not be negative")
+            resolved_budget = min(resolved_budget, budget)
         episode = MotivationEpisode(
             episode_id=f"motivation-episode-{uuid4()}",
             evaluated_motivation_ids=tuple(sorted(self.records)),
             selected_motivation_ids=selected_ids,
             held_conflict_ids=held_ids,
             generated_goal_ids=generated_goal_ids,
-            budget=self.max_goal_proposals_per_cycle,
+            budget=resolved_budget,
             event_id=event_id,
             event_sequence=event_sequence,
             created_at=_now(),
@@ -539,6 +685,7 @@ def _state(record: MotivationRecord) -> dict[str, Any]:
         "status": record.status.value,
         "evidence_count": record.evidence_count,
         "related_goal_ids": list(record.related_goal_ids),
+        "next_review_at": record.next_review_at,
     }
 
 

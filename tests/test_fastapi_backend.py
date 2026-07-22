@@ -1,5 +1,6 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 import json
 import os
 import time
@@ -13,6 +14,7 @@ from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.motivation import MotivationKind, MotivationSource
 from kagya.runtime import (
     AgentEventType,
     AgentStateStore,
@@ -2741,6 +2743,63 @@ def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> 
         "autonomy_schedule",
         "autonomy_wake",
     }
+
+
+def test_started_autonomy_loop_executes_motivation_through_wal(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "autonomy": settings.autonomy.model_copy(
+                update={"enabled": True, "poll_interval_seconds": 3600.0}
+            )
+        }
+    )
+    with _client(tmp_path, settings=settings) as client:
+        assert client.app.state.autonomy_loop is not None
+        loop = client.app.state.main_loop
+        motivation = loop.motivation_dynamics.observe_structured_signal(
+            MotivationKind.DESIRE,
+            MotivationSource.LEARNING,
+            "future-self:runtime-startup",
+            signal=0.8,
+            uncertainty=0.2,
+            source_refs=(
+                "future-self:runtime-startup",
+                "identity-claim:runtime-startup",
+            ),
+        )
+
+        cycle = client.app.state.subject_scheduler.run_cycle(
+            datetime.now(UTC)
+            + timedelta(
+                seconds=settings.autonomy.reevaluation_interval_seconds + 1
+            )
+        )
+
+        assert cycle.inferences == 0
+        assert loop.motivation_dynamics.get(motivation.motivation_id).related_goal_ids
+
+    journal = EventJournal(settings.agent_journal.path).verify()
+    wal = StateWAL(settings.agent_state_wal.path).verify()
+    assert any(
+        record.event_type == "autonomy_wake"
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in journal
+    )
+    assert any(record.event_type == "autonomy_wake" for record in wal)
+    snapshot = json.loads(settings.agent_state.path.read_text(encoding="utf-8"))
+    assert any(
+        item["kind"] == "motivation_reevaluation"
+        for item in snapshot["extensions"]["subject_scheduler"]["schedules"]
+    )
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.app.state.main_loop.motivation_dynamics.get(
+            motivation.motivation_id
+        )
+        assert restored.related_goal_ids
+        assert restarted.app.state.subject_scheduler.status().pending_count > 0
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

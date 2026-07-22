@@ -1,7 +1,12 @@
 from kagya.cognition import AppraisalResult
 from kagya.experience import build_chat_experience
 from kagya.identity import OriginActor, OriginInputKind, new_identity_origin
-from kagya.motivation import MotivationDynamics, MotivationStatus
+from kagya.motivation import (
+    MotivationDynamics,
+    MotivationKind,
+    MotivationSource,
+    MotivationStatus,
+)
 
 
 def test_repeated_experience_forms_bounded_goal_candidate() -> None:
@@ -66,6 +71,40 @@ def test_goal_outcome_and_time_update_drive_state() -> None:
     other.observe_experience(_experience("three"))
     decayed = other.decay(24.0)[0]
     assert decayed.strength < other.list_records()[0].revisions[0].before["strength"]
+
+
+def test_structured_evidence_is_deduplicated_and_persistent() -> None:
+    dynamics = MotivationDynamics(max_goal_proposals_per_cycle=1)
+
+    first = dynamics.observe_structured_signal(
+        MotivationKind.DESIRE,
+        MotivationSource.LEARNING,
+        "future-self:planner",
+        signal=0.8,
+        uncertainty=0.2,
+        source_refs=("future-self:planner", "identity-claim:planning"),
+    )
+    repeated = dynamics.observe_structured_signal(
+        MotivationKind.DESIRE,
+        MotivationSource.LEARNING,
+        "future-self:planner",
+        signal=0.8,
+        uncertainty=0.2,
+        source_refs=("future-self:planner", "identity-claim:planning"),
+    )
+
+    assert repeated == first
+    assert repeated.evidence_count == 2
+    assert dynamics.goal_candidates()[0][0].motivation_id == first.motivation_id
+    episode = dynamics.record_episode(
+        selected_ids=(),
+        held_ids=(),
+        generated_goal_ids=(),
+        event_id=None,
+        event_sequence=None,
+        budget=0,
+    )
+    assert episode.budget == 0
 
 
 def _experience(identifier: str):

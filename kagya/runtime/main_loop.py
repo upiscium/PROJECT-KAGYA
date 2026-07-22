@@ -109,7 +109,9 @@ from kagya.motivation import (
     GoalType,
     MotivationDynamics,
     MotivationEpisode,
+    MotivationKind,
     MotivationRecord,
+    MotivationSource,
     MotivationStatus,
 )
 from kagya.persona import (
@@ -1264,9 +1266,162 @@ class KagyaMainLoop:
             self.plan_store.to_json()
         )
 
-    def reevaluate_motivation(self) -> tuple[MotivationEpisode, list[Goal]]:
+    def derive_structured_motivations(self) -> list[MotivationRecord]:
+        """Translate existing structured state into evidence-bound motives."""
+        observed: list[MotivationRecord] = []
+        for episode in self.narrative_self.episodes.values():
+            if episode.unresolved_tension < 0.4:
+                continue
+            observed.append(
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.DRIVE,
+                    MotivationSource.CLOSURE,
+                    f"narrative:{episode.episode_id}",
+                    signal=episode.unresolved_tension,
+                    uncertainty=0.3,
+                    source_refs=(
+                        f"narrative:{episode.episode_id}",
+                        *(f"experience:{item}" for item in episode.experience_ids),
+                    ),
+                )
+            )
+        for self_conflict in self.narrative_self.conflicts.values():
+            if self_conflict.resolved_at is not None:
+                continue
+            observed.append(
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.DRIVE,
+                    MotivationSource.DELIBERATION,
+                    f"self-conflict:{self_conflict.conflict_id}",
+                    signal=0.7,
+                    uncertainty=0.6,
+                    source_refs=(
+                        f"self-conflict:{self_conflict.conflict_id}",
+                        *self_conflict.evidence_refs,
+                    ),
+                )
+            )
+        for projection in self.narrative_self.future_self.values():
+            if projection.gap <= 0.0:
+                continue
+            motivation = self.motivation_dynamics.observe_structured_signal(
+                MotivationKind.DESIRE,
+                MotivationSource.LEARNING,
+                f"future-self:{projection.projection_id}",
+                signal=projection.gap,
+                uncertainty=max(0.0, 1.0 - projection.current_level),
+                source_refs=(
+                    f"future-self:{projection.projection_id}",
+                    *projection.evidence_refs,
+                ),
+            )
+            self.narrative_self.link_future_motivation(
+                projection.projection_id, motivation.motivation_id
+            )
+            observed.append(motivation)
+        for relationship in self.relationship_store.list_relationships():
+            evidence_refs = tuple(
+                dict.fromkeys(
+                    (
+                        f"relationship:{relationship.relationship_id}@{relationship.revision}",
+                        *relationship.unresolved_matter_refs,
+                        *relationship.conflict_refs,
+                        *relationship.commitment_refs,
+                    )
+                )
+            )
+            if len(evidence_refs) == 1:
+                continue
+            observed.append(
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.DRIVE,
+                    MotivationSource.SOCIAL,
+                    f"relationship:{relationship.relationship_id}",
+                    signal=max(0.5, relationship.axes.closeness),
+                    uncertainty=relationship.uncertainty,
+                    source_refs=evidence_refs,
+                )
+            )
+        for tradeoff in self.value_system.tradeoffs:
+            if not tradeoff.conflict_names:
+                continue
+            values = [self.value_system.get(item) for item in tradeoff.value_ids]
+            evidence_refs = tuple(
+                dict.fromkeys(
+                    (
+                        f"value-tradeoff:{tradeoff.tradeoff_id}",
+                        *(f"value-conflict:{item}" for item in tradeoff.conflict_names),
+                        *(
+                            f"value:{value.value_id}@{value.revision}"
+                            for value in values
+                        ),
+                    )
+                )
+            )
+            motives = [
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.DESIRE,
+                    MotivationSource.DELIBERATION,
+                    f"value:{value.value_id}",
+                    signal=min(
+                        1.0,
+                        max(
+                            value.weight,
+                            abs(tradeoff.contribution_by_value.get(value.value_id, 0.0)),
+                        ),
+                    ),
+                    uncertainty=1.0 - value.confidence,
+                    source_refs=evidence_refs,
+                    value_ids=(value.value_id,),
+                )
+                for value in values
+            ]
+            for index, left_motive in enumerate(motives):
+                for right_motive in motives[index + 1 :]:
+                    self.motivation_dynamics.register_conflict(
+                        left_motive.motivation_id, right_motive.motivation_id
+                    )
+            observed.extend(motives)
+        for limitation in self.self_model.state.known_limitations.values():
+            observed.append(
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.DRIVE,
+                    MotivationSource.LEARNING,
+                    f"limitation:{limitation.limitation_id}",
+                    signal=limitation.confidence,
+                    uncertainty=1.0 - limitation.confidence,
+                    source_refs=(
+                        f"limitation:{limitation.limitation_id}",
+                        *limitation.evidence_refs,
+                    ),
+                )
+            )
+        for uncertainty in self.self_model.state.epistemic_uncertainties.values():
+            observed.append(
+                self.motivation_dynamics.observe_structured_signal(
+                    MotivationKind.INTEREST,
+                    MotivationSource.LEARNING,
+                    f"uncertainty:{uncertainty.uncertainty_id}",
+                    signal=max(0.4, 1.0 - uncertainty.confidence),
+                    uncertainty=uncertainty.confidence,
+                    source_refs=(
+                        f"uncertainty:{uncertainty.uncertainty_id}",
+                        *uncertainty.evidence_refs,
+                    ),
+                )
+            )
+        self._persist_narrative_self_state()
+        self._persist_motivation_state()
+        return observed
+
+    def reevaluate_motivation(
+        self, *, max_goal_proposals: int | None = None
+    ) -> tuple[MotivationEpisode, list[Goal]]:
         event = current_agent_event()
-        candidates, held_ids = self.motivation_dynamics.goal_candidates()
+        self.derive_structured_motivations()
+        candidates, held_ids = self.motivation_dynamics.goal_candidates(
+            max_goal_proposals
+        )
         goals: list[Goal] = []
         selected_ids: list[str] = []
         for candidate in candidates:
@@ -1276,6 +1431,7 @@ class KagyaMainLoop:
                 structured_target={
                     "motivation_id": candidate.motivation_id,
                     "target_ref": candidate.target_ref,
+                    "source_refs": list(candidate.source_refs),
                 },
                 origin_actor=OriginActor.SELF,
                 origin_input_kind=OriginInputKind.INTERNAL_STATE,
@@ -1302,6 +1458,7 @@ class KagyaMainLoop:
             selected_ids=tuple(selected_ids),
             held_ids=held_ids,
             generated_goal_ids=tuple(goal.goal_id for goal in goals),
+            budget=max_goal_proposals,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
         )
@@ -1310,6 +1467,22 @@ class KagyaMainLoop:
 
     def decay_motivation(self, elapsed_hours: float) -> list[MotivationRecord]:
         records = self.motivation_dynamics.decay(elapsed_hours)
+        self._persist_motivation_state()
+        return records
+
+    def decay_motivation_record(
+        self, motivation_id: str, elapsed_hours: float
+    ) -> MotivationRecord | None:
+        record = self.motivation_dynamics.decay_record(
+            motivation_id, elapsed_hours
+        )
+        self._persist_motivation_state()
+        return record
+
+    def schedule_motivation_reviews(
+        self, review_at: datetime
+    ) -> list[MotivationRecord]:
+        records = self.motivation_dynamics.schedule_next_reviews(review_at)
         self._persist_motivation_state()
         return records
 
