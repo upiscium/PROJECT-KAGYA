@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.decision import DecisionStatus
 from kagya.motivation import CommitmentStatus, GoalStatus
+from kagya.planning import PlanStatus, StepStatus
 from kagya.runtime.agent_runtime import (
     AgentEventType,
     AgentRuntime,
@@ -36,6 +37,8 @@ class WakeUpKind(StrEnum):
     OUTBOX_DEADLINE = "outbox_deadline"
     SLEEP_CONSOLIDATION = "sleep_consolidation"
     OPERATOR = "operator"
+    STEP_RETRY = "step_retry"
+    STEP_TIMEOUT = "step_timeout"
 
 
 class ScheduleStatus(StrEnum):
@@ -88,7 +91,11 @@ class SchedulerBudget:
     max_wall_seconds: float
 
     def __post_init__(self) -> None:
-        if self.max_events <= 0 or self.max_inferences < 0 or self.max_wall_seconds <= 0:
+        if (
+            self.max_events <= 0
+            or self.max_inferences < 0
+            or self.max_wall_seconds <= 0
+        ):
             raise ValueError("Scheduler budgets must be positive")
 
 
@@ -201,7 +208,13 @@ class SubjectScheduler:
         with self._lock:
             if not self._accepting:
                 return self._finish_cycle(
-                    CycleResult.STOPPED, 0, 0, 0, started_at, self.clock(), started_clock
+                    CycleResult.STOPPED,
+                    0,
+                    0,
+                    0,
+                    started_at,
+                    self.clock(),
+                    started_clock,
                 )
         due = self._due_schedules(started_at)
         if not due:
@@ -217,12 +230,10 @@ class SubjectScheduler:
                 or time.monotonic() - started_clock >= self.budget.max_wall_seconds
             ):
                 break
-            if (
-                inferences + schedule.estimated_inferences
-                > self.budget.max_inferences
-            ):
+            if inferences + schedule.estimated_inferences > self.budget.max_inferences:
                 continue
             try:
+
                 def process(item: WakeUpSchedule = schedule) -> str:
                     return self._process(item)
 
@@ -286,7 +297,9 @@ class SubjectScheduler:
     def _all_schedules(self) -> list[WakeUpSchedule]:
         stored = self._stored_schedules()
         known = {item.schedule_id for item in stored}
-        return stored + [item for item in self._derived_schedules() if item.schedule_id not in known]
+        return stored + [
+            item for item in self._derived_schedules() if item.schedule_id not in known
+        ]
 
     def _stored_schedules(self) -> list[WakeUpSchedule]:
         raw = self.main_loop.persistent_state.extensions.get(SCHEDULER_STATE_KEY)
@@ -308,7 +321,11 @@ class SubjectScheduler:
     def _derived_schedules(self) -> list[WakeUpSchedule]:
         schedules: list[WakeUpSchedule] = []
         for goal in self.main_loop.goal_manager.list_goals():
-            if goal.status in {GoalStatus.COMPLETED, GoalStatus.ABANDONED, GoalStatus.FAILED}:
+            if goal.status in {
+                GoalStatus.COMPLETED,
+                GoalStatus.ABANDONED,
+                GoalStatus.FAILED,
+            }:
                 continue
             if goal.deadline is not None:
                 schedules.append(
@@ -364,6 +381,41 @@ class SubjectScheduler:
                     decision.decision_id,
                 )
             )
+        plan_store = getattr(self.main_loop, "plan_store", None)
+        if plan_store is not None:
+            for plan in plan_store.list_plans():
+                if plan.status != PlanStatus.ACTIVE:
+                    continue
+                for definition in plan.current_revision.steps:
+                    state = plan.step_state(definition.step_id)
+                    target = f"{plan.plan_id}/{definition.step_id}"
+                    if (
+                        state.status == StepStatus.WAITING_RETRY
+                        and state.retry_at is not None
+                    ):
+                        schedules.append(
+                            self._derived(
+                                f"step-retry:{target}:{state.retry_at.isoformat()}",
+                                WakeUpKind.STEP_RETRY,
+                                state.retry_at,
+                                target,
+                            )
+                        )
+                    if (
+                        state.status == StepStatus.IN_PROGRESS
+                        and state.started_at is not None
+                    ):
+                        timeout_at = state.started_at + timedelta(
+                            seconds=definition.timeout_seconds
+                        )
+                        schedules.append(
+                            self._derived(
+                                f"step-timeout:{target}:{timeout_at.isoformat()}",
+                                WakeUpKind.STEP_TIMEOUT,
+                                timeout_at,
+                                target,
+                            )
+                        )
         return schedules
 
     def _derived(
@@ -394,7 +446,11 @@ class SubjectScheduler:
             WakeUpKind.NEEDS_INFORMATION,
         }:
             decisions = self.main_loop.reevaluate_goals()
-            outcome = "reevaluated" if any(item.action.value != "no_action" for item in decisions) else "no_action"
+            outcome = (
+                "reevaluated"
+                if any(item.action.value != "no_action" for item in decisions)
+                else "no_action"
+            )
         elif schedule.kind == WakeUpKind.COMMITMENT_DEADLINE:
             commitment = self.main_loop.commitment_store.commitments.get(
                 schedule.target_id or ""
@@ -407,9 +463,25 @@ class SubjectScheduler:
                 )
                 outcome = "commitment_breached"
         elif schedule.kind == WakeUpKind.DECISION_OUTCOME:
-            decision = self.main_loop.decision_store.records.get(schedule.target_id or "")
-            if decision is not None and decision.status == DecisionStatus.AWAITING_OUTCOME:
+            decision = self.main_loop.decision_store.records.get(
+                schedule.target_id or ""
+            )
+            if (
+                decision is not None
+                and decision.status == DecisionStatus.AWAITING_OUTCOME
+            ):
                 outcome = "awaiting_outcome"
+        elif schedule.kind in {WakeUpKind.STEP_RETRY, WakeUpKind.STEP_TIMEOUT}:
+            target = schedule.target_id or ""
+            if "/" not in target:
+                raise ValueError("Invalid Step wake-up target")
+            plan_id, step_id = target.split("/", 1)
+            if schedule.kind == WakeUpKind.STEP_RETRY:
+                self.main_loop.retry_plan_step(plan_id, step_id)
+                outcome = "step_retry_started"
+            else:
+                self.main_loop.timeout_plan_step(plan_id, step_id)
+                outcome = "step_timed_out"
 
         completed = schedule.model_copy(
             update={
@@ -443,8 +515,13 @@ class SubjectScheduler:
 
     def _should_recheck(self, schedule: WakeUpSchedule) -> bool:
         if schedule.kind == WakeUpKind.DECISION_OUTCOME:
-            decision = self.main_loop.decision_store.records.get(schedule.target_id or "")
-            return decision is not None and decision.status == DecisionStatus.AWAITING_OUTCOME
+            decision = self.main_loop.decision_store.records.get(
+                schedule.target_id or ""
+            )
+            return (
+                decision is not None
+                and decision.status == DecisionStatus.AWAITING_OUTCOME
+            )
         if schedule.kind in {
             WakeUpKind.GOAL_REEVALUATION,
             WakeUpKind.NEEDS_INFORMATION,
@@ -502,7 +579,9 @@ class SubjectScheduler:
 class AutonomyLoop:
     """Single timer thread that stops before the authoritative runtime drains."""
 
-    def __init__(self, scheduler: SubjectScheduler, *, poll_interval_seconds: float) -> None:
+    def __init__(
+        self, scheduler: SubjectScheduler, *, poll_interval_seconds: float
+    ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("Autonomy poll interval must be positive")
         self.scheduler = scheduler
@@ -514,9 +593,7 @@ class AutonomyLoop:
         if self._thread is not None:
             return
         self.scheduler.set_notifier(self._wake.set)
-        self._thread = Thread(
-            target=self._run, name="kagya-autonomy-loop", daemon=True
-        )
+        self._thread = Thread(target=self._run, name="kagya-autonomy-loop", daemon=True)
         self._thread.start()
 
     def shutdown(self) -> None:

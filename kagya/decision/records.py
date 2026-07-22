@@ -51,6 +51,9 @@ class ActionCandidate:
     estimated_risk: float
     value_effects: dict[str, float]
     appraisal_contributions: dict[str, float]
+    plan_id: str | None = None
+    plan_revision: int | None = None
+    step_id: str | None = None
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -73,6 +76,13 @@ class ActionCandidate:
         _bounded_mapping(self.appraisal_contributions, "appraisal_contributions")
         if _contains_private_key(asdict(self)):
             raise ValueError("Action candidate contains a private reasoning field")
+        plan_refs = (self.plan_id, self.plan_revision, self.step_id)
+        if any(item is not None for item in plan_refs) and any(
+            item is None for item in plan_refs
+        ):
+            raise ValueError("Action candidate Plan references must be complete")
+        if self.plan_revision is not None and self.plan_revision < 1:
+            raise ValueError("Action candidate Plan revision must be positive")
 
 
 @dataclass(frozen=True)
@@ -670,6 +680,9 @@ def _candidate_from_json(payload: Any) -> ActionCandidate:
         "estimated_risk",
         "value_effects",
         "appraisal_contributions",
+        "plan_id",
+        "plan_revision",
+        "step_id",
         "schema_version",
     }
     if set(payload) - allowed:

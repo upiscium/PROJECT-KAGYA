@@ -2298,6 +2298,136 @@ def test_feedback_ledger_survives_restart_without_correction_text_in_snapshot(
     assert restored.json()["current_revision"] == 1
 
 
+def test_plan_api_is_strict_persistent_and_committed_to_wal(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    plan_body = {
+        "schema_version": 1,
+        "plan_id": "api-plan",
+        "goal_id": "api-plan-goal",
+        "success_condition": {
+            "condition_code": "verified_result",
+            "required_evidence_types": ["verification"],
+        },
+        "failure_condition": {
+            "condition_code": "failed_result",
+            "required_evidence_types": ["failure"],
+        },
+        "abandonment_condition": {
+            "condition_code": "operator_abandoned",
+            "required_evidence_types": ["operator_decision"],
+        },
+        "steps": [
+            {
+                "schema_version": 1,
+                "step_id": "verify",
+                "action_type": "internal",
+                "action_code": "verify_result",
+                "parameters": {"mode": "structured"},
+                "dependency_ids": [],
+                "expected_observation": {
+                    "observation_code": "result_verified",
+                    "evidence_types": ["verification"],
+                },
+                "verification": {
+                    "verification_code": "verify_result_evidence",
+                    "required_evidence_types": ["verification"],
+                    "minimum_evidence_count": 1,
+                },
+                "retry": {"max_attempts": 2, "backoff_seconds": 0},
+                "timeout_seconds": 60,
+                "rollback": {
+                    "action_type": "internal",
+                    "action_code": "restore_previous_state",
+                    "parameters": {},
+                },
+            }
+        ],
+    }
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/plans").status_code == 401
+        assert (
+            client.post(
+                "/api/goals",
+                headers=admin_headers(),
+                json={
+                    "goal_id": "api-plan-goal",
+                    "goal_type": "external_request",
+                    "description": "Complete a structured plan",
+                },
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/goals/api-plan-goal/adopt", headers=admin_headers()
+            ).status_code
+            == 200
+        )
+        rejected = client.post(
+            "/api/plans",
+            headers=admin_headers(),
+            json={**plan_body, "reasoning": "unstructured model prose"},
+        )
+        assert rejected.status_code == 422
+        created = client.post("/api/plans", headers=admin_headers(), json=plan_body)
+        assert created.status_code == 200
+        assert (
+            client.post(
+                "/api/plans/api-plan/activate", headers=admin_headers()
+            ).status_code
+            == 200
+        )
+        candidates = client.get(
+            "/api/plans/candidates", headers=admin_headers()
+        ).json()["candidates"]
+        assert candidates[0]["plan_id"] == "api-plan"
+        assert candidates[0]["step_id"] == "verify"
+        assert (
+            client.post(
+                "/api/plans/api-plan/steps/verify/start", headers=admin_headers()
+            ).status_code
+            == 200
+        )
+        no_evidence = client.post(
+            "/api/plans/api-plan/steps/verify/complete",
+            headers=admin_headers(),
+            json={"evidence": []},
+        )
+        assert no_evidence.status_code == 422
+        completed = client.post(
+            "/api/plans/api-plan/steps/verify/complete",
+            headers=admin_headers(),
+            json={
+                "evidence": [
+                    {
+                        "reference": "observation:verified-1",
+                        "evidence_type": "verification",
+                        "observation_code": "result_verified",
+                    }
+                ]
+            },
+        )
+        assert completed.status_code == 200
+        assert completed.json()["status"] == "completed"
+        goal = next(
+            item
+            for item in client.get("/api/goals", headers=admin_headers()).json()[
+                "goals"
+            ]
+            if item["goal_id"] == "api-plan-goal"
+        )
+        assert goal["status"] == "completed"
+
+    wal_types = {
+        record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
+    }
+    assert {"plan_update", "step_update"}.issubset(wal_types)
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/plans", headers=admin_headers())
+        assert restored.json()["plans"][0]["status"] == "completed"
+        assert restored.json()["plans"][0]["step_states"][0]["evidence"]
+
+
 def _client(
     tmp_path: Path,
     *,
