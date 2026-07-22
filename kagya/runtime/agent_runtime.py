@@ -59,6 +59,8 @@ class AgentEventType(StrEnum):
     AUTONOMY_WAKE = "autonomy_wake"
     FEEDBACK_READ = "feedback_read"
     FEEDBACK_UPDATE = "feedback_update"
+    RELATIONSHIP_READ = "relationship_read"
+    RELATIONSHIP_UPDATE = "relationship_update"
 
 
 @dataclass(frozen=True)

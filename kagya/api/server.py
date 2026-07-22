@@ -25,6 +25,7 @@ from kagya.api.routes import (
     metacognition,
     motivation,
     narrative_self,
+    relationships,
     sleep,
     self_model,
     state,
@@ -151,6 +152,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(autonomy.router)
         app.include_router(feedback.router)
         app.include_router(metacognition.router)
+        app.include_router(relationships.router)
 
     return app
 

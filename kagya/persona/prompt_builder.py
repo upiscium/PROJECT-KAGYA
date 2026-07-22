@@ -22,6 +22,7 @@ class PromptBuilder:
         *,
         current_context: ContextFrame,
         attachments: list[dict[str, object]] | None = None,
+        relationship_context: tuple[str, ...] = (),
     ) -> str:
         working_memory_lines = [
             (
@@ -51,6 +52,9 @@ class PromptBuilder:
                 f"- participants: {', '.join(current_context.participant_ids) or 'none'}",
                 f"- topic: {current_context.active_topic or 'unspecified'}",
                 f"- task: {current_context.active_task or 'unspecified'}",
+                "",
+                "Relationship continuity:",
+                *(relationship_context or ("- none",)),
                 "",
                 "Working memory:",
                 *(working_memory_lines or ["- none"]),
