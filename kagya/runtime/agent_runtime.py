@@ -69,6 +69,12 @@ class AgentEventType(StrEnum):
     INTRINSIC_GOAL_DELIBERATE = "intrinsic_goal_deliberate"
     INTRINSIC_GOAL_ADOPT = "intrinsic_goal_adopt"
     PLAN_GENERATE = "plan_generate"
+    ACTION_READ = "action_read"
+    ACTION_INTENT = "action_intent"
+    ACTION_APPROVAL = "action_approval"
+    ACTION_EXECUTE = "action_execute"
+    ACTION_CANCEL = "action_cancel"
+    ACTION_COMPENSATE = "action_compensate"
 
 
 @dataclass(frozen=True)

@@ -14,6 +14,7 @@ from uuid import uuid4
 from fastapi import Header, HTTPException, Request, status
 
 from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
+from kagya.actions import ActionExecutionLayer
 from kagya.config import Settings, TrainingBackendType, get_settings
 from kagya.learning import (
     AdapterEntry,
@@ -80,6 +81,7 @@ _APPROVAL_PATHS = (
     "/api/beliefs/*/retract",
     "/api/beliefs/*/supersede",
     "/api/self-model/identity/proposals/*/resolve",
+    "/api/actions/intents/*/approval",
 )
 
 
@@ -197,6 +199,21 @@ def get_subject_scheduler(request: Request) -> SubjectScheduler:
         )
         request.app.state.subject_scheduler = scheduler
     return scheduler
+
+
+def get_action_execution(request: Request) -> ActionExecutionLayer:
+    execution = getattr(request.app.state, "action_execution", None)
+    main_loop = get_main_loop(request)
+    if execution is None or execution.main_loop is not main_loop:
+        settings = get_api_settings(request).actions
+        execution = ActionExecutionLayer(
+            main_loop,
+            document_root=settings.document_root,
+            calendar_path=settings.calendar_path,
+        )
+        request.app.state.action_execution = execution
+        main_loop.action_execution = execution
+    return execution
 
 
 def _event_sequence(sequence: int | None) -> int:
@@ -410,6 +427,10 @@ def _replace_main_loop(
     scheduler = getattr(request.app.state, "subject_scheduler", None)
     if scheduler is not None:
         scheduler.main_loop = main_loop
+    execution = getattr(request.app.state, "action_execution", None)
+    if execution is not None:
+        execution.main_loop = main_loop
+        main_loop.action_execution = execution
     return main_loop
 
 

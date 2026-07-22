@@ -108,6 +108,8 @@ class ActualOutcome:
     recorded_at: str
     feedback_id: str | None = None
     feedback_revision: int | None = None
+    compensated: bool = False
+    compensation_receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.description:
@@ -115,6 +117,8 @@ class ActualOutcome:
         _bounded(self.utility, "utility", minimum=-1.0, maximum=1.0)
         if _contains_private_key(asdict(self)):
             raise ValueError("Actual outcome contains a private reasoning field")
+        if self.compensated != (self.compensation_receipt_id is not None):
+            raise ValueError("Compensated outcome requires a compensation receipt")
 
 
 @dataclass(frozen=True)
@@ -147,12 +151,12 @@ class DecisionRecord:
     narrative_self_refs: tuple[str, ...] = ()
     metacognition_pre_assessment_id: str | None = None
     metacognition_post_assessment_id: str | None = None
-    schema_version: int = 8
+    schema_version: int = 9
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -419,6 +423,43 @@ class DecisionStore:
             actual_outcome=None,
             prediction_error=None,
             updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def record_compensation(
+        self,
+        decision_id: str,
+        *,
+        receipt_id: str,
+        observed_event_id: str | None,
+        observed_event_sequence: int | None,
+    ) -> DecisionRecord:
+        if not receipt_id:
+            raise ValueError("Compensation receipt ID must not be empty")
+        record = self.get(decision_id)
+        if record.actual_outcome is None:
+            raise ValueError("Decision has no action outcome to compensate")
+        selected = next(
+            item
+            for item in record.considered_candidates
+            if item.candidate.candidate_id == record.selected_candidate_id
+        )
+        outcome = ActualOutcome(
+            description="action_compensated",
+            utility=0.0,
+            success=False,
+            observed_event_id=observed_event_id,
+            observed_event_sequence=observed_event_sequence,
+            recorded_at=_now(),
+            compensated=True,
+            compensation_receipt_id=receipt_id,
+        )
+        updated = replace(
+            record,
+            actual_outcome=outcome,
+            prediction_error=-selected.predicted_utility,
+            updated_at=outcome.recorded_at,
         )
         self.records[decision_id] = updated
         return updated
@@ -713,7 +754,7 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data["narrative_self_refs"] = tuple(data.get("narrative_self_refs", ()))
     data.setdefault("metacognition_pre_assessment_id", None)
     data.setdefault("metacognition_post_assessment_id", None)
-    data["schema_version"] = 8
+    data["schema_version"] = 9
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)
@@ -731,7 +772,10 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data["selection_reasons"] = tuple(data.get("selection_reasons", ()))
     data["status"] = DecisionStatus(data["status"])
     if data.get("actual_outcome") is not None:
-        data["actual_outcome"] = ActualOutcome(**data["actual_outcome"])
+        outcome = dict(data["actual_outcome"])
+        outcome.setdefault("compensated", False)
+        outcome.setdefault("compensation_receipt_id", None)
+        data["actual_outcome"] = ActualOutcome(**outcome)
     return DecisionRecord(**data)
 
 

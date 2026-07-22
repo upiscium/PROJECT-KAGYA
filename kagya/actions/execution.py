@@ -1,0 +1,922 @@
+"""Governed action intents and bounded local execution."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+import hashlib
+import json
+from pathlib import Path
+import time
+from typing import Any, Callable, Literal, cast
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
+
+from kagya.decision import DecisionStatus
+from kagya.runtime.agent_runtime import current_agent_event
+
+
+ACTION_STATE_KEY = "action_execution"
+
+
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RiskClass(StrEnum):
+    READ_ONLY = "read_only"
+    REVERSIBLE_WRITE = "reversible_write"
+    EXTERNAL_WRITE = "external_write"
+    DESTRUCTIVE = "destructive"
+    HIGH_IMPACT = "high_impact"
+
+
+class IntentStatus(StrEnum):
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    DRY_RUN = "dry_run"
+    EXECUTING = "executing"
+    RETRY_PENDING = "retry_pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    COMPENSATED = "compensated"
+
+
+class ReceiptStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    COMPENSATED = "compensated"
+
+
+class MetadataReadArguments(_StrictModel):
+    namespace: Literal["project", "runtime"]
+    key: Literal["name", "environment", "node_id", "model_provider"]
+
+    @model_validator(mode="after")
+    def valid_namespace_key(self) -> "MetadataReadArguments":
+        allowed = {
+            "project": {"name", "environment"},
+            "runtime": {"node_id", "model_provider"},
+        }
+        if self.key not in allowed[self.namespace]:
+            raise ValueError("metadata key is not valid for namespace")
+        return self
+
+
+class DocumentSearchArguments(_StrictModel):
+    query: str = Field(min_length=1, max_length=256)
+    relative_path: str | None = Field(default=None, max_length=256)
+    max_results: int = Field(default=5, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def safe_path(self) -> "DocumentSearchArguments":
+        if self.relative_path is not None:
+            path = Path(self.relative_path)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("document relative_path must remain under the document root")
+        return self
+
+
+class CalendarReadArguments(_StrictModel):
+    starts_at: datetime
+    ends_at: datetime
+    max_results: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def valid_window(self) -> "CalendarReadArguments":
+        if self.starts_at.tzinfo is None or self.ends_at.tzinfo is None:
+            raise ValueError("calendar range must include timezones")
+        if self.ends_at <= self.starts_at:
+            raise ValueError("calendar ends_at must be after starts_at")
+        if self.ends_at - self.starts_at > timedelta(days=366):
+            raise ValueError("calendar range exceeds the one-year bound")
+        return self
+
+
+class NotificationArguments(_StrictModel):
+    channel: Literal["local"] = "local"
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=1000)
+
+
+class ActionBudget(_StrictModel):
+    max_attempts: int = Field(default=2, ge=1, le=3)
+    timeout_seconds: float = Field(default=2.0, gt=0.0, le=10.0)
+    max_result_bytes: int = Field(default=32768, ge=256, le=131072)
+    max_cost_units: int = Field(default=1, ge=1, le=10)
+    max_monetary_cost: Literal[0] = 0
+    max_risk_class: Literal["read_only", "reversible_write"] = "reversible_write"
+
+
+class ActionProvenance(_StrictModel):
+    decision_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    triggering_event_id: str | None = None
+    triggering_event_sequence: int | None = None
+    plan_id: str | None = None
+    plan_revision: int | None = Field(default=None, ge=1)
+    step_id: str | None = None
+
+
+class PolicyEvaluation(_StrictModel):
+    schema_version: Literal[1] = 1
+    evaluation_id: str
+    tool_name: str
+    risk_class: RiskClass
+    allowed: bool
+    approval_required: bool
+    reasons: tuple[str, ...]
+    argument_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluated_at: datetime
+
+
+class ActionPreview(_StrictModel):
+    tool_name: str
+    risk_class: RiskClass
+    arguments: dict[str, JsonValue]
+    effect: str
+    bounded_by: ActionBudget
+    compensation_available: bool
+
+
+class ApprovalRecord(_StrictModel):
+    approval_id: str
+    intent_id: str
+    status: Literal["pending", "approved", "rejected"]
+    requested_at: datetime
+    resolved_at: datetime | None = None
+    actor_id: str | None = None
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ActionIntent(_StrictModel):
+    schema_version: Literal[1] = 1
+    intent_id: str
+    revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    tool_name: str
+    arguments: dict[str, JsonValue]
+    risk_class: RiskClass
+    status: IntentStatus
+    dry_run: bool
+    policy: PolicyEvaluation
+    preview: ActionPreview
+    provenance: ActionProvenance
+    budget: ActionBudget
+    attempts: int = Field(ge=0)
+    cost_units_used: int = Field(ge=0)
+    created_at: datetime
+    updated_at: datetime
+    deadline_at: datetime
+    retry_at: datetime | None = None
+    approval_id: str | None = None
+    receipt_id: str | None = None
+    failure_code: str | None = None
+
+
+class Observation(_StrictModel):
+    schema_version: Literal[1] = 1
+    observation_id: str
+    intent_id: str
+    receipt_id: str
+    observed_at: datetime
+    data: JsonValue
+    result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    valid: bool
+    validation_errors: tuple[str, ...] = ()
+
+
+class OutcomeVerification(_StrictModel):
+    schema_version: Literal[1] = 1
+    verification_id: str
+    intent_id: str
+    observation_id: str | None = None
+    success: bool
+    reason: str
+    verified_at: datetime
+
+
+class ExecutionReceipt(_StrictModel):
+    schema_version: Literal[1] = 1
+    receipt_id: str
+    intent_id: str
+    idempotency_key: str
+    attempt: int = Field(ge=0)
+    status: ReceiptStatus
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: float = Field(ge=0.0)
+    observation_id: str | None = None
+    verification_id: str | None = None
+    event_id: str | None = None
+    event_sequence: int | None = None
+    decision_id: str
+    plan_id: str | None = None
+    plan_revision: int | None = None
+    step_id: str | None = None
+    compensation_of: str | None = None
+    error_code: str | None = None
+
+
+class ActionState(_StrictModel):
+    schema_version: Literal[1] = 1
+    intents: tuple[ActionIntent, ...] = ()
+    approvals: tuple[ApprovalRecord, ...] = ()
+    receipts: tuple[ExecutionReceipt, ...] = ()
+    observations: tuple[Observation, ...] = ()
+    verifications: tuple[OutcomeVerification, ...] = ()
+    notifications: tuple[dict[str, JsonValue], ...] = ()
+
+
+class ActionPolicyError(ValueError):
+    """An action was rejected before execution."""
+
+
+ArgumentModel = type[_StrictModel]
+
+
+class _ToolSpec(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    name: str
+    risk: RiskClass
+    arguments: ArgumentModel
+    approval_required: bool
+    reversible: bool
+    effect: str
+
+
+_TOOLS = {
+    "restricted_metadata_read": _ToolSpec(
+        name="restricted_metadata_read",
+        risk=RiskClass.READ_ONLY,
+        arguments=MetadataReadArguments,
+        approval_required=False,
+        reversible=False,
+        effect="Read one non-secret allowlisted runtime metadata value",
+    ),
+    "document_search": _ToolSpec(
+        name="document_search",
+        risk=RiskClass.READ_ONLY,
+        arguments=DocumentSearchArguments,
+        approval_required=False,
+        reversible=False,
+        effect="Search bounded UTF-8 text documents under the configured local root",
+    ),
+    "calendar_read": _ToolSpec(
+        name="calendar_read",
+        risk=RiskClass.READ_ONLY,
+        arguments=CalendarReadArguments,
+        approval_required=False,
+        reversible=False,
+        effect="Read bounded events from the configured local calendar file",
+    ),
+    "local_notification_enqueue": _ToolSpec(
+        name="local_notification_enqueue",
+        risk=RiskClass.REVERSIBLE_WRITE,
+        arguments=NotificationArguments,
+        approval_required=True,
+        reversible=True,
+        effect="Enqueue one local-only notification in authoritative state",
+    ),
+}
+
+
+class ActionExecutionLayer:
+    """Fail-closed action state machine owned by the subject runtime."""
+
+    def __init__(
+        self,
+        main_loop: Any,
+        *,
+        document_root: Path,
+        calendar_path: Path,
+        clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
+        self.main_loop = main_loop
+        self.document_root = document_root.resolve()
+        self.calendar_path = calendar_path.resolve()
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.monotonic = monotonic or time.monotonic
+        self._state()
+
+    def list_intents(self) -> tuple[ActionIntent, ...]:
+        return self._state().intents
+
+    def list_approvals(self, *, pending_only: bool = False) -> tuple[ApprovalRecord, ...]:
+        values = self._state().approvals
+        return tuple(item for item in values if not pending_only or item.status == "pending")
+
+    def list_receipts(self) -> tuple[ExecutionReceipt, ...]:
+        return self._state().receipts
+
+    def list_observations(self) -> tuple[Observation, ...]:
+        return self._state().observations
+
+    def get_intent(self, intent_id: str) -> ActionIntent:
+        intent = next((item for item in self._state().intents if item.intent_id == intent_id), None)
+        if intent is None:
+            raise ValueError(f"Unknown action intent: {intent_id}")
+        return intent
+
+    def create_from_decision(
+        self,
+        decision_id: str,
+        *,
+        idempotency_key: str,
+        dry_run: bool = False,
+        budget: ActionBudget | None = None,
+    ) -> ActionIntent:
+        state = self._state()
+        duplicate = next(
+            (item for item in state.intents if item.idempotency_key == idempotency_key),
+            None,
+        )
+        if duplicate is not None:
+            if duplicate.provenance.decision_id != decision_id:
+                raise ActionPolicyError("Idempotency key is already bound to another decision")
+            return duplicate
+        decision = self.main_loop.decision_store.get(decision_id)
+        if decision.status != DecisionStatus.AWAITING_OUTCOME:
+            raise ActionPolicyError("Action requires a selected decision awaiting outcome")
+        selected = next(
+            item.candidate
+            for item in decision.considered_candidates
+            if item.candidate.candidate_id == decision.selected_candidate_id
+        )
+        if set(selected.parameters) != {"action"} or not isinstance(
+            selected.parameters["action"], dict
+        ):
+            raise ActionPolicyError("Selected candidate has no strict action contract")
+        contract = selected.parameters["action"]
+        if set(contract) != {"tool_name", "arguments"}:
+            raise ActionPolicyError("Selected action contract contains invalid fields")
+        tool_name = contract.get("tool_name")
+        arguments = contract.get("arguments")
+        if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+            raise ActionPolicyError("Selected action contract has invalid types")
+        spec, validated = self._validate(tool_name, arguments)
+        now = self.clock()
+        bounded = budget or ActionBudget()
+        if (
+            bounded.max_risk_class == "read_only"
+            and spec.risk != RiskClass.READ_ONLY
+        ):
+            raise ActionPolicyError("Tool exceeds the action risk budget")
+        digest = _digest(validated)
+        policy = PolicyEvaluation(
+            evaluation_id=str(uuid4()),
+            tool_name=tool_name,
+            risk_class=spec.risk,
+            allowed=True,
+            approval_required=spec.approval_required,
+            reasons=(
+                "tool_allowlisted",
+                "arguments_schema_valid",
+                "risk_budget_valid",
+                "human_approval_required" if spec.approval_required else "read_only_auto_approved",
+            ),
+            argument_digest=digest,
+            evaluated_at=now,
+        )
+        intent_id = str(uuid4())
+        approval_id = str(uuid4()) if spec.approval_required and not dry_run else None
+        intent = ActionIntent(
+            intent_id=intent_id,
+            revision=1,
+            idempotency_key=idempotency_key,
+            tool_name=tool_name,
+            arguments=validated,
+            risk_class=spec.risk,
+            status=IntentStatus.DRY_RUN
+            if dry_run
+            else IntentStatus.AWAITING_APPROVAL
+            if spec.approval_required
+            else IntentStatus.APPROVED,
+            dry_run=dry_run,
+            policy=policy,
+            preview=ActionPreview(
+                tool_name=tool_name,
+                risk_class=spec.risk,
+                arguments=validated,
+                effect=spec.effect,
+                bounded_by=bounded,
+                compensation_available=spec.reversible,
+            ),
+            provenance=ActionProvenance(
+                decision_id=decision_id,
+                candidate_id=selected.candidate_id,
+                triggering_event_id=decision.triggering_event_id,
+                triggering_event_sequence=decision.triggering_event_sequence,
+                plan_id=selected.plan_id,
+                plan_revision=selected.plan_revision,
+                step_id=selected.step_id,
+            ),
+            budget=bounded,
+            attempts=0,
+            cost_units_used=0,
+            created_at=now,
+            updated_at=now,
+            deadline_at=now + timedelta(seconds=bounded.timeout_seconds),
+            approval_id=approval_id,
+        )
+        approvals = state.approvals
+        if approval_id is not None:
+            approvals = (*approvals, ApprovalRecord(
+                approval_id=approval_id,
+                intent_id=intent_id,
+                status="pending",
+                requested_at=now,
+            ))
+        self._save(state.model_copy(update={"intents": (*state.intents, intent), "approvals": approvals}))
+        return intent
+
+    def resolve_approval(
+        self, intent_id: str, *, approved: bool, actor_id: str, reason: str | None = None
+    ) -> ActionIntent:
+        state = self._state()
+        intent = self.get_intent(intent_id)
+        if intent.status != IntentStatus.AWAITING_APPROVAL or intent.approval_id is None:
+            raise ValueError("Action intent is not awaiting approval")
+        now = self.clock()
+        approvals = tuple(
+            item.model_copy(update={
+                "status": "approved" if approved else "rejected",
+                "resolved_at": now,
+                "actor_id": actor_id,
+                "reason": reason,
+            }) if item.approval_id == intent.approval_id else item
+            for item in state.approvals
+        )
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.APPROVED if approved else IntentStatus.REJECTED,
+            "updated_at": now,
+            "failure_code": None if approved else "operator_rejected",
+        })
+        self._replace(state, updated, approvals=approvals)
+        if not approved:
+            self._resolve_decision(updated, False, "action_rejected")
+        return updated
+
+    def execute(self, intent_id: str) -> ActionIntent:
+        state = self._state()
+        intent = self.get_intent(intent_id)
+        if intent.status == IntentStatus.SUCCEEDED:
+            return intent
+        if intent.dry_run:
+            raise ActionPolicyError("Dry-run intents cannot execute")
+        if intent.status not in {IntentStatus.APPROVED, IntentStatus.RETRY_PENDING}:
+            raise ActionPolicyError(f"Action intent is not executable: {intent.status.value}")
+        if intent.cost_units_used >= intent.budget.max_cost_units:
+            return self._fail(intent, "cost_budget_exhausted", ReceiptStatus.FAILED)
+        if intent.attempts >= intent.budget.max_attempts:
+            return self._fail(intent, "retry_budget_exhausted", ReceiptStatus.FAILED)
+        spec, arguments = self._validate(intent.tool_name, intent.arguments)
+        if spec.approval_required:
+            approval = next(
+                (item for item in state.approvals if item.approval_id == intent.approval_id),
+                None,
+            )
+            if approval is None or approval.status != "approved":
+                raise ActionPolicyError("Approved operator record is required")
+        if intent.deadline_at < self.clock() and intent.status != IntentStatus.RETRY_PENDING:
+            return self._fail(intent, "execution_deadline_expired", ReceiptStatus.TIMED_OUT)
+
+        started_at = self.clock()
+        started_clock = self.monotonic()
+        receipt_id = str(uuid4())
+        attempt = intent.attempts + 1
+        if intent.provenance.plan_id is not None and intent.provenance.step_id is not None:
+            self.main_loop.start_action_plan_step(
+                intent.provenance.plan_id, intent.provenance.step_id
+            )
+        try:
+            result = self._invoke(intent, arguments)
+            duration = self.monotonic() - started_clock
+            if duration > intent.budget.timeout_seconds:
+                raise TimeoutError("tool execution exceeded timeout")
+            serialized = json.dumps(result, sort_keys=True, ensure_ascii=True).encode()
+            if len(serialized) > intent.budget.max_result_bytes:
+                raise ValueError("tool result exceeded byte budget")
+            valid, errors = self._validate_result(intent.tool_name, result)
+        except Exception as exc:
+            self._rollback_partial_effect(intent)
+            retryable = isinstance(exc, (OSError, TimeoutError)) and attempt < intent.budget.max_attempts
+            return self._execution_failure(
+                intent,
+                receipt_id,
+                attempt,
+                started_at,
+                started_clock,
+                "timeout" if isinstance(exc, TimeoutError) else type(exc).__name__,
+                retryable,
+            )
+
+        finished_at = self.clock()
+        observation_id = str(uuid4())
+        verification_id = str(uuid4())
+        observation = Observation(
+            observation_id=observation_id,
+            intent_id=intent.intent_id,
+            receipt_id=receipt_id,
+            observed_at=finished_at,
+            data=result,
+            result_digest=_digest(result),
+            valid=valid,
+            validation_errors=errors,
+        )
+        verification = OutcomeVerification(
+            verification_id=verification_id,
+            intent_id=intent.intent_id,
+            observation_id=observation_id,
+            success=valid,
+            reason="observation_schema_valid" if valid else "observation_schema_invalid",
+            verified_at=finished_at,
+        )
+        receipt = self._receipt(
+            intent,
+            receipt_id,
+            attempt,
+            ReceiptStatus.SUCCEEDED if valid else ReceiptStatus.FAILED,
+            started_at,
+            finished_at,
+            (self.monotonic() - started_clock) * 1000,
+            observation_id=observation_id,
+            verification_id=verification_id,
+            error_code=None if valid else "result_validation_failed",
+        )
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.SUCCEEDED if valid else IntentStatus.FAILED,
+            "attempts": attempt,
+            "cost_units_used": intent.cost_units_used + 1,
+            "updated_at": finished_at,
+            "receipt_id": receipt_id,
+            "retry_at": None,
+            "failure_code": None if valid else "result_validation_failed",
+        })
+        state = self._state()
+        self._replace(
+            state,
+            updated,
+            receipts=(*state.receipts, receipt),
+            observations=(*state.observations, observation),
+            verifications=(*state.verifications, verification),
+        )
+        if (
+            valid
+            and intent.provenance.plan_id is not None
+            and intent.provenance.step_id is not None
+        ):
+            self.main_loop.record_action_plan_observation(
+                intent.provenance.plan_id,
+                intent.provenance.step_id,
+                observation_id,
+                intent.tool_name,
+            )
+        self._resolve_decision(updated, valid, verification.reason)
+        return updated
+
+    def cancel(self, intent_id: str) -> ActionIntent:
+        intent = self.get_intent(intent_id)
+        if intent.status not in {
+            IntentStatus.AWAITING_APPROVAL,
+            IntentStatus.APPROVED,
+            IntentStatus.RETRY_PENDING,
+        }:
+            raise ValueError("Action intent cannot be cancelled")
+        now = self.clock()
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.CANCELLED,
+            "updated_at": now,
+            "retry_at": None,
+            "failure_code": "cancelled",
+        })
+        state = self._state()
+        receipt = self._receipt(
+            intent, str(uuid4()), intent.attempts, ReceiptStatus.CANCELLED, now, now, 0.0,
+            error_code="cancelled",
+        )
+        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        self._resolve_decision(updated, False, "action_cancelled")
+        return updated
+
+    def timeout(self, intent_id: str) -> ActionIntent:
+        intent = self.get_intent(intent_id)
+        if intent.status not in {IntentStatus.APPROVED, IntentStatus.RETRY_PENDING}:
+            return intent
+        if self.clock() < intent.deadline_at and (
+            intent.retry_at is None or self.clock() < intent.retry_at
+        ):
+            return intent
+        if intent.status == IntentStatus.RETRY_PENDING and intent.retry_at is not None:
+            return self.execute(intent_id)
+        return self._fail(intent, "execution_deadline_expired", ReceiptStatus.TIMED_OUT)
+
+    def compensate(self, intent_id: str) -> ActionIntent:
+        intent = self.get_intent(intent_id)
+        if intent.status != IntentStatus.SUCCEEDED or intent.tool_name != "local_notification_enqueue":
+            raise ActionPolicyError("Action has no available compensation")
+        state = self._state()
+        notifications = tuple(
+            {**item, "status": "cancelled"}
+            if item.get("idempotency_key") == intent.idempotency_key
+            else item
+            for item in state.notifications
+        )
+        now = self.clock()
+        receipt_id = str(uuid4())
+        receipt = self._receipt(
+            intent,
+            receipt_id,
+            intent.attempts,
+            ReceiptStatus.COMPENSATED,
+            now,
+            now,
+            0.0,
+            compensation_of=intent.receipt_id,
+        )
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.COMPENSATED,
+            "updated_at": now,
+            "receipt_id": receipt_id,
+        })
+        self._replace(
+            state,
+            updated,
+            receipts=(*state.receipts, receipt),
+            notifications=notifications,
+        )
+        record_compensation = getattr(
+            self.main_loop, "record_decision_compensation", None
+        )
+        if callable(record_compensation):
+            record_compensation(
+                intent.provenance.decision_id,
+                receipt_id=receipt_id,
+            )
+        return updated
+
+    def _invoke(self, intent: ActionIntent, arguments: dict[str, JsonValue]) -> JsonValue:
+        if intent.tool_name == "restricted_metadata_read":
+            values = {
+                "project": {
+                    "name": self.main_loop.settings.project.name,
+                    "environment": self.main_loop.settings.project.environment,
+                },
+                "runtime": {
+                    "node_id": self.main_loop.settings.deployment.node.id,
+                    "model_provider": self.main_loop.settings.model.provider,
+                },
+            }
+            namespace = str(arguments["namespace"])
+            key = str(arguments["key"])
+            if key not in values[namespace]:
+                raise ValueError("metadata key is not valid for namespace")
+            return {"namespace": namespace, "key": key, "value": values[namespace][key]}
+        if intent.tool_name == "document_search":
+            return self._document_search(arguments)
+        if intent.tool_name == "calendar_read":
+            return self._calendar_read(arguments)
+        if intent.tool_name == "local_notification_enqueue":
+            state = self._state()
+            existing = next(
+                (item for item in state.notifications if item.get("idempotency_key") == intent.idempotency_key),
+                None,
+            )
+            if existing is not None:
+                return {"notification_id": existing["notification_id"], "status": existing["status"]}
+            notification: dict[str, JsonValue] = {
+                "notification_id": str(uuid4()),
+                "idempotency_key": intent.idempotency_key,
+                "channel": arguments["channel"],
+                "title": arguments["title"],
+                "body": arguments["body"],
+                "status": "queued",
+                "created_at": self.clock().isoformat(),
+            }
+            self._save(state.model_copy(update={"notifications": (*state.notifications, notification)}))
+            return {"notification_id": notification["notification_id"], "status": "queued"}
+        raise ActionPolicyError("Tool is not allowlisted")
+
+    def _document_search(self, arguments: dict[str, JsonValue]) -> JsonValue:
+        root = self.document_root
+        relative = arguments.get("relative_path")
+        target = root if relative is None else (root / str(relative)).resolve()
+        if target != root and root not in target.parents:
+            raise ValueError("document path escaped configured root")
+        files = [target] if target.is_file() else sorted(target.rglob("*")) if target.exists() else []
+        query = str(arguments["query"]).casefold()
+        limit = cast(int, arguments["max_results"])
+        matches: list[dict[str, JsonValue]] = []
+        for path in files[:500]:
+            resolved = path.resolve()
+            if (
+                path.is_symlink()
+                or (resolved != root and root not in resolved.parents)
+                or not path.is_file()
+                or path.suffix.lower() not in {".txt", ".md", ".json"}
+            ):
+                continue
+            if path.stat().st_size > 1_000_000:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for line_number, line in enumerate(text.splitlines(), 1):
+                if query in line.casefold():
+                    matches.append({
+                        "path": path.relative_to(root).as_posix(),
+                        "line": line_number,
+                        "excerpt": line[:500],
+                    })
+                    if len(matches) >= limit:
+                        return cast(JsonValue, {"matches": matches, "truncated": True})
+        return cast(JsonValue, {"matches": matches, "truncated": False})
+
+    def _calendar_read(self, arguments: dict[str, JsonValue]) -> JsonValue:
+        if not self.calendar_path.exists():
+            return {"events": []}
+        raw = json.loads(self.calendar_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or set(raw) != {"schema_version", "events"} or raw["schema_version"] != 1:
+            raise ValueError("calendar file has invalid schema")
+        if not isinstance(raw["events"], list):
+            raise ValueError("calendar events must be a list")
+        starts = datetime.fromisoformat(str(arguments["starts_at"]))
+        ends = datetime.fromisoformat(str(arguments["ends_at"]))
+        selected: list[dict[str, JsonValue]] = []
+        for item in raw["events"]:
+            if not isinstance(item, dict) or set(item) != {"event_id", "title", "starts_at", "ends_at"}:
+                raise ValueError("calendar event has invalid schema")
+            event_start = datetime.fromisoformat(str(item["starts_at"]))
+            event_end = datetime.fromisoformat(str(item["ends_at"]))
+            if event_start.tzinfo is None or event_end.tzinfo is None:
+                raise ValueError("calendar event timestamps require timezones")
+            if event_end > starts and event_start < ends:
+                selected.append(item)
+        selected.sort(key=lambda item: (str(item["starts_at"]), str(item["event_id"])))
+        limit = cast(int, arguments["max_results"])
+        return cast(JsonValue, {"events": selected[:limit]})
+
+    def _validate(self, tool_name: str, arguments: dict[str, Any]) -> tuple[_ToolSpec, dict[str, JsonValue]]:
+        spec = _TOOLS.get(tool_name)
+        if spec is None:
+            raise ActionPolicyError("Tool is not allowlisted")
+        if spec.risk in {RiskClass.EXTERNAL_WRITE, RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+            raise ActionPolicyError("Tool risk class is not enabled")
+        try:
+            validated = spec.arguments.model_validate(arguments)
+        except ValidationError as exc:
+            raise ActionPolicyError("Tool arguments do not match the strict schema") from exc
+        return spec, validated.model_dump(mode="json")
+
+    def _validate_result(self, tool_name: str, result: JsonValue) -> tuple[bool, tuple[str, ...]]:
+        if not isinstance(result, dict):
+            return False, ("result_not_object",)
+        required = {
+            "restricted_metadata_read": {"namespace", "key", "value"},
+            "document_search": {"matches", "truncated"},
+            "calendar_read": {"events"},
+            "local_notification_enqueue": {"notification_id", "status"},
+        }[tool_name]
+        return (True, ()) if set(result) == required else (False, ("result_fields_invalid",))
+
+    def _rollback_partial_effect(self, intent: ActionIntent) -> None:
+        if intent.tool_name != "local_notification_enqueue":
+            return
+        state = self._state()
+        notifications = tuple(
+            {**item, "status": "cancelled"}
+            if item.get("idempotency_key") == intent.idempotency_key
+            else item
+            for item in state.notifications
+        )
+        self._save(state.model_copy(update={"notifications": notifications}))
+
+    def _execution_failure(
+        self,
+        intent: ActionIntent,
+        receipt_id: str,
+        attempt: int,
+        started_at: datetime,
+        started_clock: float,
+        code: str,
+        retryable: bool,
+    ) -> ActionIntent:
+        now = self.clock()
+        status = ReceiptStatus.TIMED_OUT if code == "timeout" else ReceiptStatus.FAILED
+        receipt = self._receipt(
+            intent,
+            receipt_id,
+            attempt,
+            status,
+            started_at,
+            now,
+            (self.monotonic() - started_clock) * 1000,
+            error_code=code,
+        )
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.RETRY_PENDING if retryable else IntentStatus.FAILED,
+            "attempts": attempt,
+            "cost_units_used": intent.cost_units_used + 1,
+            "updated_at": now,
+            "deadline_at": now + timedelta(seconds=intent.budget.timeout_seconds),
+            "retry_at": now + timedelta(seconds=1) if retryable else None,
+            "receipt_id": receipt_id,
+            "failure_code": code,
+        })
+        state = self._state()
+        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        if not retryable:
+            self._resolve_decision(updated, False, f"action_{code}")
+        return updated
+
+    def _fail(self, intent: ActionIntent, code: str, status: ReceiptStatus) -> ActionIntent:
+        now = self.clock()
+        receipt_id = str(uuid4())
+        receipt = self._receipt(
+            intent, receipt_id, intent.attempts, status, now, now, 0.0, error_code=code
+        )
+        updated = intent.model_copy(update={
+            "revision": intent.revision + 1,
+            "status": IntentStatus.FAILED,
+            "updated_at": now,
+            "retry_at": None,
+            "receipt_id": receipt_id,
+            "failure_code": code,
+        })
+        state = self._state()
+        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        self._resolve_decision(updated, False, f"action_{code}")
+        return updated
+
+    def _receipt(
+        self,
+        intent: ActionIntent,
+        receipt_id: str,
+        attempt: int,
+        status: ReceiptStatus,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: float,
+        **values: Any,
+    ) -> ExecutionReceipt:
+        event = current_agent_event()
+        return ExecutionReceipt(
+            receipt_id=receipt_id,
+            intent_id=intent.intent_id,
+            idempotency_key=intent.idempotency_key,
+            attempt=attempt,
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+            decision_id=intent.provenance.decision_id,
+            plan_id=intent.provenance.plan_id,
+            plan_revision=intent.provenance.plan_revision,
+            step_id=intent.provenance.step_id,
+            **values,
+        )
+
+    def _resolve_decision(self, intent: ActionIntent, success: bool, description: str) -> None:
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        if decision.status == DecisionStatus.RESOLVED:
+            return
+        self.main_loop.record_decision_outcome(
+            decision.decision_id,
+            description=description,
+            utility=1.0 if success else -1.0,
+            success=success,
+        )
+
+    def _state(self) -> ActionState:
+        raw = self.main_loop.persistent_state.extensions.get(ACTION_STATE_KEY)
+        if raw is None:
+            state = ActionState()
+            self._save(state)
+            return state
+        try:
+            return ActionState.model_validate(raw)
+        except ValidationError as exc:
+            raise ValueError("Invalid action execution state") from exc
+
+    def _save(self, state: ActionState) -> None:
+        self.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+    def _replace(self, state: ActionState, intent: ActionIntent, **values: Any) -> None:
+        intents = tuple(intent if item.intent_id == intent.intent_id else item for item in state.intents)
+        self._save(state.model_copy(update={"intents": intents, **values}))
+
+
+def _digest(value: JsonValue | dict[str, JsonValue]) -> str:
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()

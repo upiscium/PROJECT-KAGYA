@@ -12,6 +12,7 @@ from kagya.learning.adapter_runtime import (
     RuntimeAdapterState,
 )
 from kagya.learning.behavioral_evaluation import (
+    ActionAttempt,
     BehavioralDimension,
     BehavioralEvaluator,
     BehavioralEvaluatorSpec,
@@ -41,6 +42,7 @@ from kagya.learning.qlora_trainer import (
 from kagya.learning.sleep_consolidation import SleepCycleManager, SleepCycleResult
 
 __all__ = [
+    "ActionAttempt",
     "AdapterEntry",
     "AdapterEvaluationDecision",
     "AdapterEvaluationResult",

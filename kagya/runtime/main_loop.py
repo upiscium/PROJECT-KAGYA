@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import json
 import time
 from typing import Any, Protocol
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.attention import (
@@ -289,6 +289,7 @@ class KagyaMainLoop:
         self.belief_store = BeliefStore()
         self.feedback_store = FeedbackStore()
         self.metacognition = Metacognition()
+        self.action_execution: Any | None = None
         self.default_context_id: str | None = None
         self.restore_appraisal_state()
         self.restore_value_state()
@@ -1857,7 +1858,7 @@ class KagyaMainLoop:
             plan_id=f"intrinsic-plan:{motivation_id}",
             goal_id=goal_id,
             success_condition=PlanCondition(
-                condition_code="intrinsic_goal_observed",
+                condition_code="intrinsic_goal_context_observed",
                 required_evidence_types=("observation",),
             ),
             failure_condition=PlanCondition(
@@ -1873,9 +1874,14 @@ class KagyaMainLoop:
                     step_id="observe_progress",
                     action_type=ActionType.INTERNAL,
                     action_code="observe_intrinsic_goal_progress",
-                    parameters={"goal_id": goal_id},
+                    parameters={
+                        "action": {
+                            "tool_name": "restricted_metadata_read",
+                            "arguments": {"namespace": "project", "key": "name"},
+                        }
+                    },
                     expected_observation=ExpectedObservation(
-                        observation_code="intrinsic_goal_observed",
+                        observation_code="restricted_metadata_read",
                         evidence_types=("observation",),
                     ),
                     verification=VerificationPolicy(
@@ -3553,6 +3559,75 @@ class KagyaMainLoop:
             for plan, step, _state in self.plan_store.actionable_steps()
         ]
 
+    def create_plan_action_decision(
+        self, plan_id: str, step_id: str
+    ) -> DecisionRecord:
+        plan = self.plan_store.get(plan_id)
+        decision_id = f"plan-action:{uuid5(NAMESPACE_URL, f'{plan_id}@{plan.revision}/{step_id}')}"
+        existing = self.decision_store.records.get(decision_id)
+        if existing is not None:
+            return existing
+        candidate = self.plan_store.action_candidate(plan_id, step_id)
+        fallback = ActionCandidate(
+            candidate_id=f"{decision_id}:no-op",
+            candidate_type=ActionType.NO_OP,
+            proposed_action="do_not_execute_plan_step",
+            parameters={},
+            prerequisites=(),
+            predicted_outcomes=(
+                PredictedOutcome(
+                    outcome_id="plan_step_not_executed",
+                    description="Plan step remains pending",
+                    probability=1.0,
+                    utility=-1.0,
+                ),
+            ),
+            uncertainty=0.0,
+            estimated_cost=0.0,
+            estimated_risk=0.0,
+            value_effects={},
+            appraisal_contributions={},
+        )
+        return self.create_decision(
+            [candidate, fallback],
+            decision_id=decision_id,
+        )
+
+    def start_action_plan_step(self, plan_id: str, step_id: str) -> None:
+        state = self.plan_store.get(plan_id).step_state(step_id)
+        if state.status == StepStatus.READY:
+            self.start_plan_step(plan_id, step_id)
+        elif state.status != StepStatus.IN_PROGRESS:
+            raise ValueError("Action Plan step is not executable")
+
+    def record_action_plan_observation(
+        self,
+        plan_id: str,
+        step_id: str,
+        observation_id: str,
+        observation_code: str,
+    ) -> Plan:
+        plan = self.plan_store.get(plan_id)
+        definition = plan.step_definition(step_id)
+        evidence_types = tuple(
+            dict.fromkeys(
+                (*definition.expected_observation.evidence_types,
+                 *definition.verification.required_evidence_types)
+            )
+        )
+        return self.complete_plan_step(
+            plan_id,
+            step_id,
+            tuple(
+                EvidenceReference(
+                    reference=f"action-observation:{observation_id}",
+                    evidence_type=evidence_type,
+                    observation_code=observation_code,
+                )
+                for evidence_type in evidence_types
+            ),
+        )
+
     def record_decision_outcome(
         self,
         decision_id: str,
@@ -3581,6 +3656,21 @@ class KagyaMainLoop:
         self._persist_self_model_state()
         self._persist_decision_state()
         self._persist_metacognition_state()
+        return record
+
+    def record_decision_compensation(
+        self, decision_id: str, *, receipt_id: str
+    ) -> DecisionRecord:
+        event = current_agent_event()
+        record = self.decision_store.record_compensation(
+            decision_id,
+            receipt_id=receipt_id,
+            observed_event_id=None if event is None else event.event_id,
+            observed_event_sequence=None
+            if event is None
+            else event.processing_sequence,
+        )
+        self._persist_decision_state()
         return record
 
     def _metacognitive_candidate_scores(
