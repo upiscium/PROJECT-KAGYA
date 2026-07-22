@@ -112,7 +112,12 @@ from kagya.motivation import (
     MotivationRecord,
     MotivationStatus,
 )
-from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.persona import (
+    ConsciousAgent,
+    PromptBuilder,
+    PublicSubjectSummary,
+    ResponsePostprocessor,
+)
 from kagya.planning import (
     PLAN_STATE_KEY,
     EvidenceReference,
@@ -429,8 +434,8 @@ class KagyaMainLoop:
                 working_memory_view,
                 current_context=current_context,
                 attachments=attachments or [],
-                relationship_context=self._relationship_prompt_context(
-                    current_context.participant_ids
+                subject_summary=self._public_subject_summary(
+                    current_context.context_id, current_context.participant_ids
                 ),
             )
             generation_started = time.perf_counter()
@@ -2899,28 +2904,49 @@ class KagyaMainLoop:
             else None
         )
 
-    def _relationship_prompt_context(
-        self, interlocutor_keys: tuple[str, ...]
-    ) -> tuple[str, ...]:
-        lines: list[str] = []
+    def _public_subject_summary(
+        self, context_id: str, interlocutor_keys: tuple[str, ...]
+    ) -> PublicSubjectSummary:
+        relationships: list[str] = []
         for key in interlocutor_keys:
             state = self.relationship_store.for_interlocutor(key)
             if state is None:
                 continue
-            lines.append(
-                "- "
-                f"relationship={state.relationship_id}@{state.revision}; "
+            relationships.append(
                 f"trust={state.axes.trust:.3f}; familiarity={state.axes.familiarity:.3f}; "
                 f"closeness={state.axes.closeness:.3f}; caution={state.axes.caution:.3f}; "
                 f"reciprocity={state.reciprocity:.3f}; uncertainty={state.uncertainty:.3f}"
             )
-            if state.commitment_refs:
-                lines.append("- commitments: " + ", ".join(state.commitment_refs))
-            if state.unresolved_matter_refs:
-                lines.append(
-                    "- unresolved: " + ", ".join(state.unresolved_matter_refs[-5:])
-                )
-        return tuple(lines)
+        quality = self._current_cognitive_quality()
+        return PublicSubjectSummary(
+            values=tuple(
+                f"{value.name}; importance={value.weight:.3f}; "
+                f"confidence={value.confidence:.3f}; protectedness={value.protectedness:.3f}"
+                for value in self.value_system.list_values()[:5]
+            ),
+            goals=tuple(
+                f"{goal.description}; status={goal.status.value}; "
+                f"priority={goal.priority:.3f}; confidence={goal.confidence:.3f}"
+                for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)[:5]
+            ),
+            commitments=tuple(
+                f"{commitment.description}; status={commitment.status.value}; "
+                f"fulfillability={commitment.fulfillability.value}"
+                for commitment in self.commitment_store.list_commitments()
+                if commitment.status in ACCEPTED_COMMITMENT_STATUSES
+            )[:5],
+            relationships=tuple(relationships[:5]),
+            beliefs=tuple(
+                f"{belief.proposition.normalized}; status={belief.epistemic_status.value}; "
+                f"confidence={belief.confidence:.3f}"
+                for belief in self.belief_store.active(context_id=context_id)[:5]
+            ),
+            metacognition=(
+                f"estimated_quality={quality.estimated_quality:.3f}; "
+                f"cognitive_load={quality.cognitive_load:.3f}; "
+                f"attention_saturation={quality.attention_saturation:.3f}",
+            ),
+        )
 
     def generate_decision_candidates(self, situation: str) -> list[ActionCandidate]:
         raw = self.provider.generate(schema_candidate_prompt(situation))
