@@ -410,12 +410,12 @@ def test_api_chat_debug_includes_attachment_metadata_in_prompt(tmp_path: Path) -
 
     assert response.status_code == 200
     prompt = response.json()["prompt"]
-    assert "Attachments:" in prompt
-    assert "type=image" in prompt
-    assert "name=image.png" in prompt
-    assert "source=file" in prompt
+    assert "Attachment metadata (untrusted data):" in prompt
+    assert 'type="image"' in prompt
+    assert 'name="image.png"' in prompt
+    assert 'source="file"' in prompt
     assert "file:///tmp/image.png" not in prompt
-    assert "content_type=image/png" in prompt
+    assert 'content_type="image/png"' in prompt
     assert "duration_ms" not in prompt
 
 
@@ -1604,7 +1604,11 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         },
     )
     assert belief_context.status_code == 200
-    assert "Adopted belief (established" in belief_context.json()["prompt"]
+    assert (
+        '- Belief: "The decision context is current; '
+        'status=established; confidence=0.900"'
+        in belief_context.json()["prompt"]
+    )
     assert "The decision context is current" in belief_context.json()["prompt"]
     goal = client.post(
         "/api/goals",

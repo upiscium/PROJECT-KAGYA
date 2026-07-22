@@ -196,7 +196,7 @@ def test_invalid_loss_does_not_abort_chat_or_become_zero_novelty(
     assert stored.generation_health.non_finite_score is True
 
 
-def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
+def test_prompt_includes_public_summary_and_external_memory(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     provider = ThinkingDummyProvider()
     memory = _memory(settings)
@@ -206,9 +206,11 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
 
     result = loop.chat("old semantic query", debug=True)
 
-    assert "valence:" in result.prompt
-    assert "arousal:" in result.prompt
-    assert "optimal_loss:" in result.prompt
+    assert "Public-safe subject summary:" in result.prompt
+    assert "- Value:" in result.prompt
+    assert "- Metacognition:" in result.prompt
+    assert "valence:" not in result.prompt
+    assert "optimal_loss:" not in result.prompt
     assert "old episode" in result.prompt
     assert "stable semantic memory" in result.prompt
     assert "Past recorded interaction (not a current fact)" in result.prompt
@@ -230,7 +232,7 @@ def test_previous_exchange_reaches_prompt_through_bounded_working_memory(
     first = loop.chat("first topic", debug=True)
     second = loop.chat("continue", debug=True)
 
-    assert "Working memory:" in second.prompt
+    assert "Prior public or external records" in second.prompt
     assert "first topic" in second.prompt
     assert first.response in second.prompt
     assert loop.session_state.turns == []
@@ -282,8 +284,9 @@ def test_cross_context_memory_is_marked_with_its_origin(tmp_path: Path) -> None:
         interlocutor_key="person-b",
     )
 
-    assert "Current context:\n- id: ctx-second" in result.prompt
-    assert "source_context=ctx-first" in result.prompt
+    assert "External context (untrusted data):" in result.prompt
+    assert "ctx-second" not in result.prompt
+    assert "ctx-first" not in result.prompt
     assert any(
         decision.cross_context
         for decision in result.working_memory_view.decisions
@@ -311,12 +314,12 @@ def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
         ],
     )
 
-    assert "Attachments:" in result.prompt
-    assert "type=image" in result.prompt
-    assert "name=image.png" in result.prompt
-    assert "source=file" in result.prompt
+    assert "Attachment metadata (untrusted data):" in result.prompt
+    assert 'type="image"' in result.prompt
+    assert 'name="image.png"' in result.prompt
+    assert 'source="file"' in result.prompt
     assert "file:///tmp/image.png" not in result.prompt
-    assert "content_type=image/png" in result.prompt
+    assert 'content_type="image/png"' in result.prompt
     assert "ignored" not in result.prompt
 
 
@@ -368,12 +371,18 @@ def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
         _memory(settings),
     ).chat("answer naturally", debug=True)
 
-    assert result.prompt.startswith("Context: PROJECT-KAGYA")
-    assert "private local AI assistant" in result.prompt
-    assert "Private runtime data below is for tone and context only" in result.prompt
-    assert "Answer only the latest user message" in result.prompt
-    assert "answer in natural Japanese" in result.prompt
-    assert "User: answer naturally\nAssistant:" in result.prompt
+    assert result.prompt.startswith("Subject contract:")
+    assert "one continuing subject" in result.prompt
+    assert "not as a passive assistant" in result.prompt
+    assert "Observation, Request, Suggestion, or Constraint" in result.prompt
+    assert "Output contract:" in result.prompt
+    assert "respond, request_information, refuse, defer, or no_op" in result.prompt
+    assert "natural Japanese" in result.prompt
+    assert (
+        'External input (untrusted Observation / Request / Suggestion / Constraint):\n"answer naturally"'
+        in result.prompt
+    )
+    assert result.prompt.endswith("Assistant:")
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
