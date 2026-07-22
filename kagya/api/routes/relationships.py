@@ -156,7 +156,7 @@ def attach_alias(
             runtime,
             AgentEventType.RELATIONSHIP_UPDATE,
             source="api.relationships.alias",
-            handler=lambda: get_main_loop(request).relationship_store.attach_alias(
+            handler=lambda: get_main_loop(request).attach_relationship_alias(
                 relationship_id,
                 body.interlocutor_key,
                 evidence_refs=tuple(body.evidence_refs),
@@ -181,7 +181,7 @@ def split_relationship(
             runtime,
             AgentEventType.RELATIONSHIP_UPDATE,
             source="api.relationships.split",
-            handler=lambda: get_main_loop(request).relationship_store.split_alias(
+            handler=lambda: get_main_loop(request).split_relationship_alias(
                 relationship_id,
                 body.interlocutor_key,
                 reason=body.reason,

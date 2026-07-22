@@ -94,12 +94,12 @@ def inspect_decisions(
     status: DecisionStatus | None = None,
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
-    store = get_main_loop(request).decision_store
+    coordinator = get_main_loop(request).plan_decision_coordinator
     records = execute_agent_event(
         runtime,
         AgentEventType.DECISION_READ,
         source="api.decisions.inspect",
-        handler=lambda: store.list_records(status),
+        handler=lambda: coordinator.list_decisions(status),
     ).value
     return {"decisions": [asdict(record) for record in records]}
 
