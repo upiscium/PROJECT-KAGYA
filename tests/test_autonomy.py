@@ -8,6 +8,9 @@ from kagya.motivation import (
     CommitmentFulfillability,
     CommitmentStatus,
     GoalStatus,
+    MotivationDynamics,
+    MotivationKind,
+    MotivationSource,
 )
 from kagya.runtime import (
     AgentRuntime,
@@ -55,8 +58,13 @@ class _MainLoop:
         self.goal_manager = _GoalManager()
         self.commitment_store = _CommitmentStore()
         self.decision_store = _DecisionStore()
+        self.motivation_dynamics = MotivationDynamics(
+            max_goal_proposals_per_cycle=1
+        )
         self.reevaluations = 0
         self.commitment_reevaluations = 0
+        self.motivation_reevaluations = 0
+        self.generated_goals = 0
 
     def reevaluate_goals(self) -> list[object]:
         self.reevaluations += 1
@@ -75,6 +83,31 @@ class _MainLoop:
         assert fulfillability == CommitmentFulfillability.AT_RISK
         assert reason
         self.commitment_reevaluations += 1
+
+    def reevaluate_motivation(
+        self, *, max_goal_proposals: int | None = None
+    ) -> tuple[object, list[object]]:
+        self.motivation_reevaluations += 1
+        candidates, _ = self.motivation_dynamics.goal_candidates(
+            max_goal_proposals
+        )
+        goals = []
+        for candidate in candidates:
+            goal_id = f"intrinsic:{candidate.motivation_id}"
+            self.motivation_dynamics.link_goal(candidate.motivation_id, goal_id)
+            goals.append(SimpleNamespace(goal_id=goal_id))
+        self.generated_goals += len(goals)
+        return SimpleNamespace(), goals
+
+    def decay_motivation_record(
+        self, motivation_id: str, elapsed_hours: float
+    ) -> object:
+        return self.motivation_dynamics.decay_record(
+            motivation_id, elapsed_hours
+        )
+
+    def schedule_motivation_reviews(self, review_at: datetime) -> list[object]:
+        return self.motivation_dynamics.schedule_next_reviews(review_at)
 
 
 def _runtime(path: Path, initial_sequence: int = 0) -> tuple[AgentRuntime, EventJournal]:
@@ -221,6 +254,75 @@ def test_at_risk_commitment_is_reevaluated_through_runtime(tmp_path: Path) -> No
 
     assert cycle.result == CycleResult.PROCESSED
     assert loop.commitment_reevaluations == 1
+    runtime.shutdown()
+
+
+def test_persistent_motivation_wakes_are_budgeted_and_journaled(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    runtime, journal = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    record = loop.motivation_dynamics.observe_structured_signal(
+        MotivationKind.DESIRE,
+        MotivationSource.LEARNING,
+        "future-self:planner",
+        signal=0.8,
+        uncertainty=0.2,
+        source_refs=("future-self:planner", "identity-claim:planning"),
+    )
+    scheduler = _scheduler(runtime, loop, max_events=2, max_inferences=0)
+
+    cycle = scheduler.run_cycle(now + timedelta(seconds=61))
+
+    assert cycle.processed == 2
+    assert cycle.inferences == 0
+    assert loop.generated_goals == 1
+    assert loop.motivation_dynamics.get(record.motivation_id).related_goal_ids
+    completed = [
+        item
+        for item in journal.verify()
+        if item.lifecycle == JournalLifecycle.COMPLETED
+        and item.event_type == "autonomy_wake"
+    ]
+    assert len(completed) == 2
+    outcomes = {
+        item["outcome"]
+        for item in loop.persistent_state.extensions["subject_scheduler"]["schedules"]
+        if item["status"] == ScheduleStatus.COMPLETED.value
+    }
+    assert outcomes == {"reevaluated", "decayed"}
+    runtime.shutdown()
+
+
+def test_motivation_reevaluation_records_explicit_no_action(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    loop.motivation_dynamics.observe_structured_signal(
+        MotivationKind.INTEREST,
+        MotivationSource.CURIOSITY,
+        "context:weak",
+        signal=0.2,
+        uncertainty=0.8,
+        source_refs=("experience:one", "experience:two"),
+    )
+    scheduler = _scheduler(runtime, loop, max_events=1, max_inferences=0)
+    scheduler.schedule(
+        WakeUpKind.MOTIVATION_REEVALUATION,
+        now,
+        target_id="context:weak",
+        schedule_id="weak-motivation-review",
+    )
+
+    scheduler.run_cycle(now)
+
+    stored = loop.persistent_state.extensions["subject_scheduler"]["schedules"]
+    completed = next(
+        item for item in stored if item["schedule_id"] == "weak-motivation-review"
+    )
+    assert completed["outcome"] == "no_action"
+    assert loop.generated_goals == 0
     runtime.shutdown()
 
 
