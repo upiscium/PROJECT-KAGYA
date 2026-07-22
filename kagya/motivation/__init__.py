@@ -29,6 +29,9 @@ from kagya.motivation.goal_manager import (
     GoalStatus,
     GoalTransition,
     GoalType,
+    IntrinsicGoalAction,
+    IntrinsicGoalDeliberation,
+    IntrinsicGoalStatus,
 )
 
 __all__ = [
@@ -50,6 +53,9 @@ __all__ = [
     "GoalStatus",
     "GoalTransition",
     "GoalType",
+    "IntrinsicGoalAction",
+    "IntrinsicGoalDeliberation",
+    "IntrinsicGoalStatus",
     "MotivationDynamics",
     "MotivationEpisode",
     "MotivationKind",

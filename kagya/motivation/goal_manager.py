@@ -33,6 +33,23 @@ class GoalStatus(StrEnum):
     FAILED = "failed"
 
 
+class IntrinsicGoalStatus(StrEnum):
+    PROPOSAL = "proposal"
+    DELIBERATING = "deliberating"
+    ENDORSED = "endorsed"
+    ACTIVE = "active"
+    DEFERRED = "deferred"
+    REJECTED = "rejected"
+    ABANDONED = "abandoned"
+
+
+class IntrinsicGoalAction(StrEnum):
+    ENDORSE = "endorse"
+    DEFER = "defer"
+    REJECT = "reject"
+    NO_GOAL = "no_goal"
+
+
 class GoalDecisionAction(StrEnum):
     ACTIVATE = "activate"
     SUSPEND = "suspend"
@@ -101,6 +118,41 @@ class GoalTransition:
 
 
 @dataclass(frozen=True)
+class IntrinsicGoalDeliberation:
+    deliberation_id: str
+    goal_id: str | None
+    action: IntrinsicGoalAction
+    score: float | None
+    factor_scores: dict[str, float]
+    reason_codes: tuple[str, ...]
+    provenance_refs: tuple[str, ...]
+    value_revision_refs: dict[str, int]
+    motivation_revision_ref: str | None
+    self_model_revision: int
+    attention_revision: int
+    relationship_revision_refs: dict[str, int]
+    event_id: str | None
+    event_sequence: int | None
+    created_at: str
+
+    def __post_init__(self) -> None:
+        if self.action == IntrinsicGoalAction.NO_GOAL:
+            if self.goal_id is not None or self.score is not None:
+                raise ValueError("no_goal deliberation cannot reference a proposal")
+        elif self.goal_id is None or self.score is None:
+            raise ValueError("proposal deliberation requires a goal and score")
+        for value in self.factor_scores.values():
+            if not math.isfinite(value) or not -1.0 <= value <= 1.0:
+                raise ValueError("Deliberation factors must be finite and bounded")
+        if self.score is not None and (
+            not math.isfinite(self.score) or not -1.0 <= self.score <= 1.0
+        ):
+            raise ValueError("Deliberation score must be finite and bounded")
+        if not self.reason_codes or not self.provenance_refs:
+            raise ValueError("Deliberation requires reasons and provenance")
+
+
+@dataclass(frozen=True)
 class Goal:
     goal_id: str
     goal_type: GoalType
@@ -125,6 +177,14 @@ class Goal:
     value_revision_refs: dict[str, int] = field(default_factory=dict)
     narrative_self_refs: tuple[str, ...] = ()
     related_desire_ids: tuple[str, ...] = ()
+    intrinsic_status: IntrinsicGoalStatus | None = None
+    motivation_revision_ref: str | None = None
+    proposal_event_id: str | None = None
+    proposal_event_sequence: int | None = None
+    deliberations: tuple[IntrinsicGoalDeliberation, ...] = ()
+    endorsement_provenance_refs: tuple[str, ...] = ()
+    endorsement_value_revision_refs: dict[str, int] = field(default_factory=dict)
+    endorsed_at: str | None = None
     schema_version: int = 4
 
     def __post_init__(self) -> None:
@@ -148,6 +208,15 @@ class Goal:
                     "Value effects require an ID and a finite value between -1 and one"
                 )
         _parse_deadline(self.deadline)
+        if self.goal_type == GoalType.INTRINSIC and self.intrinsic_status is None:
+            raise ValueError("Intrinsic goals require an explicit proposal lifecycle")
+        if self.goal_type != GoalType.INTRINSIC and self.intrinsic_status is not None:
+            raise ValueError("Only intrinsic goals have an intrinsic lifecycle")
+        if self.intrinsic_status in {
+            IntrinsicGoalStatus.ENDORSED,
+            IntrinsicGoalStatus.ACTIVE,
+        } and (not self.endorsement_provenance_refs or self.endorsed_at is None):
+            raise ValueError("Endorsed intrinsic goals require frozen provenance")
 
 
 @dataclass(frozen=True)
@@ -290,6 +359,7 @@ class GoalManager:
     def __init__(self) -> None:
         self.goals: dict[str, Goal] = {}
         self.decisions: list[GoalDecision] = []
+        self.intrinsic_deliberations: list[IntrinsicGoalDeliberation] = []
 
     def propose(
         self,
@@ -311,6 +381,7 @@ class GoalManager:
         value_revision_refs: dict[str, int] | None = None,
         narrative_self_refs: tuple[str, ...] = (),
         related_desire_ids: tuple[str, ...] = (),
+        motivation_revision_ref: str | None = None,
         needs_information: bool = False,
         goal_id: str | None = None,
     ) -> Goal:
@@ -350,6 +421,16 @@ class GoalManager:
             value_revision_refs=dict(value_revision_refs or {}),
             narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
             related_desire_ids=tuple(dict.fromkeys(related_desire_ids)),
+            intrinsic_status=(
+                IntrinsicGoalStatus.PROPOSAL
+                if goal_type == GoalType.INTRINSIC
+                else None
+            ),
+            motivation_revision_ref=motivation_revision_ref,
+            proposal_event_id=origin_event_id,
+            proposal_event_sequence=(
+                None if identity_origin is None else identity_origin.event_sequence
+            ),
         )
         self.goals[identifier] = goal
         return goal
@@ -375,6 +456,11 @@ class GoalManager:
             (goal, self._score(goal, scores.get(goal.goal_id, 0.0)))
             for goal in self.goals.values()
             if goal.status in {GoalStatus.CANDIDATE, GoalStatus.SUSPENDED}
+            and (
+                goal.goal_type != GoalType.INTRINSIC
+                or goal.intrinsic_status == IntrinsicGoalStatus.ENDORSED
+                or goal.motivation_revision_ref is None
+            )
         ]
         return sorted(ranked, key=lambda item: (item[1], item[0].goal_id), reverse=True)
 
@@ -392,6 +478,14 @@ class GoalManager:
         scores = value_scores or {goal_id: value_score}
         if goal.status not in {GoalStatus.CANDIDATE, GoalStatus.SUSPENDED}:
             raise ValueError(f"Goal cannot be adopted from {goal.status.value}")
+        if (
+            goal.goal_type == GoalType.INTRINSIC
+            and goal.intrinsic_status != IntrinsicGoalStatus.ENDORSED
+            and goal.motivation_revision_ref is not None
+        ):
+            raise ValueError(
+                "Intrinsic goal adoption requires prior deliberative endorsement"
+            )
         current_time = now or datetime.now(UTC)
         if current_time.tzinfo is None:
             raise ValueError("Goal evaluation time must include a timezone")
@@ -494,6 +588,16 @@ class GoalManager:
                 ),
                 updated_at=_now(),
             )
+        if goal.goal_type == GoalType.INTRINSIC:
+            current = self.get(goal_id)
+            self.goals[goal_id] = replace(
+                current,
+                intrinsic_status=IntrinsicGoalStatus.ACTIVE,
+                endorsement_provenance_refs=current.endorsement_provenance_refs
+                or ("trusted:legacy_internal_adoption",),
+                endorsed_at=current.endorsed_at or _now(),
+                updated_at=_now(),
+            )
         return self._decision(
             action,
             self.get(goal_id),
@@ -503,6 +607,133 @@ class GoalManager:
             event_id,
             event_sequence,
         )
+
+    def begin_intrinsic_deliberation(self, goal_id: str) -> Goal:
+        goal = self.get(goal_id)
+        if goal.goal_type != GoalType.INTRINSIC:
+            raise ValueError("Only intrinsic proposals can be deliberated")
+        if goal.intrinsic_status not in {
+            IntrinsicGoalStatus.PROPOSAL,
+            IntrinsicGoalStatus.DEFERRED,
+        }:
+            raise ValueError(
+                f"Intrinsic proposal cannot be deliberated from {goal.intrinsic_status}"
+            )
+        updated = replace(
+            goal,
+            intrinsic_status=IntrinsicGoalStatus.DELIBERATING,
+            updated_at=_now(),
+        )
+        self.goals[goal_id] = updated
+        return updated
+
+    def resolve_intrinsic_deliberation(
+        self,
+        goal_id: str,
+        *,
+        action: IntrinsicGoalAction,
+        score: float,
+        factor_scores: dict[str, float],
+        reason_codes: tuple[str, ...],
+        provenance_refs: tuple[str, ...],
+        value_revision_refs: dict[str, int],
+        self_model_revision: int,
+        attention_revision: int,
+        relationship_revision_refs: dict[str, int],
+        event_id: str | None,
+        event_sequence: int | None,
+    ) -> IntrinsicGoalDeliberation:
+        goal = self.get(goal_id)
+        if goal.intrinsic_status != IntrinsicGoalStatus.DELIBERATING:
+            raise ValueError("Intrinsic proposal is not deliberating")
+        if action == IntrinsicGoalAction.NO_GOAL:
+            raise ValueError("no_goal is valid only when no proposal exists")
+        target = {
+            IntrinsicGoalAction.ENDORSE: IntrinsicGoalStatus.ENDORSED,
+            IntrinsicGoalAction.DEFER: IntrinsicGoalStatus.DEFERRED,
+            IntrinsicGoalAction.REJECT: IntrinsicGoalStatus.REJECTED,
+        }[action]
+        record = IntrinsicGoalDeliberation(
+            deliberation_id=f"intrinsic-deliberation-{uuid4()}",
+            goal_id=goal_id,
+            action=action,
+            score=score,
+            factor_scores=dict(factor_scores),
+            reason_codes=reason_codes,
+            provenance_refs=tuple(dict.fromkeys(provenance_refs)),
+            value_revision_refs=dict(value_revision_refs),
+            motivation_revision_ref=goal.motivation_revision_ref,
+            self_model_revision=self_model_revision,
+            attention_revision=attention_revision,
+            relationship_revision_refs=dict(relationship_revision_refs),
+            event_id=event_id,
+            event_sequence=event_sequence,
+            created_at=_now(),
+        )
+        origin = goal.identity_origin
+        if action == IntrinsicGoalAction.ENDORSE:
+            origin = origin.endorse(
+                "structured_intrinsic_deliberation",
+                event_id=event_id,
+                event_sequence=event_sequence,
+            )
+        elif action == IntrinsicGoalAction.REJECT:
+            origin = origin.reject(
+                "structured_intrinsic_deliberation",
+                event_id=event_id,
+                event_sequence=event_sequence,
+            )
+        self.goals[goal_id] = replace(
+            goal,
+            intrinsic_status=target,
+            identity_origin=origin,
+            deliberations=(*goal.deliberations, record),
+            endorsement_provenance_refs=(
+                record.provenance_refs
+                if action == IntrinsicGoalAction.ENDORSE
+                else goal.endorsement_provenance_refs
+            ),
+            endorsement_value_revision_refs=(
+                dict(value_revision_refs)
+                if action == IntrinsicGoalAction.ENDORSE
+                else goal.endorsement_value_revision_refs
+            ),
+            endorsed_at=(
+                record.created_at
+                if action == IntrinsicGoalAction.ENDORSE
+                else goal.endorsed_at
+            ),
+            updated_at=record.created_at,
+        )
+        self.intrinsic_deliberations.append(record)
+        return record
+
+    def record_no_intrinsic_goal(
+        self,
+        *,
+        provenance_refs: tuple[str, ...],
+        event_id: str | None,
+        event_sequence: int | None,
+    ) -> IntrinsicGoalDeliberation:
+        record = IntrinsicGoalDeliberation(
+            deliberation_id=f"intrinsic-deliberation-{uuid4()}",
+            goal_id=None,
+            action=IntrinsicGoalAction.NO_GOAL,
+            score=None,
+            factor_scores={},
+            reason_codes=("no_intrinsic_proposal",),
+            provenance_refs=provenance_refs,
+            value_revision_refs={},
+            motivation_revision_ref=None,
+            self_model_revision=0,
+            attention_revision=0,
+            relationship_revision_refs={},
+            event_id=event_id,
+            event_sequence=event_sequence,
+            created_at=_now(),
+        )
+        self.intrinsic_deliberations.append(record)
+        return record
 
     def transition(
         self,
@@ -534,6 +765,12 @@ class GoalManager:
         updated = replace(
             goal,
             status=status,
+            intrinsic_status=(
+                IntrinsicGoalStatus.ABANDONED
+                if goal.goal_type == GoalType.INTRINSIC
+                and status in {GoalStatus.ABANDONED, GoalStatus.FAILED}
+                else goal.intrinsic_status
+            ),
             updated_at=transition.created_at,
             transitions=(*goal.transitions, transition),
         )
@@ -625,6 +862,7 @@ class GoalManager:
         self,
         goals: Iterable[dict[str, Any]],
         decisions: Iterable[dict[str, Any]] = (),
+        intrinsic_deliberations: Iterable[dict[str, Any]] = (),
     ) -> None:
         restored: dict[str, Goal] = {}
         for payload in goals:
@@ -632,12 +870,19 @@ class GoalManager:
             restored[goal.goal_id] = goal
         self.goals = restored
         self.decisions = [_decision_from_json(payload) for payload in decisions]
+        self.intrinsic_deliberations = [
+            _intrinsic_deliberation_from_json(payload)
+            for payload in intrinsic_deliberations
+        ]
 
     def goals_json(self) -> list[dict[str, Any]]:
         return [asdict(goal) for goal in self.list_goals()]
 
     def decisions_json(self) -> list[dict[str, Any]]:
         return [asdict(decision) for decision in self.decisions]
+
+    def intrinsic_deliberations_json(self) -> list[dict[str, Any]]:
+        return [asdict(item) for item in self.intrinsic_deliberations]
 
     def _active_conflicts(self, goal: Goal) -> tuple[Goal, ...]:
         return tuple(
@@ -1116,6 +1361,9 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
             needs_information=False,
             created_at=now,
             updated_at=now,
+            intrinsic_status=IntrinsicGoalStatus.ACTIVE,
+            endorsement_provenance_refs=("legacy:goal",),
+            endorsed_at=now,
         )
     data = dict(payload)
     data["schema_version"] = 4
@@ -1127,6 +1375,44 @@ def _goal_from_json(payload: dict[str, Any]) -> Goal:
     )
     data["goal_type"] = GoalType(data["goal_type"])
     data["status"] = GoalStatus(data["status"])
+    data["intrinsic_status"] = (
+        IntrinsicGoalStatus(
+            data.get(
+                "intrinsic_status",
+                IntrinsicGoalStatus.ACTIVE
+                if data["status"] == GoalStatus.ACTIVE
+                else IntrinsicGoalStatus.ABANDONED
+                if data["status"] in TERMINAL_GOAL_STATUSES
+                else IntrinsicGoalStatus.DEFERRED,
+            )
+        )
+        if data["goal_type"] == GoalType.INTRINSIC
+        else None
+    )
+    data.setdefault("motivation_revision_ref", None)
+    data.setdefault("proposal_event_id", data.get("origin_event_id"))
+    data.setdefault("proposal_event_sequence", None)
+    data["deliberations"] = tuple(
+        _intrinsic_deliberation_from_json(item)
+        for item in data.get("deliberations", ())
+    )
+    data["endorsement_provenance_refs"] = tuple(
+        data.get("endorsement_provenance_refs", ())
+    )
+    data.setdefault("endorsement_value_revision_refs", {})
+    data.setdefault(
+        "endorsed_at",
+        data.get("updated_at")
+        if data["intrinsic_status"]
+        in {IntrinsicGoalStatus.ENDORSED, IntrinsicGoalStatus.ACTIVE}
+        else None,
+    )
+    if (
+        data["intrinsic_status"]
+        in {IntrinsicGoalStatus.ENDORSED, IntrinsicGoalStatus.ACTIVE}
+        and not data["endorsement_provenance_refs"]
+    ):
+        data["endorsement_provenance_refs"] = ("legacy:goal",)
     data["dependency_ids"] = tuple(data.get("dependency_ids", ()))
     data["conflict_ids"] = tuple(data.get("conflict_ids", ()))
     data["transitions"] = tuple(
@@ -1141,6 +1427,16 @@ def _decision_from_json(payload: dict[str, Any]) -> GoalDecision:
     data["reasons"] = tuple(data.get("reasons", ()))
     data["conflicting_goal_ids"] = tuple(data.get("conflicting_goal_ids", ()))
     return GoalDecision(**data)
+
+
+def _intrinsic_deliberation_from_json(
+    payload: dict[str, Any],
+) -> IntrinsicGoalDeliberation:
+    data = dict(payload)
+    data["action"] = IntrinsicGoalAction(data["action"])
+    data["reason_codes"] = tuple(data.get("reason_codes", ()))
+    data["provenance_refs"] = tuple(data.get("provenance_refs", ()))
+    return IntrinsicGoalDeliberation(**data)
 
 
 def _commitment_from_json(payload: dict[str, Any]) -> Commitment:

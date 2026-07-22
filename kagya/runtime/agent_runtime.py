@@ -65,6 +65,10 @@ class AgentEventType(StrEnum):
     FEEDBACK_UPDATE = "feedback_update"
     RELATIONSHIP_READ = "relationship_read"
     RELATIONSHIP_UPDATE = "relationship_update"
+    INTRINSIC_GOAL_PROPOSE = "intrinsic_goal_propose"
+    INTRINSIC_GOAL_DELIBERATE = "intrinsic_goal_deliberate"
+    INTRINSIC_GOAL_ADOPT = "intrinsic_goal_adopt"
+    PLAN_GENERATE = "plan_generate"
 
 
 @dataclass(frozen=True)

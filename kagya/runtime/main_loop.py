@@ -103,10 +103,14 @@ from kagya.motivation import (
     CommitmentStore,
     Goal,
     GoalDecision,
+    GoalDecisionAction,
     GoalDecisionInput,
     GoalManager,
     GoalStatus,
     GoalType,
+    IntrinsicGoalAction,
+    IntrinsicGoalDeliberation,
+    IntrinsicGoalStatus,
     MotivationDynamics,
     MotivationEpisode,
     MotivationKind,
@@ -125,9 +129,13 @@ from kagya.planning import (
     EvidenceReference,
     Plan,
     PlanCandidate,
+    PlanCondition,
     PlanStatus,
     PlanStore,
+    ExpectedObservation,
+    StepDefinition,
     StepStatus,
+    VerificationPolicy,
 )
 from kagya.relationship import RelationshipState, RelationshipStore
 from kagya.runtime.session_state import SessionState
@@ -1240,9 +1248,15 @@ class KagyaMainLoop:
         decisions = self.persistent_state.motivation_extensions.get(
             "goal_decisions", []
         )
+        intrinsic_deliberations = self.persistent_state.motivation_extensions.get(
+            "intrinsic_goal_deliberations", []
+        )
         self.goal_manager.restore(
             self.persistent_state.active_goals,
             decisions if isinstance(decisions, list) else [],
+            intrinsic_deliberations
+            if isinstance(intrinsic_deliberations, list)
+            else [],
         )
         self.commitment_store.restore(self.persistent_state.commitments)
         self.plan_store.restore(
@@ -1258,6 +1272,9 @@ class KagyaMainLoop:
         self.persistent_state.commitments = self.commitment_store.to_json()
         self.persistent_state.motivation_extensions["goal_decisions"] = (
             self.goal_manager.decisions_json()
+        )
+        self.persistent_state.motivation_extensions["intrinsic_goal_deliberations"] = (
+            self.goal_manager.intrinsic_deliberations_json()
         )
         self.persistent_state.motivation_extensions["dynamics"] = (
             self.motivation_dynamics.to_json()
@@ -1367,7 +1384,9 @@ class KagyaMainLoop:
                         1.0,
                         max(
                             value.weight,
-                            abs(tradeoff.contribution_by_value.get(value.value_id, 0.0)),
+                            abs(
+                                tradeoff.contribution_by_value.get(value.value_id, 0.0)
+                            ),
                         ),
                     ),
                     uncertainty=1.0 - value.confidence,
@@ -1432,6 +1451,18 @@ class KagyaMainLoop:
                     "motivation_id": candidate.motivation_id,
                     "target_ref": candidate.target_ref,
                     "source_refs": list(candidate.source_refs),
+                    "motivation_revision": self.motivation_dynamics.get(
+                        candidate.motivation_id
+                    ).revision,
+                    "motivation_strength": self.motivation_dynamics.get(
+                        candidate.motivation_id
+                    ).strength,
+                    "motivation_persistence": self.motivation_dynamics.get(
+                        candidate.motivation_id
+                    ).persistence,
+                    "motivation_uncertainty": self.motivation_dynamics.get(
+                        candidate.motivation_id
+                    ).uncertainty,
                 },
                 origin_actor=OriginActor.SELF,
                 origin_input_kind=OriginInputKind.INTERNAL_STATE,
@@ -1440,6 +1471,10 @@ class KagyaMainLoop:
                 urgency=candidate.urgency,
                 expected_utility=candidate.priority,
                 confidence=candidate.confidence,
+                motivation_revision_ref=(
+                    f"motivation:{candidate.motivation_id}@"
+                    f"{self.motivation_dynamics.get(candidate.motivation_id).revision}"
+                ),
                 goal_id=f"intrinsic:{candidate.motivation_id}",
             )
             motivation = self.motivation_dynamics.link_goal(
@@ -1462,6 +1497,23 @@ class KagyaMainLoop:
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
         )
+        unresolved_intrinsic = any(
+            goal.intrinsic_status
+            in {
+                IntrinsicGoalStatus.PROPOSAL,
+                IntrinsicGoalStatus.DELIBERATING,
+                IntrinsicGoalStatus.DEFERRED,
+                IntrinsicGoalStatus.ENDORSED,
+            }
+            for goal in self.goal_manager.goals.values()
+            if goal.goal_type == GoalType.INTRINSIC
+        )
+        if not candidates and not unresolved_intrinsic:
+            self.goal_manager.record_no_intrinsic_goal(
+                provenance_refs=("motivation-dynamics:no-eligible-proposal",),
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            )
         self._persist_motivation_state()
         return episode, goals
 
@@ -1473,8 +1525,304 @@ class KagyaMainLoop:
     def decay_motivation_record(
         self, motivation_id: str, elapsed_hours: float
     ) -> MotivationRecord | None:
-        record = self.motivation_dynamics.decay_record(
-            motivation_id, elapsed_hours
+        record = self.motivation_dynamics.decay_record(motivation_id, elapsed_hours)
+        self._persist_motivation_state()
+        return record
+
+    def deliberate_intrinsic_goal(self, goal_id: str) -> IntrinsicGoalDeliberation:
+        """Resolve an intrinsic proposal from structured authoritative state only."""
+        event = current_agent_event()
+        goal = self.goal_manager.get(goal_id)
+        if goal.intrinsic_status not in {
+            IntrinsicGoalStatus.PROPOSAL,
+            IntrinsicGoalStatus.DEFERRED,
+        }:
+            raise ValueError("Intrinsic proposal is not available for deliberation")
+        target = goal.structured_target or {}
+        motivation_id = target.get("motivation_id")
+        if not isinstance(motivation_id, str):
+            raise ValueError("Intrinsic proposal requires an originating Motivation")
+        motivation = self.motivation_dynamics.get(motivation_id)
+        motivation_score = (
+            0.5 * float(target.get("motivation_strength", motivation.strength))
+            + 0.3 * float(target.get("motivation_persistence", motivation.persistence))
+            + 0.2
+            * (
+                1.0
+                - float(target.get("motivation_uncertainty", motivation.uncertainty))
+            )
+        )
+
+        deliberation_value_effects = dict(goal.value_effects)
+        for value_id in motivation.related_value_ids:
+            deliberation_value_effects.setdefault(value_id, 1.0)
+        value_scores = self.value_system.evaluate(
+            {goal.goal_id: deliberation_value_effects}
+        )
+        value_score = max(-1.0, min(1.0, value_scores[0].total_score))
+        value_conflicts = value_scores[0].conflicts
+        value_ids = set(deliberation_value_effects)
+        if goal.origin_value_id is not None:
+            value_ids.add(goal.origin_value_id)
+        values = [self.value_system.get(value_id) for value_id in sorted(value_ids)]
+        value_revisions = {value.value_id: value.revision for value in values}
+
+        active_goal_conflicts = tuple(
+            conflict_id
+            for conflict_id in goal.conflict_ids
+            if self.goal_manager.get(conflict_id).status == GoalStatus.ACTIVE
+        )
+        active_commitments = [
+            item
+            for item in self.commitment_store.list_commitments()
+            if item.status in ACCEPTED_COMMITMENT_STATUSES
+        ]
+        proposal_conflict_refs = {
+            motivation_id,
+            f"motivation:{motivation_id}",
+            *goal.related_desire_ids,
+            *value_ids,
+            *(f"value:{item}" for item in value_ids),
+            *goal.conflict_ids,
+            *(f"goal:{item}" for item in goal.conflict_ids),
+        }
+        commitment_conflicts = tuple(
+            item.commitment_id
+            for item in active_commitments
+            if any(
+                conflict.subject_ref in proposal_conflict_refs
+                for conflict in item.unresolved_conflicts
+            )
+            or (
+                item.related_goal_id is not None
+                and item.related_goal_id in goal.conflict_ids
+            )
+        )
+        conflict_score = -1.0 if active_goal_conflicts or commitment_conflicts else 1.0
+
+        attention_capacity = self.attention_system.capacity
+        proposal_has_attention = any(
+            candidate_id
+            in {
+                f"goal:{goal.goal_id}",
+                f"motivation:{motivation_id}",
+            }
+            for candidate_id in self.attention_system.focus.candidate_ids
+        )
+        available_attention = max(
+            0, attention_capacity - len(self.attention_system.focus.candidate_ids)
+        )
+        if proposal_has_attention:
+            available_attention = max(1, available_attention)
+        attention_score = available_attention / attention_capacity
+        cost = _unit_target(target.get("estimated_cost", 0.0), "estimated_cost")
+        risk = _unit_target(target.get("estimated_risk", 0.0), "estimated_risk")
+        cost_risk_score = 1.0 - 0.5 * (cost + risk)
+
+        cognitive_load = min(
+            1.0, len(self.working_memory.items) / self.working_memory.item_capacity
+        )
+        attention_saturation = len(self.attention_system.focus.candidate_ids) / max(
+            1, attention_capacity
+        )
+        quality = self.metacognition.current_quality(
+            cognitive_load=cognitive_load,
+            attention_saturation=attention_saturation,
+            emotion_valence=self.emotion_engine.state.valence,
+            emotion_arousal=self.emotion_engine.state.arousal,
+            provenance_refs=(
+                f"working-memory:{len(self.working_memory.items)}",
+                f"attention-focus:{self.attention_system.focus.revision}",
+                "emotion:current",
+            ),
+        )
+
+        relationship = self._relationship_for_target(target)
+        relationship_score = (
+            0.5
+            if relationship is None
+            else max(
+                -1.0,
+                min(
+                    1.0,
+                    relationship.axes.trust
+                    + relationship.reciprocity
+                    - relationship.axes.caution
+                    - relationship.uncertainty,
+                ),
+            )
+        )
+        relationship_revisions = (
+            {}
+            if relationship is None
+            else {relationship.relationship_id: relationship.revision}
+        )
+
+        themes = set(_string_values(target.get("theme_codes"))) | set(
+            _string_values(target.get("topic_tags"))
+        )
+        narrative_conflicts = tuple(
+            item.conflict_id
+            for item in self.narrative_self.conflicts.values()
+            if item.resolved_at is None
+            and any(
+                themes.intersection(self.narrative_self.get_claim(claim_id).theme_codes)
+                for claim_id in item.claim_ids
+            )
+        )
+        narrative_score = (
+            -1.0 if narrative_conflicts else (0.7 if goal.narrative_self_refs else 0.5)
+        )
+
+        capability_ids = _string_values(target.get("capability_ids"))
+        capabilities = self.self_model.state.capabilities
+        missing_capabilities = tuple(
+            identifier
+            for identifier in capability_ids
+            if identifier not in capabilities
+        )
+        matching_limitations = tuple(
+            item
+            for item in self.self_model.state.known_limitations.values()
+            if set(item.capability_ids).intersection(capability_ids)
+            or themes.intersection(item.tags)
+        )
+        matching_uncertainties = tuple(
+            item
+            for item in self.self_model.state.epistemic_uncertainties.values()
+            if themes.intersection(item.tags)
+        )
+        capability_score = (
+            0.5
+            if not capability_ids
+            else sum(
+                capabilities[item].confidence
+                for item in capability_ids
+                if item in capabilities
+            )
+            / max(1, len(capability_ids))
+        )
+        capability_score -= max(
+            (item.confidence for item in matching_limitations), default=0.0
+        )
+        missing_information = tuple(
+            dict.fromkeys(
+                (
+                    *_string_values(target.get("missing_information")),
+                    *(f"capability:{item}" for item in missing_capabilities),
+                    *(
+                        f"uncertainty:{item.uncertainty_id}"
+                        for item in matching_uncertainties
+                    ),
+                    *(("goal:needs_information",) if goal.needs_information else ()),
+                )
+            )
+        )
+        information_score = -1.0 if missing_information else 1.0
+
+        factors = {
+            "motivation": motivation_score,
+            "values": value_score,
+            "goal_commitment_conflicts": conflict_score,
+            "attention_capacity": attention_score,
+            "cost_risk": cost_risk_score,
+            "metacognitive_quality": quality.estimated_quality,
+            "relationship": relationship_score,
+            "narrative_continuity": narrative_score,
+            "capability": max(-1.0, min(1.0, capability_score)),
+            "information": information_score,
+        }
+        score = max(
+            -1.0,
+            min(
+                1.0,
+                0.2 * motivation_score
+                + 0.15 * value_score
+                + 0.12 * conflict_score
+                + 0.08 * attention_score
+                + 0.1 * cost_risk_score
+                + 0.1 * quality.estimated_quality
+                + 0.06 * relationship_score
+                + 0.07 * narrative_score
+                + 0.07 * capability_score
+                + 0.05 * information_score,
+            ),
+        )
+        reasons: list[str] = ["structured_multi_factor_deliberation"]
+        if motivation.status != MotivationStatus.ACTIVE:
+            action = IntrinsicGoalAction.REJECT
+            reasons.append("originating_motivation_inactive")
+        elif (
+            active_goal_conflicts
+            or commitment_conflicts
+            or value_conflicts
+            or narrative_conflicts
+        ):
+            action = IntrinsicGoalAction.DEFER
+            reasons.append("major_unresolved_conflict")
+        elif missing_information:
+            action = IntrinsicGoalAction.DEFER
+            reasons.append("missing_information_or_capability")
+        elif available_attention == 0 or quality.estimated_quality < 0.4:
+            action = IntrinsicGoalAction.DEFER
+            reasons.append("insufficient_deliberative_capacity")
+        elif risk >= 0.85 or cost >= 0.9 or score < 0.2:
+            action = IntrinsicGoalAction.REJECT
+            reasons.append("cost_risk_or_utility_unacceptable")
+        elif score >= 0.45:
+            action = IntrinsicGoalAction.ENDORSE
+            reasons.append("multi_factor_threshold_satisfied")
+        else:
+            action = IntrinsicGoalAction.DEFER
+            reasons.append("endorsement_threshold_not_met")
+
+        provenance = tuple(
+            dict.fromkeys(
+                (
+                    goal.motivation_revision_ref
+                    or f"motivation:{motivation_id}@{motivation.revision}",
+                    *(f"value:{item.value_id}@{item.revision}" for item in values),
+                    *(
+                        f"value-evidence:{item}"
+                        for value in values
+                        for item in (
+                            *value.supporting_evidence_ids,
+                            *value.opposing_evidence_ids,
+                        )
+                    ),
+                    *(f"goal:{item}" for item in active_goal_conflicts),
+                    *(f"commitment:{item}" for item in commitment_conflicts),
+                    f"attention-focus:{self.attention_system.focus.revision}",
+                    *quality.provenance_refs,
+                    *(
+                        f"relationship:{key}@{revision}"
+                        for key, revision in relationship_revisions.items()
+                    ),
+                    *goal.narrative_self_refs,
+                    *(f"self-conflict:{item}" for item in narrative_conflicts),
+                    f"self-model:{self.self_model.state.revision}",
+                    *(
+                        f"limitation:{item.limitation_id}"
+                        for item in matching_limitations
+                    ),
+                    *missing_information,
+                )
+            )
+        )
+        self.goal_manager.begin_intrinsic_deliberation(goal_id)
+        record = self.goal_manager.resolve_intrinsic_deliberation(
+            goal_id,
+            action=action,
+            score=score,
+            factor_scores=factors,
+            reason_codes=tuple(reasons),
+            provenance_refs=provenance,
+            value_revision_refs=value_revisions,
+            self_model_revision=self.self_model.state.revision,
+            attention_revision=self.attention_system.focus.revision,
+            relationship_revision_refs=relationship_revisions,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
         )
         self._persist_motivation_state()
         return record
@@ -1485,6 +1833,72 @@ class KagyaMainLoop:
         records = self.motivation_dynamics.schedule_next_reviews(review_at)
         self._persist_motivation_state()
         return records
+
+    def record_no_intrinsic_goal(self) -> IntrinsicGoalDeliberation:
+        event = current_agent_event()
+        record = self.goal_manager.record_no_intrinsic_goal(
+            provenance_refs=("motivation-dynamics:no-eligible-proposal",),
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+        self._persist_motivation_state()
+        return record
+
+    def generate_intrinsic_plan(self, goal_id: str) -> Plan:
+        goal = self.goal_manager.get(goal_id)
+        if goal.intrinsic_status != IntrinsicGoalStatus.ENDORSED:
+            raise ValueError("Plan generation requires an endorsed intrinsic Goal")
+        existing = self.plan_store.list_plans(goal_id=goal_id)
+        if existing:
+            return existing[0]
+        target = goal.structured_target or {}
+        motivation_id = str(target.get("motivation_id", goal_id))
+        candidate = PlanCandidate(
+            plan_id=f"intrinsic-plan:{motivation_id}",
+            goal_id=goal_id,
+            success_condition=PlanCondition(
+                condition_code="intrinsic_goal_observed",
+                required_evidence_types=("observation",),
+            ),
+            failure_condition=PlanCondition(
+                condition_code="intrinsic_goal_blocked",
+                required_evidence_types=("failure",),
+            ),
+            abandonment_condition=PlanCondition(
+                condition_code="intrinsic_goal_abandoned",
+                required_evidence_types=("abandonment",),
+            ),
+            steps=(
+                StepDefinition(
+                    step_id="observe_progress",
+                    action_type=ActionType.INTERNAL,
+                    action_code="observe_intrinsic_goal_progress",
+                    parameters={"goal_id": goal_id},
+                    expected_observation=ExpectedObservation(
+                        observation_code="intrinsic_goal_observed",
+                        evidence_types=("observation",),
+                    ),
+                    verification=VerificationPolicy(
+                        verification_code="structured_observation",
+                        required_evidence_types=("observation",),
+                    ),
+                    timeout_seconds=3600.0,
+                ),
+            ),
+        )
+        return self.create_plan(candidate, actor_id="subject_scheduler")
+
+    def activate_endorsed_intrinsic_goal(self, goal_id: str) -> GoalDecision:
+        goal = self.goal_manager.get(goal_id)
+        plans = self.plan_store.list_plans(goal_id=goal_id)
+        if goal.intrinsic_status != IntrinsicGoalStatus.ENDORSED or not plans:
+            raise ValueError(
+                "Intrinsic adoption requires endorsement and a generated Plan"
+            )
+        decision = self.adopt_goal(goal_id)
+        if decision.action in {GoalDecisionAction.ACTIVATE, GoalDecisionAction.RESUME}:
+            self.activate_plan(plans[0].plan_id)
+        return decision
 
     def propose_goal(
         self,
@@ -1505,6 +1919,7 @@ class KagyaMainLoop:
         deadline: str | None = None,
         value_effects: dict[str, float] | None = None,
         related_desire_ids: tuple[str, ...] = (),
+        motivation_revision_ref: str | None = None,
         needs_information: bool = False,
         goal_id: str | None = None,
     ) -> Goal:
@@ -1553,6 +1968,12 @@ class KagyaMainLoop:
                 source_ref=origin_source_ref,
                 event_id=None if event is None else event.event_id,
                 event_sequence=None if event is None else event.processing_sequence,
+                endorsement=(
+                    EndorsementStatus.PENDING
+                    if goal_type == GoalType.INTRINSIC
+                    and motivation_revision_ref is not None
+                    else None
+                ),
             )
         goal = self.goal_manager.propose(
             goal_type=goal_type,
@@ -1576,6 +1997,7 @@ class KagyaMainLoop:
             },
             narrative_self_refs=narrative_refs,
             related_desire_ids=related_desire_ids,
+            motivation_revision_ref=motivation_revision_ref,
             needs_information=needs_information,
             goal_id=goal_id,
         )
@@ -3826,6 +4248,15 @@ def _string_values(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _unit_target(value: object, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric")
+    result = float(value)
+    if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} must be between zero and one")
+    return result
 
 
 def _fallback_used(provider: ModelProvider) -> bool:

@@ -283,9 +283,13 @@ def test_persistent_motivation_wakes_are_budgeted_and_journaled(
         item
         for item in journal.verify()
         if item.lifecycle == JournalLifecycle.COMPLETED
-        and item.event_type == "autonomy_wake"
+        and item.event_type in {"autonomy_wake", "intrinsic_goal_propose"}
     ]
     assert len(completed) == 2
+    assert {item.event_type for item in completed} == {
+        "autonomy_wake",
+        "intrinsic_goal_propose",
+    }
     outcomes = {
         item["outcome"]
         for item in loop.persistent_state.extensions["subject_scheduler"]["schedules"]

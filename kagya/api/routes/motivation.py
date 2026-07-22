@@ -47,7 +47,7 @@ def reevaluate_motivation(
     try:
         episode, goals = execute_agent_event(
             runtime,
-            AgentEventType.MOTIVATION_REEVALUATE,
+            AgentEventType.INTRINSIC_GOAL_PROPOSE,
             source="api.motivation.reevaluate",
             handler=get_main_loop(request).reevaluate_motivation,
         ).value
