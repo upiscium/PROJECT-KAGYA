@@ -42,6 +42,8 @@ class TrainingJobResponse(BaseModel):
     training_metrics: dict
     total_duration_seconds: float
     stale: bool
+    dataset_revision: str | None
+    dataset_manifest_hash: str | None
 
 
 class TrainingJobListResponse(BaseModel):

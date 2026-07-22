@@ -228,8 +228,43 @@ export type TrainingJob = {
   training_metrics: Record<string, unknown>;
   total_duration_seconds: number;
   stale: boolean;
+  dataset_revision: string | null;
+  dataset_manifest_hash: string | null;
 };
 export type TrainingJobListResponse = { jobs: TrainingJob[] };
+export type DatasetRevisionSummary = {
+  revision: string;
+  parent_revision: string | null;
+  created_at: string;
+  source_job_id: string | null;
+  record_count: number;
+  disposition_counts: Record<string, number>;
+  split_counts: Record<string, number>;
+  quality_findings: string[];
+  record_ids: string[];
+  manifest_hash: string;
+};
+export type GovernedDatasetRecord = {
+  record_id: string;
+  schema_version: number;
+  input: string;
+  thought: string;
+  output: string;
+  provenance: { source_kind: string; source_id: string; source_event_ids: string[]; source_memory_ids: string[]; source_decision_ids: string[]; source_feedback_ids: string[] };
+  inclusion_reason: string;
+  consent: string;
+  privacy: string;
+  disposition: "included" | "excluded" | "quarantined";
+  split: "train" | "validation" | "test" | null;
+  content_hash: string;
+  quarantine_reasons: string[];
+  exclusion_reasons: string[];
+  quality_checks: string[];
+  context_id: string | null;
+  interlocutor_id: string | null;
+};
+export type DatasetRevisionDetail = { manifest: DatasetRevisionSummary; records: GovernedDatasetRecord[] };
+export type DatasetRevisionDiff = { from_revision: string; to_revision: string; added_record_ids: string[]; removed_record_ids: string[]; changed_record_ids: string[] };
 export type BuildInfo = { version: string; commit: string | null };
 export type RuntimeInfo = {
   environment: string;
@@ -430,6 +465,9 @@ export const api = {
   updateSemanticPolicy: (memoryId: string, body: { confidence: number; validity: "valid" | "disputed" | "invalid"; valid_from?: string | null; valid_until?: string | null; expires_at?: string | null; decay_rate: number; idempotency_key: string }) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/policy`, { method: "POST", body: JSON.stringify(body) }),
   createSleepJob: (idempotency_key?: string) => adminRequest<TrainingJob>("/sleep/jobs", { method: "POST", body: JSON.stringify({ idempotency_key }) }),
   sleepJobs: () => adminRequest<TrainingJobListResponse>("/sleep/jobs"),
+  datasetRevisions: () => adminRequest<{ datasets: DatasetRevisionSummary[] }>("/training/datasets"),
+  datasetRevision: (revision: string) => adminRequest<DatasetRevisionDetail>(`/training/datasets/${encodeURIComponent(revision)}`),
+  datasetRevisionDiff: (fromRevision: string, toRevision: string) => adminRequest<DatasetRevisionDiff>(`/training/datasets/diff?from=${encodeURIComponent(fromRevision)}&to=${encodeURIComponent(toRevision)}`),
   cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
   retrySleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   reconcileSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/reconcile`, { method: "POST" }),

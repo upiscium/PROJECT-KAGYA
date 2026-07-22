@@ -21,6 +21,17 @@ from kagya.training.jobs import (
 )
 from kagya.training.remote import SSHTrainingBackend
 from kagya.training.importer import AdapterImportAttempt, CandidateArtifactImporter
+from kagya.training.dataset_governance import (
+    DatasetCandidate,
+    DatasetDisposition,
+    DatasetGovernanceStore,
+    DatasetProvenance,
+    DatasetRevision,
+    DatasetSplit,
+    GovernedDatasetRecord,
+    candidate_from_episode,
+    detect_sensitive_content,
+)
 from kagya.training.worker import (
     TrainingWorkerService,
     WorkerJob,
@@ -47,6 +58,15 @@ __all__ = [
     "SSHTrainingBackend",
     "AdapterImportAttempt",
     "CandidateArtifactImporter",
+    "DatasetCandidate",
+    "DatasetDisposition",
+    "DatasetGovernanceStore",
+    "DatasetProvenance",
+    "DatasetRevision",
+    "DatasetSplit",
+    "GovernedDatasetRecord",
+    "candidate_from_episode",
+    "detect_sensitive_content",
     "TrainingWorkerService",
     "WorkerJob",
     "WorkerJobStatus",

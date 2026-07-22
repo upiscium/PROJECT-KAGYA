@@ -48,6 +48,7 @@ from kagya.training import (
     SSHTrainingBackend,
     TrainingBackend,
     CandidateArtifactImporter,
+    DatasetGovernanceStore,
     TrainingBundleBuilder,
     TrainingJobRegistry,
 )
@@ -547,7 +548,11 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
                 MemoryConsolidator(
                     settings, get_memory_system(request), get_model_provider(request)
                 ),
-                TrainingBundleBuilder(settings, get_adapter_registry(request)),
+                TrainingBundleBuilder(
+                    settings,
+                    get_adapter_registry(request),
+                    get_dataset_governance(request),
+                ),
                 TrainingJobRegistry(settings.sleep.job_registry_path),
                 backend,
                 get_adapter_registry(request),
@@ -566,6 +571,20 @@ def get_sleep_coordinator(request: Request) -> SleepCoordinator:
             )
             request.app.state.sleep_coordinator = coordinator
     return coordinator
+
+
+def get_dataset_governance(request: Request) -> DatasetGovernanceStore:
+    store = getattr(request.app.state, "dataset_governance", None)
+    if store is None:
+        with _dependency_lock:
+            store = getattr(request.app.state, "dataset_governance", None)
+            if store is None:
+                settings = get_api_settings(request)
+                store = DatasetGovernanceStore(
+                    settings.sleep.training_artifact_directory / "datasets"
+                )
+                request.app.state.dataset_governance = store
+    return store
 
 
 def _get_active_adapter(request: Request) -> AdapterEntry | None:

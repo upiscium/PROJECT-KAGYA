@@ -15,7 +15,6 @@ from uuid import uuid4
 
 from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry
-from kagya.learning.dream_dataset_generator import DreamDatasetRecord
 from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
 from kagya.memory import (
     ConsolidationStatus,
@@ -29,6 +28,11 @@ from kagya.training.artifacts import (
     TrainingArtifactContract,
     TrainingBundleManifest,
     sha256_bytes,
+)
+from kagya.training.dataset_governance import (
+    DatasetGovernanceStore,
+    DatasetSplit,
+    candidate_from_dream_json,
 )
 
 
@@ -87,6 +91,8 @@ class TrainingJob:
     training_metrics: dict[str, Any] | None = None
     total_duration_seconds: float = 0.0
     stale: bool = False
+    dataset_revision: str | None = None
+    dataset_manifest_hash: str | None = None
     schema_version: int = 2
 
     @classmethod
@@ -391,32 +397,21 @@ class MemoryConsolidator:
 
 class TrainingBundleBuilder:
     def __init__(
-        self, settings: Settings, adapter_registry: AdapterRegistry | None = None
+        self,
+        settings: Settings,
+        adapter_registry: AdapterRegistry | None = None,
+        dataset_governance: DatasetGovernanceStore | None = None,
     ) -> None:
         self.settings = settings
         self.adapter_registry = adapter_registry
         self.contract = TrainingArtifactContract()
+        self.dataset_governance = dataset_governance or DatasetGovernanceStore(
+            settings.sleep.training_artifact_directory / "datasets"
+        )
 
     def build(
         self, job: TrainingJob, episodes: tuple[EpisodicMemoryRecord, ...]
     ) -> Path:
-        episodes = tuple(episode for episode in episodes if episode.training_included)
-        current_records = [
-            (
-                json.dumps(
-                    DreamDatasetRecord(
-                        input=episode.user_input,
-                        thought="",
-                        output=episode.response,
-                        source_id=episode.id,
-                        validation_status=episode.validation_status.value,
-                    ).to_json(),
-                    ensure_ascii=False,
-                )
-                + "\n"
-            ).encode()
-            for episode in episodes
-        ]
         parent = None
         lineage: list[AdapterEntry] = []
         if job.parent_adapter_id is not None:
@@ -429,26 +424,28 @@ class TrainingBundleBuilder:
                 raise ValueError(f"Unknown parent adapter: {job.parent_adapter_id}")
             lineage = self.adapter_registry.lineage(parent.adapter_id)
         historical = _lineage_records(lineage)
-        historical_by_hash = {_canonical_record_hash(item): item for item in historical}
-        current_hashes = {_canonical_record_hash(item) for item in current_records}
-        available = sorted(
-            (digest, record)
-            for digest, record in historical_by_hash.items()
-            if digest not in current_hashes
+        historical_candidates = []
+        for record in historical:
+            try:
+                historical_candidates.append(candidate_from_dream_json(json.loads(record)))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        revision = self.dataset_governance.create_from_episodes(
+            episodes,
+            source_job_id=job.job_id,
+            additional_candidates=historical_candidates,
         )
-        holdout_records = [
-            record
-            for index, (_digest, record) in enumerate(available)
-            if index % 2 == 0
-        ]
-        rehearsal_records = [
-            record
-            for index, (_digest, record) in enumerate(available)
-            if index % 2 == 1
-        ]
-        dataset_records = current_records + rehearsal_records
-        dataset = b"".join(dataset_records)
-        evaluation = b"".join(holdout_records)
+        dataset = revision.split_bytes(DatasetSplit.TRAIN)
+        evaluation = revision.split_bytes(DatasetSplit.VALIDATION) + revision.split_bytes(
+            DatasetSplit.TEST
+        )
+        dataset_records = [line for line in dataset.splitlines() if line.strip()]
+        evaluation_records = [line for line in evaluation.splitlines() if line.strip()]
+        repeated_record_count = sum(
+            "duplicate" in reason
+            for record in revision.records
+            for reason in record.quarantine_reasons
+        )
         sequences = [
             episode.processing_sequence
             for episode in episodes
@@ -484,13 +481,15 @@ class TrainingBundleBuilder:
             dataset_hash=sha256_bytes(dataset),
             dataset_record_count=len(dataset_records),
             evaluation_set_hash=sha256_bytes(evaluation),
-            evaluation_record_count=len(holdout_records),
-            rehearsal_record_count=len(rehearsal_records),
-            repeated_record_count=len(dataset_records)
-            - len({_canonical_record_hash(item) for item in dataset_records}),
+            evaluation_record_count=len(evaluation_records),
+            rehearsal_record_count=len(historical_candidates),
+            repeated_record_count=repeated_record_count,
             training_evaluation_overlap_count=0,
             chat_template_version="gemma-v1",
             dataset_format_version="dream-v2",
+            dataset_revision=revision.revision,
+            dataset_manifest_path="dataset_manifest.json",
+            dataset_manifest_hash=revision.manifest_hash,
             qlora_hyperparameters={
                 "r": self.settings.qlora.r,
                 "alpha": self.settings.qlora.lora_alpha,
@@ -505,6 +504,7 @@ class TrainingBundleBuilder:
             manifest,
             dataset=dataset,
             evaluation_set=evaluation,
+            dataset_manifest=(revision.path / "manifest.json").read_bytes(),
         )
 
 
@@ -802,6 +802,12 @@ class SleepCoordinator:
                 raise _Cancelled
             bundle = self.bundle_builder.build(job, preparation.episodes)
             bundle_hash = sha256_bytes((bundle / "checksums.sha256").read_bytes())
+            manifest_path = bundle / "manifest.json"
+            bundle_manifest = (
+                json.loads(manifest_path.read_text("utf-8"))
+                if manifest_path.is_file()
+                else {}
+            )
             sequences = [
                 episode.processing_sequence
                 for episode in preparation.episodes
@@ -812,6 +818,8 @@ class SleepCoordinator:
                 TrainingJobStatus.READY,
                 bundle_path=str(bundle),
                 bundle_hash=bundle_hash,
+                dataset_revision=bundle_manifest.get("dataset_revision"),
+                dataset_manifest_hash=bundle_manifest.get("dataset_manifest_hash"),
                 selected_episode_ids=tuple(item.id for item in preparation.episodes),
                 semantic_memory_ids=preparation.semantic_ids,
                 source_event_sequence_start=min(sequences, default=0),
@@ -961,19 +969,6 @@ def _lineage_records(lineage: list[Any]) -> list[bytes]:
                 line + b"\n" for line in path.read_bytes().splitlines() if line.strip()
             )
     return records
-
-
-def _canonical_record_hash(record: bytes) -> str:
-    try:
-        normalized = json.dumps(
-            json.loads(record),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-    except json.JSONDecodeError:
-        normalized = record.strip()
-    return sha256_bytes(normalized)
 
 
 def _now() -> str:

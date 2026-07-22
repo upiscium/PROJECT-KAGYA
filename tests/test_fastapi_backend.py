@@ -31,6 +31,11 @@ from kagya.tools import (
     ToolStatus,
     ToolType,
 )
+from kagya.training import (
+    DatasetCandidate,
+    DatasetGovernanceStore,
+    DatasetProvenance,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -2296,6 +2301,54 @@ def test_feedback_ledger_survives_restart_without_correction_text_in_snapshot(
 
     assert restored.status_code == 200
     assert restored.json()["current_revision"] == 1
+
+
+def test_dataset_governance_browser_is_admin_only_and_supports_diff(
+    tmp_path: Path,
+) -> None:
+    store = DatasetGovernanceStore(tmp_path / "governed-datasets")
+    first = store.create_revision(
+        [
+            DatasetCandidate(
+                input="first prompt",
+                output="first response",
+                provenance=DatasetProvenance("verified_episode", "episode-1"),
+            )
+        ]
+    )
+    second = store.create_revision(
+        [
+            DatasetCandidate(
+                input="second prompt",
+                output="second response",
+                provenance=DatasetProvenance("verified_episode", "episode-2"),
+            )
+        ]
+    )
+    with _client(tmp_path) as client:
+        client.app.state.dataset_governance = store
+
+        assert client.get("/api/training/datasets").status_code == 401
+        listing = client.get(
+            "/api/training/datasets", headers=admin_headers()
+        )
+        detail = client.get(
+            f"/api/training/datasets/{second.revision}", headers=admin_headers()
+        )
+        diff = client.get(
+            "/api/training/datasets/diff",
+            params={"from": first.revision, "to": second.revision},
+            headers=admin_headers(),
+        )
+
+    assert listing.status_code == 200
+    assert [item["revision"] for item in listing.json()["datasets"]] == [
+        first.revision,
+        second.revision,
+    ]
+    assert detail.json()["records"][0]["provenance"]["source_id"] == "episode-2"
+    assert diff.status_code == 200
+    assert diff.json()["from_revision"] == first.revision
 
 
 def _client(

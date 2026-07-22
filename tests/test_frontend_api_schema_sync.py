@@ -55,6 +55,7 @@ def test_frontend_api_client_exposes_backend_routes() -> None:
         "/chat/debug",
         "/memory/search",
         "/sleep/jobs",
+        "/training/datasets",
         "/adapters",
         "/evaluations",
         "/evaluations/adapters/",

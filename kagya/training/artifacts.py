@@ -57,6 +57,9 @@ class TrainingBundleManifest(_ArtifactModel):
     training_evaluation_overlap_count: int = Field(default=0, ge=0)
     chat_template_version: str = Field(min_length=1)
     dataset_format_version: str = Field(min_length=1)
+    dataset_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    dataset_manifest_path: Literal["dataset_manifest.json"] | None = None
+    dataset_manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     qlora_hyperparameters: dict[str, int | float | str | bool]
     required_capabilities: list[str] = Field(default_factory=list)
 
@@ -66,6 +69,15 @@ class TrainingBundleManifest(_ArtifactModel):
             raise ValueError("source event sequence range is reversed")
         if (self.parent_adapter_id is None) != (self.parent_adapter_hash is None):
             raise ValueError("parent adapter ID and hash must be provided together")
+        governance_fields = (
+            self.dataset_revision,
+            self.dataset_manifest_path,
+            self.dataset_manifest_hash,
+        )
+        if any(item is not None for item in governance_fields) and not all(
+            item is not None for item in governance_fields
+        ):
+            raise ValueError("dataset governance revision fields must be provided together")
         self._validate_lineage()
         return self
 
@@ -152,6 +164,7 @@ class TrainingArtifactContract:
         *,
         dataset: bytes,
         evaluation_set: bytes,
+        dataset_manifest: bytes | None = None,
     ) -> Path:
         if sha256_bytes(dataset) != manifest.dataset_hash:
             raise ValueError("dataset hash does not match bundle manifest")
@@ -163,6 +176,14 @@ class TrainingArtifactContract:
             "dataset.jsonl": dataset,
             "evaluation_set.jsonl": evaluation_set,
         }
+        if manifest.dataset_manifest_path is not None:
+            if dataset_manifest is None:
+                raise ValueError("governed bundle requires a dataset manifest")
+            if sha256_bytes(dataset_manifest) != manifest.dataset_manifest_hash:
+                raise ValueError("dataset manifest hash does not match bundle manifest")
+            files[manifest.dataset_manifest_path] = dataset_manifest
+        elif dataset_manifest is not None:
+            raise ValueError("ungoverned bundle cannot contain a dataset manifest")
         self._atomic_finalize(artifact_root, final_path, files)
         self.validate_bundle(final_path)
         return final_path
@@ -177,10 +198,17 @@ class TrainingArtifactContract:
         expected_parent_adapter_id: str | None | object = _UNSET,
         expected_parent_adapter_hash: str | None | object = _UNSET,
     ) -> TrainingBundleManifest:
-        self._validate_tree(path, exact_files=self.BUNDLE_FILES)
+        self._validate_tree(path)
+        if not self.BUNDLE_FILES.issubset(_relative_files(path)):
+            raise ValueError("artifact file set does not match contract")
         manifest = TrainingBundleManifest.model_validate(
             _read_json(path / "manifest.json")
         )
+        expected_files = set(self.BUNDLE_FILES)
+        if manifest.dataset_manifest_path is not None:
+            expected_files.add(manifest.dataset_manifest_path)
+        if _relative_files(path) != expected_files:
+            raise ValueError("artifact file set does not match contract")
         self._validate_checksums(path)
         dataset = (path / manifest.dataset_path).read_bytes()
         evaluation = (path / manifest.evaluation_set_path).read_bytes()
@@ -188,6 +216,13 @@ class TrainingArtifactContract:
             raise ValueError("bundle dataset hash mismatch")
         if sha256_bytes(evaluation) != manifest.evaluation_set_hash:
             raise ValueError("bundle evaluation hash mismatch")
+        if manifest.dataset_manifest_path is not None:
+            dataset_manifest = (path / manifest.dataset_manifest_path).read_bytes()
+            if sha256_bytes(dataset_manifest) != manifest.dataset_manifest_hash:
+                raise ValueError("bundle dataset manifest hash mismatch")
+            revision_manifest = json.loads(dataset_manifest)
+            if revision_manifest.get("revision") != manifest.dataset_revision:
+                raise ValueError("bundle dataset revision mismatch")
         if (
             expected_model_id is not None
             and manifest.base_model_id != expected_model_id

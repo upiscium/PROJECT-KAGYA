@@ -37,6 +37,8 @@ class QloraTrainingResult:
     parent_adapter_id: str | None = None
     parent_adapter_hash: str | None = None
     adapter_hash: str | None = None
+    dataset_revision: str | None = None
+    dataset_manifest_hash: str | None = None
 
 
 class QloraTrainer:
@@ -79,7 +81,11 @@ class QloraTrainer:
                     "hardware_validation_required",
                     "continued adapter loading remains gated by hardware validation issue #98",
                 )
-        result = self.train(bundle_path / manifest.dataset_path)
+        result = self.train(
+            bundle_path / manifest.dataset_path,
+            dataset_revision=manifest.dataset_revision,
+            dataset_manifest_hash=manifest.dataset_manifest_hash,
+        )
         return QloraTrainingResult(
             **{
                 **result.__dict__,
@@ -88,7 +94,13 @@ class QloraTrainer:
             }
         )
 
-    def train(self, dataset_path: Path) -> QloraTrainingResult:
+    def train(
+        self,
+        dataset_path: Path,
+        *,
+        dataset_revision: str | None = None,
+        dataset_manifest_hash: str | None = None,
+    ) -> QloraTrainingResult:
         records = self._load_dataset(dataset_path)
         dataset_hash = _hash_file(dataset_path)
         adapter_id = f"adapter-{uuid4()}"
@@ -99,10 +111,22 @@ class QloraTrainer:
         try:
             if self.settings.qlora.dry_run:
                 self._write_dry_run_manifest(
-                    staging_path, dataset_path, dataset_hash, records
+                    staging_path,
+                    dataset_path,
+                    dataset_hash,
+                    records,
+                    dataset_revision=dataset_revision,
+                    dataset_manifest_hash=dataset_manifest_hash,
                 )
             else:
-                self._run_training(staging_path, dataset_path, dataset_hash, records)
+                self._run_training(
+                    staging_path,
+                    dataset_path,
+                    dataset_hash,
+                    records,
+                    dataset_revision=dataset_revision,
+                    dataset_manifest_hash=dataset_manifest_hash,
+                )
             if not any(staging_path.iterdir()):
                 raise QloraTrainingError("empty_adapter", "trainer produced no files")
             os.rename(staging_path, adapter_path)
@@ -117,6 +141,8 @@ class QloraTrainer:
             dry_run=self.settings.qlora.dry_run,
             training_records=len(records),
             adapter_hash=_hash_directory(adapter_path),
+            dataset_revision=dataset_revision,
+            dataset_manifest_hash=dataset_manifest_hash,
         )
 
     def _load_dataset(self, dataset_path: Path) -> list[DreamDatasetRecord]:
@@ -150,8 +176,18 @@ class QloraTrainer:
         dataset_path: Path,
         dataset_hash: str,
         records: list[DreamDatasetRecord],
+        *,
+        dataset_revision: str | None,
+        dataset_manifest_hash: str | None,
     ) -> None:
-        manifest = self._training_manifest(True, dataset_path, dataset_hash, records)
+        manifest = self._training_manifest(
+            True,
+            dataset_path,
+            dataset_hash,
+            records,
+            dataset_revision=dataset_revision,
+            dataset_manifest_hash=dataset_manifest_hash,
+        )
         with (adapter_path / "dry_run_manifest.json").open(
             "w", encoding="utf-8"
         ) as manifest_file:
@@ -163,6 +199,9 @@ class QloraTrainer:
         dataset_path: Path,
         dataset_hash: str,
         records: list[DreamDatasetRecord],
+        *,
+        dataset_revision: str | None,
+        dataset_manifest_hash: str | None,
     ) -> None:
         deps = self._load_training_dependencies()
         processor = deps["AutoProcessor"].from_pretrained(
@@ -234,7 +273,13 @@ class QloraTrainer:
             )
         trainer.save_model(str(adapter_path))
         self._write_training_manifest(
-            adapter_path, dataset_path, dataset_hash, records, metrics=metrics
+            adapter_path,
+            dataset_path,
+            dataset_hash,
+            records,
+            metrics=metrics,
+            dataset_revision=dataset_revision,
+            dataset_manifest_hash=dataset_manifest_hash,
         )
 
     def _validate_target_modules(self, model: Any) -> None:
@@ -330,8 +375,17 @@ class QloraTrainer:
         records: list[DreamDatasetRecord],
         *,
         metrics: dict[str, Any],
+        dataset_revision: str | None,
+        dataset_manifest_hash: str | None,
     ) -> None:
-        manifest = self._training_manifest(False, dataset_path, dataset_hash, records)
+        manifest = self._training_manifest(
+            False,
+            dataset_path,
+            dataset_hash,
+            records,
+            dataset_revision=dataset_revision,
+            dataset_manifest_hash=dataset_manifest_hash,
+        )
         manifest["metrics"] = metrics
         manifest["environment"] = self._environment_metadata()
         with (adapter_path / "training_manifest.json").open(
@@ -345,6 +399,9 @@ class QloraTrainer:
         dataset_path: Path,
         dataset_hash: str,
         records: list[DreamDatasetRecord],
+        *,
+        dataset_revision: str | None,
+        dataset_manifest_hash: str | None,
     ) -> dict[str, Any]:
         return {
             "dry_run": dry_run,
@@ -354,6 +411,8 @@ class QloraTrainer:
             "dataset_path": str(dataset_path),
             "dataset_hash": dataset_hash,
             "training_records": len(records),
+            "dataset_revision": dataset_revision,
+            "dataset_manifest_hash": dataset_manifest_hash,
             "qlora": {
                 "r": self.settings.qlora.r,
                 "alpha": self.settings.qlora.alpha,
