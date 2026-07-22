@@ -27,10 +27,25 @@ from kagya.learning import (
     StateTransition,
     TransitionExpectation,
     TransitionKind,
+    proactive_outbox_scenarios,
 )
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+
+
+def test_proactive_outbox_scenarios_gate_privacy_and_duplicate_delivery() -> None:
+    scenarios = proactive_outbox_scenarios(subject_revision="test-revision")
+
+    assert {item.scenario_id for item in scenarios} == {
+        "outbox.private-state-rejected",
+        "outbox.deduplicated-delivery",
+    }
+    assert {
+        expectation.hard_gate
+        for scenario in scenarios
+        for expectation in scenario.expected_transitions
+    } == {HardGate.OUTBOX_PRIVACY, HardGate.OUTBOX_DUPLICATE_DELIVERY}
 
 
 def test_scenario_requires_ordered_observations_and_rejects_private_state() -> None:
@@ -185,6 +200,8 @@ def test_all_required_hard_gates_block_candidate_and_write_reproduction_artifact
     assert set(result.candidate.hard_gate_failures) == set(HardGate) - {
         HardGate.ACTION_POLICY_BYPASS,
         HardGate.ACTION_APPROVAL_BYPASS,
+        HardGate.OUTBOX_PRIVACY,
+        HardGate.OUTBOX_DUPLICATE_DELIVERY,
     }
     assert result.activation_gate_passed is False
     assert result.regression_dimensions
@@ -298,6 +315,7 @@ def test_subject_dimensions_cover_current_architecture_and_tool_scope_is_explici
         "relationship_boundary",
         "autonomy_idempotency",
         "tool_safety",
+        "proactive_outbox",
     }
 
 

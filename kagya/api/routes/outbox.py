@@ -1,0 +1,188 @@
+"""Admin API for proactive local delivery and correlated responses."""
+
+from datetime import datetime
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+from kagya.actions import ActionExecutionLayer
+from kagya.api.dependencies import (
+    AdminActor,
+    execute_agent_event,
+    get_action_execution,
+    get_agent_runtime,
+    get_outbox,
+    require_admin,
+)
+from kagya.outbox import (
+    Outbox,
+    OutboxMessage,
+    OutboxMessageKind,
+    OutboxReferences,
+    OutboxUrgency,
+    PrivacyClass,
+)
+from kagya.runtime import AgentEventType, AgentRuntime, current_agent_event
+
+
+class _Request(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class EnqueueRequest(_Request):
+    kind: OutboxMessageKind
+    title: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=1, max_length=4000)
+    deduplication_key: str = Field(min_length=1, max_length=256)
+    context_id: str | None = None
+    interlocutor_id: str | None = None
+    references: OutboxReferences = Field(default_factory=OutboxReferences)
+    urgency: OutboxUrgency = OutboxUrgency.NORMAL
+    not_before: datetime | None = None
+    expires_at: datetime | None = None
+    privacy_class: PrivacyClass = PrivacyClass.OPERATOR
+
+
+class ResponseRequest(_Request):
+    kind: Literal["read", "reply", "approval", "reject"]
+    text: str | None = Field(default=None, max_length=4000)
+
+
+class FailureRequest(_Request):
+    failure_code: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$"
+    )
+
+
+router = APIRouter(prefix="/api/outbox", tags=["outbox"])
+
+
+@router.get("/messages", dependencies=[Depends(require_admin)])
+def list_messages(
+    outbox: Outbox = Depends(get_outbox),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    messages = execute_agent_event(
+        runtime,
+        AgentEventType.OUTBOX_READ,
+        source="api.outbox.list",
+        handler=outbox.list_messages,
+    ).value
+    return {"messages": [item.model_dump(mode="json") for item in messages]}
+
+
+@router.post("/messages", dependencies=[Depends(require_admin)])
+def enqueue_message(
+    body: EnqueueRequest,
+    outbox: Outbox = Depends(get_outbox),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    try:
+        message = execute_agent_event(
+            runtime,
+            AgentEventType.OUTBOX_ENQUEUE,
+            source="api.outbox.enqueue",
+            handler=lambda: outbox.enqueue(
+                body.kind,
+                title=body.title,
+                body=body.body,
+                deduplication_key=body.deduplication_key,
+                context_id=body.context_id,
+                interlocutor_id=body.interlocutor_id,
+                references=body.references,
+                urgency=body.urgency,
+                not_before=body.not_before,
+                expires_at=body.expires_at,
+                privacy_class=body.privacy_class,
+            ),
+            payload={"kind": body.kind.value, "deduplication_key": body.deduplication_key},
+            correlation_id=body.deduplication_key,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return message.model_dump(mode="json")
+
+
+@router.post("/deliveries", dependencies=[Depends(require_admin)])
+def deliver_messages(
+    limit: int = 20,
+    outbox: Outbox = Depends(get_outbox),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    try:
+        messages = execute_agent_event(
+            runtime,
+            AgentEventType.OUTBOX_DELIVER,
+            source="api.outbox.deliver",
+            handler=lambda: outbox.deliver(limit=limit),
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"messages": [item.model_dump(mode="json") for item in messages]}
+
+
+@router.post("/messages/{message_id}/responses")
+def respond_to_message(
+    message_id: str,
+    body: ResponseRequest,
+    actor: AdminActor = Depends(require_admin),
+    outbox: Outbox = Depends(get_outbox),
+    execution: ActionExecutionLayer = Depends(get_action_execution),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    def correlate() -> OutboxMessage:
+        message = outbox.get(message_id)
+        action_id = message.references.action_id
+        if body.kind in {"approval", "reject"}:
+            if action_id is None:
+                raise ValueError("Approval request has no originating action")
+            execution.resolve_approval(
+                action_id,
+                approved=body.kind == "approval",
+                actor_id=actor.actor_id,
+                reason=body.text,
+            )
+        event = current_agent_event()
+        return outbox.respond(
+            message_id,
+            kind=body.kind,
+            actor_id=actor.actor_id,
+            text=body.text,
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
+        )
+
+    try:
+        message = execute_agent_event(
+            runtime,
+            AgentEventType.OUTBOX_RESPONSE,
+            source="api.outbox.response",
+            handler=correlate,
+            payload={"message_id": message_id, "response_kind": body.kind},
+            correlation_id=message_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return message.model_dump(mode="json")
+
+
+@router.post("/messages/{message_id}/delivery-failures", dependencies=[Depends(require_admin)])
+def record_delivery_failure(
+    message_id: str,
+    body: FailureRequest,
+    outbox: Outbox = Depends(get_outbox),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    try:
+        message = execute_agent_event(
+            runtime,
+            AgentEventType.OUTBOX_FAILURE,
+            source="api.outbox.failure",
+            handler=lambda: outbox.fail_delivery(message_id, body.failure_code),
+            payload={"message_id": message_id, "failure_code": body.failure_code},
+            correlation_id=message_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return message.model_dump(mode="json")

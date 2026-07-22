@@ -12,6 +12,7 @@ export const metadata: Metadata = {
 
 const navItems = [
   ["Chat", "/chat"],
+  ["Outbox", "/outbox"],
   ["Debug", "/debug"],
   ["Memory", "/memory"],
   ["Sleep", "/sleep"],

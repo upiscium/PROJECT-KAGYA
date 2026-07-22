@@ -26,6 +26,7 @@ from kagya.learning import (
 )
 from kagya.memory import DualMemorySystem
 from kagya.models import ModelProvider, load_model_provider
+from kagya.outbox import Outbox
 from kagya.runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -82,6 +83,7 @@ _APPROVAL_PATHS = (
     "/api/beliefs/*/supersede",
     "/api/self-model/identity/proposals/*/resolve",
     "/api/actions/intents/*/approval",
+    "/api/outbox/messages/*/responses",
 )
 
 
@@ -214,6 +216,23 @@ def get_action_execution(request: Request) -> ActionExecutionLayer:
         request.app.state.action_execution = execution
         main_loop.action_execution = execution
     return execution
+
+
+def get_outbox(request: Request) -> Outbox:
+    outbox = getattr(request.app.state, "outbox", None)
+    main_loop = get_main_loop(request)
+    if outbox is None or outbox.main_loop is not main_loop:
+        settings = get_api_settings(request).outbox
+        outbox = Outbox(
+            main_loop,
+            quiet_hours_start=settings.quiet_hours_start,
+            quiet_hours_end=settings.quiet_hours_end,
+            max_deliveries_per_hour=settings.max_deliveries_per_hour,
+            event_recorder=get_runtime_event_log(request),
+        )
+        request.app.state.outbox = outbox
+        main_loop.outbox = outbox
+    return outbox
 
 
 def _event_sequence(sequence: int | None) -> int:

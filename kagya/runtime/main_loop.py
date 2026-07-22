@@ -233,6 +233,7 @@ class KagyaMainLoop:
         self.adapter_hash = adapter_hash
         self.activation_sequence = activation_sequence
         self.persistent_state = persistent_state or PersistentAgentState()
+        self.outbox: Any | None = None
         self.working_memory = working_memory or WorkingMemory(
             item_capacity=settings.working_memory.item_capacity,
             token_capacity=settings.working_memory.token_capacity,
