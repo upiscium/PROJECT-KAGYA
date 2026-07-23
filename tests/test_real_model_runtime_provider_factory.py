@@ -76,10 +76,14 @@ def test_actual_runtime_calls_prompt_builder_with_injected_provider(
 ) -> None:
     settings = load_settings(CONFIG_PATH)
     provider = FakeProvider(settings)
-    scenario = deterministic_runtime_scenarios(
-        subject_revision="fake-real-runtime",
-        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
-    )[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(
+            subject_revision="fake-real-runtime",
+            runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        )
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
 
     trace = RuntimeBehavioralRunner(
         tmp_path / "runtime", settings, "candidate", provider=provider
@@ -93,7 +97,11 @@ def test_actual_runtime_calls_prompt_builder_with_injected_provider(
 
 def test_runtime_rejects_fallback_and_candidate_load_failure(tmp_path: Path) -> None:
     settings = load_settings(CONFIG_PATH)
-    scenario = deterministic_runtime_scenarios(subject_revision="fallback")[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="fallback")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
     with pytest.raises(RuntimeError, match="fallback"):
         RuntimeBehavioralRunner(
             tmp_path / "fallback",

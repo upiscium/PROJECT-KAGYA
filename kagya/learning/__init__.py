@@ -28,6 +28,7 @@ from kagya.learning.behavioral_evaluation import (
     BehavioralScenario,
     BehavioralTrace,
     BehavioralRuntimeKind,
+    CoverageStatus,
     RuntimeBehaviorClassifier,
     RuntimeBehaviorObservation,
     ExternalObservation,
@@ -43,6 +44,14 @@ from kagya.learning.behavioral_evaluation import (
     counterfactual_simulation_scenarios,
     fixture_set_hash,
     scenario_fixture_hash,
+)
+from kagya.learning.behavioral_coverage import (
+    BEHAVIORAL_COVERAGE_MANIFEST,
+    BehavioralCoverageEvaluation,
+    BehavioralCoverageManifest,
+    BehavioralCoverageRequirement,
+    BehavioralHardGateRequirement,
+    evaluate_behavioral_coverage,
 )
 from kagya.learning.subject_behavioral_suite import (
     DeterministicSubjectRunner,
@@ -110,6 +119,13 @@ __all__ = [
     "BehavioralEvaluatorSpec",
     "BehavioralInvariant",
     "BehavioralRuntimeKind",
+    "CoverageStatus",
+    "BEHAVIORAL_COVERAGE_MANIFEST",
+    "BehavioralCoverageEvaluation",
+    "BehavioralCoverageManifest",
+    "BehavioralCoverageRequirement",
+    "BehavioralHardGateRequirement",
+    "evaluate_behavioral_coverage",
     "RuntimeBehaviorClassifier",
     "RuntimeBehaviorObservation",
     "BehavioralScenario",

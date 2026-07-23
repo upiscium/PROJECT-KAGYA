@@ -222,12 +222,16 @@ def behavioral_evaluation_status(
             "drift": _gate_status(entry.drift_gate_passed),
         },
         deterministic_status=eligibility.deterministic_status,
+        deterministic_coverage=_coverage_status(
+            entry.deterministic_coverage_complete
+        ),
         deterministic_artifact=_artifact_status(
             entry.behavioral_evaluation_id,
             entry.behavioral_artifact_state,
             artifacts,
         ),
         real_status=eligibility.real_model_status,
+        real_coverage=_coverage_status(entry.real_model_coverage_complete),
         real_required=eligibility.real_model_required,
         real_artifact=_artifact_status(
             entry.real_model_behavioral_evaluation_id,
@@ -645,10 +649,16 @@ def adapter_response(
         subject_revision=entry.subject_revision,
         fixture_set_hash=entry.fixture_set_hash,
         behavioral_artifact_state=entry.behavioral_artifact_state,
+        deterministic_coverage_status=_coverage_status(
+            entry.deterministic_coverage_complete
+        ),
         deterministic_behavioral_artifact_status=deterministic_artifact,
         real_model_behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
         real_model_behavioral_gate_passed=entry.real_model_behavioral_gate_passed,
         real_model_behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
+        real_model_coverage_status=_coverage_status(
+            entry.real_model_coverage_complete
+        ),
         real_model_behavioral_artifact_status=real_artifact,
         behavioral_artifact_hash_match=hash_match,
         activation_eligibility_reason=reason,
@@ -668,6 +678,14 @@ def adapter_response(
         canary_failures=entry.canary_failures,
         rollback_target_id=entry.rollback_target_id,
     )
+
+
+def _coverage_status(value: bool | None) -> Literal[
+    "complete", "incomplete", "not_evaluated"
+]:
+    if value is None:
+        return "not_evaluated"
+    return "complete" if value else "incomplete"
 
 
 def _artifact_status(

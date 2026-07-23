@@ -48,12 +48,18 @@ class AdapterResponse(BaseModel):
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
     behavioral_artifact_state: str = "unbound"
+    deterministic_coverage_status: Literal[
+        "complete", "incomplete", "not_evaluated"
+    ] = "not_evaluated"
     deterministic_behavioral_artifact_status: Literal[
         "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
     ] = "not_run"
     real_model_behavioral_evaluation_id: str | None = None
     real_model_behavioral_gate_passed: bool | None = None
     real_model_behavioral_artifact_state: str = "unbound"
+    real_model_coverage_status: Literal[
+        "complete", "incomplete", "not_evaluated"
+    ] = "not_evaluated"
     real_model_behavioral_artifact_status: Literal[
         "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
     ] = "not_run"
@@ -129,8 +135,10 @@ class AdapterBehavioralStatusResponse(BaseModel):
     policy: BehavioralActivationPolicy
     ordinary_gates: dict[str, Literal["passed", "failed", "not_run"]]
     deterministic_status: BehavioralEvidenceStatus
+    deterministic_coverage: Literal["complete", "incomplete", "not_evaluated"]
     deterministic_artifact: BehavioralArtifactStatusValue
     real_status: BehavioralEvidenceStatus
+    real_coverage: Literal["complete", "incomplete", "not_evaluated"]
     real_required: bool
     real_artifact: BehavioralArtifactStatusValue
     activation_eligible: bool

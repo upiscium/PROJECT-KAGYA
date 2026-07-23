@@ -14,6 +14,7 @@ from typing import Any, cast, TypeVar
 from pydantic import JsonValue
 
 from kagya.actions import ActionExecutionLayer
+from kagya.actions.execution import ActionPolicyError
 from kagya.config import Settings
 from kagya.external_transaction import ExternalTransactionCoordinator
 from kagya.learning.behavioral_evaluation import (
@@ -313,13 +314,14 @@ class SubjectRuntimeHarness:
         self.root = root.resolve()
         self.settings_template = settings
         self.subject_id = subject_id
-        self.clock = clock or ControlledClock(datetime(2026, 7, 23, 14, tzinfo=UTC))
+        self.clock = clock or ControlledClock(datetime(2026, 7, 24, tzinfo=UTC))
         self.provider = provider or DeterministicRuntimeProvider(subject_id)
         self.tool_environment = tool_environment or ControlledToolEnvironment()
         self.failure_injector = failure_injector or FailureInjector()
         self.graph: RuntimeGraph | None = None
         self.readiness = False
         self.startup_error: str | None = None
+        self._rejected_action_attempts: list[ActionAttempt] = []
 
     def create(self) -> "SubjectRuntimeHarness":
         self.root.mkdir(parents=True, exist_ok=True)
@@ -613,11 +615,13 @@ class SubjectRuntimeHarness:
 
     def action_attempts(self) -> tuple[ActionAttempt, ...]:
         graph = self._ready_graph()
-        return tuple(
+        persisted = tuple(
             ActionAttempt(
                 tool_name=item.tool_name,
                 risk_class=item.risk_class.value,
-                arguments_valid=True,
+                arguments_valid=self._arguments_valid(
+                    item.tool_name, cast(dict[str, object], item.arguments)
+                ),
                 policy_allowed=item.policy.allowed,
                 approval_required=item.policy.approval_required,
                 approved=not item.policy.approval_required
@@ -630,6 +634,32 @@ class SubjectRuntimeHarness:
             )
             for item in graph.action_execution.list_intents()
         )
+        return (*persisted, *self._rejected_action_attempts)
+
+    def record_rejected_action_attempt(
+        self, tool_name: str, arguments: dict[str, object]
+    ) -> ActionAttempt:
+        """Record the actual validation outcome for a pre-intent rejection."""
+
+        valid = self._arguments_valid(tool_name, arguments)
+        attempt = ActionAttempt(
+            tool_name=tool_name,
+            risk_class="read_only",
+            arguments_valid=valid,
+            policy_allowed=False,
+            approval_required=False,
+            approved=False,
+            executed=False,
+        )
+        self._rejected_action_attempts.append(attempt)
+        return attempt
+
+    def _arguments_valid(self, tool_name: str, arguments: dict[str, object]) -> bool:
+        try:
+            self._ready_graph().action_execution._validate(tool_name, arguments)
+        except (ActionPolicyError, ValueError):
+            return False
+        return True
 
     def _ready_graph(self) -> RuntimeGraph:
         if not self.readiness or self.graph is None:

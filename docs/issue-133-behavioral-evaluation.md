@@ -10,11 +10,12 @@ Runtime execution reads fixture inputs only. Public behavior is classified after
 
 ## Coverage
 
-- `runtime.external-observation-closed-loop` covers every current `BehavioralDimension`, causal ordering, policy-governed action, exactly-once external effects, and revisioned domain evidence.
+- Coverage is defined by the immutable `issue-133-coverage-v1` manifest, not by scenario dimension labels. Every `BehavioralDimension` names explicit required runtime scenario IDs, runtime kinds, associated hard gates, and a minimum passed count.
+- `runtime.external-observation-closed-loop` covers only the causal dimensions it concretely asserts; focused runtime scenarios cover the remaining dimensions and adversarial boundaries.
 - `runtime.ambiguous-irreversible-defer` independently checks calibrated defer with no authority or external mutation.
 - `runtime.action-failure-counterfactual-replan` checks mixed attribution, bounded counterfactual inference, and evidence-linked Plan revision.
-- `runtime.commitment-restart-persistence` reconstructs a fresh object graph and verifies accepted responsibility continuity.
-- One adversarial fixture per `HardGate` makes every hard failure independently observable. Aggregate score cannot hide a hard-gate, threshold, or per-dimension regression.
+- `runtime.commitment-continuity` verifies accepted responsibility through Desire decay, Goal abandonment, and fresh-graph restart.
+- One actual runtime attack per `HardGate` makes every hard failure independently observable. Aggregate score cannot hide missing, failed, wrong-runtime, or unexecuted evidence.
 - A behavioral result bound to an adapter is persisted in the registry. A failed behavioral hard gate or regression clears the adapter activation gate, so approval cannot bypass it.
 
 ## Reproduction
@@ -58,6 +59,6 @@ Normal CI runs the synthetic evaluator contract, provider factories with fakes, 
 
 `behavioral_activation_policy` defaults to `real_model_required`. Recognized environments are `production`, `development`, `test`, and `ci`; unknown environments fail validation. Production accepts only `real_model_required`. `deterministic_runtime_only` is limited to development, test, and CI and must be explicitly configured. `disabled` is limited to explicit test settings.
 
-The config loader maps the removed `require_real_model_behavioral_gate` key explicitly: `true` becomes `real_model_required`, while `false` becomes `deterministic_runtime_only`. New configuration should use only the policy enum. Adapter registry schema v8 does not migrate pre-v8 real-model fields as activation authority. A legacy active adapter may continue running with a warning, but reactivation and rollback promotion use current policy gates.
+The config loader maps the removed `require_real_model_behavioral_gate` key explicitly: `true` becomes `real_model_required`, while `false` becomes `deterministic_runtime_only`. New configuration should use only the policy enum. Adapter registry schema v9 does not migrate pre-v9 coverage fields as activation authority. A legacy active adapter may continue running with a warning, but reactivation and rollback promotion use current policy and coverage gates.
 
 `POST /api/adapters/{adapter_id}/evaluate` accepts an empty, extra-forbidden request body and always loads separate configured baseline and registered candidate providers over server-owned eval sets. Client-provided scores and dimensions are rejected during schema validation. `GET /api/adapters/{adapter_id}/behavioral-evaluation-status` returns bounded ordinary, deterministic, real-model, artifact, policy, and eligibility states without absolute paths, raw hashes, or private configuration.

@@ -212,7 +212,11 @@ def test_disabling_each_authoritative_connection_fails_runtime_suite(
 def test_failed_action_produces_mixed_attribution_bounded_counterfactual_and_replan(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="failure-test")[6]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="failure-test")
+        if item.scenario_id == "runtime.action-failure-counterfactual-replan"
+    )
 
     trace = DeterministicRuntimeRunner(
         tmp_path / "failure", load_settings(CONFIG_PATH), "candidate"
@@ -338,7 +342,11 @@ def test_ambiguous_defer_uses_chat_without_authority_or_action_mutation(
 def test_prompt_injection_is_classified_from_actual_prompt_response_and_state(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="injection-test")[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="injection-test")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
     runner = DeterministicRuntimeRunner(
         tmp_path / "injection", load_settings(CONFIG_PATH), "candidate"
     )
@@ -360,7 +368,11 @@ def test_prompt_injection_is_classified_from_actual_prompt_response_and_state(
 def test_external_commitment_requires_acceptance_and_persists_after_restart(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="commitment-test")[5]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="commitment-test")
+        if item.scenario_id == "runtime.commitment-continuity"
+    )
 
     trace = DeterministicRuntimeRunner(
         tmp_path / "commitment", load_settings(CONFIG_PATH), "candidate"
