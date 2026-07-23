@@ -159,24 +159,11 @@ class ExperienceStore:
 
     def __init__(self) -> None:
         self.records: dict[str, ExperienceRecord] = {}
-        self._event_index: dict[str, str] = {}
-        self._observation_index: dict[str, str] = {}
+        self._semantic_index: dict[tuple[str, str, tuple[str, ...]], str] = {}
+        self._observation_context_index: dict[tuple[str, tuple[str, ...]], str] = {}
 
     def integrate(self, record: ExperienceRecord) -> ExperienceRecord:
-        existing_id = (
-            self._event_index.get(record.source_event_id)
-            if record.source_event_id is not None
-            else None
-        )
-        if existing_id is None:
-            existing_id = next(
-                (
-                    self._observation_index[reference]
-                    for reference in record.external_observation_refs
-                    if reference in self._observation_index
-                ),
-                None,
-            )
+        existing_id = self._existing_semantic_id(record)
         if existing_id is not None:
             return self.records[existing_id]
         if record.experience_id in self.records:
@@ -219,35 +206,70 @@ class ExperienceStore:
         event_id: str | None = None,
         event_sequence: int | None = None,
     ) -> ExperienceRecord:
+        return self.revise(
+            experience_id,
+            appraisal=appraisal,
+            reason_code=reason_code,
+            evidence_refs=evidence_refs,
+            event_id=event_id,
+            event_sequence=event_sequence,
+        )
+
+    def revise(
+        self,
+        experience_id: str,
+        *,
+        reason_code: str,
+        evidence_refs: tuple[str, ...],
+        appraisal: ExperienceAppraisal | None = None,
+        context_id: str | None = None,
+        situation_codes: tuple[str, ...] | None = None,
+        interpretation_codes: tuple[str, ...] | None = None,
+        value_revision_refs: dict[str, int] | None = None,
+        self_model_revision: int | None = None,
+        event_id: str | None = None,
+        event_sequence: int | None = None,
+    ) -> ExperienceRecord:
         if not evidence_refs:
-            raise ValueError("experience reassessment requires evidence references")
+            raise ValueError("experience revision requires evidence references")
         current = self.get(experience_id)
-        metrics = _experience_metrics(appraisal, current.prediction_error)
-        revision = _revision(
+        changes: dict[str, Any] = {}
+        if appraisal is not None and appraisal != current.appraisal:
+            changes.update(
+                appraisal=appraisal,
+                **_experience_metrics(appraisal, current.prediction_error),
+            )
+        for name, value in (
+            ("context_id", context_id),
+            ("situation_codes", situation_codes),
+            ("interpretation_codes", interpretation_codes),
+            ("value_revision_refs", value_revision_refs),
+            ("self_model_revision", self_model_revision),
+        ):
+            if value is not None and value != getattr(current, name):
+                changes[name] = value
+        if not changes:
+            return current
+        history = _revision(
             current,
             reason_code,
             evidence_refs,
-            (
-                "appraisal",
-                "self_relevance",
-                "subjective_salience",
-                "familiarity",
-                "agency_attribution",
-                "unresolved_tension",
-                "autobiographical_importance",
-            ),
+            tuple(changes),
             event_id,
             event_sequence,
         )
         updated = replace(
             current,
-            appraisal=appraisal,
-            **metrics,
-            revision=revision.to_revision,
-            revisions=(*current.revisions, revision),
-            updated_at=revision.created_at,
+            **changes,
+            revision=history.to_revision,
+            revisions=(*current.revisions, history),
+            updated_at=history.created_at,
         )
+        existing = self._existing_semantic_id(updated)
+        if existing is not None and existing != experience_id:
+            raise ValueError("Experience revision duplicates existing semantics")
         self.records[experience_id] = updated
+        self._rebuild_indexes()
         return updated
 
     def link_result(
@@ -307,8 +329,8 @@ class ExperienceStore:
     def restore(self, payload: object) -> None:
         if not isinstance(payload, dict) or not payload:
             self.records = {}
-            self._event_index = {}
-            self._observation_index = {}
+            self._semantic_index = {}
+            self._observation_context_index = {}
             return
         if payload.get("schema_version") != self.SCHEMA_VERSION:
             raise ValueError(
@@ -322,22 +344,85 @@ class ExperienceStore:
         if len(records) != len({record.experience_id for record in records}):
             raise ValueError("Experience identifiers must be unique")
         self.records = {record.experience_id: record for record in records}
-        self._event_index = {}
-        self._observation_index = {}
+        self._semantic_index = {}
+        self._observation_context_index = {}
         for record in records:
             self._index(record)
 
     def _index(self, record: ExperienceRecord) -> None:
-        if record.source_event_id is not None:
-            existing = self._event_index.get(record.source_event_id)
-            if existing is not None and existing != record.experience_id:
-                raise ValueError("Multiple experiences reference the same source event")
-            self._event_index[record.source_event_id] = record.experience_id
-        for reference in record.external_observation_refs:
-            existing = self._observation_index.get(reference)
-            if existing is not None and existing != record.experience_id:
-                raise ValueError("Multiple experiences reference the same observation")
-            self._observation_index[reference] = record.experience_id
+        observations = tuple(sorted(record.external_observation_refs))
+        semantic_key = (record.source_event_id or "", record.context_id, observations)
+        existing = self._semantic_index.get(semantic_key)
+        if existing is not None and existing != record.experience_id:
+            raise ValueError("Duplicate experience event/observation/context semantics")
+        self._semantic_index[semantic_key] = record.experience_id
+        observation_key = (record.context_id, observations)
+        existing = self._observation_context_index.get(observation_key)
+        if existing is not None and existing != record.experience_id:
+            raise ValueError("Duplicate experience observation/context semantics")
+        self._observation_context_index[observation_key] = record.experience_id
+
+    def _existing_semantic_id(self, record: ExperienceRecord) -> str | None:
+        observations = tuple(sorted(record.external_observation_refs))
+        return self._semantic_index.get(
+            (record.source_event_id or "", record.context_id, observations)
+        ) or self._observation_context_index.get((record.context_id, observations))
+
+    def _rebuild_indexes(self) -> None:
+        self._semantic_index = {}
+        self._observation_context_index = {}
+        for record in self.records.values():
+            self._index(record)
+
+
+def build_observation_experience(
+    *,
+    source_event_id: str | None,
+    source_event_sequence: int | None,
+    external_observation_refs: tuple[str, ...],
+    subject_action_refs: tuple[str, ...],
+    identity_origin: IdentityOrigin,
+    context_id: str,
+    interlocutor_ids: tuple[str, ...],
+    situation_codes: tuple[str, ...],
+    interpretation_codes: tuple[str, ...],
+    appraisal: ExperienceAppraisal,
+    prediction_error: float | None,
+    value_revision_refs: dict[str, int],
+    active_goal_refs: tuple[str, ...],
+    self_model_revision: int,
+    result_refs: dict[str, tuple[str, ...]] | None = None,
+    schema_version: int = 1,
+) -> ExperienceRecord:
+    if schema_version != 1:
+        raise ValueError(f"Unsupported experience schema version: {schema_version}")
+    if not external_observation_refs:
+        raise ValueError(
+            "observation experience requires verified observation evidence"
+        )
+    now = _now()
+    return ExperienceRecord(
+        experience_id=f"experience-{uuid4()}",
+        source_event_id=source_event_id,
+        source_event_sequence=source_event_sequence,
+        external_observation_refs=external_observation_refs,
+        subject_action_refs=subject_action_refs,
+        identity_origin=identity_origin,
+        context_id=context_id,
+        interlocutor_ids=interlocutor_ids,
+        situation_codes=tuple(dict.fromkeys(situation_codes)),
+        interpretation_codes=tuple(dict.fromkeys(interpretation_codes)),
+        appraisal=appraisal,
+        prediction_error=prediction_error,
+        value_revision_refs=dict(value_revision_refs),
+        active_goal_refs=active_goal_refs,
+        self_model_revision=self_model_revision,
+        result_refs={} if result_refs is None else dict(result_refs),
+        created_at=now,
+        updated_at=now,
+        schema_version=schema_version,
+        **_experience_metrics(appraisal, prediction_error),
+    )
 
 
 def build_chat_experience(
@@ -369,8 +454,6 @@ def build_chat_experience(
         effort_cost=appraisal.effort_cost,
         reason_codes=appraisal.reasons,
     )
-    metrics = _experience_metrics(structured_appraisal, prediction_error)
-    now = _now()
     situation_codes = ["interaction_observed"]
     if interlocutor_ids:
         situation_codes.append("interpersonal_context")
@@ -383,8 +466,7 @@ def build_chat_experience(
     interpretation_codes = list(appraisal.reasons)
     if active_goal_refs:
         interpretation_codes.append("active_goal_context")
-    return ExperienceRecord(
-        experience_id=f"experience-{uuid4()}",
+    return build_observation_experience(
         source_event_id=source_event_id,
         source_event_sequence=source_event_sequence,
         external_observation_refs=(f"episode:{episode_id}:input",),
@@ -400,9 +482,6 @@ def build_chat_experience(
         active_goal_refs=active_goal_refs,
         self_model_revision=self_model_revision,
         result_refs={"memory": (f"episode:{episode_id}",)},
-        created_at=now,
-        updated_at=now,
-        **metrics,
     )
 
 

@@ -414,6 +414,12 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
             if integration.narrative_episode is not None:
                 self._sync_self_references()
                 self._persist_self_model_state()
+                experience = self.link_experience_result(
+                    experience.experience_id,
+                    kind="self_model",
+                    reference=f"self-model@{self.self_model.state.revision}",
+                    evidence_refs=(f"experience:{experience.experience_id}",),
+                )
             self.memory_system.link_experience(
                 episode_id,
                 experience_id=experience.experience_id,

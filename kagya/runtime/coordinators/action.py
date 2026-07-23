@@ -30,9 +30,19 @@ from kagya.decision import (
 from kagya.identity import (
     IdentityClaimKind,
     IdentityClaimStatus,
+    OriginActor,
+    OriginInputKind,
+    new_identity_origin,
+)
+from kagya.experience import (
+    ExperienceAppraisal,
+    ExperienceRecord,
+    build_observation_experience,
 )
 from kagya.metacognition import CognitiveQuality
 from kagya.motivation import (
+    ACCEPTED_COMMITMENT_STATUSES,
+    GoalStatus,
     MotivationKind,
     MotivationSource,
 )
@@ -43,6 +53,11 @@ from kagya.planning import (
 )
 from kagya.runtime.agent_runtime import current_agent_event
 from kagya.runtime.coordinators._shared import RuntimeDomainMixin, string_values
+from kagya.runtime.working_memory import (
+    RetentionReason,
+    WorkingMemoryKind,
+    working_memory_item,
+)
 
 
 class ActionCoordinator(RuntimeDomainMixin):
@@ -201,8 +216,24 @@ class ActionCoordinator(RuntimeDomainMixin):
             intent.provenance.decision_id == decision_id for intent in action_intents
         ):
             record = self._apply_metacognitive_outcome(record)
-            proposals = self.value_system.proposals_from_decision_outcome(record)
+            source_experiences = tuple(
+                item
+                for item in self.experience_store.list_records()
+                if f"decision:{decision_id}" in item.result_refs.get("decision", ())
+            )
+            proposals = self.value_system.proposals_from_decision_outcome(
+                record,
+                experience_ids=tuple(item.experience_id for item in source_experiences),
+            )
             updates = self.value_system.apply(proposals)
+            for experience in source_experiences:
+                for update in updates:
+                    self.link_experience_result(
+                        experience.experience_id,
+                        kind="value",
+                        reference=f"value:{update.value_id}@{update.after['revision']}",
+                        evidence_refs=update.evidence_ids,
+                    )
             self.value_system.record_reassessment(record, updates)
             self._persist_value_state()
             self._sync_self_references()
@@ -210,6 +241,127 @@ class ActionCoordinator(RuntimeDomainMixin):
             self._persist_metacognition_state()
         self._persist_decision_state()
         return record
+
+    def record_verified_action_experience(self, intent_id: str) -> ExperienceRecord:
+        if current_agent_event() is None:
+            raise RuntimeError("Action Experience integration requires AgentRuntime")
+        execution = self._action_execution
+        if execution is None:
+            raise ValueError("Action execution layer is unavailable")
+        intent = execution.get_intent(intent_id)
+        if intent.receipt_id is None:
+            raise ValueError("Action intent has no verified receipt")
+        receipt = execution.get_receipt(intent.receipt_id)
+        if receipt.observation_id is None or receipt.verification_id is None:
+            raise ValueError("Action receipt has no verified observation")
+        observation = execution.get_observation(receipt.observation_id)
+        verification = next(
+            item
+            for item in execution.list_verifications()
+            if item.verification_id == receipt.verification_id
+        )
+        decision = self.decision_store.get(intent.provenance.decision_id)
+        context_id = decision.context_id or f"action:{decision.decision_id}"
+        context = (
+            None
+            if decision.context_id is None
+            else self.context_registry.get(decision.context_id)
+        )
+        event = current_agent_event()
+        assert event is not None
+        success = verification.success
+        appraisal = ExperienceAppraisal(
+            valence=0.35 if success else -0.45,
+            arousal=0.5 if success else 0.75,
+            novelty=None,
+            novelty_valid=False,
+            goal_progress=1.0 if success else -1.0,
+            threat=0.0 if success else 0.7,
+            controllability=0.8,
+            certainty=1.0,
+            social_relevance=0.0
+            if context is None or not context.participant_ids
+            else 0.6,
+            effort_cost=min(
+                1.0, intent.cost_units_used / max(1, intent.budget.max_cost_units)
+            ),
+            reason_codes=(
+                "verified_action_outcome",
+                "action_succeeded" if success else "action_failed",
+                verification.reason,
+            ),
+        )
+        proposal = build_observation_experience(
+            source_event_id=event.event_id,
+            source_event_sequence=event.processing_sequence,
+            external_observation_refs=(
+                f"observation:{observation.observation_id}",
+                f"outcome-verification:{verification.verification_id}",
+            ),
+            subject_action_refs=(
+                f"action-intent:{intent.intent_id}@{intent.revision}",
+            ),
+            identity_origin=new_identity_origin(
+                OriginActor.SELF,
+                OriginInputKind.OBSERVATION,
+                source_ref=f"observation:{observation.observation_id}",
+                event_id=event.event_id,
+                event_sequence=event.processing_sequence,
+            ),
+            context_id=context_id,
+            interlocutor_ids=() if context is None else context.participant_ids,
+            situation_codes=("verified_action_observation", intent.tool_name),
+            interpretation_codes=appraisal.reason_codes,
+            appraisal=appraisal,
+            prediction_error=None,
+            value_revision_refs={
+                value.value_id: value.revision
+                for value in self.value_system.list_values()
+            },
+            active_goal_refs=tuple(
+                goal.goal_id for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+            ),
+            self_model_revision=self.self_model.state.revision,
+            result_refs={"decision": (f"decision:{decision.decision_id}",)},
+        )
+        integration = self.experience_coordinator.integrate(
+            proposal,
+            active_commitment_refs=tuple(
+                f"commitment:{item.commitment_id}"
+                for item in self.commitment_store.list_commitments()
+                if item.status in ACCEPTED_COMMITMENT_STATUSES
+            ),
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            observe_motivation=False,
+        )
+        experience = integration.experience
+        if integration.narrative_episode is not None:
+            self._sync_self_references()
+            self._persist_self_model_state()
+            experience = self.link_experience_result(
+                experience.experience_id,
+                kind="self_model",
+                reference=f"self-model@{self.self_model.state.revision}",
+                evidence_refs=(f"experience:{experience.experience_id}",),
+            )
+        self.working_memory.admit(
+            working_memory_item(
+                item_id=f"experience:{experience.experience_id}",
+                kind=WorkingMemoryKind.EPISODIC,
+                content="Structured verified action outcome: "
+                + ", ".join(experience.interpretation_codes),
+                source_event_id=event.event_id,
+                source_event_sequence=event.processing_sequence,
+                context_id=context_id,
+                source=event.source,
+                activation=0.5 + 0.5 * experience.subjective_salience,
+                salience=experience.subjective_salience,
+                retention_reason=RetentionReason.RECENT_CONTEXT,
+            )
+        )
+        self.refresh_attention(compete=True)
+        return experience
 
     def attribute_action_outcome(self, intent_id: str) -> AgencyAttribution:
         if current_agent_event() is None:
@@ -733,7 +885,25 @@ class ActionCoordinator(RuntimeDomainMixin):
             proposal_id=attribution_ref,
             decision_id=decision.decision_id,
             context_id=decision.context_id,
+            experience_ids=tuple(
+                item.experience_id
+                for item in self.experience_store.list_records()
+                if f"decision:{decision.decision_id}"
+                in item.result_refs.get("decision", ())
+            ),
         )
+        for experience in self.experience_store.list_records():
+            if f"decision:{decision.decision_id}" not in experience.result_refs.get(
+                "decision", ()
+            ):
+                continue
+            for update in value_updates:
+                self.link_experience_result(
+                    experience.experience_id,
+                    kind="value",
+                    reference=f"value:{update.value_id}@{update.after['revision']}",
+                    evidence_refs=update.evidence_ids,
+                )
         self.agency_attribution_store.record_projection(
             attribution,
             AttributionTarget.VALUE,

@@ -281,7 +281,10 @@ class ValueSystem:
         )
 
     def proposals_from_decision_outcome(
-        self, decision: "DecisionRecord"
+        self,
+        decision: "DecisionRecord",
+        *,
+        experience_ids: tuple[str, ...] = (),
     ) -> list[ValueUpdateProposal]:
         if decision.actual_outcome is None or decision.prediction_error is None:
             raise ValueError("Value reassessment requires a resolved decision outcome")
@@ -317,6 +320,7 @@ class ValueSystem:
                     event_id=outcome.observed_event_id,
                     event_sequence=outcome.observed_event_sequence,
                     decision_id=decision.decision_id,
+                    experience_ids=experience_ids,
                     context_id=decision.context_id,
                     source="decision.outcome",
                 ),
@@ -344,10 +348,11 @@ class ValueSystem:
                 (*state.supporting_evidence_ids, *state.opposing_evidence_ids)
             )
             novel = [
-                (proposal, self._record_evidence(proposal))
-                for proposal in candidates
+                (proposal, self._record_evidence(proposal)) for proposal in candidates
             ]
-            novel = [item for item in novel if item[1].evidence_id not in known_evidence_ids]
+            novel = [
+                item for item in novel if item[1].evidence_id not in known_evidence_ids
+            ]
             if not novel:
                 continue
             candidates = [item[0] for item in novel]
@@ -410,9 +415,7 @@ class ValueSystem:
                     else:
                         next_strength = abs(next_strength)
                         next_polarity = -state.polarity
-                actual_delta = (
-                    -state.weight if next_strength == 0.0 else applied
-                )
+                actual_delta = -state.weight if next_strength == 0.0 else applied
                 after = replace(
                     state,
                     weight=max(0.0, min(1.0, next_strength)),
@@ -532,16 +535,12 @@ class ValueSystem:
             stability=float(target["stability"]),
             frozen=bool(target["frozen"]),
             polarity=int(target.get("polarity", current.polarity)),
-            protectedness=float(
-                target.get("protectedness", current.protectedness)
-            ),
+            protectedness=float(target.get("protectedness", current.protectedness)),
             negotiability=float(target.get("negotiability", current.negotiability)),
             scope=ValueScope(target.get("scope", current.scope)),
             context_ids=tuple(target.get("context_ids", current.context_ids)),
             supporting_evidence_ids=tuple(
-                target.get(
-                    "supporting_evidence_ids", current.supporting_evidence_ids
-                )
+                target.get("supporting_evidence_ids", current.supporting_evidence_ids)
             ),
             opposing_evidence_ids=tuple(
                 target.get("opposing_evidence_ids", current.opposing_evidence_ids)
@@ -836,8 +835,7 @@ class ValueSystem:
             reason_codes=reason_codes,
             identity_origin=proposals[-1].evidence.identity_origin,
             requested_delta=sum(
-                proposal.requested_delta * proposal.confidence
-                for proposal in proposals
+                proposal.requested_delta * proposal.confidence for proposal in proposals
             ),
             applied_delta=0.0,
             before=before,

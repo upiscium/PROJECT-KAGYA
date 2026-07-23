@@ -164,6 +164,83 @@ def test_experience_api_exposes_structured_state_without_chat_content(
     assert "hidden_thought" not in serialized
 
 
+def test_experience_revision_api_requires_reviewed_evidence_and_updates_history(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+    chat = client.post(
+        "/api/chat", json={"text": "revision source", "attachments": []}
+    ).json()
+    body = {
+        "reason_code": "reviewed_observation",
+        "evidence_refs": ["memory:not-authoritative"],
+        "appraisal": {
+            "valence": -0.5,
+            "arousal": 0.9,
+            "novelty": 1.0,
+            "novelty_valid": True,
+            "goal_progress": -0.5,
+            "threat": 0.8,
+            "controllability": 0.2,
+            "certainty": 0.9,
+            "social_relevance": 0.8,
+            "effort_cost": 0.3,
+            "reason_codes": ["reviewed_observation"],
+        },
+        "interpretation_codes": ["reviewed_observation"],
+    }
+
+    rejected = client.post(
+        f"/api/experiences/{chat['experience_id']}/revisions",
+        headers=admin_headers(),
+        json=body,
+    )
+    feedback = client.post(
+        "/api/feedback/admin",
+        headers=admin_headers(),
+        json={
+            "idempotency_key": "experience-revision-review",
+            "feedback_id": "experience-revision-review",
+            "target": {
+                "target_type": "episode",
+                "target_id": chat["episode_id"],
+                "episode_id": chat["episode_id"],
+                "experience_id": chat["experience_id"],
+                "context_id": chat["context_id"],
+            },
+            "signals": ["style_problem"],
+        },
+    )
+    assert feedback.status_code == 200
+    body["evidence_refs"] = ["feedback:experience-revision-review@1"]
+    revised = client.post(
+        f"/api/experiences/{chat['experience_id']}/revisions",
+        headers=admin_headers(),
+        json=body,
+    )
+    duplicate = client.post(
+        f"/api/experiences/{chat['experience_id']}/revisions",
+        headers=admin_headers(),
+        json=body,
+    )
+
+    assert rejected.status_code == 409
+    assert revised.status_code == 200
+    assert duplicate.status_code == 200
+    payload = revised.json()
+    assert duplicate.json() == payload
+    assert payload["revision"] > 0
+    assert payload["interpretation_codes"] == ["reviewed_observation"]
+    assert "self_model" in payload["result_refs"]
+    assert any(
+        "interpretation_codes" in item["changed_fields"]
+        for item in payload["revisions"]
+    )
+    serialized = json.dumps(payload)
+    assert "revision source" not in serialized
+    assert "hidden_thought" not in serialized
+
+
 def test_relationship_api_is_admin_only_versioned_and_private(tmp_path: Path) -> None:
     client = _client(tmp_path)
     chat = client.post(

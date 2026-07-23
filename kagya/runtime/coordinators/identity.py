@@ -331,6 +331,7 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
         return link
 
     def _sync_self_references(self) -> None:
+        event = current_agent_event()
         self.self_model.sync_references(
             commitment_refs=(
                 commitment.commitment_id
@@ -345,6 +346,12 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
                 f"narrative:{episode.episode_id}"
                 for episode in self.narrative_self.episodes.values()
             ),
+            evidence_refs=tuple(
+                f"narrative:{episode.episode_id}"
+                for episode in self.narrative_self.episodes.values()
+            ),
+            event_id=None if event is None else event.event_id,
+            event_sequence=None if event is None else event.processing_sequence,
         )
 
     def _sync_self_model_working_memory(

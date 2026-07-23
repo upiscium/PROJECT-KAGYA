@@ -90,6 +90,7 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
         active_commitment_refs: tuple[str, ...],
         event_id: str | None,
         event_sequence: int | None,
+        observe_motivation: bool = True,
     ) -> ExperienceIntegrationResult:
         integrated = self._experiences.integrate(experience)
         self._persist_experience()
@@ -126,8 +127,9 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
             )
             self._persist_experience()
         self._persist_narrative()
-        self._motivation.observe_experience(integrated)
-        self._persist_motivation()
+        if observe_motivation:
+            self._motivation.observe_experience(integrated)
+            self._persist_motivation()
         return ExperienceIntegrationResult(
             experience=integrated,
             relationships=relationships,
@@ -550,16 +552,32 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
         appraisal: ExperienceAppraisal,
         reason_code: str,
         evidence_refs: tuple[str, ...],
+        context_id: str | None = None,
+        situation_codes: tuple[str, ...] | None = None,
+        interpretation_codes: tuple[str, ...] | None = None,
+        value_revision_refs: dict[str, int] | None = None,
+        self_model_revision: int | None = None,
     ) -> ExperienceRecord:
         event = current_agent_event()
-        record = self.experience_store.revise_appraisal(
+        if event is None:
+            raise RuntimeError("Experience reassessment requires AgentRuntime")
+        previous = self.experience_store.get(experience_id)
+        self._validate_experience_revision_evidence(previous, evidence_refs)
+        record = self.experience_store.revise(
             experience_id,
             appraisal=appraisal,
             reason_code=reason_code,
             evidence_refs=evidence_refs,
-            event_id=None if event is None else event.event_id,
-            event_sequence=None if event is None else event.processing_sequence,
+            context_id=context_id,
+            situation_codes=situation_codes,
+            interpretation_codes=interpretation_codes,
+            value_revision_refs=value_revision_refs,
+            self_model_revision=self_model_revision,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
         )
+        if record.revision == previous.revision:
+            return record
         for reference in record.result_refs.get("memory", ()):
             if reference.startswith("episode:"):
                 self.memory_system.link_experience(
@@ -568,8 +586,134 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
                     subjective_salience=record.subjective_salience,
                     autobiographical_importance=record.autobiographical_importance,
                 )
+                item_id = reference
+                existing = next(
+                    (
+                        item
+                        for item in self.working_memory.items
+                        if item.item_id == item_id
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    self.working_memory.forget(item_id)
+                    self.working_memory.admit(
+                        working_memory_item(
+                            item_id=item_id,
+                            kind=existing.kind,
+                            content=existing.content,
+                            reference=existing.reference,
+                            source_event_id=existing.source_event_id,
+                            source_event_sequence=existing.source_event_sequence,
+                            context_id=record.context_id,
+                            source=existing.source,
+                            source_channel=existing.source_channel,
+                            source_session_id=existing.source_session_id,
+                            activation=0.5 + 0.5 * record.subjective_salience,
+                            salience=record.subjective_salience,
+                            retention_reason=existing.retention_reason,
+                        )
+                    )
+        action_item_id = f"experience:{record.experience_id}"
+        action_item = next(
+            (
+                item
+                for item in self.working_memory.items
+                if item.item_id == action_item_id
+            ),
+            None,
+        )
+        if action_item is not None:
+            self.working_memory.forget(action_item_id)
+            self.working_memory.admit(
+                working_memory_item(
+                    item_id=action_item_id,
+                    kind=action_item.kind,
+                    content="Structured revised experience: "
+                    + ", ".join(record.interpretation_codes),
+                    context_id=record.context_id,
+                    source=action_item.source,
+                    activation=0.5 + 0.5 * record.subjective_salience,
+                    salience=record.subjective_salience,
+                    retention_reason=action_item.retention_reason,
+                )
+            )
+        self.relationship_store.reassess_experience(
+            record,
+            evidence_refs=evidence_refs,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+        )
+        self.narrative_self.observe_experience(record)
+        self.motivation_dynamics.reassess_experience(record)
+        self._sync_self_references()
+        record = self.experience_store.link_result(
+            experience_id,
+            kind="self_model",
+            reference=f"self-model@{self.self_model.state.revision}",
+            evidence_refs=evidence_refs,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+        )
         self._persist_experience_state()
+        self._persist_narrative_self_state()
+        self._persist_motivation_state()
+        self._persist_self_model_state()
+        self.refresh_attention(compete=True)
         return record
+
+    def _validate_experience_revision_evidence(
+        self, experience: ExperienceRecord, evidence_refs: tuple[str, ...]
+    ) -> None:
+        if not evidence_refs:
+            raise ValueError("Experience revision requires evidence")
+        execution = getattr(self, "action_execution", None)
+        observations = () if execution is None else execution.list_observations()
+        verifications = () if execution is None else execution.list_verifications()
+        for reference in evidence_refs:
+            if reference.startswith("observation:"):
+                observation_id = reference.removeprefix("observation:")
+                observation = next(
+                    (
+                        item
+                        for item in observations
+                        if item.observation_id == observation_id and item.valid
+                    ),
+                    None,
+                )
+                if observation is not None and any(
+                    item.observation_id == observation_id for item in verifications
+                ):
+                    continue
+            elif reference.startswith("feedback:") and "@" in reference:
+                identifier, raw_revision = reference.removeprefix("feedback:").rsplit(
+                    "@", 1
+                )
+                try:
+                    revision_number = int(raw_revision)
+                    feedback = self.feedback_store.get(identifier)
+                except (ValueError, KeyError):
+                    feedback = None
+                if feedback is not None:
+                    revision = next(
+                        (
+                            item
+                            for item in feedback.revisions
+                            if item.revision == revision_number
+                        ),
+                        None,
+                    )
+                    if (
+                        revision is not None
+                        and revision.status.value == "active"
+                        and revision.provenance.actor_type == "operator"
+                        and revision.target.experience_id == experience.experience_id
+                    ):
+                        continue
+            raise ValueError(
+                "Experience revision evidence must resolve to a verified Observation "
+                "or active operator-reviewed Feedback"
+            )
 
     def link_experience_result(
         self,
