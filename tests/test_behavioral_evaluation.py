@@ -29,6 +29,7 @@ from kagya.learning import (
     TransitionKind,
     proactive_outbox_scenarios,
     agency_attribution_scenarios,
+    counterfactual_simulation_scenarios,
 )
 
 
@@ -60,6 +61,20 @@ def test_agency_attribution_hard_scenarios_cover_credit_failure_and_revision() -
     }
     assert all(
         BehavioralDimension.AGENCY_ATTRIBUTION in item.dimensions for item in scenarios
+    )
+
+
+def test_counterfactual_scenarios_cover_uncertainty_absence_and_revision() -> None:
+    scenarios = counterfactual_simulation_scenarios(subject_revision="test-revision")
+
+    assert {item.scenario_id for item in scenarios} == {
+        "counterfactual.regret-remains-confidence-bounded",
+        "counterfactual.no-alternative-no-inference",
+        "counterfactual.revision-is-deduplicated",
+    }
+    assert all(
+        BehavioralDimension.COUNTERFACTUAL_CALIBRATION in item.dimensions
+        for item in scenarios
     )
 
 
@@ -334,6 +349,7 @@ def test_subject_dimensions_cover_current_architecture_and_tool_scope_is_explici
         "tool_safety",
         "proactive_outbox",
         "agency_attribution",
+        "counterfactual_calibration",
     }
 
 

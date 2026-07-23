@@ -44,6 +44,15 @@ from kagya.cognition import (
     ValueUpdateRecord,
 )
 from kagya.config import Settings
+from kagya.counterfactual import (
+    COUNTERFACTUAL_STATE_KEY,
+    AlternativeOutcome,
+    CounterfactualSignal,
+    CounterfactualSimulation,
+    CounterfactualStore,
+    CounterfactualTarget,
+    EvidenceStatus,
+)
 from kagya.decision import (
     ActionCandidate,
     ActionType,
@@ -309,6 +318,7 @@ class _MainLoopImplementation:
         self.metacognition = Metacognition()
         self._action_execution: Any | None = None
         self.agency_attribution_store: AgencyAttributionStore
+        self.counterfactual_store: CounterfactualStore
         self.persistence_coordinator = PersistenceCoordinator()
         self.experience_coordinator = ExperienceIntegrationCoordinator(
             self.experience_store,
@@ -345,6 +355,7 @@ class _MainLoopImplementation:
         self.restore_motivation_state()
         self.restore_decision_state()
         self.restore_agency_attribution_state()
+        self.restore_counterfactual_state()
         self.restore_self_model_state()
         self.restore_experience_state()
         self.restore_narrative_self_state()
@@ -365,6 +376,8 @@ class _MainLoopImplementation:
         if execution is not None:
             for record in self.agency_attribution_store.state.records:
                 self._validate_attribution_chain(record)
+            for simulation in self.counterfactual_store.state.records:
+                self._validate_counterfactual_chain(simulation)
 
     def chat(
         self,
@@ -2866,6 +2879,15 @@ class _MainLoopImplementation:
     def restore_agency_attribution_state(self) -> None:
         self.agency_attribution_store = self._new_agency_attribution_store()
 
+    def restore_counterfactual_state(self) -> None:
+        self.counterfactual_store = CounterfactualStore(
+            load=lambda: self.persistent_state.extensions.get(COUNTERFACTUAL_STATE_KEY),
+            save=lambda payload: self.persistent_state.extensions.__setitem__(
+                COUNTERFACTUAL_STATE_KEY, payload
+            ),
+            validate_chain=self._validate_counterfactual_chain,
+        )
+
     def _new_agency_attribution_store(self) -> AgencyAttributionStore:
         return AgencyAttributionStore(
             load=lambda: self.persistent_state.extensions.get(
@@ -2898,6 +2920,50 @@ class _MainLoopImplementation:
             or observation.receipt_id != receipt.receipt_id
         ):
             raise ValueError("agency attribution causal provenance does not match")
+
+    def _validate_counterfactual_chain(
+        self, simulation: CounterfactualSimulation
+    ) -> None:
+        decision = self.decision_store.get(simulation.decision_id)
+        if decision.actual_outcome is None:
+            raise ValueError("counterfactual simulation requires an observed outcome")
+        if (
+            simulation.selected_candidate_id != decision.selected_candidate_id
+            or simulation.observed_utility != decision.actual_outcome.utility
+            or simulation.outcome_ref != f"decision:{decision.decision_id}:outcome"
+        ):
+            raise ValueError("counterfactual simulation cannot replace observed facts")
+        considered = {
+            item.candidate.candidate_id: item for item in decision.considered_candidates
+        }
+        if any(
+            alternative.candidate_id not in considered
+            or not considered[alternative.candidate_id].eligible
+            or alternative.candidate_type
+            != considered[alternative.candidate_id].candidate.candidate_type.value
+            for alternative in simulation.alternatives
+        ):
+            raise ValueError(
+                "counterfactual alternative was not an eligible Decision option"
+            )
+        attribution = next(
+            (
+                item
+                for item in self.agency_attribution_store.history(
+                    simulation.agency_attribution_id
+                )
+                if item.revision == simulation.agency_attribution_revision
+            ),
+            None,
+        )
+        if (
+            attribution is None
+            or attribution.decision_id != simulation.decision_id
+            or attribution.action_intent_id != simulation.action_intent_id
+            or attribution.execution_receipt_id != simulation.execution_receipt_id
+            or attribution.outcome_ref != simulation.outcome_ref
+        ):
+            raise ValueError("counterfactual attribution provenance does not match")
 
     def restore_feedback_state(self) -> None:
         payload = self.persistent_state.extensions.get("feedback")
@@ -3552,7 +3618,7 @@ class _MainLoopImplementation:
                 options, context_id=context_id
             ),
             self_model_evaluator=self.self_model.evaluate_candidates,
-            metacognition_evaluator=lambda values: self._metacognitive_candidate_scores(
+            metacognition_evaluator=lambda values: self._calibrated_candidate_scores(
                 values, pre_assessment.recommended_action
             ),
             decision_id=identifier,
@@ -3908,6 +3974,327 @@ class _MainLoopImplementation:
         self._apply_attribution(attribution)
         return attribution
 
+    def simulate_counterfactual(self, attribution_id: str) -> CounterfactualSimulation:
+        if current_agent_event() is None:
+            raise RuntimeError("Counterfactual simulation requires AgentRuntime")
+        attribution = self.agency_attribution_store.history(attribution_id)[-1]
+        decision = self.decision_store.get(attribution.decision_id)
+        outcome = decision.actual_outcome
+        if outcome is None:
+            raise ValueError("Counterfactual simulation requires an observed outcome")
+        alternatives = tuple(
+            AlternativeOutcome(
+                candidate_id=item.candidate.candidate_id,
+                candidate_type=item.candidate.candidate_type.value,
+                plausible_utility=max(-1.0, min(1.0, item.predicted_utility)),
+                confidence=min(
+                    0.6,
+                    (1.0 - item.candidate.uncertainty)
+                    * (1.0 - attribution.uncertainty)
+                    * 0.6,
+                ),
+                evidence_status=EvidenceStatus.SPECULATIVE,
+                assumption_codes=("decision_time_prediction_held",),
+                evidence_refs=(
+                    f"decision:{decision.decision_id}:candidate:{item.candidate.candidate_id}",
+                ),
+            )
+            for item in decision.considered_candidates
+            if item.eligible
+            and item.candidate.candidate_id != decision.selected_candidate_id
+            and item.candidate.predicted_outcomes
+        )
+        if not alternatives:
+            raise ValueError("Decision has no valid counterfactual alternatives")
+        best = max(
+            alternatives,
+            key=lambda item: (item.plausible_utility, item.candidate_id),
+        )
+        gap = best.plausible_utility - outcome.utility
+        confidence = max(item.confidence for item in alternatives)
+        if gap > 0.05:
+            signal = (
+                CounterfactualSignal.REGRET
+                if outcome.utility < 0.0
+                else CounterfactualSignal.MISSED_OPPORTUNITY
+            )
+        elif gap < -0.05:
+            signal = CounterfactualSignal.RELIEF
+        else:
+            signal = CounterfactualSignal.NONE
+        magnitude = (
+            0.0
+            if signal == CounterfactualSignal.NONE
+            else min(0.5, abs(gap) * confidence)
+        )
+        evidence_refs = tuple(
+            item
+            for item in (
+                None
+                if outcome.observed_event_id is None
+                else f"event:{outcome.observed_event_id}",
+                attribution.reference,
+                attribution.outcome_ref,
+            )
+            if item is not None
+        )
+        existing = self.counterfactual_store.current_for_decision(decision.decision_id)
+        if existing is None:
+            simulation = self.counterfactual_store.create(
+                decision_id=decision.decision_id,
+                selected_candidate_id=decision.selected_candidate_id,
+                action_intent_id=attribution.action_intent_id,
+                execution_receipt_id=attribution.execution_receipt_id,
+                outcome_ref=attribution.outcome_ref,
+                agency_attribution_id=attribution.attribution_id,
+                agency_attribution_revision=attribution.revision,
+                observed_utility=outcome.utility,
+                alternatives=alternatives,
+                signal=signal,
+                signal_magnitude=magnitude,
+                confidence=confidence,
+                evidence_refs=evidence_refs,
+                reason_codes=("bounded_decision_alternative_comparison",),
+            )
+        elif existing.agency_attribution_revision == attribution.revision:
+            return existing
+        else:
+            simulation = self.counterfactual_store.revise(
+                existing.simulation_id,
+                expected_revision=existing.revision,
+                agency_attribution_revision=attribution.revision,
+                alternatives=alternatives,
+                signal=signal,
+                signal_magnitude=magnitude,
+                confidence=confidence,
+                evidence_refs=(attribution.reference,),
+                reason_code="agency_attribution_revised",
+            )
+        self._apply_counterfactual(simulation)
+        return simulation
+
+    def revise_counterfactual(
+        self,
+        simulation_id: str,
+        *,
+        expected_revision: int,
+        agency_attribution_revision: int,
+        alternatives: tuple[AlternativeOutcome, ...],
+        signal: CounterfactualSignal,
+        signal_magnitude: float,
+        confidence: float,
+        evidence_refs: tuple[str, ...],
+        reason_code: str,
+    ) -> CounterfactualSimulation:
+        if current_agent_event() is None:
+            raise RuntimeError("Counterfactual revisions require AgentRuntime")
+        simulation = self.counterfactual_store.revise(
+            simulation_id,
+            expected_revision=expected_revision,
+            agency_attribution_revision=agency_attribution_revision,
+            alternatives=alternatives,
+            signal=signal,
+            signal_magnitude=signal_magnitude,
+            confidence=confidence,
+            evidence_refs=evidence_refs,
+            reason_code=reason_code,
+        )
+        self._apply_counterfactual(simulation)
+        return simulation
+
+    def _apply_counterfactual(self, simulation: CounterfactualSimulation) -> None:
+        decision = self.decision_store.get(simulation.decision_id)
+        selected = next(
+            item.candidate
+            for item in decision.considered_candidates
+            if item.candidate.candidate_id == decision.selected_candidate_id
+        )
+        history = self.counterfactual_store.history(simulation.simulation_id)
+        previous = history[-2] if simulation.revision > 1 else None
+
+        def comparison(
+            record: CounterfactualSimulation,
+        ) -> tuple[AlternativeOutcome, ActionCandidate, float, float]:
+            best_outcome = max(
+                record.alternatives,
+                key=lambda item: (item.plausible_utility, item.candidate_id),
+            )
+            candidate = next(
+                item.candidate
+                for item in decision.considered_candidates
+                if item.candidate.candidate_id == best_outcome.candidate_id
+            )
+            direction = -1.0 if record.signal == CounterfactualSignal.RELIEF else 1.0
+            if record.signal == CounterfactualSignal.NONE:
+                direction = 0.0
+            amount = min(0.05, record.signal_magnitude * record.confidence * 0.2)
+            return best_outcome, candidate, direction, amount
+
+        best, alternative, preference, learning = comparison(simulation)
+        old_comparison = None if previous is None else comparison(previous)
+        selected_subject = f"candidate-type:{selected.candidate_type.value}"
+
+        def policy_desired(
+            values: tuple[AlternativeOutcome, ActionCandidate, float, float] | None,
+        ) -> dict[str, float]:
+            if values is None:
+                return {}
+            _, candidate, direction, amount = values
+            desired = {selected_subject: -direction * amount}
+            subject = f"candidate-type:{candidate.candidate_type.value}"
+            desired[subject] = desired.get(subject, 0.0) + direction * amount
+            return desired
+
+        desired_policy = policy_desired((best, alternative, preference, learning))
+        old_policy = policy_desired(old_comparison)
+        for subject in set(desired_policy) | set(old_policy) or {selected_subject}:
+            self.counterfactual_store.record_projection(
+                simulation,
+                CounterfactualTarget.DECISION_CALIBRATION,
+                subject_ref=subject,
+                applied_delta=desired_policy.get(subject, 0.0)
+                - old_policy.get(subject, 0.0),
+                evidence_refs=(simulation.outcome_ref, best.evidence_refs[0]),
+            )
+
+        def value_desired(
+            record: CounterfactualSimulation,
+            values: tuple[AlternativeOutcome, ActionCandidate, float, float],
+        ) -> dict[str, float]:
+            _, candidate, direction, _ = values
+            return {
+                value_id: direction
+                * (
+                    candidate.value_effects.get(value_id, 0.0)
+                    - selected.value_effects.get(value_id, 0.0)
+                )
+                * min(0.2, record.signal_magnitude)
+                for value_id in set(selected.value_effects)
+                | set(candidate.value_effects)
+            }
+
+        desired_values = value_desired(
+            simulation, (best, alternative, preference, learning)
+        )
+        old_values = (
+            {}
+            if previous is None or old_comparison is None
+            else value_desired(previous, old_comparison)
+        )
+        impacts = {
+            value_id: desired_values.get(value_id, 0.0) - old_values.get(value_id, 0.0)
+            for value_id in set(desired_values) | set(old_values)
+        }
+        desired_affect = (
+            -preference * simulation.signal_magnitude * simulation.confidence
+        )
+        old_affect = (
+            0.0
+            if previous is None or old_comparison is None
+            else -old_comparison[2] * previous.signal_magnitude * previous.confidence
+        )
+        affect_correction = desired_affect - old_affect
+        appraisal = AppraisalResult(
+            novelty=None,
+            goal_progress=max(-1.0, min(1.0, affect_correction)),
+            threat=max(0.0, -affect_correction),
+            controllability=0.0,
+            certainty=simulation.confidence,
+            social_relevance=0.0,
+            effort_cost=0.0,
+            novelty_valid=False,
+            reasons=("bounded_counterfactual", simulation.reference),
+        )
+        updates = self.apply_value_impacts(
+            appraisal,
+            impacts,
+            kind=ValueUpdateKind.REFLECTION,
+            source="counterfactual.simulation",
+            proposal_id=simulation.reference,
+            decision_id=decision.decision_id,
+            context_id=decision.context_id,
+        )
+        for update in updates:
+            self.counterfactual_store.record_projection(
+                simulation,
+                CounterfactualTarget.VALUE,
+                subject_ref=f"value:{update.value_id}",
+                applied_delta=update.applied_delta,
+                evidence_refs=update.evidence_ids or (simulation.outcome_ref,),
+            )
+        if not updates:
+            self.counterfactual_store.record_projection(
+                simulation,
+                CounterfactualTarget.VALUE,
+                subject_ref="value:none",
+                applied_delta=0.0,
+                evidence_refs=(simulation.outcome_ref,),
+            )
+        if simulation.signal == CounterfactualSignal.NONE:
+            motivation_ref = "motivation:none"
+        else:
+            motivation = self.motivation_dynamics.observe_structured_signal(
+                MotivationKind.DESIRE if preference >= 0 else MotivationKind.AVERSION,
+                MotivationSource.LEARNING,
+                f"decision:{decision.decision_id}:candidate:{best.candidate_id}",
+                signal=min(0.25, simulation.signal_magnitude),
+                uncertainty=1.0 - simulation.confidence,
+                source_refs=(simulation.reference,),
+                value_ids=tuple(impacts),
+            )
+            motivation_ref = f"motivation:{motivation.motivation_id}"
+        self.counterfactual_store.record_projection(
+            simulation,
+            CounterfactualTarget.MOTIVATION,
+            subject_ref=motivation_ref,
+            applied_delta=0.0,
+            evidence_refs=(simulation.reference,),
+        )
+
+        def alternative_desired(
+            values: tuple[AlternativeOutcome, ActionCandidate, float, float] | None,
+            *,
+            prefix: str,
+            scale: float,
+        ) -> dict[str, float]:
+            if values is None:
+                return {}
+            _, candidate, direction, amount = values
+            return {
+                f"{prefix}:{candidate.candidate_type.value}": direction * amount * scale
+            }
+
+        for target, prefix, scale in (
+            (CounterfactualTarget.PLAN_STRATEGY, "plan-strategy", 1.0),
+            (CounterfactualTarget.METACOGNITION, "candidate-type", 0.5),
+        ):
+            desired = alternative_desired(
+                (best, alternative, preference, learning), prefix=prefix, scale=scale
+            )
+            old_desired = alternative_desired(
+                old_comparison, prefix=prefix, scale=scale
+            )
+            for subject in set(desired) | set(old_desired) or {f"{prefix}:none"}:
+                self.counterfactual_store.record_projection(
+                    simulation,
+                    target,
+                    subject_ref=subject,
+                    applied_delta=desired.get(subject, 0.0)
+                    - old_desired.get(subject, 0.0),
+                    evidence_refs=(best.evidence_refs[0],),
+                )
+        previous_valence = self.emotion_engine.state.valence
+        emotion = self.emotion_engine.update_from_appraisal(appraisal, max_delta=0.03)
+        self.counterfactual_store.record_projection(
+            simulation,
+            CounterfactualTarget.EMOTION,
+            subject_ref="emotion:valence",
+            applied_delta=emotion.state.valence - previous_valence,
+            evidence_refs=(simulation.outcome_ref,),
+        )
+        self._persist_motivation_state()
+        self._persist_metacognition_state()
+
     def _apply_attribution(self, attribution: AgencyAttribution) -> None:
         decision = self.decision_store.get(attribution.decision_id)
         outcome = decision.actual_outcome
@@ -4099,6 +4486,37 @@ class _MainLoopImplementation:
             scores.setdefault(candidate.candidate_id, {})[
                 "metacognition:recommended_action"
             ] = contribution
+        return scores
+
+    def _calibrated_candidate_scores(
+        self, candidates: tuple[ActionCandidate, ...], recommended_action: ActionType
+    ) -> dict[str, dict[str, float]]:
+        scores = self._metacognitive_candidate_scores(candidates, recommended_action)
+        for candidate in candidates:
+            subject = f"candidate-type:{candidate.candidate_type.value}"
+            decision_delta = self.counterfactual_store.calibration(
+                CounterfactualTarget.DECISION_CALIBRATION, subject
+            )
+            metacognitive_delta = self.counterfactual_store.calibration(
+                CounterfactualTarget.METACOGNITION, subject
+            )
+            if decision_delta:
+                scores[candidate.candidate_id][
+                    "counterfactual:decision_calibration"
+                ] = decision_delta
+            if metacognitive_delta:
+                scores[candidate.candidate_id]["counterfactual:metacognition"] = (
+                    metacognitive_delta
+                )
+            if candidate.plan_id is not None:
+                strategy_delta = self.counterfactual_store.calibration(
+                    CounterfactualTarget.PLAN_STRATEGY,
+                    f"plan-strategy:{candidate.candidate_type.value}",
+                )
+                if strategy_delta:
+                    scores[candidate.candidate_id]["counterfactual:plan_strategy"] = (
+                        strategy_delta
+                    )
         return scores
 
     def _current_cognitive_quality(self) -> CognitiveQuality:

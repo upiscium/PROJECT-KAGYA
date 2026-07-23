@@ -29,6 +29,7 @@ from kagya.learning.behavioral_evaluation import (
     TransitionKind,
     proactive_outbox_scenarios,
     agency_attribution_scenarios,
+    counterfactual_simulation_scenarios,
 )
 from kagya.learning.dream_dataset_generator import (
     DreamDatasetGenerator,
@@ -81,4 +82,5 @@ __all__ = [
     "load_eval_sets",
     "proactive_outbox_scenarios",
     "agency_attribution_scenarios",
+    "counterfactual_simulation_scenarios",
 ]
