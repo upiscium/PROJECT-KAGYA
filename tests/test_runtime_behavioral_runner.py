@@ -38,6 +38,10 @@ def test_runtime_runner_uses_real_runtime_diff_not_expected_transition(
     tmp_path: Path,
 ) -> None:
     scenario = deterministic_runtime_scenarios(subject_revision="test-revision")[1]
+    original = DeterministicRuntimeRunner(
+        tmp_path / "original", load_settings(CONFIG_PATH), "candidate"
+    )(scenario)
+    exact_actual = original.model_dump(mode="json")
     changed_expectation = scenario.model_copy(
         update={
             "expected_transitions": (
@@ -51,9 +55,6 @@ def test_runtime_runner_uses_real_runtime_diff_not_expected_transition(
             "expected_public_behavior": scenario.expected_public_behavior.RESPOND,
         }
     )
-    original = DeterministicRuntimeRunner(
-        tmp_path / "original", load_settings(CONFIG_PATH), "candidate"
-    )(scenario)
     changed = DeterministicRuntimeRunner(
         tmp_path / "changed", load_settings(CONFIG_PATH), "candidate"
     )(changed_expectation)
@@ -75,6 +76,7 @@ def test_runtime_runner_uses_real_runtime_diff_not_expected_transition(
     assert {
         failure.code for failure in evaluated.candidate.scenario_results[0].failures
     } >= {"expected_transition_missing", "public_behavior_mismatch"}
+    assert original.model_dump(mode="json") == exact_actual
     assert BehavioralRuntimeKind.DETERMINISTIC_RUNTIME.value == "deterministic_runtime"
 
 
