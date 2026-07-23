@@ -656,6 +656,14 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
     register_runtime_candidate(registry, tmp_path, "runtime-api-candidate")
+    assert client.get("/api/adapters", headers=admin_headers()).status_code == 200
+    before_sequence = (
+        client.app.state.agent_state_store.last_snapshot.last_processed_event_sequence
+    )
+    before = client.app.state.agent_state_store.capture(
+        client.app.state.main_loop,
+        before_sequence,
+    )
 
     response = client.post(
         "/api/adapters/runtime-api-candidate/behavioral-evaluate",
@@ -675,6 +683,15 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
     entry = registry.lookup("runtime-api-candidate")
     assert entry is not None
     assert entry.behavioral_evaluation_id == "runtime-api-evaluation"
+    assert entry.behavioral_artifact_state == "reconciled"
+    after = client.app.state.agent_state_store.capture(
+        client.app.state.main_loop,
+        client.app.state.agent_state_store.last_snapshot.last_processed_event_sequence,
+    )
+    assert after.last_processed_event_sequence == before.last_processed_event_sequence + 1
+    assert after.model_dump(exclude={"saved_at", "last_processed_event_sequence"}) == (
+        before.model_dump(exclude={"saved_at", "last_processed_event_sequence"})
+    )
 
     reconciliation = client.post(
         "/api/evaluations/behavioral-reconciliation", headers=admin_headers()

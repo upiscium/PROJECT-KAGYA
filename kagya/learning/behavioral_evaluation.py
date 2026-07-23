@@ -162,6 +162,8 @@ class StateTransition(_StrictModel):
 class TransitionExpectation(_StrictModel):
     transition: StateTransition
     hard_gate: HardGate | None = None
+    requires_evidence: bool = False
+    requires_revision_or_event: bool = False
 
 
 class BehavioralInvariant(_StrictModel):
@@ -255,7 +257,7 @@ class RuntimeBehaviorClassifier:
             )
         )
         if observation.duplicate_retry:
-            if observation.tool_call_count == 1 and observation.receipt_count == 1:
+            if observation.tool_call_count == 0 and observation.receipt_count == 0:
                 return PublicBehaviorClass.NO_OP
             return PublicBehaviorClass.RESPOND
         if not response:
@@ -391,8 +393,6 @@ class PairedBehavioralEvaluationResult(_StrictModel):
                     "synthetic behavioral results cannot pass the runtime gate"
                 )
             return self
-        if not self.deterministic_runtime_gate_passed:
-            raise ValueError("runtime behavioral result did not pass its runtime gate")
         if self.manifest is None:
             raise ValueError("runtime behavioral results require a manifest")
         if self.manifest.candidate_adapter_id != self.candidate.subject_id:
@@ -736,7 +736,6 @@ class BehavioralEvaluator:
         candidate_id: str,
         candidate_runner: ScenarioRunner,
         runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT,
-        deterministic_runtime_gate_passed: bool = False,
         manifest: BehavioralEvaluationManifest | None = None,
         persist_result: bool = True,
     ) -> PairedBehavioralEvaluationResult:
@@ -804,7 +803,12 @@ class BehavioralEvaluator:
             and not threshold_failures,
             reproduction_artifacts=tuple(artifacts),
             runtime_kind=runtime_kind,
-            deterministic_runtime_gate_passed=deterministic_runtime_gate_passed,
+            deterministic_runtime_gate_passed=(
+                runtime_kind == BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+                and not (set(candidate.hard_gate_failures) & set(self.spec.hard_gates))
+                and not regressions
+                and not threshold_failures
+            ),
             manifest=manifest,
         )
         if persist_result:
@@ -867,9 +871,7 @@ class BehavioralEvaluator:
                 (
                     index
                     for index in range(cursor, len(trace.transitions))
-                    if _transition_matches(
-                        expectation.transition, trace.transitions[index]
-                    )
+                    if _expectation_matches(expectation, trace.transitions[index])
                 ),
                 None,
             )
@@ -1039,7 +1041,13 @@ class BehavioralEvaluator:
 
 def _transition_matches(expected: StateTransition, actual: StateTransition) -> bool:
     return (
-        expected.path == actual.path
+        len(expected.path) == len(actual.path)
+        and all(
+            expected_part == "*" or expected_part == actual_part
+            for expected_part, actual_part in zip(
+                expected.path, actual.path, strict=True
+            )
+        )
         and expected.kind == actual.kind
         and (expected.before is None or expected.before == actual.before)
         and (expected.after is None or expected.after == actual.after)
@@ -1049,6 +1057,20 @@ def _transition_matches(expected: StateTransition, actual: StateTransition) -> b
         and (
             expected.side_effect_key is None
             or expected.side_effect_key == actual.side_effect_key
+        )
+    )
+
+
+def _expectation_matches(
+    expectation: TransitionExpectation, actual: StateTransition
+) -> bool:
+    return (
+        _transition_matches(expectation.transition, actual)
+        and (not expectation.requires_evidence or bool(actual.evidence_refs))
+        and (
+            not expectation.requires_revision_or_event
+            or actual.revision_after is not None
+            or actual.event_sequence is not None
         )
     )
 

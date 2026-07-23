@@ -722,7 +722,8 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                         "action": {
                             "tool_name": "restricted_metadata_read",
                             "arguments": {"namespace": "project", "key": "name"},
-                        }
+                        },
+                        "value_effects": {"honesty": 0.2},
                     },
                     expected_observation=ExpectedObservation(
                         observation_code="restricted_metadata_read",

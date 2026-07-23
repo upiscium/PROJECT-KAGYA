@@ -7,7 +7,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_api_settings, require_admin
+from kagya.api.dependencies import (
+    execute_agent_event,
+    get_adapter_registry,
+    get_agent_runtime,
+    get_api_settings,
+    require_admin,
+)
 from kagya.api.redaction import redact_private_fields
 from kagya.api.schemas.evaluation import (
     AdapterEvaluationHistoryResponse,
@@ -25,10 +31,12 @@ from kagya.api.schemas.evaluation import (
 from kagya.config import Settings
 from kagya.learning import (
     BehavioralArtifactStore,
+    AdapterRegistry,
     run_deterministic_subject_evaluation,
     scenario_fixture_hash,
     subject_completion_scenarios,
 )
+from kagya.runtime import AgentEventType, AgentRuntime
 
 
 router = APIRouter(
@@ -41,16 +49,31 @@ router = APIRouter(
 @router.get("/behavioral", response_model=BehavioralEvaluationHistoryResponse)
 def list_behavioral_evaluations(
     settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
 ) -> BehavioralEvaluationHistoryResponse:
-    result_dir = settings.adapter_registry.eval_result_dir / "behavioral"
-    if not result_dir.exists():
-        return BehavioralEvaluationHistoryResponse(results=[])
+    if not isinstance(registry, AdapterRegistry):
+        registry = AdapterRegistry(settings)
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    records = store.reconcile(registry)
     results = []
-    for path in result_dir.glob("*.json"):
-        if not path.is_file() or path.name == "artifact_registry.json":
+    for record in records:
+        path = settings.adapter_registry.eval_result_dir / record.relative_path
+        if record.status.value not in {"valid", "orphan_result"}:
+            results.append(
+                BehavioralEvaluationSummary(
+                    evaluation_id=record.evaluation_id,
+                    artifact_status=record.status.value,
+                    quarantine_error="Artifact quarantined by integrity reconciliation",
+                    created_at=record.updated_at.isoformat(),
+                )
+            )
             continue
         try:
-            results.append(_behavioral_summary(path))
+            results.append(
+                _behavioral_summary(path).model_copy(
+                    update={"artifact_status": record.status.value}
+                )
+            )
         except (
             HTTPException,
             OSError,
@@ -58,9 +81,14 @@ def list_behavioral_evaluations(
             json.JSONDecodeError,
             ValueError,
         ):
-            # A corrupt historical artifact is reported by reconciliation and
-            # must not make all otherwise valid history unavailable.
-            continue
+            results.append(
+                BehavioralEvaluationSummary(
+                    evaluation_id=record.evaluation_id,
+                    artifact_status="corrupt",
+                    quarantine_error="Artifact could not be safely decoded",
+                    created_at=record.updated_at.isoformat(),
+                )
+            )
     return BehavioralEvaluationHistoryResponse(
         results=sorted(results, key=lambda item: item.created_at, reverse=True)
     )
@@ -72,10 +100,17 @@ def list_behavioral_evaluations(
 )
 def reconcile_behavioral_artifacts(
     settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> BehavioralArtifactReconciliationResponse:
-    records = BehavioralArtifactStore(
-        settings.adapter_registry.eval_result_dir
-    ).reconcile()
+    records = execute_agent_event(
+        runtime,
+        AgentEventType.BEHAVIORAL_EVALUATE,
+        source="api.evaluations.behavioral_reconciliation",
+        handler=lambda: BehavioralArtifactStore(
+            settings.adapter_registry.eval_result_dir
+        ).reconcile(registry, quarantine_invalid=True),
+    ).value
     return BehavioralArtifactReconciliationResponse(
         artifacts=[item.model_dump(mode="json") for item in records]
     )

@@ -13,9 +13,11 @@ from kagya.learning import (
     SyntheticTraceRunner,
     deterministic_runtime_scenarios,
     run_deterministic_runtime_evaluation,
+    scenario_fixture_hash,
     subject_completion_scenarios,
 )
 from kagya.training.artifacts import sha256_file_map
+from kagya.learning.runtime_behavioral_runner import _manifest
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -112,8 +114,52 @@ def test_runtime_evaluation_emits_bound_manifest_and_valid_artifact(
     assert result.manifest.candidate_adapter_hash == adapter_hash
     assert result.baseline.subject_id != result.candidate.subject_id
     assert result.activation_gate_passed is True
-    assert artifact_status == "valid"
-    assert (tmp_path / "results" / "behavioral" / "runtime-bound.json").is_file()
+    assert artifact_status == "prepared"
+    assert not (tmp_path / "results" / "behavioral" / "runtime-bound.json").exists()
+    assert (
+        tmp_path / "results" / "behavioral" / ".runtime-bound.json.prepared"
+    ).is_file()
+
+
+def test_deterministic_runtime_gate_is_derived_from_failed_candidate(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG_PATH)
+    scenario = deterministic_runtime_scenarios(subject_revision="failed-gate")[0]
+    baseline = DeterministicRuntimeRunner(
+        tmp_path / "gate-baseline", settings, "baseline"
+    )(scenario)
+    failed = baseline.model_copy(update={"transitions": ()})
+    adapter_path = tmp_path / "gate-candidate"
+    adapter_path.mkdir()
+    content = b'{"adapter":"gate-candidate"}'
+    (adapter_path / "adapter_config.json").write_bytes(content)
+    adapter_hash = sha256_file_map({"adapter/adapter_config.json": content})
+    manifest = _manifest(
+        settings,
+        candidate_id="gate-candidate",
+        candidate_adapter_path=adapter_path,
+        candidate_adapter_hash=adapter_hash,
+        base_model_revision="gate-revision",
+        subject_revision="failed-gate",
+        fixture_hashes={scenario.scenario_id: scenario_fixture_hash(scenario)},
+    )
+
+    result = BehavioralEvaluator(tmp_path / "failed-gate-result").evaluate_pair(
+        "failed-deterministic-gate",
+        [scenario],
+        baseline_id="baseline",
+        baseline_runner=lambda _scenario: baseline,
+        candidate_id="gate-candidate",
+        candidate_runner=lambda _scenario: failed,
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+        manifest=manifest,
+        persist_result=False,
+    )
+
+    assert result.candidate.scenario_results[0].passed is False
+    assert result.activation_gate_passed is False
+    assert result.deterministic_runtime_gate_passed is False
 
 
 def test_disabling_each_authoritative_connection_fails_runtime_suite(
@@ -204,17 +250,28 @@ def test_full_chain_records_exact_domain_evidence_revision_and_event_sequence(
         "experiences",
         "motivations",
         "goals",
+        "attention",
+        "values",
+        "beliefs",
         "plans",
         "decisions",
         "actions",
         "agency",
         "counterfactuals",
+        "relationships",
+        "narrative",
+        "metacognition",
     ):
         records = [
             item for item in trace.transitions if item.path[:2] == ("domains", domain)
         ]
         assert records, domain
         assert any(item.evidence_refs for item in records), domain
+        if domain not in {"narrative", "metacognition"}:
+            assert any(
+                item.revision_after is not None or item.event_sequence is not None
+                for item in records
+            ), domain
     for event_type in (
         "chat",
         "intrinsic_goal_propose",

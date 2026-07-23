@@ -317,7 +317,7 @@ def test_legacy_activation_boolean_never_migrates_as_behavioral_authority(
     assert entry is not None
     assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
-    assert entry.schema_version == 5
+    assert entry.schema_version == 6
     assert (
         registry.activation_eligibility("legacy").reason
         == ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED
@@ -385,7 +385,7 @@ def test_schema_v4_behavioral_fields_migrate_to_exact_names(tmp_path: Path) -> N
     entry = registry.lookup("v4")
 
     assert entry is not None
-    assert entry.schema_version == 5
+    assert entry.schema_version == 6
     assert entry.behavioral_candidate_adapter_hash == "f" * 64
     assert entry.behavioral_base_model_revision == "model-revision"
 

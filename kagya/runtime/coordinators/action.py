@@ -7,6 +7,7 @@ from kagya.agency import (
     CausalContributor,
     CausalContributorKind,
 )
+from kagya.belief import EpistemicStatus, Proposition
 from kagya.cognition import (
     AppraisalResult,
     ValueUpdateKind,
@@ -122,9 +123,17 @@ class ActionCoordinator(RuntimeDomainMixin):
             value_effects={},
             appraisal_contributions={},
         )
+        goal = self.goal_manager.get(plan.goal_id)
+        target_ref = str((goal.structured_target or {}).get("target_ref", ""))
+        context_id = (
+            target_ref.removeprefix("context:")
+            if target_ref.startswith("context:")
+            else None
+        )
         return self.create_decision(
             [candidate, fallback],
             decision_id=decision_id,
+            context_id=context_id,
         )
 
     def start_action_plan_step(self, plan_id: str, step_id: str) -> None:
@@ -228,40 +237,69 @@ class ActionCoordinator(RuntimeDomainMixin):
         )
         if verification is None:
             raise ValueError("Action outcome verification is missing")
+        decision = self.decision_store.get(intent.provenance.decision_id)
+        decision_context = (
+            None
+            if decision.context_id is None
+            else self.context_registry.get(decision.context_id)
+        )
         self_share = 0.25 if verification.success else 0.3
-        environment_share = 0.65 if verification.success else 0.6
+        participant_ids = (
+            () if decision_context is None else decision_context.participant_ids
+        )
+        environment_share = (
+            (0.45 if verification.success else 0.4)
+            if participant_ids
+            else (0.65 if verification.success else 0.6)
+        )
+        contributors = [
+            CausalContributor(
+                kind=CausalContributorKind.SELF,
+                causal_share=self_share,
+                confidence=0.9,
+                controllability=0.8,
+                foreseeability=0.7,
+                responsibility_share=self_share,
+            ),
+            CausalContributor(
+                kind=CausalContributorKind.ENVIRONMENT,
+                causal_share=environment_share,
+                confidence=0.8,
+                controllability=0.1,
+                foreseeability=0.5,
+                responsibility_share=0.0,
+            ),
+            *(
+                [
+                    CausalContributor(
+                        kind=CausalContributorKind.OTHER,
+                        contributor_ref=participant_ids[0],
+                        causal_share=0.2,
+                        confidence=0.7,
+                        controllability=0.3,
+                        foreseeability=0.6,
+                        responsibility_share=0.1,
+                    )
+                ]
+                if participant_ids
+                else []
+            ),
+            CausalContributor(
+                kind=CausalContributorKind.CHANCE,
+                causal_share=0.1,
+                confidence=0.5,
+                controllability=0.0,
+                foreseeability=0.1,
+                responsibility_share=0.0,
+            ),
+        ]
         attribution = self.agency_attribution_store.create(
             decision_id=intent.provenance.decision_id,
             action_intent_id=intent.intent_id,
             execution_receipt_id=receipt.receipt_id,
             observation_id=observation.observation_id,
             outcome_ref=f"decision:{intent.provenance.decision_id}:outcome",
-            contributors=(
-                CausalContributor(
-                    kind=CausalContributorKind.SELF,
-                    causal_share=self_share,
-                    confidence=0.9,
-                    controllability=0.8,
-                    foreseeability=0.7,
-                    responsibility_share=self_share,
-                ),
-                CausalContributor(
-                    kind=CausalContributorKind.ENVIRONMENT,
-                    causal_share=environment_share,
-                    confidence=0.8,
-                    controllability=0.1,
-                    foreseeability=0.5,
-                    responsibility_share=0.0,
-                ),
-                CausalContributor(
-                    kind=CausalContributorKind.CHANCE,
-                    causal_share=0.1,
-                    confidence=0.5,
-                    controllability=0.0,
-                    foreseeability=0.1,
-                    responsibility_share=0.0,
-                ),
-            ),
+            contributors=tuple(contributors),
             intended=verification.success,
             uncertainty=0.2,
             evidence_refs=(
@@ -274,6 +312,36 @@ class ActionCoordinator(RuntimeDomainMixin):
             reason_codes=("autonomous_structured_outcome_verification",),
         )
         self._apply_attribution(attribution)
+        source_experience = (
+            None
+            if decision.context_id is None
+            else self.experience_store.latest_for_context(decision.context_id)
+        )
+        if source_experience is not None:
+            belief = self.propose_belief_from_experience(
+                source_experience.experience_id,
+                proposition=Proposition.create(
+                    "A verified autonomous action produced an observed outcome",
+                    subject=f"action:{intent.intent_id}",
+                    predicate="produced",
+                    object=f"observation:{observation.observation_id}",
+                ),
+                source_trust=0.8,
+                confidence=0.7,
+                context_scope=(decision.context_id,),
+                belief_id=f"action-outcome:{decision.decision_id}",
+            )
+            self.resolve_belief(
+                belief.belief_id,
+                accept=True,
+                confidence=0.85,
+                epistemic_status=EpistemicStatus.PROBABLE,
+                reason_code="verified_action_observation",
+                evidence_refs=(
+                    f"outcome-verification:{verification.verification_id}",
+                    f"observation:{observation.observation_id}",
+                ),
+            )
         return attribution
 
     def revise_agency_attribution(

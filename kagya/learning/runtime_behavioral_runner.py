@@ -72,7 +72,7 @@ def deterministic_runtime_scenarios(
                     "I observed the third external change.",
                 ],
                 "advance_seconds": 301.0,
-                "scheduler_cycles": 16,
+                "scheduler_cycles": 48,
             },
         ),
         (
@@ -102,7 +102,7 @@ def deterministic_runtime_scenarios(
                 ],
                 "responses": ["Observed one.", "Observed two.", "Observed three."],
                 "advance_seconds": 301.0,
-                "scheduler_cycles": 16,
+                "scheduler_cycles": 48,
                 "tool_outcome": {
                     "namespace": "project",
                     "key": "name",
@@ -172,7 +172,7 @@ def deterministic_runtime_scenarios(
                 ],
                 "responses": ["Observed one.", "Observed two.", "Observed three."],
                 "advance_seconds": 301.0,
-                "scheduler_cycles": 24,
+                "scheduler_cycles": 64,
                 "tool_failure": "controlled external failure",
             },
         ),
@@ -191,6 +191,69 @@ def deterministic_runtime_scenarios(
                 ),
             ),
             expected_transitions=(
+                *(
+                    tuple(
+                        TransitionExpectation(
+                            transition=StateTransition(path=path, kind=kind),
+                            requires_evidence=True,
+                            requires_revision_or_event=require_revision,
+                        )
+                        for path, kind, require_revision in (
+                            (
+                                ("domains", "actions", "intents", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (("domains", "agency", "*"), TransitionKind.CREATE, True),
+                            (
+                                ("domains", "attention", "candidates", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (("domains", "beliefs", "*"), TransitionKind.CREATE, True),
+                            (
+                                ("domains", "counterfactuals", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (
+                                ("domains", "decisions", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (
+                                ("domains", "experiences", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (("domains", "goals", "*"), TransitionKind.CREATE, True),
+                            (
+                                ("domains", "metacognition", "*"),
+                                TransitionKind.CREATE,
+                                False,
+                            ),
+                            (
+                                ("domains", "motivations", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (
+                                ("domains", "narrative", "continuity_links", "*"),
+                                TransitionKind.CREATE,
+                                False,
+                            ),
+                            (("domains", "plans", "*"), TransitionKind.CREATE, True),
+                            (
+                                ("domains", "relationships", "*"),
+                                TransitionKind.CREATE,
+                                True,
+                            ),
+                            (("domains", "values", "*"), TransitionKind.UPDATE, True),
+                        )
+                    )
+                    if event_type == "external_observation"
+                    else ()
+                ),
                 TransitionExpectation(
                     transition=StateTransition(
                         path=("last_processed_event_sequence",),
@@ -285,6 +348,8 @@ class DeterministicRuntimeRunner:
         inputs = observation.parameters
         visible_response: str | None = None
         duplicate_retry = False
+        duplicate_tool_calls = 0
+        duplicate_receipts = 0
         try:
             responses = _string_list(inputs.get("responses"))
             harness.provider.queue_responses(*responses)
@@ -351,6 +416,8 @@ class DeterministicRuntimeRunner:
                 if harness.graph is None:
                     raise RuntimeError("Runtime graph disappeared during scenario")
                 intent = harness.graph.action_execution.list_intents()[0]
+                call_count = len(harness.tool_environment.calls)
+                receipt_count = len(harness.graph.action_execution.list_receipts())
                 harness.execute(
                     AgentEventType.ACTION_EXECUTE,
                     lambda _loop: (
@@ -361,17 +428,23 @@ class DeterministicRuntimeRunner:
                     payload={"fixture": event_type, "retry": True},
                 )
                 duplicate_retry = True
-                if len(harness.tool_environment.calls) != 1:
+                if len(harness.tool_environment.calls) != call_count:
                     raise RuntimeError(
                         "Idempotent retry executed the tool more than once"
                     )
-                if len(harness.graph.action_execution.list_receipts()) != 1:
+                if len(harness.graph.action_execution.list_receipts()) != receipt_count:
                     raise RuntimeError("Idempotent retry emitted a duplicate receipt")
+                duplicate_tool_calls = len(harness.tool_environment.calls) - call_count
+                duplicate_receipts = (
+                    len(harness.graph.action_execution.list_receipts()) - receipt_count
+                )
             self.last_prompts = tuple(harness.provider.prompts)
             return harness.capture_trace(
                 collector,
                 visible_response,
                 duplicate_retry=duplicate_retry,
+                duplicate_tool_calls=duplicate_tool_calls,
+                duplicate_receipts=duplicate_receipts,
                 payload={"response": visible_response or ""},
             )
         finally:
@@ -392,6 +465,7 @@ def _submit_external_observations(
                 message,
                 context_id=current,
                 create_context=current is None,
+                interlocutor_key="fixture-operator",
             )
 
         result = harness.execute(
@@ -491,12 +565,11 @@ def run_deterministic_runtime_evaluation(
             run_root / "candidate", settings, candidate_id
         ),
         runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
-        deterministic_runtime_gate_passed=True,
         manifest=manifest,
         persist_result=False,
     )
     payload = result.model_dump(mode="json")
-    artifact = BehavioralArtifactStore(result_dir).commit(evaluation_id, payload)
+    artifact = BehavioralArtifactStore(result_dir).prepare(evaluation_id, payload)
     return result, artifact.status.value
 
 

@@ -5,6 +5,7 @@ import pytest
 from kagya.config import load_settings
 from kagya.learning import (
     AuthoritativeTransitionCollector,
+    BehavioralArtifactStore,
     FailureInjector,
     SubjectRuntimeHarness,
 )
@@ -12,6 +13,7 @@ from kagya.identity import OriginActor
 from kagya.motivation import CommitmentStatus
 from kagya.runtime import AgentEventType, JournalLifecycle, hash_snapshot
 from kagya.outbox import OutboxMessageKind
+from kagya.training import DatasetCandidate, DatasetGovernanceStore, DatasetProvenance
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -254,3 +256,112 @@ def test_duplicate_outbox_delivery_input_has_exactly_one_effect(tmp_path: Path) 
     assert len(harness.graph.outbox.list_messages()) == 1
     assert harness.graph.outbox.list_messages()[0].deduplication_key == "delivery:one"
     harness.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_classification", "committed"),
+    (
+        ("journal_accepted", "accepted_not_started", False),
+        ("journal_started", "uncommitted_after_crash", False),
+        ("external_write", "failed_before_commit", False),
+        ("external_prepare", "uncommitted_after_crash", False),
+        ("before_wal_append", "uncommitted_after_crash", False),
+        ("after_wal_append", "uncommitted_after_crash", False),
+        ("snapshot_temp_write", "uncommitted_after_crash", False),
+        ("snapshot_temp_fsync", "uncommitted_after_crash", False),
+        ("snapshot_atomic_replace", "committed_before_crash", True),
+        ("before_finalize", "committed_before_crash", True),
+        ("after_finalize", "committed_before_crash", True),
+        ("before_journal_completed", "committed_before_crash", True),
+    ),
+)
+def test_every_runtime_commit_checkpoint_recovers_with_fresh_harness(
+    tmp_path: Path,
+    checkpoint: str,
+    expected_classification: str,
+    committed: bool,
+) -> None:
+    injector = FailureInjector()
+    crashed = _harness(tmp_path, injector).create().start()
+    injector.arm(checkpoint)
+    crashed.provider.queue_responses("A bounded public response.")
+
+    with pytest.raises(Exception):
+        crashed.execute(
+            AgentEventType.CHAT,
+            lambda loop: loop.chat(
+                "checkpoint observation",
+                create_context=True,
+                interlocutor_key="checkpoint-operator",
+            ),
+        )
+    crashed.abrupt_stop()
+
+    recovered = _harness(tmp_path).create().start()
+    assert recovered.graph is not None
+    snapshot = recovered.graph.state_store.last_snapshot
+    assert snapshot is not None
+    wal = recovered.wal_records()
+    assert wal[-1].state_hash_after == hash_snapshot(snapshot)
+    assert wal[-1].processing_sequence == snapshot.last_processed_event_sequence
+    classifications = [
+        record.failure_category
+        for record in recovered.journal_records()
+        if record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+    ]
+    if any(
+        record.lifecycle == JournalLifecycle.FAILED
+        for record in recovered.journal_records()
+    ):
+        classifications.append("failed_before_commit")
+    assert expected_classification in classifications
+    assert snapshot.last_processed_event_sequence == (1 if committed else 0)
+
+    transactions = recovered.graph.external_transactions.records()
+    assert len({record.transaction_id for record in transactions}) == len(transactions)
+    assert len(transactions) <= 1
+    if committed and transactions:
+        assert {record.status.value for record in transactions} == {"committed"}
+    elif transactions:
+        assert {record.status.value for record in transactions} == {"compensated"}
+    recovered.shutdown()
+
+
+def test_private_provider_sentinels_never_cross_persistence_boundaries(
+    tmp_path: Path,
+) -> None:
+    sentinels = (
+        "hidden-thought-sentinel",
+        "private-prompt-sentinel",
+        "private-context-sentinel",
+        "tool-secret-sentinel",
+    )
+    harness = _harness(tmp_path).create().start()
+    harness.provider.generate(" ".join(sentinels))
+    harness.provider.queue_responses("A public bounded response.")
+    collector = AuthoritativeTransitionCollector(harness)
+    harness.execute(
+        AgentEventType.CHAT,
+        lambda loop: loop.chat("ordinary public observation", create_context=True),
+    )
+    trace = harness.capture_trace(collector, "A public bounded response.")
+    BehavioralArtifactStore(harness.root / "results").commit(
+        "privacy-scan", trace.model_dump(mode="json")
+    )
+    DatasetGovernanceStore(harness.root / "datasets").create_revision(
+        [
+            DatasetCandidate(
+                input="ordinary public observation",
+                output="A public bounded response.",
+                provenance=DatasetProvenance("episode", "privacy-episode"),
+            )
+        ],
+        source_job_id="privacy-scan",
+    )
+    harness.shutdown()
+
+    persisted = b"".join(
+        path.read_bytes() for path in harness.root.rglob("*") if path.is_file()
+    )
+    for sentinel in sentinels:
+        assert sentinel.encode() not in persisted

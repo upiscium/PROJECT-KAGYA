@@ -639,11 +639,21 @@ class PlanStore:
                 "Only a current actionable Step can become an ActionCandidate"
             )
         step = plan.step_definition(step_id)
+        raw_value_effects = step.parameters.get("value_effects", {})
+        value_effects = (
+            {str(key): float(value) for key, value in raw_value_effects.items()}
+            if isinstance(raw_value_effects, dict)
+            else {}
+        )
         return ActionCandidate(
             candidate_id=f"plan:{plan_id}:{plan.revision}:{step_id}",
             candidate_type=step.action_type,
             proposed_action=step.action_code,
-            parameters=dict(step.parameters),
+            parameters={
+                key: value
+                for key, value in step.parameters.items()
+                if key != "value_effects"
+            },
             prerequisites=tuple(
                 f"step:{plan.plan_id}:{plan.revision}:{item}:completed"
                 for item in step.dependency_ids
@@ -652,7 +662,7 @@ class PlanStore:
             uncertainty=0.5,
             estimated_cost=0.5,
             estimated_risk=0.5,
-            value_effects={},
+            value_effects=value_effects,
             appraisal_contributions={},
             plan_id=plan.plan_id,
             plan_revision=plan.revision,

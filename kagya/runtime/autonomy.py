@@ -492,7 +492,8 @@ class SubjectScheduler:
                     if item.candidate.candidate_id == decision.selected_candidate_id
                 )
                 if (
-                    set(selected.parameters) == {"action"}
+                    set(selected.parameters) <= {"action", "value_effects"}
+                    and "action" in selected.parameters
                     and isinstance(selected.parameters["action"], dict)
                     and not any(
                         item.provenance.decision_id == decision.decision_id
@@ -634,7 +635,8 @@ class SubjectScheduler:
                     )
                     governed_action = (
                         candidate is not None
-                        and set(candidate.parameters) == {"action"}
+                        and set(candidate.parameters) <= {"action", "value_effects"}
+                        and "action" in candidate.parameters
                         and isinstance(candidate.parameters["action"], dict)
                         and set(candidate.parameters["action"])
                         == {"tool_name", "arguments"}

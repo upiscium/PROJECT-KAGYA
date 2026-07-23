@@ -35,6 +35,7 @@ from kagya.learning import (
     AdapterRegistry,
     AdapterRuntimeManager,
     AdapterStatus,
+    BehavioralArtifactStore,
     run_deterministic_runtime_evaluation,
 )
 from kagya.models import ModelProvider, load_model_provider
@@ -66,7 +67,7 @@ def behavioral_evaluate_adapter(
             detail="Adapter lacks cryptographic runtime evaluation provenance",
         )
 
-    def evaluate() -> tuple:
+    try:
         result, artifact_status = run_deterministic_runtime_evaluation(
             settings,
             request.evaluation_id,
@@ -77,26 +78,39 @@ def behavioral_evaluate_adapter(
             base_model_revision=entry.base_model_revision or "",
             subject_revision=request.subject_revision,
         )
-        if artifact_status != "valid":
-            raise ValueError("Behavioral artifact did not finalize as valid")
-        result_path = (
-            settings.adapter_registry.eval_result_dir
-            / "behavioral"
-            / f"{request.evaluation_id}.json"
-        )
-        registry.apply_behavioral_evaluation(
-            adapter_id,
-            evaluation_id=request.evaluation_id,
-            result_path=result_path,
-        )
-        return result, artifact_status
+        if artifact_status != "prepared":
+            raise ValueError("Behavioral artifact did not enter prepared state")
+        store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
 
-    try:
-        result, artifact_status = execute_agent_event(
+        def bind_and_finalize() -> str:
+            registry.prepare_behavioral_evaluation(
+                adapter_id,
+                evaluation_id=request.evaluation_id,
+                prepared_path=store.prepared_path(request.evaluation_id),
+                final_path=store.final_path(request.evaluation_id),
+            )
+            store.finalize(request.evaluation_id)
+            registry.finalize_behavioral_evaluation(
+                adapter_id, evaluation_id=request.evaluation_id
+            )
+            reconciled = store.reconcile(registry)
+            status = next(
+                item.status.value
+                for item in reconciled
+                if item.evaluation_id == request.evaluation_id
+            )
+            if status != "valid":
+                raise ValueError("Behavioral artifact cross-reconciliation failed")
+            registry.mark_behavioral_evaluation_reconciled(
+                adapter_id, evaluation_id=request.evaluation_id
+            )
+            return status
+
+        artifact_status = execute_agent_event(
             runtime,
             AgentEventType.BEHAVIORAL_EVALUATE,
-            source="api.adapters.behavioral_evaluate",
-            handler=evaluate,
+            source="api.adapters.behavioral_evaluation_binding",
+            handler=bind_and_finalize,
             payload={"adapter_id": adapter_id, "evaluation_id": request.evaluation_id},
         ).value
     except ValueError as exc:

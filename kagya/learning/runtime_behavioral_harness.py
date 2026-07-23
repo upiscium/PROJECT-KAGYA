@@ -206,6 +206,8 @@ class AuthoritativeTransitionCollector:
         visible_response: str | None = None,
         *,
         duplicate_retry: bool = False,
+        duplicate_tool_calls: int = 0,
+        duplicate_receipts: int = 0,
         payload: dict[str, object] | None = None,
     ) -> BehavioralTrace:
         after = self.harness.capture_authoritative_state()
@@ -263,8 +265,16 @@ class AuthoritativeTransitionCollector:
                 new_action_intents=max(0, len(after_intents) - len(before_intents)),
                 new_external_effects=max(0, len(self.harness.tool_environment.calls)),
                 duplicate_retry=duplicate_retry,
-                tool_call_count=len(self.harness.tool_environment.calls),
-                receipt_count=max(0, len(after_receipts) - len(before_receipts)),
+                tool_call_count=(
+                    duplicate_tool_calls
+                    if duplicate_retry
+                    else len(self.harness.tool_environment.calls)
+                ),
+                receipt_count=(
+                    duplicate_receipts
+                    if duplicate_retry
+                    else max(0, len(after_receipts) - len(before_receipts))
+                ),
             )
         )
         return BehavioralTrace(
@@ -357,6 +367,7 @@ class SubjectRuntimeHarness:
         wal.bootstrap(snapshot)
         memory = DualMemorySystem(settings, DeterministicEmbeddingFunction())
         memory.set_external_failure_injector(self.failure_injector)
+        memory.set_external_boundary_injector(self.failure_injector)
         external = ExternalTransactionCoordinator([memory])
         external.reconcile(cast(Any, journal.verify()))
         loop = KagyaMainLoop(settings, self.provider, memory)
@@ -395,16 +406,20 @@ class SubjectRuntimeHarness:
             self.failure_injector("external_prepare")
             wal.append_transition(cast(Any, event), previous, candidate)
             saved = store.save(candidate)
+            self.failure_injector("before_finalize")
             self.failure_injector("before_external_finalize")
             external.finalize_event(event.event_id, event.processing_sequence)
+            self.failure_injector("after_finalize")
             self.failure_injector("after_external_finalize")
             return hash_snapshot(saved)
 
         def fail(event: AgentEvent, exception: Exception) -> str:
-            external.orphan_event(event.event_id, type(exception).__name__)
             previous = store.last_snapshot
             if previous is None or event.processing_sequence is None:
                 raise RuntimeError("Runtime failure lacks snapshot continuity")
+            if previous.last_processed_event_sequence == event.processing_sequence:
+                return hash_snapshot(previous)
+            external.orphan_event(event.event_id, type(exception).__name__)
             store.restore_into(loop, previous)
             external.compensate_event(event.event_id, type(exception).__name__)
             return hash_snapshot(previous)
@@ -510,11 +525,15 @@ class SubjectRuntimeHarness:
         visible_response: str | None = None,
         *,
         duplicate_retry: bool = False,
+        duplicate_tool_calls: int = 0,
+        duplicate_receipts: int = 0,
         payload: dict[str, object] | None = None,
     ) -> BehavioralTrace:
         return collector.capture(
             visible_response,
             duplicate_retry=duplicate_retry,
+            duplicate_tool_calls=duplicate_tool_calls,
+            duplicate_receipts=duplicate_receipts,
             payload=payload,
         )
 
@@ -534,6 +553,7 @@ class SubjectRuntimeHarness:
         )
         state = snapshot.model_dump(mode="json")
         state["domains"] = {
+            "attention": _json_value(graph.main_loop.attention_system.to_json()),
             "experiences": _model_values(graph.main_loop.experience_store),
             "motivations": _model_values(graph.main_loop.motivation_dynamics),
             "goals": _model_values(graph.main_loop.goal_manager),
@@ -888,6 +908,13 @@ def _record_identifier(record: dict[str, Any]) -> str | None:
         "revision_id",
         "transition_id",
         "deliberation_id",
+        "candidate_id",
+        "history_id",
+        "link_id",
+        "episode_id",
+        "chapter_id",
+        "claim_id",
+        "hypothesis_id",
     ):
         value = record.get(key)
         if isinstance(value, str) and value:

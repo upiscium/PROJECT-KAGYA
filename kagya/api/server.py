@@ -263,7 +263,7 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
 
     app.state.behavioral_artifact_reconciliation = BehavioralArtifactStore(
         settings.adapter_registry.eval_result_dir
-    ).reconcile()
+    ).reconcile(app.state.adapter_registry)
     active_adapter = next(
         (
             entry

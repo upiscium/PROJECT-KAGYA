@@ -35,18 +35,20 @@ class AdapterEvaluationHistoryResponse(BaseModel):
 
 class BehavioralEvaluationSummary(BaseModel):
     evaluation_id: str
-    baseline_id: str
-    candidate_id: str
-    baseline_score: float
-    candidate_score: float
-    baseline_dimensions: dict[str, float]
-    candidate_dimensions: dict[str, float]
-    dimension_deltas: dict[str, float]
-    activation_gate_passed: bool
-    regression_dimensions: list[str]
-    threshold_failure_dimensions: list[str]
-    hard_gate_failures: list[str]
-    tool_execution_dimensions_complete: bool
+    artifact_status: str = "valid"
+    quarantine_error: str | None = None
+    baseline_id: str = ""
+    candidate_id: str = ""
+    baseline_score: float = 0.0
+    candidate_score: float = 0.0
+    baseline_dimensions: dict[str, float] = Field(default_factory=dict)
+    candidate_dimensions: dict[str, float] = Field(default_factory=dict)
+    dimension_deltas: dict[str, float] = Field(default_factory=dict)
+    activation_gate_passed: bool = False
+    regression_dimensions: list[str] = Field(default_factory=list)
+    threshold_failure_dimensions: list[str] = Field(default_factory=list)
+    hard_gate_failures: list[str] = Field(default_factory=list)
+    tool_execution_dimensions_complete: bool = False
     created_at: str
 
 

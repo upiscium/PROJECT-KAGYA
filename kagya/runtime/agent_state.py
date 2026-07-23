@@ -209,11 +209,16 @@ class AgentStateStore:
                     sort_keys=True,
                 )
                 snapshot_file.flush()
+                if self._failure_injector is not None:
+                    self._failure_injector("snapshot_temp_write")
                 os.fsync(snapshot_file.fileno())
             if self._failure_injector is not None:
+                self._failure_injector("snapshot_temp_fsync")
                 self._failure_injector("snapshot_temp_fsynced")
             os.replace(temporary_path, self.path)
+            self.last_snapshot = validated
             if self._failure_injector is not None:
+                self._failure_injector("snapshot_atomic_replace")
                 self._failure_injector("snapshot_replaced")
             directory_fd = os.open(self.path.parent, os.O_RDONLY)
             try:

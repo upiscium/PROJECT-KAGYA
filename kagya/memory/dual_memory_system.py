@@ -137,6 +137,7 @@ class DualMemorySystem:
             metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
         self._external_failure_injector: Callable[[str, str], None] | None = None
+        self._external_boundary_injector: Callable[[str, str], None] | None = None
         self._scrub_legacy_hidden_thoughts()
         self._backfill_episodic_transactions()
         self._backfill_semantic_records()
@@ -246,6 +247,8 @@ class DualMemorySystem:
             documents=[_episodic_document(user_input, response)],
             metadatas=[record_metadata],
         )
+        if self._external_boundary_injector is not None:
+            self._external_boundary_injector("external_write", transaction_id)
         return episode_id
 
     def _scrub_legacy_hidden_thoughts(self) -> None:
@@ -274,6 +277,13 @@ class DualMemorySystem:
         """Install a deterministic boundary failure hook for verification."""
 
         self._external_failure_injector = injector
+
+    def set_external_boundary_injector(
+        self, injector: Callable[[str, str], None] | None
+    ) -> None:
+        """Install a physical external-write checkpoint hook for recovery tests."""
+
+        self._external_boundary_injector = injector
 
     def list_external_transactions(self) -> list[ExternalTransactionRecord]:
         result = self.db1.get(include=["metadatas"])
