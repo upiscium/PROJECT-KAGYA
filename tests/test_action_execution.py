@@ -264,6 +264,42 @@ def test_retry_is_bounded_and_cancellable(tmp_path: Path) -> None:
         layer.execute(intent.intent_id)
 
 
+def test_rejection_records_structured_verification_for_later_attribution(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-rejected",
+        "local_notification_enqueue",
+        {"channel": "local", "title": "Review", "body": "Reject this"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    intent = layer.create_from_decision(
+        "decision-rejected", idempotency_key="rejected-1"
+    )
+
+    rejected = layer.resolve_approval(
+        intent.intent_id,
+        approved=False,
+        actor_id="operator-1",
+        reason="not_authorized",
+    )
+
+    receipt = layer.get_receipt(rejected.receipt_id or "")
+    observation = layer.get_observation(receipt.observation_id or "")
+    verification = layer.list_verifications()[0]
+    assert receipt.status == ReceiptStatus.CANCELLED
+    assert observation.data == {
+        "status": "cancelled",
+        "error_code": "operator_rejected",
+    }
+    assert verification.observation_id == observation.observation_id
+    assert verification.success is False
+
+
 def _decision(
     loop: _Loop,
     decision_id: str,

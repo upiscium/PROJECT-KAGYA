@@ -2881,6 +2881,42 @@ def admin_headers() -> dict[str, str]:
     return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
 
 
+def test_agency_attribution_admin_api_is_read_and_revise_only(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        assert client.get("/api/attributions").status_code == 401
+        listed = client.get("/api/attributions", headers=admin_headers())
+        assert listed.status_code == 200
+        assert listed.json() == {"attributions": []}
+        assert client.post(
+            "/api/attributions/not-created/revisions",
+            headers=admin_headers(),
+            json={
+                "expected_revision": 1,
+                "contributors": [
+                    {
+                        "kind": "self",
+                        "causal_share": 1.0,
+                        "confidence": 1.0,
+                        "controllability": 1.0,
+                        "foreseeability": 1.0,
+                        "responsibility_share": 1.0,
+                    }
+                ],
+                "intended": True,
+                "uncertainty": 0.0,
+                "evidence_refs": ["observation:later"],
+                "reason_code": "later_evidence",
+            },
+        ).status_code == 409
+        assert client.post(
+            "/api/attributions",
+            headers=admin_headers(),
+            json={},
+        ).status_code == 405
+
+
 def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     settings = settings.model_copy(

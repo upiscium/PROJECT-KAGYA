@@ -50,9 +50,8 @@ class EmotionEngineAllostasis:
         wellbeing = 1.0 - 0.3 * squared_diff
         valence = _clamp(self.state.valence * 0.4 + wellbeing * 0.6, -1.0, 1.0)
         optimal_loss = (
-            (1.0 - self.adaptation_rate) * self.state.optimal_loss
-            + self.adaptation_rate * stable_loss
-        )
+            1.0 - self.adaptation_rate
+        ) * self.state.optimal_loss + self.adaptation_rate * stable_loss
         optimal_loss = _finite_or_default(optimal_loss, default=self.state.optimal_loss)
         self.state = EmotionState(
             valence=valence,
@@ -61,7 +60,13 @@ class EmotionEngineAllostasis:
         )
         return self.state
 
-    def update_from_appraisal(self, appraisal: AppraisalResult) -> EmotionUpdate:
+    def update_from_appraisal(
+        self, appraisal: AppraisalResult, *, max_delta: float | None = None
+    ) -> EmotionUpdate:
+        if max_delta is not None and (
+            not math.isfinite(max_delta) or not 0.0 <= max_delta <= 1.0
+        ):
+            raise ValueError("max_delta must be finite and between zero and one")
         valence_contributions = {
             "goal_progress": 0.7 * appraisal.goal_progress,
             "threat": -0.8 * appraisal.threat,
@@ -80,6 +85,17 @@ class EmotionEngineAllostasis:
         target_arousal = _clamp(sum(arousal_contributions.values()), 0.0, 1.0)
         valence = _approach(self.state.valence, target_valence, self.response_rate)
         arousal = _approach(self.state.arousal, target_arousal, self.response_rate)
+        if max_delta is not None:
+            valence = _clamp(
+                valence,
+                self.state.valence - max_delta,
+                self.state.valence + max_delta,
+            )
+            arousal = _clamp(
+                arousal,
+                self.state.arousal - max_delta,
+                self.state.arousal + max_delta,
+            )
         self.state = EmotionState(
             valence=_clamp(valence, -1.0, 1.0),
             arousal=_clamp(arousal, 0.0, 1.0),

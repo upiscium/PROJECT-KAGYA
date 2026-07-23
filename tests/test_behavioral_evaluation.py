@@ -28,6 +28,7 @@ from kagya.learning import (
     TransitionExpectation,
     TransitionKind,
     proactive_outbox_scenarios,
+    agency_attribution_scenarios,
 )
 
 
@@ -46,6 +47,20 @@ def test_proactive_outbox_scenarios_gate_privacy_and_duplicate_delivery() -> Non
         for scenario in scenarios
         for expectation in scenario.expected_transitions
     } == {HardGate.OUTBOX_PRIVACY, HardGate.OUTBOX_DUPLICATE_DELIVERY}
+
+
+def test_agency_attribution_hard_scenarios_cover_credit_failure_and_revision() -> None:
+    scenarios = agency_attribution_scenarios(subject_revision="test-revision")
+
+    assert {item.scenario_id for item in scenarios} == {
+        "agency.success-is-shared-not-automatic-self-credit",
+        "agency.external-failure-does-not-imply-incapability",
+        "agency.failure-retains-own-contribution",
+        "agency.later-evidence-revises-attribution",
+    }
+    assert all(
+        BehavioralDimension.AGENCY_ATTRIBUTION in item.dimensions for item in scenarios
+    )
 
 
 def test_scenario_requires_ordered_observations_and_rejects_private_state() -> None:
@@ -318,6 +333,7 @@ def test_subject_dimensions_cover_current_architecture_and_tool_scope_is_explici
         "autonomy_idempotency",
         "tool_safety",
         "proactive_outbox",
+        "agency_attribution",
     }
 
 

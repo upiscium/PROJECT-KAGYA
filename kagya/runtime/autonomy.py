@@ -51,6 +51,7 @@ class WakeUpKind(StrEnum):
     ACTION_DECISION = "action_decision"
     ACTION_INTENT = "action_intent"
     ACTION_EXECUTION = "action_execution"
+    AGENCY_ATTRIBUTION = "agency_attribution"
     OUTBOX_DEADLINE = "outbox_deadline"
     SLEEP_CONSOLIDATION = "sleep_consolidation"
     OPERATOR = "operator"
@@ -273,6 +274,7 @@ class SubjectScheduler:
                     WakeUpKind.ACTION_INTENT: AgentEventType.ACTION_INTENT,
                     WakeUpKind.ACTION_EXECUTION: AgentEventType.ACTION_EXECUTE,
                     WakeUpKind.ACTION_RETRY: AgentEventType.ACTION_EXECUTE,
+                    WakeUpKind.AGENCY_ATTRIBUTION: AgentEventType.ATTRIBUTION_APPLY,
                 }.get(schedule.kind, AgentEventType.AUTONOMY_WAKE)
                 outcome = self.runtime.execute(
                     event_type,
@@ -500,6 +502,40 @@ class SubjectScheduler:
                         )
                     )
             for intent in action_execution.list_intents():
+                attribution_store = getattr(
+                    self.main_loop, "agency_attribution_store", None
+                )
+                list_verifications = getattr(
+                    action_execution, "list_verifications", None
+                )
+                provenance = getattr(intent, "provenance", None)
+                decision = (
+                    None
+                    if provenance is None
+                    else self.main_loop.decision_store.records.get(
+                        provenance.decision_id
+                    )
+                )
+                if (
+                    getattr(intent, "receipt_id", None) is not None
+                    and attribution_store is not None
+                    and attribution_store.current_for_intent(intent.intent_id) is None
+                    and callable(list_verifications)
+                    and decision is not None
+                    and decision.status == DecisionStatus.RESOLVED
+                    and any(
+                        item.intent_id == intent.intent_id
+                        for item in list_verifications()
+                    )
+                ):
+                    schedules.append(
+                        self._derived(
+                            f"agency-attribution:{intent.intent_id}:{intent.revision}",
+                            WakeUpKind.AGENCY_ATTRIBUTION,
+                            intent.updated_at,
+                            intent.intent_id,
+                        )
+                    )
                 if intent.status.value == "approved":
                     schedules.append(
                         self._derived(
@@ -517,7 +553,10 @@ class SubjectScheduler:
                             intent.intent_id,
                         )
                     )
-                elif intent.status.value == "retry_pending" and intent.retry_at is not None:
+                elif (
+                    intent.status.value == "retry_pending"
+                    and intent.retry_at is not None
+                ):
                     schedules.append(
                         self._derived(
                             f"action-retry:{intent.intent_id}:{intent.retry_at.isoformat()}",
@@ -534,9 +573,13 @@ class SubjectScheduler:
                 for definition in plan.current_revision.steps:
                     state = plan.step_state(definition.step_id)
                     target = f"{plan.plan_id}/{definition.step_id}"
-                    candidate = self.main_loop.plan_store.action_candidate(
-                        plan.plan_id, definition.step_id
-                    ) if state.status == StepStatus.READY else None
+                    candidate = (
+                        self.main_loop.plan_store.action_candidate(
+                            plan.plan_id, definition.step_id
+                        )
+                        if state.status == StepStatus.READY
+                        else None
+                    )
                     governed_action = (
                         candidate is not None
                         and set(candidate.parameters) == {"action"}
@@ -596,8 +639,10 @@ class SubjectScheduler:
         if outbox is not None:
             for message in outbox.list_messages():
                 if (
-                    message.delivery_status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED}
-                    and message.acknowledgment_status == AcknowledgmentStatus.UNACKNOWLEDGED
+                    message.delivery_status
+                    in {DeliveryStatus.PENDING, DeliveryStatus.FAILED}
+                    and message.acknowledgment_status
+                    == AcknowledgmentStatus.UNACKNOWLEDGED
                 ):
                     schedules.append(
                         self._derived(
@@ -822,6 +867,11 @@ class SubjectScheduler:
                 raise ValueError("Action execution layer is unavailable")
             updated = execution.timeout(schedule.target_id or "")
             outcome = updated.status.value
+        elif schedule.kind == WakeUpKind.AGENCY_ATTRIBUTION:
+            attribution = self.main_loop.attribute_action_outcome(
+                schedule.target_id or ""
+            )
+            outcome = f"attributed:{attribution.attribution_id}"
         elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
             _, goals = self.main_loop.reevaluate_motivation(
                 max_goal_proposals=goal_budget
@@ -951,7 +1001,11 @@ class SubjectScheduler:
     def _enqueue_outcome(self, schedule: WakeUpSchedule, outcome: str) -> None:
         outbox = getattr(self.main_loop, "outbox", None)
         target = schedule.target_id
-        if outbox is None or target is None or schedule.kind == WakeUpKind.OUTBOX_DEADLINE:
+        if (
+            outbox is None
+            or target is None
+            or schedule.kind == WakeUpKind.OUTBOX_DEADLINE
+        ):
             return
         kind: OutboxMessageKind | None = None
         title = "Subject state update"

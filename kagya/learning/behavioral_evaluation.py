@@ -48,6 +48,7 @@ class BehavioralDimension(StrEnum):
     AUTONOMY_IDEMPOTENCY = "autonomy_idempotency"
     TOOL_SAFETY = "tool_safety"
     PROACTIVE_OUTBOX = "proactive_outbox"
+    AGENCY_ATTRIBUTION = "agency_attribution"
 
 
 class HardGate(StrEnum):
@@ -347,6 +348,119 @@ def proactive_outbox_scenarios(
                 ),
             ),
             reproducibility=reproducibility,
+        ),
+    )
+
+
+def agency_attribution_scenarios(
+    *, subject_revision: str = "phase-10-agency-attribution"
+) -> tuple[BehavioralScenario, ...]:
+    """Return hard causal-credit fixtures for mixed and revisable outcomes."""
+
+    reproducibility = ReproducibilityMetadata(
+        subject_revision=subject_revision,
+        fixture_revision="agency-attribution-v1",
+        seed=142,
+        clock=datetime(2026, 7, 23, 12, tzinfo=UTC),
+    )
+
+    def scenario(
+        scenario_id: str,
+        event_type: str,
+        initial: dict[str, JsonValue],
+        transition: StateTransition,
+        invariant: BehavioralInvariant,
+    ) -> BehavioralScenario:
+        return BehavioralScenario(
+            scenario_id=scenario_id,
+            dimensions=(
+                BehavioralDimension.AGENCY_ATTRIBUTION,
+                BehavioralDimension.SELF_MODEL_CALIBRATION,
+            ),
+            initial_authoritative_state=initial,
+            observations=(
+                ExternalObservation(
+                    sequence=1,
+                    event_type=event_type,
+                    source="autonomous_outcome_verification",
+                ),
+            ),
+            expected_transitions=(TransitionExpectation(transition=transition),),
+            expected_public_behavior=PublicBehaviorClass.NO_OP,
+            invariants=(invariant,),
+            reproducibility=reproducibility,
+        )
+
+    return (
+        scenario(
+            "agency.success-is-shared-not-automatic-self-credit",
+            "verified_success",
+            {"attribution": {"self_share": 0.0, "environment_share": 0.0}},
+            StateTransition(
+                path=("attribution",),
+                kind=TransitionKind.UPDATE,
+                evidence_refs=("verification:success",),
+            ),
+            BehavioralInvariant(
+                invariant_id="success-self-share-remains-below-total",
+                kind=InvariantKind.PATH_EQUALS,
+                path=("attribution", "self_share"),
+                expected=0.25,
+            ),
+        ),
+        scenario(
+            "agency.external-failure-does-not-imply-incapability",
+            "verified_external_failure",
+            {
+                "attribution": {"self_share": 0.3, "environment_share": 0.6},
+                "self_model": {"capability": 0.5},
+            },
+            StateTransition(
+                path=("self_model", "capability"),
+                kind=TransitionKind.NO_OP,
+                before=0.5,
+                after=0.5,
+                evidence_refs=("attribution:external-failure",),
+            ),
+            BehavioralInvariant(
+                invariant_id="external-failure-capability-unchanged",
+                kind=InvariantKind.PATH_UNCHANGED,
+                path=("self_model", "capability"),
+            ),
+        ),
+        scenario(
+            "agency.failure-retains-own-contribution",
+            "verified_mixed_failure",
+            {"attribution": {"self_share": 0.0}},
+            StateTransition(
+                path=("attribution", "self_share"),
+                kind=TransitionKind.UPDATE,
+                before=0.0,
+                after=0.3,
+                evidence_refs=("verification:mixed-failure",),
+            ),
+            BehavioralInvariant(
+                invariant_id="failure-self-contribution-retained",
+                kind=InvariantKind.PATH_EQUALS,
+                path=("attribution", "self_share"),
+                expected=0.3,
+            ),
+        ),
+        scenario(
+            "agency.later-evidence-revises-attribution",
+            "attribution_revision_evidence",
+            {"attribution": {"revision": 1, "uncertainty": 0.4}},
+            StateTransition(
+                path=("attribution",),
+                kind=TransitionKind.APPEND,
+                evidence_refs=("observation:later",),
+            ),
+            BehavioralInvariant(
+                invariant_id="attribution-revision-is-retained",
+                kind=InvariantKind.PATH_EQUALS,
+                path=("attribution", "revision"),
+                expected=2,
+            ),
         ),
     )
 

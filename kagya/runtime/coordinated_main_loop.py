@@ -7,6 +7,14 @@ import time
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from kagya.agency import (
+    AGENCY_ATTRIBUTION_STATE_KEY,
+    AgencyAttribution,
+    AgencyAttributionStore,
+    AttributionTarget,
+    CausalContributor,
+    CausalContributorKind,
+)
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.attention import (
     AttentionCandidate,
@@ -300,6 +308,7 @@ class _MainLoopImplementation:
         self.feedback_store = FeedbackStore()
         self.metacognition = Metacognition()
         self._action_execution: Any | None = None
+        self.agency_attribution_store: AgencyAttributionStore
         self.persistence_coordinator = PersistenceCoordinator()
         self.experience_coordinator = ExperienceIntegrationCoordinator(
             self.experience_store,
@@ -335,6 +344,7 @@ class _MainLoopImplementation:
         self.restore_value_state()
         self.restore_motivation_state()
         self.restore_decision_state()
+        self.restore_agency_attribution_state()
         self.restore_self_model_state()
         self.restore_experience_state()
         self.restore_narrative_self_state()
@@ -352,6 +362,9 @@ class _MainLoopImplementation:
         self._action_execution = execution
         if hasattr(self, "action_coordinator"):
             self.action_coordinator.bind(execution)
+        if execution is not None:
+            for record in self.agency_attribution_store.state.records:
+                self._validate_attribution_chain(record)
 
     def chat(
         self,
@@ -2850,6 +2863,42 @@ class _MainLoopImplementation:
         self.decision_store.restore(payload if isinstance(payload, list) else [])
         self._persist_decision_state()
 
+    def restore_agency_attribution_state(self) -> None:
+        self.agency_attribution_store = self._new_agency_attribution_store()
+
+    def _new_agency_attribution_store(self) -> AgencyAttributionStore:
+        return AgencyAttributionStore(
+            load=lambda: self.persistent_state.extensions.get(
+                AGENCY_ATTRIBUTION_STATE_KEY
+            ),
+            save=lambda payload: self.persistent_state.extensions.__setitem__(
+                AGENCY_ATTRIBUTION_STATE_KEY, payload
+            ),
+            validate_chain=self._validate_attribution_chain,
+        )
+
+    def _validate_attribution_chain(self, attribution: AgencyAttribution) -> None:
+        decision = self.decision_store.get(attribution.decision_id)
+        if decision.actual_outcome is None:
+            raise ValueError("agency attribution requires a resolved decision outcome")
+        if attribution.outcome_ref != f"decision:{decision.decision_id}:outcome":
+            raise ValueError("agency attribution outcome provenance does not match")
+        execution = self._action_execution
+        if execution is None:
+            return
+        intent = execution.get_intent(attribution.action_intent_id)
+        receipt = execution.get_receipt(attribution.execution_receipt_id)
+        observation = execution.get_observation(attribution.observation_id)
+        if (
+            intent.provenance.decision_id != attribution.decision_id
+            or receipt.intent_id != intent.intent_id
+            or receipt.decision_id != attribution.decision_id
+            or receipt.observation_id != observation.observation_id
+            or observation.intent_id != intent.intent_id
+            or observation.receipt_id != receipt.receipt_id
+        ):
+            raise ValueError("agency attribution causal provenance does not match")
+
     def restore_feedback_state(self) -> None:
         payload = self.persistent_state.extensions.get("feedback")
         self.feedback_store.restore(payload if isinstance(payload, dict) else None)
@@ -3741,16 +3790,279 @@ class _MainLoopImplementation:
             if event is None
             else event.processing_sequence,
         )
-        record = self._apply_metacognitive_outcome(record)
-        proposals = self.value_system.proposals_from_decision_outcome(record)
-        updates = self.value_system.apply(proposals)
-        self.value_system.record_reassessment(record, updates)
-        self._persist_value_state()
-        self._sync_self_references()
-        self._persist_self_model_state()
+        action_intents = (
+            ()
+            if self._action_execution is None
+            else self._action_execution.list_intents()
+        )
+        if not any(
+            intent.provenance.decision_id == decision_id for intent in action_intents
+        ):
+            record = self._apply_metacognitive_outcome(record)
+            proposals = self.value_system.proposals_from_decision_outcome(record)
+            updates = self.value_system.apply(proposals)
+            self.value_system.record_reassessment(record, updates)
+            self._persist_value_state()
+            self._sync_self_references()
+            self._persist_self_model_state()
+            self._persist_metacognition_state()
+        self._persist_decision_state()
+        return record
+
+    def attribute_action_outcome(self, intent_id: str) -> AgencyAttribution:
+        if current_agent_event() is None:
+            raise RuntimeError("Agency attribution application requires AgentRuntime")
+        execution = self._action_execution
+        if execution is None:
+            raise ValueError("Action execution layer is unavailable")
+        existing = self.agency_attribution_store.current_for_intent(intent_id)
+        if existing is not None:
+            return existing
+        intent = execution.get_intent(intent_id)
+        if intent.receipt_id is None:
+            raise ValueError("Action intent has no execution receipt")
+        receipt = execution.get_receipt(intent.receipt_id)
+        if receipt.observation_id is None or receipt.verification_id is None:
+            raise ValueError("Action outcome has not been autonomously verified")
+        observation = execution.get_observation(receipt.observation_id)
+        verification = next(
+            (
+                item
+                for item in execution.list_verifications()
+                if item.verification_id == receipt.verification_id
+            ),
+            None,
+        )
+        if verification is None:
+            raise ValueError("Action outcome verification is missing")
+        self_share = 0.25 if verification.success else 0.3
+        environment_share = 0.65 if verification.success else 0.6
+        attribution = self.agency_attribution_store.create(
+            decision_id=intent.provenance.decision_id,
+            action_intent_id=intent.intent_id,
+            execution_receipt_id=receipt.receipt_id,
+            observation_id=observation.observation_id,
+            outcome_ref=f"decision:{intent.provenance.decision_id}:outcome",
+            contributors=(
+                CausalContributor(
+                    kind=CausalContributorKind.SELF,
+                    causal_share=self_share,
+                    confidence=0.9,
+                    controllability=0.8,
+                    foreseeability=0.7,
+                    responsibility_share=self_share,
+                ),
+                CausalContributor(
+                    kind=CausalContributorKind.ENVIRONMENT,
+                    causal_share=environment_share,
+                    confidence=0.8,
+                    controllability=0.1,
+                    foreseeability=0.5,
+                    responsibility_share=0.0,
+                ),
+                CausalContributor(
+                    kind=CausalContributorKind.CHANCE,
+                    causal_share=0.1,
+                    confidence=0.5,
+                    controllability=0.0,
+                    foreseeability=0.1,
+                    responsibility_share=0.0,
+                ),
+            ),
+            intended=verification.success,
+            uncertainty=0.2,
+            evidence_refs=(
+                f"decision:{intent.provenance.decision_id}",
+                f"action-intent:{intent.intent_id}@{intent.revision}",
+                f"execution-receipt:{receipt.receipt_id}",
+                f"observation:{observation.observation_id}",
+                f"outcome-verification:{verification.verification_id}",
+            ),
+            reason_codes=("autonomous_structured_outcome_verification",),
+        )
+        self._apply_attribution(attribution)
+        return attribution
+
+    def revise_agency_attribution(
+        self,
+        attribution_id: str,
+        *,
+        expected_revision: int,
+        contributors: tuple[CausalContributor, ...],
+        intended: bool,
+        uncertainty: float,
+        evidence_refs: tuple[str, ...],
+        reason_code: str,
+    ) -> AgencyAttribution:
+        if current_agent_event() is None:
+            raise RuntimeError("Agency attribution revisions require AgentRuntime")
+        attribution = self.agency_attribution_store.revise(
+            attribution_id,
+            expected_revision=expected_revision,
+            contributors=contributors,
+            intended=intended,
+            uncertainty=uncertainty,
+            evidence_refs=evidence_refs,
+            reason_code=reason_code,
+        )
+        self._apply_attribution(attribution)
+        return attribution
+
+    def _apply_attribution(self, attribution: AgencyAttribution) -> None:
+        decision = self.decision_store.get(attribution.decision_id)
+        outcome = decision.actual_outcome
+        if outcome is None:
+            raise ValueError("Agency attribution requires an outcome")
+        attribution_ref = attribution.reference
+        self_contribution = attribution.contribution(CausalContributorKind.SELF)
+        weighted_controllability = sum(
+            item.causal_share * item.controllability
+            for item in attribution.contributors
+        )
+        has_other = any(
+            item.kind == CausalContributorKind.OTHER
+            for item in attribution.contributors
+        )
+        appraisal = AppraisalResult(
+            novelty=None,
+            goal_progress=outcome.utility,
+            threat=max(0.0, -outcome.utility) * (1.0 - weighted_controllability),
+            controllability=weighted_controllability,
+            certainty=1.0 - attribution.uncertainty,
+            social_relevance=1.0 if has_other else 0.0,
+            effort_cost=0.0,
+            novelty_valid=False,
+            reasons=("agency_attribution", attribution_ref),
+        )
+        selected = next(
+            item.candidate
+            for item in decision.considered_candidates
+            if item.candidate.candidate_id == decision.selected_candidate_id
+        )
+        impacts = {
+            value_id: effect * outcome.utility * self_contribution
+            for value_id, effect in selected.value_effects.items()
+        }
+        value_updates = self.apply_value_impacts(
+            appraisal,
+            impacts,
+            kind=ValueUpdateKind.OUTCOME,
+            source="agency.attribution",
+            proposal_id=attribution_ref,
+            decision_id=decision.decision_id,
+            context_id=decision.context_id,
+        )
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.VALUE,
+            applied_delta=sum(item.applied_delta for item in value_updates),
+            evidence_refs=tuple(
+                evidence_id
+                for item in value_updates
+                for evidence_id in item.evidence_ids
+            )
+            or (attribution.outcome_ref,),
+        )
+        before_assessment = decision.metacognition_post_assessment_id
+        decision = self._apply_metacognitive_outcome(
+            decision,
+            attribution_ref=attribution_ref,
+            self_contribution=self_contribution,
+            controllability=weighted_controllability,
+        )
+        assessment_ref = (
+            decision.metacognition_post_assessment_id
+            if decision.metacognition_post_assessment_id is not None
+            and decision.metacognition_post_assessment_id != before_assessment
+            else attribution.outcome_ref
+        )
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.METACOGNITION,
+            applied_delta=0.0,
+            evidence_refs=(assessment_ref,),
+        )
+        link_id = (
+            f"agency-continuity:{attribution.attribution_id}:{attribution.revision}"
+        )
+        if link_id not in self.narrative_self.continuity_links:
+            self.narrative_self.link_continuity(
+                f"decision:{decision.decision_id}",
+                attribution_ref,
+                relation_code="causal_attribution",
+                evidence_refs=(attribution.outcome_ref,),
+                confidence=1.0 - attribution.uncertainty,
+                link_id=link_id,
+            )
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.NARRATIVE_SELF,
+            applied_delta=0.0,
+            evidence_refs=(link_id,),
+        )
+        relationship_refs: list[str] = []
+        for contributor in attribution.contributors:
+            if (
+                contributor.kind != CausalContributorKind.OTHER
+                or contributor.contributor_ref is None
+            ):
+                continue
+            relationship = self.relationship_store.for_interlocutor(
+                contributor.contributor_ref
+            )
+            if relationship is None:
+                continue
+            updated = self.relationship_store.correct(
+                relationship.relationship_id,
+                reason="agency_attribution_evidence",
+                evidence_refs=(attribution_ref,),
+                uncertainty=max(
+                    0.0,
+                    relationship.uncertainty
+                    - min(
+                        0.05, contributor.causal_share * contributor.confidence * 0.05
+                    ),
+                ),
+            )
+            relationship_refs.append(
+                f"relationship:{updated.relationship_id}@{updated.revision}"
+            )
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.RELATIONSHIP,
+            applied_delta=0.0,
+            evidence_refs=tuple(relationship_refs) or (attribution_ref,),
+        )
+        previous_valence = self.emotion_engine.state.valence
+        emotion = self.emotion_engine.update_from_appraisal(appraisal, max_delta=0.05)
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.EMOTION_APPRAISAL,
+            applied_delta=emotion.state.valence - previous_valence,
+            evidence_refs=(attribution.outcome_ref,),
+        )
+        motivation = self.motivation_dynamics.observe_structured_signal(
+            MotivationKind.DRIVE if not outcome.success else MotivationKind.DESIRE,
+            MotivationSource.DELIBERATION,
+            f"decision:{decision.decision_id}",
+            signal=min(0.5, abs(outcome.utility) * (0.25 + self_contribution)),
+            uncertainty=attribution.uncertainty,
+            source_refs=(attribution_ref,),
+            value_ids=tuple(selected.value_effects),
+        )
+        self.agency_attribution_store.record_projection(
+            attribution,
+            AttributionTarget.MOTIVATION,
+            applied_delta=0.0,
+            evidence_refs=(
+                f"motivation:{motivation.motivation_id}@{motivation.revision}",
+            ),
+        )
         self._persist_decision_state()
         self._persist_metacognition_state()
-        return record
+        self._persist_self_model_state()
+        self._persist_narrative_self_state()
+        self._persist_motivation_state()
 
     def record_decision_compensation(
         self, decision_id: str, *, receipt_id: str
@@ -3809,7 +4121,14 @@ class _MainLoopImplementation:
             ),
         )
 
-    def _apply_metacognitive_outcome(self, record: DecisionRecord) -> DecisionRecord:
+    def _apply_metacognitive_outcome(
+        self,
+        record: DecisionRecord,
+        *,
+        attribution_ref: str | None = None,
+        self_contribution: float = 1.0,
+        controllability: float = 1.0,
+    ) -> DecisionRecord:
         if record.metacognition_pre_assessment_id is None:
             return record
         selected = next(
@@ -3818,7 +4137,11 @@ class _MainLoopImplementation:
             if item.candidate.candidate_id == record.selected_candidate_id
         )
         capability_ids = _string_values(selected.parameters.get("capability_ids"))
-        if record.actual_outcome is not None and not record.actual_outcome.success:
+        if (
+            record.actual_outcome is not None
+            and not record.actual_outcome.success
+            and self_contribution >= 0.5
+        ):
             for capability_id in capability_ids:
                 current = self.self_model.state.capabilities.get(capability_id)
                 self.self_model.update_capability_from_decision(
@@ -3831,6 +4154,9 @@ class _MainLoopImplementation:
             record,
             self_model_revision=self.self_model.state.revision,
             cognitive_quality=self._current_cognitive_quality(),
+            attribution_ref=attribution_ref,
+            self_contribution=self_contribution,
+            controllability=controllability,
         )
         record = self.decision_store.link_post_assessment(
             record.decision_id, assessment.assessment_id
