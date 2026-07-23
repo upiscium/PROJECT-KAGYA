@@ -1,9 +1,11 @@
-"""Persistence helpers for coordinator-owned domain state."""
-
-from typing import Any, Callable
+from typing import Any
 
 
-class PersistenceCoordinator:
+from typing import Callable
+from kagya.runtime.coordinators._shared import RuntimeDomainMixin
+
+
+class PersistenceCoordinator(RuntimeDomainMixin):
     """Copies store state to and from the existing persistent schema."""
 
     @staticmethod

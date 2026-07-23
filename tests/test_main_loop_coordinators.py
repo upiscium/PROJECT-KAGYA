@@ -10,6 +10,7 @@ from kagya.runtime.coordinators import (
     ChatOrchestrationCoordinator,
     ChatRollbackScope,
     ChatStage,
+    ChatTransactionCallbacks,
 )
 
 
@@ -42,6 +43,70 @@ def test_chat_coordinator_propagates_failure_to_runtime_rollback_scope() -> None
         coordinator.chat()
 
     assert raised.value is expected
+
+
+def test_chat_transaction_runs_stages_in_commit_order() -> None:
+    events: list[str] = []
+    callbacks = ChatTransactionCallbacks[str](
+        prepare_context=lambda: events.append("prepare_context"),
+        appraise_and_generate=lambda: events.append("appraise_and_generate"),
+        prepare_external=lambda: events.append("prepare_external"),
+        integrate_domains=lambda: events.append("integrate_domains"),
+        commit_authoritative=lambda: events.append("commit_authoritative") or "ok",
+        rollback_local_domain=lambda: events.append("rollback_local_domain"),
+        rollback_external_saga=lambda: events.append("rollback_external_saga"),
+    )
+
+    assert ChatOrchestrationCoordinator.run_transaction(callbacks) == "ok"
+    assert events == [stage.value for stage in ChatStage]
+
+
+def test_chat_transaction_runs_each_rollback_scope_and_preserves_failure() -> None:
+    events: list[str] = []
+    expected = RuntimeError("integration failed")
+
+    def fail_integration() -> None:
+        events.append("integrate_domains")
+        raise expected
+
+    def fail_local_rollback() -> None:
+        events.append("local_domain")
+        raise RuntimeError("local rollback failed")
+
+    callbacks = ChatTransactionCallbacks[None](
+        prepare_context=lambda: events.append("prepare_context"),
+        appraise_and_generate=lambda: events.append("appraise_and_generate"),
+        prepare_external=lambda: events.append("prepare_external"),
+        integrate_domains=fail_integration,
+        commit_authoritative=lambda: events.append("commit_authoritative"),
+        rollback_local_domain=fail_local_rollback,
+        rollback_external_saga=lambda: events.append("external_saga"),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        ChatOrchestrationCoordinator.run_transaction(callbacks)
+
+    assert raised.value is expected
+    assert events == [
+        "prepare_context",
+        "appraise_and_generate",
+        "prepare_external",
+        "integrate_domains",
+        "local_domain",
+        "external_saga",
+    ]
+
+
+def test_private_main_loop_owns_only_wiring_and_observability_methods() -> None:
+    from kagya.runtime.coordinated_main_loop import _MainLoopImplementation
+
+    owned_methods = {
+        name
+        for name, value in _MainLoopImplementation.__dict__.items()
+        if callable(value)
+    }
+
+    assert owned_methods == {"__init__", "_metric"}
 
 
 def test_main_loop_wires_coordinators_to_authoritative_stores(tmp_path: Path) -> None:
