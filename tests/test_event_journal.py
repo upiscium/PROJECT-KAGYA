@@ -19,13 +19,24 @@ from kagya.runtime import (
 from kagya.runtime.agent_state import default_agent_state_snapshot
 
 
-def test_journal_records_lifecycle_hash_chain_without_private_payload(
+def test_journal_rejects_hidden_thought_payload(
     tmp_path: Path,
 ) -> None:
     journal = EventJournal(tmp_path / "journal.jsonl")
     accepted = _event(
         payload={"prompt": "private prompt", "hidden_thought": "private thought"}
     )
+
+    with pytest.raises(JournalIntegrityError, match="hidden thought"):
+        journal.accepted(accepted)
+    assert not journal.path.exists()
+
+
+def test_journal_records_lifecycle_hash_chain_without_event_payload(
+    tmp_path: Path,
+) -> None:
+    journal = EventJournal(tmp_path / "journal.jsonl")
+    accepted = _event(payload={"prompt": "private prompt"})
     started = replace(accepted, processing_sequence=1)
     before = default_agent_state_snapshot(1.0)
     after = before.model_copy(update={"last_processed_event_sequence": 1})
@@ -49,7 +60,7 @@ def test_journal_records_lifecycle_hash_chain_without_private_payload(
     assert restored[-1].previous_record_hash == restored[-2].record_hash
     serialized = journal.path.read_text(encoding="utf-8")
     assert "private prompt" not in serialized
-    assert "private thought" not in serialized
+    assert "hidden_thought" not in serialized
 
 
 def test_journal_rejects_tamper_and_unsupported_records(tmp_path: Path) -> None:

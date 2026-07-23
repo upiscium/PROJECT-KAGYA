@@ -16,6 +16,10 @@ class DreamDatasetRecord:
     source_id: str = ""
     validation_status: str = "verified"
 
+    def __post_init__(self) -> None:
+        if self.thought:
+            raise ValueError("Dream datasets cannot contain teacher thoughts")
+
     def to_json(self) -> dict[str, str | int]:
         return {
             "schema_version": self.schema_version,
@@ -57,10 +61,6 @@ class DreamDatasetGenerator:
 
 
 def format_training_text(record: DreamDatasetRecord) -> str:
-    return (
-        f"ユーザー: {record.input}\n"
-        "私: <think>\n"
-        f"{record.thought}\n"
-        "</think>\n"
-        f"{record.output}<eos>"
-    )
+    if record.thought:
+        raise ValueError("Dream datasets cannot contain teacher thoughts")
+    return f"ユーザー: {record.input}\n私: {record.output}<eos>"

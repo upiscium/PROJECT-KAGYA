@@ -375,6 +375,7 @@ class EventJournal:
         snapshot_sequence: int | None = None,
         failure_category: str | None = None,
     ) -> JournalRecord:
+        _reject_private_payload(getattr(event, "payload", {}))
         event_type = getattr(event.event_type, "value", str(event.event_type))
         return self._append(
             lifecycle=lifecycle,
@@ -410,7 +411,10 @@ class EventJournal:
                     self._last_sequence = max(
                         self._last_sequence, record.processing_sequence
                     )
-                if record.snapshot_hash is not None and record.snapshot_sequence is not None:
+                if (
+                    record.snapshot_hash is not None
+                    and record.snapshot_sequence is not None
+                ):
                     self._last_snapshot_hash = record.snapshot_hash
                     self._last_snapshot_sequence = record.snapshot_sequence
                 status = "success"
@@ -528,6 +532,22 @@ class EventJournal:
         return [path for _index, path in reversed(existing)] + (
             [self.path] if self.path.exists() else []
         )
+
+
+def _reject_private_payload(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if normalized == "hiddenthought":
+                raise JournalIntegrityError(
+                    "hidden thought is forbidden in the event journal"
+                )
+            _reject_private_payload(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_private_payload(item)
 
 
 def hash_snapshot(snapshot: AgentStateSnapshot) -> str:

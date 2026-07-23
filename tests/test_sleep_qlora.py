@@ -55,7 +55,6 @@ def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -
     episode_id = memory.save_episodic(
         "dream input",
         "dream output",
-        hidden_thought="dream thought",
         emotion_arousal=0.9,
     )
     episode = memory._get_unarchived_episodic_records()[0]
@@ -80,15 +79,18 @@ def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -
     }
 
 
-def test_dataset_records_include_think_only_in_training_format() -> None:
-    record = DreamDatasetRecord("input", "internal", "output")
+def test_dataset_records_reject_teacher_thoughts() -> None:
+    with pytest.raises(ValueError, match="teacher thoughts"):
+        DreamDatasetRecord("input", "internal", "output")
+
+    record = DreamDatasetRecord("input", "", "output")
 
     raw_record = record.to_json()
     training_text = format_training_text(record)
 
     assert "<think>" not in json.dumps(raw_record)
-    assert "<think>" in training_text
-    assert "</think>" in training_text
+    assert "<think>" not in training_text
+    assert "</think>" not in training_text
     assert training_text.endswith("output<eos>")
 
 
@@ -110,7 +112,7 @@ def test_qlora_dry_run_returns_adapter_candidate_result(tmp_path: Path) -> None:
     dataset_path = settings.sleep.dream_dataset_path
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     dataset_path.write_text(
-        json.dumps({"input": "i", "thought": "t", "output": "o"}) + "\n",
+        json.dumps({"input": "i", "thought": "", "output": "o"}) + "\n",
         encoding="utf-8",
     )
 
@@ -132,7 +134,7 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
     dataset_path = settings.sleep.dream_dataset_path
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     dataset_path.write_text(
-        json.dumps({"input": "i", "thought": "t", "output": "o"}) + "\n",
+        json.dumps({"input": "i", "thought": "", "output": "o"}) + "\n",
         encoding="utf-8",
     )
     calls: dict[str, object] = {}
@@ -212,7 +214,9 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
     assert calls["model_id"] == settings.model.primary_id
     assert calls["trained"] is True
     assert Path(calls["saved_path"]).name == f".{result.adapter_id}.tmp"
-    assert calls["dataset"] == [{"text": format_training_text(DreamDatasetRecord("i", "t", "o"))}]
+    assert calls["dataset"] == [
+        {"text": format_training_text(DreamDatasetRecord("i", "", "o"))}
+    ]
     assert calls["peft_config"] == {
         "r": settings.qlora.r,
         "lora_alpha": settings.qlora.lora_alpha,
@@ -359,7 +363,6 @@ def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> Non
     memory.save_episodic(
         "sleep input",
         "sleep output",
-        hidden_thought="sleep thought",
         emotion_arousal=0.9,
     )
     manager = SleepCycleManager(settings, memory, DummyProvider(), registry)

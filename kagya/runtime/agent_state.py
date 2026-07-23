@@ -118,11 +118,11 @@ class AgentStateSnapshot(_StateModel):
     @model_validator(mode="after")
     def reject_private_runtime_fields(self) -> "AgentStateSnapshot":
         forbidden = {
-            "hidden_thought",
+            "hiddenthought",
             "prompt",
             "turns",
             "attachments",
-            "event_payload",
+            "eventpayload",
         }
         if _contains_forbidden_key(self.model_dump(), forbidden):
             raise ValueError("snapshot contains a forbidden private runtime field")
@@ -507,7 +507,9 @@ def _attribute_from_json(value: dict[str, Any]) -> InferredAttribute:
 def _contains_forbidden_key(value: Any, forbidden: set[str]) -> bool:
     if isinstance(value, dict):
         return any(
-            str(key).lower() in forbidden or _contains_forbidden_key(item, forbidden)
+            "".join(character for character in str(key).lower() if character.isalnum())
+            in forbidden
+            or _contains_forbidden_key(item, forbidden)
             for key, item in value.items()
         )
     if isinstance(value, list):

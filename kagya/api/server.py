@@ -6,8 +6,10 @@ from datetime import UTC, datetime
 import time
 
 import uvicorn
-from fastapi import FastAPI, Response, status
+from fastapi import FastAPI, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from kagya.actions import ActionExecutionLayer
 from kagya.api.routes import (
@@ -80,6 +82,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_without_input(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        errors = [
+            {key: value for key, value in error.items() if key not in {"input", "ctx"}}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     @app.get("/health")
     def health() -> dict[str, str]:

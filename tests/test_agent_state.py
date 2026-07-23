@@ -3,6 +3,8 @@ from pathlib import Path
 import json
 import os
 
+import pytest
+
 from kagya.body import EmotionState
 from kagya.config import load_settings
 from kagya.decision import ActionCandidate, ActionType
@@ -280,6 +282,18 @@ def test_snapshot_contains_no_session_or_generation_private_data(tmp_path: Path)
     assert "private thought" not in serialized
     assert "hidden_thought" not in serialized
     assert "prompt" not in serialized
+
+
+def test_snapshot_rejects_normalized_hidden_thought_alias() -> None:
+    snapshot = default_agent_state_snapshot(1.0)
+
+    with pytest.raises(ValueError, match="forbidden private runtime field"):
+        AgentStateSnapshot.model_validate(
+            {
+                **snapshot.model_dump(mode="json"),
+                "extensions": {"nested": {"hiddenThought": "private"}},
+            }
+        )
 
 
 def test_explicit_snapshot_model_validates_sequence() -> None:
