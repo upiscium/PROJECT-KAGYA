@@ -3,8 +3,10 @@
 from kagya.runtime.coordinators.action import ActionCoordinator
 from kagya.runtime.coordinators.chat import (
     ChatOrchestrationCoordinator,
+    ChatResult,
     ChatRollbackScope,
     ChatStage,
+    ChatTransactionCallbacks,
     ChatTransactionTrace,
 )
 from kagya.runtime.coordinators.experience import (
@@ -19,8 +21,10 @@ from kagya.runtime.coordinators.planning import PlanDecisionCoordinator
 __all__ = [
     "ActionCoordinator",
     "ChatOrchestrationCoordinator",
+    "ChatResult",
     "ChatRollbackScope",
     "ChatStage",
+    "ChatTransactionCallbacks",
     "ChatTransactionTrace",
     "ExperienceIntegrationCoordinator",
     "ExperienceIntegrationResult",
