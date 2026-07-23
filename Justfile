@@ -52,6 +52,10 @@ behavioral-real-model config="config.yaml":
     @echo "==> Running opt-in real-model behavioral check..."
     uv run python -m kagya.learning.real_model_behavioral --config {{config}}
 
+# Deterministic real-runtime behavioral harness and recovery checks.
+behavioral-runtime:
+    uv run pytest tests/test_runtime_behavioral_harness.py tests/test_runtime_behavioral_runner.py tests/test_behavioral_artifact_reconciliation.py -v
+
 # Check non-dry-run QLoRA production prerequisites without starting training.
 qlora-prod-check config="config.yaml":
     @echo "==> Checking production QLoRA prerequisites..."
@@ -67,7 +71,7 @@ api:
 # =============================================================================
 
 # プルリクエスト作成前や、大きな変更の後にエージェントに実行させる一括検証
-check-all: lint typecheck test config-check schema-check
+check-all: lint typecheck test behavioral-runtime config-check schema-check
     @echo "==> [OK] All checks passed successfully."
 
 # =============================================================================

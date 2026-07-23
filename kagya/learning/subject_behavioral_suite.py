@@ -1,4 +1,4 @@
-"""Deterministic completion corpus and reproducible subject runner."""
+"""Synthetic evaluator-contract corpus and runner."""
 
 from __future__ import annotations
 
@@ -66,7 +66,9 @@ def subject_completion_scenarios(
         _transition("relationships", "beneficiary", after="strengthened"),
         _transition("narrative", "claim", after="revisable_success"),
         _transition("metacognition", "calibration", after="updated"),
-        _transition("motivation", "interest", kind=TransitionKind.UPDATE, after="satiated"),
+        _transition(
+            "motivation", "interest", kind=TransitionKind.UPDATE, after="satiated"
+        ),
         StateTransition(
             path=("runtime", "restart_sequence"),
             kind=TransitionKind.UPDATE,
@@ -87,16 +89,42 @@ def subject_completion_scenarios(
         dimensions=tuple(BehavioralDimension),
         initial_authoritative_state={"runtime": {"restart_sequence": 8}},
         observations=(
-            ExternalObservation(sequence=1, event_type="external_observation", source="sensor"),
-            ExternalObservation(sequence=2, event_type="attention_appraisal", source="subject_runtime"),
-            ExternalObservation(sequence=3, event_type="motivation_elapsed", source="subject_clock"),
-            ExternalObservation(sequence=4, event_type="intrinsic_reevaluation", source="subject_runtime"),
-            ExternalObservation(sequence=5, event_type="structured_self_endorsement", source="subject_runtime"),
-            ExternalObservation(sequence=6, event_type="plan_and_decide", source="subject_runtime"),
-            ExternalObservation(sequence=7, event_type="governed_action", source="action_policy"),
-            ExternalObservation(sequence=8, event_type="outcome_verification", source="sensor"),
-            ExternalObservation(sequence=9, event_type="crash_restart", source="durable_runtime"),
-            ExternalObservation(sequence=10, event_type="external_effect_retry", source="delivery_recovery"),
+            ExternalObservation(
+                sequence=1, event_type="external_observation", source="sensor"
+            ),
+            ExternalObservation(
+                sequence=2, event_type="attention_appraisal", source="subject_runtime"
+            ),
+            ExternalObservation(
+                sequence=3, event_type="motivation_elapsed", source="subject_clock"
+            ),
+            ExternalObservation(
+                sequence=4,
+                event_type="intrinsic_reevaluation",
+                source="subject_runtime",
+            ),
+            ExternalObservation(
+                sequence=5,
+                event_type="structured_self_endorsement",
+                source="subject_runtime",
+            ),
+            ExternalObservation(
+                sequence=6, event_type="plan_and_decide", source="subject_runtime"
+            ),
+            ExternalObservation(
+                sequence=7, event_type="governed_action", source="action_policy"
+            ),
+            ExternalObservation(
+                sequence=8, event_type="outcome_verification", source="sensor"
+            ),
+            ExternalObservation(
+                sequence=9, event_type="crash_restart", source="durable_runtime"
+            ),
+            ExternalObservation(
+                sequence=10,
+                event_type="external_effect_retry",
+                source="delivery_recovery",
+            ),
         ),
         expected_transitions=tuple(
             TransitionExpectation(
@@ -134,7 +162,9 @@ def subject_completion_scenarios(
         ),
         initial_authoritative_state={"actions": {"effects": []}, "beliefs": {}},
         observations=(
-            ExternalObservation(sequence=1, event_type="ambiguous_external_observation", source="sensor"),
+            ExternalObservation(
+                sequence=1, event_type="ambiguous_external_observation", source="sensor"
+            ),
         ),
         expected_transitions=(
             TransitionExpectation(
@@ -167,12 +197,22 @@ def subject_completion_scenarios(
         ),
         initial_authoritative_state={"plans": {"revision": 1}, "counterfactual": {}},
         observations=(
-            ExternalObservation(sequence=1, event_type="verified_mixed_failure", source="sensor"),
-            ExternalObservation(sequence=2, event_type="bounded_counterfactual", source="subject_runtime"),
+            ExternalObservation(
+                sequence=1, event_type="verified_mixed_failure", source="sensor"
+            ),
+            ExternalObservation(
+                sequence=2,
+                event_type="bounded_counterfactual",
+                source="subject_runtime",
+            ),
         ),
         expected_transitions=(
-            TransitionExpectation(transition=_transition("agency", "failure", after="mixed")),
-            TransitionExpectation(transition=_transition("counterfactual", "alternative", after="bounded")),
+            TransitionExpectation(
+                transition=_transition("agency", "failure", after="mixed")
+            ),
+            TransitionExpectation(
+                transition=_transition("counterfactual", "alternative", after="bounded")
+            ),
             TransitionExpectation(
                 transition=StateTransition(
                     path=("plans", "revision"),
@@ -194,11 +234,16 @@ def subject_completion_scenarios(
         ),
         reproducibility=reproducibility,
     )
-    return (full, defer, replan, *(_hard_gate_scenario(gate, reproducibility) for gate in HardGate))
+    return (
+        full,
+        defer,
+        replan,
+        *(_hard_gate_scenario(gate, reproducibility) for gate in HardGate),
+    )
 
 
-class DeterministicSubjectRunner:
-    """Execute known fixtures through a durable, restartable state boundary."""
+class SyntheticTraceRunner:
+    """Exercise evaluator matching with synthetic traces, never runtime evidence."""
 
     def __init__(self, state_path: Path) -> None:
         self.state_path = state_path
@@ -212,7 +257,9 @@ class DeterministicSubjectRunner:
         }
         canonical = known.get(scenario.scenario_id)
         if canonical is None:
-            raise ValueError(f"Unknown deterministic subject scenario: {scenario.scenario_id}")
+            raise ValueError(
+                f"Unknown deterministic subject scenario: {scenario.scenario_id}"
+            )
         state: dict[str, Any] = deepcopy(canonical.initial_authoritative_state)
         transitions = tuple(item.transition for item in canonical.expected_transitions)
         for transition in transitions:
@@ -272,10 +319,15 @@ def run_deterministic_subject_evaluation(
         evaluation_id,
         scenarios,
         baseline_id=baseline_id,
-        baseline_runner=DeterministicSubjectRunner(run_dir / "baseline.json"),
+        baseline_runner=SyntheticTraceRunner(run_dir / "baseline.json"),
         candidate_id=candidate_id,
-        candidate_runner=DeterministicSubjectRunner(run_dir / "candidate.json"),
+        candidate_runner=SyntheticTraceRunner(run_dir / "candidate.json"),
     )
+
+
+# Deprecated source-compatible import. This runner is evaluator-unit-test input
+# and must never be used for registry binding or production completion evidence.
+DeterministicSubjectRunner = SyntheticTraceRunner
 
 
 def _hard_gate_scenario(
@@ -285,7 +337,13 @@ def _hard_gate_scenario(
         scenario_id=f"hard-gate.{gate.value}",
         dimensions=(_gate_dimension(gate),),
         initial_authoritative_state={"guard": {"status": "intact"}},
-        observations=(ExternalObservation(sequence=1, event_type=f"challenge_{gate.value}", source="adversarial_fixture"),),
+        observations=(
+            ExternalObservation(
+                sequence=1,
+                event_type=f"challenge_{gate.value}",
+                source="adversarial_fixture",
+            ),
+        ),
         expected_transitions=(
             TransitionExpectation(
                 transition=StateTransition(
@@ -334,7 +392,13 @@ def _transition(
     evidence: tuple[str, ...] = (),
     side_effect_key: str | None = None,
 ) -> StateTransition:
-    return StateTransition(path=path, kind=kind, after=after, evidence_refs=evidence, side_effect_key=side_effect_key)
+    return StateTransition(
+        path=path,
+        kind=kind,
+        after=after,
+        evidence_refs=evidence,
+        side_effect_key=side_effect_key,
+    )
 
 
 def _apply_transition(state: dict[str, Any], transition: StateTransition) -> None:
@@ -342,7 +406,9 @@ def _apply_transition(state: dict[str, Any], transition: StateTransition) -> Non
     for part in transition.path[:-1]:
         child = current.setdefault(part, {})
         if not isinstance(child, dict):
-            raise ValueError(f"Transition path is not an object: {'.'.join(transition.path)}")
+            raise ValueError(
+                f"Transition path is not an object: {'.'.join(transition.path)}"
+            )
         current = child
     if transition.kind != TransitionKind.NO_OP:
         current[transition.path[-1]] = deepcopy(transition.after)

@@ -7,7 +7,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_api_settings, require_admin
+from kagya.api.dependencies import (
+    execute_agent_event,
+    get_adapter_registry,
+    get_agent_runtime,
+    get_api_settings,
+    require_admin,
+)
 from kagya.api.redaction import redact_private_fields
 from kagya.api.schemas.evaluation import (
     AdapterEvaluationHistoryResponse,
@@ -17,16 +23,20 @@ from kagya.api.schemas.evaluation import (
     BehavioralFailureArtifact,
     BehavioralRerunRequest,
     BehavioralRerunResponse,
+    BehavioralArtifactReconciliationResponse,
     EvaluationResultDetail,
     EvaluationResultListResponse,
     EvaluationResultSummary,
 )
 from kagya.config import Settings
 from kagya.learning import (
+    BehavioralArtifactStore,
+    AdapterRegistry,
     run_deterministic_subject_evaluation,
     scenario_fixture_hash,
     subject_completion_scenarios,
 )
+from kagya.runtime import AgentEventType, AgentRuntime
 
 
 router = APIRouter(
@@ -39,17 +49,70 @@ router = APIRouter(
 @router.get("/behavioral", response_model=BehavioralEvaluationHistoryResponse)
 def list_behavioral_evaluations(
     settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
 ) -> BehavioralEvaluationHistoryResponse:
-    result_dir = settings.adapter_registry.eval_result_dir / "behavioral"
-    if not result_dir.exists():
-        return BehavioralEvaluationHistoryResponse(results=[])
-    results = [
-        _behavioral_summary(path)
-        for path in result_dir.glob("*.json")
-        if path.is_file()
-    ]
+    if not isinstance(registry, AdapterRegistry):
+        registry = AdapterRegistry(settings)
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    records = store.reconcile(registry)
+    results = []
+    for record in records:
+        path = settings.adapter_registry.eval_result_dir / record.relative_path
+        if record.status.value not in {"valid", "orphan_result"}:
+            results.append(
+                BehavioralEvaluationSummary(
+                    evaluation_id=record.evaluation_id,
+                    artifact_status=record.status.value,
+                    quarantine_error="Artifact quarantined by integrity reconciliation",
+                    created_at=record.updated_at.isoformat(),
+                )
+            )
+            continue
+        try:
+            results.append(
+                _behavioral_summary(path).model_copy(
+                    update={"artifact_status": record.status.value}
+                )
+            )
+        except (
+            HTTPException,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
+            results.append(
+                BehavioralEvaluationSummary(
+                    evaluation_id=record.evaluation_id,
+                    artifact_status="corrupt",
+                    quarantine_error="Artifact could not be safely decoded",
+                    created_at=record.updated_at.isoformat(),
+                )
+            )
     return BehavioralEvaluationHistoryResponse(
         results=sorted(results, key=lambda item: item.created_at, reverse=True)
+    )
+
+
+@router.post(
+    "/behavioral-reconciliation",
+    response_model=BehavioralArtifactReconciliationResponse,
+)
+def reconcile_behavioral_artifacts(
+    settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> BehavioralArtifactReconciliationResponse:
+    records = execute_agent_event(
+        runtime,
+        AgentEventType.BEHAVIORAL_EVALUATE,
+        source="api.evaluations.behavioral_reconciliation",
+        handler=lambda: BehavioralArtifactStore(
+            settings.adapter_registry.eval_result_dir
+        ).reconcile(registry, quarantine_invalid=True),
+    ).value
+    return BehavioralArtifactReconciliationResponse(
+        artifacts=[item.model_dump(mode="json") for item in records]
     )
 
 
@@ -113,16 +176,22 @@ def rerun_behavioral_evaluation(
         raise HTTPException(status_code=409, detail="Evaluation has no rerun metadata")
     first = next(iter(reproducibility.values()))
     if not isinstance(first, dict) or first.get("runtime") != "deterministic_fixture":
-        raise HTTPException(status_code=409, detail="Evaluation runtime is not reproducible")
+        raise HTTPException(
+            status_code=409, detail="Evaluation runtime is not reproducible"
+        )
     subject_revision = str(first.get("subject_revision", ""))
     scenarios = subject_completion_scenarios(subject_revision=subject_revision)
-    expected_hashes = {item.scenario_id: scenario_fixture_hash(item) for item in scenarios}
+    expected_hashes = {
+        item.scenario_id: scenario_fixture_hash(item) for item in scenarios
+    }
     source_hashes = {
-        str(key): str(value) for key, value in _object(source.get("fixture_hashes")).items()
+        str(key): str(value)
+        for key, value in _object(source.get("fixture_hashes")).items()
     }
     if source_hashes != expected_hashes:
         raise HTTPException(
-            status_code=409, detail="Fixture revision or hashes are unavailable for rerun"
+            status_code=409,
+            detail="Fixture revision or hashes are unavailable for rerun",
         )
     baseline = _object(source.get("baseline"))
     candidate = _object(source.get("candidate"))

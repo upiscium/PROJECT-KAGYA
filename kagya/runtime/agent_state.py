@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 import json
 import os
 import tempfile
@@ -145,10 +145,16 @@ class PersistentAgentState:
 
 
 class AgentStateStore:
-    def __init__(self, path: Path, event_recorder: Any | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        event_recorder: Any | None = None,
+        failure_injector: Callable[[str], None] | None = None,
+    ) -> None:
         self.path = path
         self.event_recorder = event_recorder
         self.last_snapshot: AgentStateSnapshot | None = None
+        self._failure_injector = failure_injector
 
     def load(self, baseline_surprisal: float) -> AgentStateSnapshot:
         default = default_agent_state_snapshot(baseline_surprisal)
@@ -203,8 +209,17 @@ class AgentStateStore:
                     sort_keys=True,
                 )
                 snapshot_file.flush()
+                if self._failure_injector is not None:
+                    self._failure_injector("snapshot_temp_write")
                 os.fsync(snapshot_file.fileno())
+            if self._failure_injector is not None:
+                self._failure_injector("snapshot_temp_fsync")
+                self._failure_injector("snapshot_temp_fsynced")
             os.replace(temporary_path, self.path)
+            self.last_snapshot = validated
+            if self._failure_injector is not None:
+                self._failure_injector("snapshot_atomic_replace")
+                self._failure_injector("snapshot_replaced")
             directory_fd = os.open(self.path.parent, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)

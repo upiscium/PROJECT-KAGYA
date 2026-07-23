@@ -184,6 +184,9 @@ class PlanRevision(_StrictModel):
     abandonment_condition: PlanCondition
     steps: tuple[StepDefinition, ...]
     final_step_states: tuple[StepState, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    event_id: str | None = None
+    event_sequence: int | None = None
     created_at: datetime
 
 
@@ -368,6 +371,7 @@ class PlanStore:
         expected_revision: int,
         reason_code: str,
         actor_id: str,
+        evidence_refs: tuple[str, ...] = (),
         event_id: str | None = None,
         event_sequence: int | None = None,
     ) -> Plan:
@@ -376,11 +380,14 @@ class PlanStore:
             raise ValueError("Plan revision cannot change Plan or Goal identity")
         if plan.revision != expected_revision:
             raise ValueError("Plan revision conflict")
-        if plan.status in {
-            PlanStatus.COMPLETED,
-            PlanStatus.FAILED,
-            PlanStatus.ABANDONED,
-        }:
+        reflective_failure_revision = (
+            plan.status == PlanStatus.FAILED
+            and reason_code == "bounded_counterfactual_replan"
+            and actor_id == "subject_scheduler"
+        )
+        if plan.status in {PlanStatus.COMPLETED, PlanStatus.ABANDONED} or (
+            plan.status == PlanStatus.FAILED and not reflective_failure_revision
+        ):
             raise ValueError("Terminal Plan cannot be revised")
         now = _now()
         old_states = {item.step_id: item for item in plan.step_states}
@@ -419,6 +426,9 @@ class PlanStore:
             failure_condition=candidate.failure_condition,
             abandonment_condition=candidate.abandonment_condition,
             steps=candidate.steps,
+            evidence_refs=evidence_refs,
+            event_id=event_id,
+            event_sequence=event_sequence,
             created_at=now,
         )
         updated = plan.model_copy(
@@ -629,11 +639,21 @@ class PlanStore:
                 "Only a current actionable Step can become an ActionCandidate"
             )
         step = plan.step_definition(step_id)
+        raw_value_effects = step.parameters.get("value_effects", {})
+        value_effects = (
+            {str(key): float(value) for key, value in raw_value_effects.items()}
+            if isinstance(raw_value_effects, dict)
+            else {}
+        )
         return ActionCandidate(
             candidate_id=f"plan:{plan_id}:{plan.revision}:{step_id}",
             candidate_type=step.action_type,
             proposed_action=step.action_code,
-            parameters=dict(step.parameters),
+            parameters={
+                key: value
+                for key, value in step.parameters.items()
+                if key != "value_effects"
+            },
             prerequisites=tuple(
                 f"step:{plan.plan_id}:{plan.revision}:{item}:completed"
                 for item in step.dependency_ids
@@ -642,7 +662,7 @@ class PlanStore:
             uncertainty=0.5,
             estimated_cost=0.5,
             estimated_risk=0.5,
-            value_effects={},
+            value_effects=value_effects,
             appraisal_contributions={},
             plan_id=plan.plan_id,
             plan_revision=plan.revision,

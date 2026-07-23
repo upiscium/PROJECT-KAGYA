@@ -259,6 +259,11 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
         embedding_model()
     if getattr(app.state, "adapter_registry", None) is None:
         app.state.adapter_registry = AdapterRegistry(settings)
+    from kagya.learning import BehavioralArtifactStore
+
+    app.state.behavioral_artifact_reconciliation = BehavioralArtifactStore(
+        settings.adapter_registry.eval_result_dir
+    ).reconcile(app.state.adapter_registry)
     active_adapter = next(
         (
             entry

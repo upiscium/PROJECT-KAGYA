@@ -244,7 +244,6 @@ class EventJournal:
                 record.lifecycle
                 in {
                     JournalLifecycle.COMPLETED,
-                    JournalLifecycle.FAILED,
                 }
                 or (
                     record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED

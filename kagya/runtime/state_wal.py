@@ -7,8 +7,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 from threading import Lock
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -97,9 +98,12 @@ class StateDryRun(BaseModel):
 class StateWAL:
     """Store validated state replacement patches in a private hash-chained file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, failure_injector: Callable[[str], None] | None = None
+    ) -> None:
         self.path = path
         self._lock = Lock()
+        self._failure_injector = failure_injector
         records = self.verify()
         self._last_hash = records[-1].record_hash if records else None
         self._last_sequence = records[-1].processing_sequence if records else None
@@ -229,6 +233,41 @@ class StateWAL:
             records.append(record)
         return records
 
+    def truncate_after(self, sequence: int) -> list[StateWalRecord]:
+        """Remove an uncommitted tail after Journal/snapshot reconciliation."""
+
+        with self._lock:
+            records = self.verify()
+            retained = [
+                record for record in records if record.processing_sequence <= sequence
+            ]
+            if len(retained) == len(records):
+                return retained
+            if not retained or retained[-1].processing_sequence != sequence:
+                raise StateWalIntegrityError(
+                    "WAL cannot truncate without a retained snapshot sequence"
+                )
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    for record in retained:
+                        output.write(record.model_dump_json() + "\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, self.path)
+                _fsync_directory(self.path.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+            last = retained[-1]
+            self._last_hash = last.record_hash
+            self._last_sequence = last.processing_sequence
+            self._last_state_hash = last.state_hash_after
+            return retained
+
     def _append_locked(
         self,
         *,
@@ -268,9 +307,13 @@ class StateWAL:
             os.close(descriptor)
             raise
         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
+            if self._failure_injector is not None:
+                self._failure_injector("before_wal_append")
             output.write(record.model_dump_json() + "\n")
             output.flush()
             os.fsync(output.fileno())
+            if self._failure_injector is not None:
+                self._failure_injector("after_wal_append")
         _fsync_directory(self.path.parent)
         self._last_hash = record.record_hash
         self._last_sequence = processing_sequence

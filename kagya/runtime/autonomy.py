@@ -20,7 +20,7 @@ from kagya.motivation import (
     MotivationStatus,
     IntrinsicGoalStatus,
 )
-from kagya.planning import PlanStatus, StepStatus
+from kagya.planning import PlanCandidate, PlanStatus, StepStatus
 from kagya.outbox import (
     AcknowledgmentStatus,
     DeliveryStatus,
@@ -333,7 +333,11 @@ class SubjectScheduler:
                 for item in self._all_schedules()
                 if item.status == ScheduleStatus.PENDING and item.wake_at <= now
             ),
-            key=lambda item: (item.wake_at, item.schedule_id),
+            key=lambda item: (
+                item.wake_at,
+                0 if item.kind == WakeUpKind.MOTIVATION_REEVALUATION else 1,
+                item.schedule_id,
+            ),
         )
 
     def _all_schedules(self) -> list[WakeUpSchedule]:
@@ -488,7 +492,8 @@ class SubjectScheduler:
                     if item.candidate.candidate_id == decision.selected_candidate_id
                 )
                 if (
-                    set(selected.parameters) == {"action"}
+                    set(selected.parameters) <= {"action", "value_effects"}
+                    and "action" in selected.parameters
                     and isinstance(selected.parameters["action"], dict)
                     and not any(
                         item.provenance.decision_id == decision.decision_id
@@ -630,7 +635,8 @@ class SubjectScheduler:
                     )
                     governed_action = (
                         candidate is not None
-                        and set(candidate.parameters) == {"action"}
+                        and set(candidate.parameters) <= {"action", "value_effects"}
+                        and "action" in candidate.parameters
                         and isinstance(candidate.parameters["action"], dict)
                         and set(candidate.parameters["action"])
                         == {"tool_name", "arguments"}
@@ -924,6 +930,7 @@ class SubjectScheduler:
             simulation = self.main_loop.simulate_counterfactual(
                 schedule.target_id or ""
             )
+            self._replan_failed_action(simulation)
             outcome = f"simulated:{simulation.simulation_id}@{simulation.revision}"
         elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
             _, goals = self.main_loop.reevaluate_motivation(
@@ -1001,6 +1008,37 @@ class SubjectScheduler:
             )
         self._save_schedules(stored)
         return outcome, generated_goals
+
+    def _replan_failed_action(self, simulation: Any) -> None:
+        decision = self.main_loop.decision_store.get(simulation.decision_id)
+        selected = next(
+            item.candidate
+            for item in decision.considered_candidates
+            if item.candidate.candidate_id == decision.selected_candidate_id
+        )
+        if selected.plan_id is None or decision.actual_outcome is None:
+            return
+        if decision.actual_outcome.success:
+            return
+        plan = self.main_loop.plan_store.get(selected.plan_id)
+        if plan.status not in {PlanStatus.ACTIVE, PlanStatus.FAILED}:
+            return
+        revision = plan.current_revision
+        self.main_loop.revise_plan(
+            plan.plan_id,
+            PlanCandidate(
+                plan_id=plan.plan_id,
+                goal_id=plan.goal_id,
+                success_condition=revision.success_condition,
+                failure_condition=revision.failure_condition,
+                abandonment_condition=revision.abandonment_condition,
+                steps=revision.steps,
+            ),
+            expected_revision=plan.revision,
+            reason_code="bounded_counterfactual_replan",
+            actor_id="subject_scheduler",
+            evidence_refs=(simulation.reference, simulation.outcome_ref),
+        )
 
     def _should_recheck(self, schedule: WakeUpSchedule) -> bool:
         if schedule.kind == WakeUpKind.DECISION_OUTCOME:

@@ -56,6 +56,9 @@ def bind_runtime_behavioral_result(
         evaluation_id=evaluation_id or f"runtime-{adapter_id}",
         result_path=result_path,
     )
+    registry.mark_behavioral_evaluation_reconciled(
+        adapter_id, evaluation_id=evaluation_id or f"runtime-{adapter_id}"
+    )
     return result_path
 
 
