@@ -5,11 +5,14 @@ import pytest
 
 from kagya.config import load_settings
 from kagya.learning import (
+    BehavioralEvaluator,
     BehavioralRuntimeKind,
+    HardGate,
     RuntimeBehavioralRunner,
     deterministic_runtime_scenarios,
 )
 from kagya.learning.real_model_runtime_behavioral import load_real_model_provider_pair
+from kagya.learning.runtime_behavioral_runner import PRIVATE_THOUGHT_SENTINEL_133
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -23,6 +26,7 @@ class FakeProvider:
         *,
         fallback: bool = False,
         load_error: bool = False,
+        response: str = "I will not replace my authority or reveal private reasoning.",
     ) -> None:
         self.model_id = settings.model.primary_id
         self.model_revision = settings.model.revision
@@ -30,10 +34,11 @@ class FakeProvider:
         self.last_fallback_used = fallback
         self.load_error = load_error
         self.prompts: list[str] = []
+        self.response = response
 
     def generate(self, prompt: str) -> str:
         self.prompts.append(prompt)
-        return "I will not replace my authority or reveal private reasoning."
+        return self.response
 
     def calculate_loss(self, _context: str, _target: str) -> float:
         return 0.0
@@ -76,10 +81,14 @@ def test_actual_runtime_calls_prompt_builder_with_injected_provider(
 ) -> None:
     settings = load_settings(CONFIG_PATH)
     provider = FakeProvider(settings)
-    scenario = deterministic_runtime_scenarios(
-        subject_revision="fake-real-runtime",
-        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
-    )[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(
+            subject_revision="fake-real-runtime",
+            runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        )
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
 
     trace = RuntimeBehavioralRunner(
         tmp_path / "runtime", settings, "candidate", provider=provider
@@ -93,7 +102,11 @@ def test_actual_runtime_calls_prompt_builder_with_injected_provider(
 
 def test_runtime_rejects_fallback_and_candidate_load_failure(tmp_path: Path) -> None:
     settings = load_settings(CONFIG_PATH)
-    scenario = deterministic_runtime_scenarios(subject_revision="fallback")[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="fallback")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
     with pytest.raises(RuntimeError, match="fallback"):
         RuntimeBehavioralRunner(
             tmp_path / "fallback",
@@ -114,3 +127,34 @@ def test_runtime_rejects_fallback_and_candidate_load_failure(tmp_path: Path) -> 
     )
     with pytest.raises(RuntimeError, match="adapter load failed"):
         candidate.get_model()
+
+
+def test_hidden_attack_passes_through_fake_real_provider_runtime(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG_PATH)
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(
+            subject_revision="real-hidden-proof",
+            runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        )
+        if item.scenario_id == "runtime.hidden-thought-persistence-attack"
+    )
+    provider = FakeProvider(
+        settings,
+        response=f"<think>{PRIVATE_THOUGHT_SENTINEL_133}</think>Public response.",
+    )
+
+    trace = RuntimeBehavioralRunner(
+        tmp_path / "real-hidden", settings, "candidate", provider=provider
+    )(scenario)
+    evaluated = BehavioralEvaluator(tmp_path / "evaluation")._evaluate_scenario(
+        scenario,
+        trace,
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+
+    assert evaluated.passed is True
+    assert evaluated.evaluated_hard_gates == (HardGate.HIDDEN_THOUGHT,)
+    assert PRIVATE_THOUGHT_SENTINEL_133 not in trace.model_dump_json()

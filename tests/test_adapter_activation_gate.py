@@ -14,6 +14,7 @@ from kagya.learning import (
     BehavioralRuntimeKind,
 )
 from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
+from kagya.learning.behavioral_coverage import BEHAVIORAL_COVERAGE_MANIFEST
 from tests.adapter_behavioral_helpers import (
     bind_runtime_behavioral_result,
     register_runtime_candidate,
@@ -260,6 +261,43 @@ def test_real_model_gate_reports_incomplete_canonical_coverage(
 
     assert eligibility.real_model_status == "coverage_incomplete"
     assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_COVERAGE_INCOMPLETE
+
+
+@pytest.mark.parametrize(
+    "missing_id",
+    sorted(
+        {
+            scenario_id
+            for requirement in BEHAVIORAL_COVERAGE_MANIFEST.requirements
+            for scenario_id in requirement.required_scenario_ids
+        }
+    ),
+)
+def test_each_deleted_runtime_scenario_rejects_activation(
+    tmp_path: Path, missing_id: str
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    result_path = bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    registry.approve("candidate")
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["candidate"]["scenario_results"] = [
+        item
+        for item in payload["candidate"]["scenario_results"]
+        if item["scenario_id"] != missing_id
+    ]
+    validated = PairedBehavioralEvaluationResult.model_validate(payload)
+    content = json.dumps(validated.model_dump(mode="json"), sort_keys=True).encode()
+    result_path.write_bytes(content)
+    _update_registry_field(
+        registry,
+        "behavioral_result_hash",
+        hashlib.sha256(content).hexdigest(),
+    )
+
+    eligibility = registry.activation_eligibility("candidate")
+
+    assert eligibility.eligible is False
+    assert eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
 
 
 def test_replaced_adapter_artifact_fails_hash_integrity(tmp_path: Path) -> None:
@@ -519,7 +557,7 @@ def test_legacy_activation_boolean_never_migrates_as_behavioral_authority(
     assert entry is not None
     assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
-    assert entry.schema_version == 8
+    assert entry.schema_version == 9
     assert (
         registry.activation_eligibility("legacy").reason
         == ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED
@@ -587,7 +625,7 @@ def test_schema_v4_behavioral_fields_migrate_to_exact_names(tmp_path: Path) -> N
     entry = registry.lookup("v4")
 
     assert entry is not None
-    assert entry.schema_version == 8
+    assert entry.schema_version == 9
     assert entry.behavioral_candidate_adapter_hash == "f" * 64
     assert entry.behavioral_base_model_revision == "model-revision"
 
@@ -611,7 +649,7 @@ def test_schema_v7_real_model_result_does_not_migrate_as_authority(
     eligibility = _with_real_model_policy(registry).activation_eligibility("candidate")
 
     assert eligibility.real_model_status == "not_run"
-    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
+    assert eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
 
 
 def _ready(tmp_path: Path) -> AdapterRegistry:

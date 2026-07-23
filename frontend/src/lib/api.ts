@@ -179,10 +179,12 @@ export type Adapter = {
   subject_revision: string | null;
   fixture_set_hash: string | null;
   behavioral_artifact_state: string;
+  deterministic_coverage_status: "complete" | "incomplete" | "not_evaluated";
   deterministic_behavioral_artifact_status: BehavioralArtifactStatus;
   real_model_behavioral_evaluation_id: string | null;
   real_model_behavioral_gate_passed: boolean | null;
   real_model_behavioral_artifact_state: string;
+  real_model_coverage_status: "complete" | "incomplete" | "not_evaluated";
   real_model_behavioral_artifact_status: BehavioralArtifactStatus;
   behavioral_artifact_hash_match: "passed" | "failed" | "not_run";
   activation_eligibility_reason: string;
@@ -206,8 +208,10 @@ export type AdapterBehavioralStatus = {
   policy: "real_model_required" | "deterministic_runtime_only" | "disabled";
   ordinary_gates: Record<string, "passed" | "failed" | "not_run">;
   deterministic_status: "not_run" | "failed" | "stale" | "corrupt" | "hash_mismatch" | "coverage_incomplete" | "passed";
+  deterministic_coverage: "complete" | "incomplete" | "not_evaluated";
   deterministic_artifact: BehavioralArtifactStatus;
   real_status: "not_run" | "failed" | "stale" | "corrupt" | "hash_mismatch" | "coverage_incomplete" | "passed";
+  real_coverage: "complete" | "incomplete" | "not_evaluated";
   real_required: boolean;
   real_artifact: BehavioralArtifactStatus;
   activation_eligible: boolean;

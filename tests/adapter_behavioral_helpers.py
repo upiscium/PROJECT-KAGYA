@@ -19,6 +19,7 @@ from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResul
 from kagya.learning.runtime_behavioral_runner import (
     deterministic_runtime_scenarios,
 )
+from kagya.learning.behavioral_coverage import BEHAVIORAL_COVERAGE_MANIFEST
 from kagya.training.artifacts import sha256_file_map
 
 
@@ -146,6 +147,8 @@ def write_runtime_behavioral_result(
         "policy_revision": "test-policy-v1",
         "state_schema_version": 1,
         "evaluator_implementation_hash": "e" * 64,
+        "coverage_manifest_revision": BEHAVIORAL_COVERAGE_MANIFEST.revision,
+        "coverage_manifest_hash": BEHAVIORAL_COVERAGE_MANIFEST.sha256,
     }
     manifest_payload.update(manifest_updates or {})
     manifest = BehavioralEvaluationManifest.model_validate(manifest_payload)
@@ -158,6 +161,14 @@ def write_runtime_behavioral_result(
                 **source_scenario,
                 "scenario_id": item.scenario_id,
                 "dimensions": [dimension.value for dimension in item.dimensions],
+                "runtime_kind": runtime_kind.value,
+                "evaluated_hard_gates": (
+                    [
+                        requirement.hard_gate.value
+                        for requirement in BEHAVIORAL_COVERAGE_MANIFEST.hard_gate_requirements
+                        if requirement.required_scenario_id == item.scenario_id
+                    ]
+                ),
             }
             for item in runtime_scenarios
         ]
@@ -165,7 +176,11 @@ def write_runtime_behavioral_result(
             dimension for item in runtime_scenarios for dimension in item.dimensions
         }
         payload[subject_key]["dimension_scores"] = [
-            {**source_dimension, "dimension": dimension.value}
+            {
+                **source_dimension,
+                "dimension": dimension.value,
+                "coverage_status": "passed" if passed else "failed",
+            }
             for dimension in sorted(dimensions, key=lambda item: item.value)
         ]
     payload["fixture_hashes"] = runtime_fixture_hashes
@@ -188,6 +203,14 @@ def write_runtime_behavioral_result(
                 else False
             ),
             "manifest": manifest.model_dump(mode="json"),
+            "coverage_complete": True,
+            "missing_dimensions": [],
+            "missing_hard_gates": [],
+            "executed_scenarios": sorted(
+                item.scenario_id for item in runtime_scenarios
+            ),
+            "coverage_manifest_revision": BEHAVIORAL_COVERAGE_MANIFEST.revision,
+            "coverage_manifest_hash": BEHAVIORAL_COVERAGE_MANIFEST.sha256,
         }
     )
     runtime_result = PairedBehavioralEvaluationResult.model_validate(payload)

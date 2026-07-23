@@ -136,11 +136,13 @@ class AdapterEntry:
     real_model_subject_revision: str | None = None
     real_model_fixture_set_hash: str | None = None
     real_model_behavioral_artifact_state: str = "unbound"
+    deterministic_coverage_complete: bool | None = None
+    real_model_coverage_complete: bool | None = None
     legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 8
+    schema_version: int = 9
 
     @property
     def activation_gate_passed(self) -> bool:
@@ -167,6 +169,7 @@ class AdapterEntry:
         schema_version = int(data.get("schema_version", 1))
         legacy_gate = schema_version < 4
         legacy_registry = schema_version < 8
+        legacy_coverage = schema_version < 9
         entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
@@ -290,6 +293,12 @@ class AdapterEntry:
             real_model_behavioral_artifact_state="unbound"
             if legacy_registry
             else str(data.get("real_model_behavioral_artifact_state", "unbound")),
+            deterministic_coverage_complete=None
+            if legacy_coverage
+            else _optional_bool(data.get("deterministic_coverage_complete")),
+            real_model_coverage_complete=None
+            if legacy_coverage
+            else _optional_bool(data.get("real_model_coverage_complete")),
             legacy_activation_warning=bool(
                 data.get("legacy_activation_warning", False)
                 or (legacy_registry and status == AdapterStatus.ACTIVE)
@@ -297,7 +306,7 @@ class AdapterEntry:
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=8,
+            schema_version=9,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -570,6 +579,7 @@ class AdapterRegistry:
                     real_model_subject_revision=manifest.subject_revision,
                     real_model_fixture_set_hash=manifest.fixture_set_hash,
                     real_model_behavioral_artifact_state="finalized",
+                    real_model_coverage_complete=result.coverage_complete,
                 )
             return self._replace_locked(
                 entries,
@@ -583,6 +593,7 @@ class AdapterRegistry:
                 subject_revision=manifest.subject_revision,
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="finalized",
+                deterministic_coverage_complete=result.coverage_complete,
             )
 
     def prepare_behavioral_evaluation(
@@ -626,6 +637,7 @@ class AdapterRegistry:
                     real_model_subject_revision=manifest.subject_revision,
                     real_model_fixture_set_hash=manifest.fixture_set_hash,
                     real_model_behavioral_artifact_state="prepared",
+                    real_model_coverage_complete=result.coverage_complete,
                 )
             return self._replace_locked(
                 entries,
@@ -639,6 +651,7 @@ class AdapterRegistry:
                 subject_revision=manifest.subject_revision,
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="prepared",
+                deterministic_coverage_complete=result.coverage_complete,
             )
 
     def finalize_behavioral_evaluation(
@@ -696,12 +709,14 @@ class AdapterRegistry:
                     adapter_id,
                     real_model_behavioral_artifact_state="quarantined",
                     real_model_behavioral_gate_passed=False,
+                    real_model_coverage_complete=False,
                 )
             return self._replace_locked(
                 entries,
                 adapter_id,
                 behavioral_artifact_state="quarantined",
                 behavioral_gate_passed=False,
+                deterministic_coverage_complete=False,
             )
 
     def mark_behavioral_evaluation_reconciled(
@@ -1198,7 +1213,10 @@ def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
             ActivationEligibilityReason.BEHAVIORAL_RESULT_SCHEMA_INVALID,
             "Behavioral evaluation has no manifest",
         )
-    if not _result_coverage_complete(result):
+    if (
+        entry.deterministic_coverage_complete is not True
+        or not _result_coverage_complete(result)
+    ):
         return _ineligible(
             ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE,
             "Deterministic runtime behavioral coverage is incomplete",
@@ -1343,7 +1361,12 @@ def _behavioral_binding_status(
     expected_runtime = "real_model_runtime" if real_model else "deterministic_runtime"
     if result.runtime_kind.value != expected_runtime or manifest is None:
         return BehavioralEvidenceStatus.STALE
-    if not _result_coverage_complete(result):
+    registry_coverage = (
+        entry.real_model_coverage_complete
+        if real_model
+        else entry.deterministic_coverage_complete
+    )
+    if registry_coverage is not True or not _result_coverage_complete(result):
         return BehavioralEvidenceStatus.COVERAGE_INCOMPLETE
     registry_adapter_hash = (
         entry.real_model_behavioral_candidate_adapter_hash
@@ -1396,44 +1419,40 @@ def _behavioral_binding_status(
 
 
 def _result_coverage_complete(result: PairedBehavioralEvaluationResult) -> bool:
-    from kagya.learning.runtime_behavioral_runner import (
-        deterministic_runtime_scenarios,
+    from kagya.learning.behavioral_coverage import (
+        BEHAVIORAL_COVERAGE_MANIFEST,
+        evaluate_behavioral_coverage,
     )
 
     manifest = result.manifest
     if manifest is None:
         return False
-    expected_scenarios = deterministic_runtime_scenarios(
-        subject_revision=manifest.subject_revision,
-        runtime_kind=result.runtime_kind,
-    )
-    expected_ids = {item.scenario_id for item in expected_scenarios}
-    expected_dimensions = {
-        item.scenario_id: set(item.dimensions) for item in expected_scenarios
+    expected_ids = {
+        scenario_id
+        for requirement in BEHAVIORAL_COVERAGE_MANIFEST.requirements
+        for scenario_id in requirement.required_scenario_ids
+    } | {
+        requirement.required_scenario_id
+        for requirement in BEHAVIORAL_COVERAGE_MANIFEST.hard_gate_requirements
     }
     fixture_ids = set(result.fixture_hashes)
-    baseline_results = {
-        item.scenario_id: set(item.dimensions)
-        for item in result.baseline.scenario_results
-    }
-    candidate_results = {
-        item.scenario_id: set(item.dimensions)
-        for item in result.candidate.scenario_results
-    }
+    baseline_ids = {item.scenario_id for item in result.baseline.scenario_results}
+    candidate_ids = {item.scenario_id for item in result.candidate.scenario_results}
     reproducibility_ids = set(result.reproducibility)
-    baseline_dimensions = {item.dimension for item in result.baseline.dimension_scores}
-    candidate_dimensions = {item.dimension for item in result.candidate.dimension_scores}
-    required_dimensions = {
-        dimension for dimensions in expected_dimensions.values() for dimension in dimensions
-    }
-    return bool(expected_ids) and (
-        expected_ids
-        == fixture_ids
-        == set(baseline_results)
-        == set(candidate_results)
-        == reproducibility_ids
-        and baseline_results == candidate_results == expected_dimensions
-        and baseline_dimensions == candidate_dimensions == required_dimensions
+    coverage = evaluate_behavioral_coverage(
+        result.baseline, result.candidate, result.runtime_kind
+    )
+    return (
+        expected_ids == fixture_ids == baseline_ids == candidate_ids == reproducibility_ids
+        and manifest.coverage_manifest_revision == BEHAVIORAL_COVERAGE_MANIFEST.revision
+        and manifest.coverage_manifest_hash == BEHAVIORAL_COVERAGE_MANIFEST.sha256
+        and result.coverage_manifest_revision == BEHAVIORAL_COVERAGE_MANIFEST.revision
+        and result.coverage_manifest_hash == BEHAVIORAL_COVERAGE_MANIFEST.sha256
+        and result.coverage_complete == coverage.complete
+        and result.missing_dimensions == coverage.missing_dimensions
+        and result.missing_hard_gates == coverage.missing_hard_gates
+        and result.executed_scenarios == coverage.executed_scenarios
+        and coverage.complete
     )
 
 

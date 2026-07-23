@@ -1,9 +1,16 @@
+from dataclasses import asdict
+import json
 from pathlib import Path
 
-from kagya.config import load_settings
+from kagya.api.routes.evaluations import (
+    get_behavioral_evaluation,
+    get_behavioral_failure_artifact,
+)
+from kagya.config import Settings, load_settings
 from kagya.learning import (
     BehavioralRuntimeKind,
     BehavioralEvaluator,
+    HardGate,
     RuntimeBehaviorClassifier,
     RuntimeBehaviorObservation,
     StateTransition,
@@ -15,9 +22,18 @@ from kagya.learning import (
     run_deterministic_runtime_evaluation,
     scenario_fixture_hash,
     subject_completion_scenarios,
+    SubjectRuntimeHarness,
+)
+from kagya.training.dataset_governance import (
+    DatasetCandidate,
+    DatasetGovernanceStore,
+    DatasetProvenance,
 )
 from kagya.training.artifacts import sha256_file_map
-from kagya.learning.runtime_behavioral_runner import _manifest
+from kagya.learning.runtime_behavioral_runner import (
+    PRIVATE_THOUGHT_SENTINEL_133,
+    _manifest,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -212,7 +228,11 @@ def test_disabling_each_authoritative_connection_fails_runtime_suite(
 def test_failed_action_produces_mixed_attribution_bounded_counterfactual_and_replan(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="failure-test")[6]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="failure-test")
+        if item.scenario_id == "runtime.action-failure-counterfactual-replan"
+    )
 
     trace = DeterministicRuntimeRunner(
         tmp_path / "failure", load_settings(CONFIG_PATH), "candidate"
@@ -338,7 +358,11 @@ def test_ambiguous_defer_uses_chat_without_authority_or_action_mutation(
 def test_prompt_injection_is_classified_from_actual_prompt_response_and_state(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="injection-test")[3]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="injection-test")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
     runner = DeterministicRuntimeRunner(
         tmp_path / "injection", load_settings(CONFIG_PATH), "candidate"
     )
@@ -360,7 +384,11 @@ def test_prompt_injection_is_classified_from_actual_prompt_response_and_state(
 def test_external_commitment_requires_acceptance_and_persists_after_restart(
     tmp_path: Path,
 ) -> None:
-    scenario = deterministic_runtime_scenarios(subject_revision="commitment-test")[5]
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="commitment-test")
+        if item.scenario_id == "runtime.commitment-continuity"
+    )
 
     trace = DeterministicRuntimeRunner(
         tmp_path / "commitment", load_settings(CONFIG_PATH), "candidate"
@@ -372,3 +400,149 @@ def test_external_commitment_requires_acceptance_and_persists_after_restart(
     assert commitment["identity_origin"]["endorsement"] == "endorsed"
     assert commitment["acceptance_ref"] == "subject_acceptance:behavioral-commitment"
     assert [item["to_status"] for item in commitment["transitions"]] == ["active"]
+
+
+def test_hidden_thought_paired_runtime_never_persists_or_serializes_sentinel(
+    tmp_path: Path,
+) -> None:
+    settings = _runtime_settings(tmp_path)
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="hidden-paired")
+        if item.scenario_id == "runtime.hidden-thought-persistence-attack"
+    )
+    adapter_path = tmp_path / "candidate-adapter"
+    adapter_path.mkdir()
+    adapter_content = b'{"adapter":"hidden-paired"}'
+    (adapter_path / "adapter_config.json").write_bytes(adapter_content)
+    adapter_hash = sha256_file_map(
+        {"adapter/adapter_config.json": adapter_content}
+    )
+    fixture_hashes = {scenario.scenario_id: scenario_fixture_hash(scenario)}
+    manifest = _manifest(
+        settings,
+        candidate_id="candidate",
+        candidate_adapter_path=adapter_path,
+        candidate_adapter_hash=adapter_hash,
+        base_model_revision="hidden-test-revision",
+        subject_revision="hidden-paired",
+        fixture_hashes=fixture_hashes,
+    )
+    runtime_root = tmp_path / "runtime"
+    baseline_trace = DeterministicRuntimeRunner(
+        runtime_root / "baseline", settings, "baseline"
+    )(scenario)
+    candidate_trace = DeterministicRuntimeRunner(
+        runtime_root / "candidate", settings, "candidate"
+    )(scenario)
+    assert baseline_trace.verified_hard_gates == (HardGate.HIDDEN_THOUGHT,)
+    assert candidate_trace.verified_hard_gates == (HardGate.HIDDEN_THOUGHT,)
+
+    evaluator = BehavioralEvaluator(settings.adapter_registry.eval_result_dir)
+    result = evaluator.evaluate_pair(
+        "hidden-paired",
+        [scenario],
+        baseline_id="baseline",
+        baseline_runner=lambda _scenario: baseline_trace,
+        candidate_id="candidate",
+        candidate_runner=lambda _scenario: candidate_trace,
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+        manifest=manifest,
+    )
+    assert result.candidate.scenario_results[0].passed is True
+    assert result.candidate.scenario_results[0].evaluated_hard_gates == (
+        HardGate.HIDDEN_THOUGHT,
+    )
+
+    leaked_trace = candidate_trace.model_copy(
+        update={"public_payload": {"response": PRIVATE_THOUGHT_SENTINEL_133}}
+    )
+    failed = evaluator.evaluate_pair(
+        "hidden-failure-runtime",
+        [scenario],
+        baseline_id="baseline",
+        baseline_runner=lambda _scenario: baseline_trace,
+        candidate_id="candidate",
+        candidate_runner=lambda _scenario: leaked_trace,
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+        manifest=manifest,
+    )
+    assert failed.candidate.scenario_results[0].passed is False
+
+    dataset_root = tmp_path / "datasets"
+    DatasetGovernanceStore(dataset_root).create_revision(
+        [
+            DatasetCandidate(
+                input="ordinary bounded observation",
+                output="Public response.",
+                provenance=DatasetProvenance("episode", "hidden-paired"),
+            )
+        ],
+        source_job_id="hidden-paired",
+    )
+
+    retrieval_payloads: list[str] = []
+    for subject in ("baseline", "candidate"):
+        root = runtime_root / subject / scenario.scenario_id
+        assert (root / "agent_state.json").is_file()
+        assert (root / "event_journal.jsonl").is_file()
+        assert (root / "private" / "state_wal.jsonl").is_file()
+        harness = SubjectRuntimeHarness(
+            root, settings, subject_id=subject
+        ).create().start()
+        assert harness.graph is not None
+        memory = harness.graph.memory_system
+        retrieval_payloads.append(
+            json.dumps(
+                asdict(memory.retrieve_context(PRIVATE_THOUGHT_SENTINEL_133)),
+                sort_keys=True,
+                default=str,
+            )
+        )
+        retrieval_payloads.append(
+            json.dumps(memory.db2.get(), sort_keys=True, default=str)
+        )
+        harness.shutdown()
+
+    api_payloads = (
+        get_behavioral_evaluation("hidden-paired", settings).model_dump_json(),
+        get_behavioral_failure_artifact(
+            "hidden-failure-runtime",
+            f"{scenario.scenario_id}.json",
+            settings,
+        ).model_dump_json(),
+    )
+    serialized_boundaries = (
+        baseline_trace.model_dump_json(),
+        candidate_trace.model_dump_json(),
+        result.model_dump_json(),
+        *retrieval_payloads,
+        *api_payloads,
+    )
+    assert all(
+        PRIVATE_THOUGHT_SENTINEL_133 not in value
+        for value in serialized_boundaries
+    )
+    assert "[redacted]" in api_payloads[1]
+
+    for root in (
+        runtime_root,
+        settings.adapter_registry.eval_result_dir,
+        dataset_root,
+    ):
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                assert (
+                    PRIVATE_THOUGHT_SENTINEL_133.encode() not in path.read_bytes()
+                ), path
+
+
+def _runtime_settings(tmp_path: Path) -> Settings:
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_result_dir": tmp_path / "evaluation"}
+            )
+        }
+    )
