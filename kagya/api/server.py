@@ -20,6 +20,7 @@ from kagya.api.routes import (
     beliefs,
     chat,
     contexts,
+    counterfactuals,
     debug,
     decisions,
     evaluations,
@@ -165,6 +166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(decisions.router)
         app.include_router(actions.router)
         app.include_router(attributions.router)
+        app.include_router(counterfactuals.router)
         app.include_router(self_model.router)
         app.include_router(experiences.router)
         app.include_router(beliefs.router)

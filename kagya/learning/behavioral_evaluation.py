@@ -49,6 +49,7 @@ class BehavioralDimension(StrEnum):
     TOOL_SAFETY = "tool_safety"
     PROACTIVE_OUTBOX = "proactive_outbox"
     AGENCY_ATTRIBUTION = "agency_attribution"
+    COUNTERFACTUAL_CALIBRATION = "counterfactual_calibration"
 
 
 class HardGate(StrEnum):
@@ -460,6 +461,99 @@ def agency_attribution_scenarios(
                 kind=InvariantKind.PATH_EQUALS,
                 path=("attribution", "revision"),
                 expected=2,
+            ),
+        ),
+    )
+
+
+def counterfactual_simulation_scenarios(
+    *, subject_revision: str = "phase-11-counterfactual"
+) -> tuple[BehavioralScenario, ...]:
+    """Return deterministic gates for bounded alternatives and non-fabrication."""
+
+    reproducibility = ReproducibilityMetadata(
+        subject_revision=subject_revision,
+        fixture_revision="counterfactual-v1",
+        seed=143,
+        clock=datetime(2026, 7, 23, 13, tzinfo=UTC),
+    )
+
+    def scenario(
+        scenario_id: str,
+        initial: dict[str, JsonValue],
+        event_type: str,
+        transition: StateTransition,
+        invariant: BehavioralInvariant,
+    ) -> BehavioralScenario:
+        return BehavioralScenario(
+            scenario_id=scenario_id,
+            dimensions=(
+                BehavioralDimension.COUNTERFACTUAL_CALIBRATION,
+                BehavioralDimension.DECISION_PROVENANCE,
+                BehavioralDimension.UNCERTAINTY_CALIBRATION,
+            ),
+            initial_authoritative_state=initial,
+            observations=(
+                ExternalObservation(
+                    sequence=1,
+                    event_type=event_type,
+                    source="post_attribution_scheduler",
+                ),
+            ),
+            expected_transitions=(TransitionExpectation(transition=transition),),
+            expected_public_behavior=PublicBehaviorClass.NO_OP,
+            invariants=(invariant,),
+            reproducibility=reproducibility,
+        )
+
+    return (
+        scenario(
+            "counterfactual.regret-remains-confidence-bounded",
+            {"counterfactual": {"confidence": 0.0}, "outcome": {"utility": -0.5}},
+            "plausible_unchosen_alternative",
+            StateTransition(
+                path=("counterfactual",),
+                kind=TransitionKind.CREATE,
+                evidence_refs=("decision:one", "agency-attribution:one@1"),
+            ),
+            BehavioralInvariant(
+                invariant_id="observed-outcome-remains-authoritative",
+                kind=InvariantKind.PATH_EQUALS,
+                path=("outcome", "utility"),
+                expected=-0.5,
+            ),
+        ),
+        scenario(
+            "counterfactual.no-alternative-no-inference",
+            {"counterfactual": {"records": []}},
+            "no_valid_alternative",
+            StateTransition(
+                path=("counterfactual", "records"),
+                kind=TransitionKind.NO_OP,
+                before=[],
+                after=[],
+            ),
+            BehavioralInvariant(
+                invariant_id="no-fabricated-alternative",
+                kind=InvariantKind.PATH_EQUALS,
+                path=("counterfactual", "records"),
+                expected=[],
+            ),
+        ),
+        scenario(
+            "counterfactual.revision-is-deduplicated",
+            {"counterfactual": {"revisions": [1], "projection_keys": ["one"]}},
+            "later_structured_evidence",
+            StateTransition(
+                path=("counterfactual", "revisions"),
+                kind=TransitionKind.APPEND,
+                before=[1],
+                after=[1, 2],
+                side_effect_key="counterfactual:one@2",
+            ),
+            BehavioralInvariant(
+                invariant_id="counterfactual-projections-unique",
+                kind=InvariantKind.UNIQUE_SIDE_EFFECTS,
             ),
         ),
     )

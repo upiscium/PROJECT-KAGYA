@@ -52,6 +52,7 @@ class WakeUpKind(StrEnum):
     ACTION_INTENT = "action_intent"
     ACTION_EXECUTION = "action_execution"
     AGENCY_ATTRIBUTION = "agency_attribution"
+    COUNTERFACTUAL_SIMULATION = "counterfactual_simulation"
     OUTBOX_DEADLINE = "outbox_deadline"
     SLEEP_CONSOLIDATION = "sleep_consolidation"
     OPERATOR = "operator"
@@ -275,6 +276,7 @@ class SubjectScheduler:
                     WakeUpKind.ACTION_EXECUTION: AgentEventType.ACTION_EXECUTE,
                     WakeUpKind.ACTION_RETRY: AgentEventType.ACTION_EXECUTE,
                     WakeUpKind.AGENCY_ATTRIBUTION: AgentEventType.ATTRIBUTION_APPLY,
+                    WakeUpKind.COUNTERFACTUAL_SIMULATION: AgentEventType.COUNTERFACTUAL_APPLY,
                 }.get(schedule.kind, AgentEventType.AUTONOMY_WAKE)
                 outcome = self.runtime.execute(
                     event_type,
@@ -534,6 +536,52 @@ class SubjectScheduler:
                             WakeUpKind.AGENCY_ATTRIBUTION,
                             intent.updated_at,
                             intent.intent_id,
+                        )
+                    )
+                current_attribution = (
+                    None
+                    if attribution_store is None
+                    else attribution_store.current_for_intent(intent.intent_id)
+                )
+                counterfactual_store = getattr(
+                    self.main_loop, "counterfactual_store", None
+                )
+                current_simulation = (
+                    None
+                    if counterfactual_store is None or decision is None
+                    else counterfactual_store.current_for_decision(decision.decision_id)
+                )
+                has_alternatives = bool(
+                    decision is not None
+                    and any(
+                        item.eligible
+                        and item.candidate.candidate_id
+                        != decision.selected_candidate_id
+                        and item.candidate.predicted_outcomes
+                        for item in decision.considered_candidates
+                    )
+                )
+                if (
+                    current_attribution is not None
+                    and counterfactual_store is not None
+                    and has_alternatives
+                    and (
+                        current_simulation is None
+                        or current_simulation.revision
+                        < counterfactual_store.MAX_REVISIONS
+                    )
+                    and (
+                        current_simulation is None
+                        or current_simulation.agency_attribution_revision
+                        != current_attribution.revision
+                    )
+                ):
+                    schedules.append(
+                        self._derived(
+                            f"counterfactual:{current_attribution.attribution_id}:{current_attribution.revision}",
+                            WakeUpKind.COUNTERFACTUAL_SIMULATION,
+                            current_attribution.updated_at,
+                            current_attribution.attribution_id,
                         )
                     )
                 if intent.status.value == "approved":
@@ -872,6 +920,11 @@ class SubjectScheduler:
                 schedule.target_id or ""
             )
             outcome = f"attributed:{attribution.attribution_id}"
+        elif schedule.kind == WakeUpKind.COUNTERFACTUAL_SIMULATION:
+            simulation = self.main_loop.simulate_counterfactual(
+                schedule.target_id or ""
+            )
+            outcome = f"simulated:{simulation.simulation_id}@{simulation.revision}"
         elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
             _, goals = self.main_loop.reevaluate_motivation(
                 max_goal_proposals=goal_budget

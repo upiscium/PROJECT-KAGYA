@@ -2917,6 +2917,29 @@ def test_agency_attribution_admin_api_is_read_and_revise_only(
         ).status_code == 405
 
 
+def test_counterfactual_admin_api_is_read_and_revise_only(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/counterfactuals").status_code == 401
+        listed = client.get("/api/counterfactuals", headers=admin_headers())
+        assert listed.status_code == 200
+        assert listed.json() == {"counterfactuals": []}
+        assert client.get(
+            "/api/counterfactuals/not-created", headers=admin_headers()
+        ).status_code == 404
+        assert client.post(
+            "/api/counterfactuals",
+            headers=admin_headers(),
+            json={},
+        ).status_code == 405
+    assert "counterfactual_read" in {
+        record.event_type for record in EventJournal(settings.agent_journal.path).verify()
+    }
+    assert "counterfactual_read" in {
+        record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
+    }
+
+
 def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     settings = settings.model_copy(
