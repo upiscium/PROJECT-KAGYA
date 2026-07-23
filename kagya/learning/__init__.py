@@ -8,6 +8,7 @@ from kagya.learning.adapter_evaluator import (
 from kagya.learning.adapter_registry import (
     ActivationEligibility,
     ActivationEligibilityReason,
+    BehavioralEvidenceStatus,
     AdapterEntry,
     AdapterRegistry,
     AdapterStatus,
@@ -90,6 +91,7 @@ __all__ = [
     "ActionAttempt",
     "ActivationEligibility",
     "ActivationEligibilityReason",
+    "BehavioralEvidenceStatus",
     "BehavioralEvaluationManifest",
     "BehavioralArtifactRecord",
     "BehavioralArtifactStatus",

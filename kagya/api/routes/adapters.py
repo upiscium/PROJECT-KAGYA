@@ -2,9 +2,9 @@
 
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 
 from kagya.api.dependencies import (
     execute_agent_event,
@@ -12,7 +12,6 @@ from kagya.api.dependencies import (
     get_adapter_registry,
     get_adapter_runtime_manager,
     get_api_settings,
-    get_model_provider,
     get_runtime_event_log,
     require_admin,
 )
@@ -23,12 +22,13 @@ from kagya.api.schemas.adapter import (
     AdapterEvaluateResponse,
     AdapterBehavioralEvaluateRequest,
     AdapterBehavioralEvaluateResponse,
+    AdapterBehavioralStatusResponse,
     AdapterListResponse,
     AdapterResponse,
     AdapterActivationResponse,
     AdapterRuntimeStateResponse,
 )
-from kagya.config import Settings
+from kagya.config import BehavioralActivationPolicy, ProjectEnvironment, Settings
 from kagya.learning import (
     AdapterEntry,
     AdapterEvaluationResult,
@@ -42,7 +42,7 @@ from kagya.learning import (
     run_deterministic_runtime_evaluation,
     run_real_model_runtime_evaluation,
 )
-from kagya.models import ModelProvider, load_model_provider
+from kagya.models import load_model_provider
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -54,6 +54,9 @@ ArtifactStatusValue = Literal[
     "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
 ]
 ArtifactHashMatch = Literal["passed", "failed", "not_run"]
+BehavioralPolicyValue = Literal[
+    "real_model_required", "deterministic_runtime_only", "disabled"
+]
 
 
 @router.post(
@@ -77,9 +80,28 @@ def behavioral_evaluate_adapter(
         )
 
     try:
+        policy = settings.adapter_registry.behavioral_activation_policy
+        if policy == BehavioralActivationPolicy.DISABLED:
+            raise HTTPException(
+                status_code=403, detail="Behavioral evaluation is disabled by policy"
+            )
+        runtime_kind = (
+            "real_model_runtime"
+            if policy == BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+            else "deterministic_runtime"
+        )
+        if request.runtime_kind is not None and request.runtime_kind != runtime_kind:
+            raise HTTPException(
+                status_code=(
+                    403
+                    if settings.project.environment == ProjectEnvironment.PRODUCTION
+                    else 409
+                ),
+                detail=f"Behavioral runtime kind is fixed by policy to {runtime_kind}",
+            )
         evaluation_runner = (
             run_real_model_runtime_evaluation
-            if request.runtime_kind == "real_model_runtime"
+            if runtime_kind == "real_model_runtime"
             else run_deterministic_runtime_evaluation
         )
         result, artifact_status = evaluation_runner(
@@ -172,6 +194,51 @@ def adapter_runtime_state(
     )
 
 
+@router.get(
+    "/{adapter_id}/behavioral-evaluation-status",
+    response_model=AdapterBehavioralStatusResponse,
+)
+def behavioral_evaluation_status(
+    adapter_id: str,
+    settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+) -> AdapterBehavioralStatusResponse:
+    entry = registry.lookup(adapter_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown adapter: {adapter_id}")
+    eligibility = registry.activation_eligibility(adapter_id)
+    artifacts = {
+        item.evaluation_id: item
+        for item in BehavioralArtifactStore(
+            settings.adapter_registry.eval_result_dir
+        ).reconcile(registry)
+    }
+    return AdapterBehavioralStatusResponse(
+        adapter_id=adapter_id,
+        policy=settings.adapter_registry.behavioral_activation_policy,
+        ordinary_gates={
+            "quality": _gate_status(entry.quality_gate_passed),
+            "holdout": _gate_status(entry.holdout_gate_passed),
+            "drift": _gate_status(entry.drift_gate_passed),
+        },
+        deterministic_status=eligibility.deterministic_status,
+        deterministic_artifact=_artifact_status(
+            entry.behavioral_evaluation_id,
+            entry.behavioral_artifact_state,
+            artifacts,
+        ),
+        real_status=eligibility.real_model_status,
+        real_required=eligibility.real_model_required,
+        real_artifact=_artifact_status(
+            entry.real_model_behavioral_evaluation_id,
+            entry.real_model_behavioral_artifact_state,
+            artifacts,
+        ),
+        activation_eligible=eligibility.eligible,
+        activation_reason=eligibility.reason,
+    )
+
+
 @router.get("/{adapter_id}/provenance")
 def adapter_provenance(
     adapter_id: str,
@@ -223,8 +290,7 @@ def list_adapters(
 @router.post("/{adapter_id}/evaluate", response_model=AdapterEvaluateResponse)
 def evaluate_adapter(
     adapter_id: str,
-    request: AdapterEvaluateRequest,
-    http_request: Request,
+    _request: AdapterEvaluateRequest,
     settings: Settings = Depends(get_api_settings),
     registry: AdapterRegistry = Depends(get_adapter_registry),
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -237,10 +303,8 @@ def evaluate_adapter(
             source="api.adapters.evaluate",
             handler=lambda: _evaluate_candidate(
                 adapter_id,
-                request,
                 settings,
                 registry,
-                get_model_provider(http_request),
             ),
             payload={"adapter_id": adapter_id},
         ).value
@@ -408,26 +472,16 @@ def _transition(
     try:
         entry = registry.transition(adapter_id, status)
         _record_adapter_transition(event_log, entry, status.value)
-        return adapter_response(entry)
+        return adapter_response(entry, registry.activation_eligibility(adapter_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _evaluate_candidate(
     adapter_id: str,
-    request: AdapterEvaluateRequest,
     settings: Settings,
     registry: AdapterRegistry,
-    runtime_provider: ModelProvider,
 ) -> AdapterEvaluationResult:
-    if request.deterministic_score is not None:
-        return AdapterEvaluator(settings, registry).evaluate(
-            adapter_id,
-            runtime_provider,
-            deterministic_score=request.deterministic_score,
-            deterministic_dimensions=request.deterministic_dimensions,
-            deterministic_baselines=request.deterministic_baselines,
-        )
     entry = registry.lookup(adapter_id)
     if entry is None:
         raise ValueError(f"Unknown adapter: {adapter_id}")
@@ -451,7 +505,7 @@ def _approve(
 ) -> AdapterResponse:
     entry = registry.approve(adapter_id)
     _record_adapter_transition(event_log, entry, "approved")
-    return adapter_response(entry)
+    return adapter_response(entry, registry.activation_eligibility(adapter_id))
 
 
 def _activate(
@@ -471,7 +525,7 @@ def _activate(
         message="Adapter runtime activation completed",
         metadata=record.__dict__,
     )
-    return adapter_response(entry)
+    return adapter_response(entry, registry.activation_eligibility(adapter_id))
 
 
 def _record_adapter_transition(
@@ -601,6 +655,14 @@ def adapter_response(
         real_model_behavioral_required=bool(
             getattr(eligibility, "real_model_required", False)
         ),
+        behavioral_activation_policy=cast(
+            BehavioralPolicyValue,
+            getattr(
+                eligibility,
+                "policy",
+                BehavioralActivationPolicy.REAL_MODEL_REQUIRED,
+            ).value,
+        ),
         legacy_activation_warning=entry.legacy_activation_warning,
         rollout_state=entry.rollout_state,
         canary_failures=entry.canary_failures,
@@ -639,3 +701,7 @@ def _artifact_status(
 
 def _safe_path_reference(value: str | None) -> str | None:
     return None if value is None else Path(value).name
+
+
+def _gate_status(value: bool | None) -> Literal["passed", "failed", "not_run"]:
+    return "passed" if value is True else "failed" if value is False else "not_run"

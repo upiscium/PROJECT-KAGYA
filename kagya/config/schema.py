@@ -14,9 +14,22 @@ class StrictBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ProjectEnvironment(StrEnum):
+    PRODUCTION = "production"
+    DEVELOPMENT = "development"
+    TEST = "test"
+    CI = "ci"
+
+
+class BehavioralActivationPolicy(StrEnum):
+    REAL_MODEL_REQUIRED = "real_model_required"
+    DETERMINISTIC_RUNTIME_ONLY = "deterministic_runtime_only"
+    DISABLED = "disabled"
+
+
 class ProjectSettings(StrictBaseModel):
     name: str
-    environment: str
+    environment: ProjectEnvironment
 
 
 class ModelSettings(StrictBaseModel):
@@ -253,7 +266,9 @@ class AdapterRegistrySettings(StrictBaseModel):
     max_value_drift: float = Field(default=0.1, ge=0.0, le=1.0)
     max_behavior_drift: float = Field(default=0.1, ge=0.0, le=1.0)
     canary_failure_limit: int = Field(default=1, ge=1)
-    require_real_model_behavioral_gate: bool = False
+    behavioral_activation_policy: BehavioralActivationPolicy = (
+        BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+    )
 
 
 class ToolRegistrySettings(StrictBaseModel):
@@ -405,6 +420,31 @@ class Settings(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_deployment_topology(self) -> "Settings":
+        policy = self.adapter_registry.behavioral_activation_policy
+        environment = self.project.environment
+        if (
+            environment == ProjectEnvironment.PRODUCTION
+            and policy != BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+        ):
+            raise ValueError(
+                "production requires behavioral_activation_policy=real_model_required"
+            )
+        if (
+            policy == BehavioralActivationPolicy.DETERMINISTIC_RUNTIME_ONLY
+            and environment not in {
+                ProjectEnvironment.DEVELOPMENT,
+                ProjectEnvironment.TEST,
+                ProjectEnvironment.CI,
+            }
+        ):
+            raise ValueError(
+                "deterministic_runtime_only is limited to development, test, and ci"
+            )
+        if (
+            policy == BehavioralActivationPolicy.DISABLED
+            and environment != ProjectEnvironment.TEST
+        ):
+            raise ValueError("disabled behavioral activation is limited to test")
         mode = self.deployment.mode
         role = self.deployment.node.role
         training = self.deployment.training

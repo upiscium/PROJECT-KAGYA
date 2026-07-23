@@ -53,6 +53,24 @@ def migrate_config(raw_config: dict[str, Any]) -> tuple[dict[str, Any], list[str
         model["fallback_revision"] = "main"
         notes.append("model.fallback_revision migrated to main")
     migrated["model"] = model
+    adapter_registry = dict(migrated.get("adapter_registry", {}))
+    legacy_real_gate = adapter_registry.pop(
+        "require_real_model_behavioral_gate", None
+    )
+    if (
+        legacy_real_gate is not None
+        and "behavioral_activation_policy" not in adapter_registry
+    ):
+        adapter_registry["behavioral_activation_policy"] = (
+            "real_model_required"
+            if bool(legacy_real_gate)
+            else "deterministic_runtime_only"
+        )
+        notes.append(
+            "adapter_registry.require_real_model_behavioral_gate migrated to "
+            "behavioral_activation_policy"
+        )
+    migrated["adapter_registry"] = adapter_registry
     if "deployment" not in migrated:
         migrated["deployment"] = {
             "mode": "standalone",

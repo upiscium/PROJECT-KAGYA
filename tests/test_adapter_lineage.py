@@ -110,31 +110,24 @@ def test_holdout_and_identity_value_behavior_regressions_block_activation(
     registry = _registry(tmp_path)
     _candidate(registry, tmp_path, "candidate")
 
-    result = AdapterEvaluator(registry.settings, registry).evaluate(
+    entry = registry.apply_evaluation(
         "candidate",
-        DummyProvider(),
-        deterministic_score=0.95,
-        deterministic_dimensions={
-            "holdout": 0.7,
-            "identity": 0.7,
-            "value": 0.95,
-            "behavior": 0.95,
-        },
-        deterministic_baselines={
-            "holdout": 0.9,
-            "identity": 0.9,
-            "value": 0.9,
-            "behavior": 0.9,
-        },
+        score=0.95,
+        result_path=tmp_path / "fixture-evaluation.json",
+        holdout_score=0.7,
+        holdout_baseline_score=0.9,
+        drift_scores={"identity": -0.2, "value": 0.05, "behavior": 0.05},
+        quality_gate_passed=True,
+        holdout_gate_passed=False,
+        drift_gate_passed=False,
     )
 
-    entry = registry.lookup("candidate")
-    assert result.activation_gate_passed is False
-    assert result.holdout_score == 0.7
-    assert result.drift_scores == pytest.approx(
+    assert entry.activation_gate_passed is False
+    assert entry.holdout_score == 0.7
+    assert entry.drift_scores == pytest.approx(
         {"identity": -0.2, "value": 0.05, "behavior": 0.05}
     )
-    assert entry is not None and entry.status.value == "candidate"
+    assert entry.status.value == "trial_active"
     assert entry.holdout_regression is True
 
 

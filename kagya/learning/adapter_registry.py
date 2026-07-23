@@ -17,7 +17,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any
 import warnings
 
-from kagya.config import Settings
+from kagya.config import BehavioralActivationPolicy, Settings
 
 if TYPE_CHECKING:
     from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
@@ -50,9 +50,23 @@ class ActivationEligibilityReason(StrEnum):
     BEHAVIORAL_RESULT_TAMPERED = "behavioral_result_tampered"
     BEHAVIORAL_BINDING_MISMATCH = "behavioral_binding_mismatch"
     ADAPTER_ARTIFACT_MISMATCH = "adapter_artifact_mismatch"
-    REAL_MODEL_BEHAVIORAL_UNEVALUATED = "real_model_behavioral_unevaluated"
-    REAL_MODEL_BEHAVIORAL_FAILED = "real_model_behavioral_failed"
-    REAL_MODEL_BEHAVIORAL_STALE = "real_model_behavioral_stale"
+    BEHAVIORAL_COVERAGE_INCOMPLETE = "behavioral_coverage_incomplete"
+    REAL_MODEL_NOT_RUN = "real_model_not_run"
+    REAL_MODEL_FAILED = "real_model_failed"
+    REAL_MODEL_STALE = "real_model_stale"
+    REAL_MODEL_CORRUPT = "real_model_corrupt"
+    REAL_MODEL_HASH_MISMATCH = "real_model_hash_mismatch"
+    REAL_MODEL_COVERAGE_INCOMPLETE = "real_model_coverage_incomplete"
+
+
+class BehavioralEvidenceStatus(StrEnum):
+    NOT_RUN = "not_run"
+    FAILED = "failed"
+    STALE = "stale"
+    CORRUPT = "corrupt"
+    HASH_MISMATCH = "hash_mismatch"
+    COVERAGE_INCOMPLETE = "coverage_incomplete"
+    PASSED = "passed"
 
 
 @dataclass(frozen=True)
@@ -61,8 +75,9 @@ class ActivationEligibility:
     reason: ActivationEligibilityReason
     detail: str
     real_model_required: bool = False
-    deterministic_status: str = "not_run"
-    real_model_status: str = "not_run"
+    deterministic_status: BehavioralEvidenceStatus = BehavioralEvidenceStatus.NOT_RUN
+    real_model_status: BehavioralEvidenceStatus = BehavioralEvidenceStatus.NOT_RUN
+    policy: BehavioralActivationPolicy = BehavioralActivationPolicy.REAL_MODEL_REQUIRED
 
 
 @dataclass(frozen=True)
@@ -125,7 +140,7 @@ class AdapterEntry:
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 7
+    schema_version: int = 8
 
     @property
     def activation_gate_passed(self) -> bool:
@@ -151,6 +166,7 @@ class AdapterEntry:
         status = AdapterStatus(str(data.get("status", data.get("state"))))
         schema_version = int(data.get("schema_version", 1))
         legacy_gate = schema_version < 4
+        legacy_registry = schema_version < 8
         entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
@@ -247,41 +263,41 @@ class AdapterEntry:
             ),
             subject_revision=_optional_str(data.get("subject_revision")),
             fixture_set_hash=_optional_str(data.get("fixture_set_hash")),
-            real_model_behavioral_evaluation_id=_optional_str(
-                data.get("real_model_behavioral_evaluation_id")
-            ),
-            real_model_behavioral_evaluation_path=_optional_str(
-                data.get("real_model_behavioral_evaluation_path")
-            ),
-            real_model_behavioral_result_hash=_optional_str(
-                data.get("real_model_behavioral_result_hash")
-            ),
-            real_model_behavioral_gate_passed=_optional_bool(
-                data.get("real_model_behavioral_gate_passed")
-            ),
-            real_model_behavioral_candidate_adapter_hash=_optional_str(
-                data.get("real_model_behavioral_candidate_adapter_hash")
-            ),
-            real_model_behavioral_base_model_revision=_optional_str(
-                data.get("real_model_behavioral_base_model_revision")
-            ),
-            real_model_subject_revision=_optional_str(
-                data.get("real_model_subject_revision")
-            ),
-            real_model_fixture_set_hash=_optional_str(
-                data.get("real_model_fixture_set_hash")
-            ),
-            real_model_behavioral_artifact_state=str(
-                data.get("real_model_behavioral_artifact_state", "unbound")
-            ),
+            real_model_behavioral_evaluation_id=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_behavioral_evaluation_id")),
+            real_model_behavioral_evaluation_path=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_behavioral_evaluation_path")),
+            real_model_behavioral_result_hash=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_behavioral_result_hash")),
+            real_model_behavioral_gate_passed=None
+            if legacy_registry
+            else _optional_bool(data.get("real_model_behavioral_gate_passed")),
+            real_model_behavioral_candidate_adapter_hash=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_behavioral_candidate_adapter_hash")),
+            real_model_behavioral_base_model_revision=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_behavioral_base_model_revision")),
+            real_model_subject_revision=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_subject_revision")),
+            real_model_fixture_set_hash=None
+            if legacy_registry
+            else _optional_str(data.get("real_model_fixture_set_hash")),
+            real_model_behavioral_artifact_state="unbound"
+            if legacy_registry
+            else str(data.get("real_model_behavioral_artifact_state", "unbound")),
             legacy_activation_warning=bool(
                 data.get("legacy_activation_warning", False)
-                or (legacy_gate and status == AdapterStatus.ACTIVE)
+                or (legacy_registry and status == AdapterStatus.ACTIVE)
             ),
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=7,
+            schema_version=8,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -733,7 +749,7 @@ class AdapterRegistry:
         with self._locked(exclusive=False):
             entry = self._require_locked(self._list_locked(), adapter_id)
             return _activation_eligibility(
-                entry, self.settings.adapter_registry.require_real_model_behavioral_gate
+                entry, self.settings.adapter_registry.behavioral_activation_policy
             )
 
     def activate(
@@ -744,7 +760,7 @@ class AdapterRegistry:
             entry = self._require_locked(current_entries, adapter_id)
             self._ensure_transition(entry.status, AdapterStatus.ACTIVE)
             eligibility = _activation_eligibility(
-                entry, self.settings.adapter_registry.require_real_model_behavioral_gate
+                entry, self.settings.adapter_registry.behavioral_activation_policy
             )
             if not eligibility.eligible:
                 raise ValueError(
@@ -803,7 +819,7 @@ class AdapterRegistry:
             if target is not None:
                 eligibility = _activation_eligibility(
                     target,
-                    self.settings.adapter_registry.require_real_model_behavioral_gate,
+                    self.settings.adapter_registry.behavioral_activation_policy,
                 )
                 if not eligibility.eligible:
                     raise ValueError(
@@ -1108,7 +1124,7 @@ def _ineligible(
     return ActivationEligibility(False, reason, detail)
 
 
-def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
+def _ordinary_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
     gate_checks = (
         (
             entry.quality_gate_passed,
@@ -1134,6 +1150,15 @@ def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
             return _ineligible(missing, f"Adapter {name} gate has not been evaluated")
         if not gate:
             return _ineligible(failed, f"Adapter {name} gate failed")
+    return ActivationEligibility(
+        True, ActivationEligibilityReason.ELIGIBLE, "All ordinary gates passed"
+    )
+
+
+def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
+    ordinary = _ordinary_activation_eligibility(entry)
+    if not ordinary.eligible:
+        return ordinary
     if entry.behavioral_artifact_state != "reconciled":
         return _ineligible(
             ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED,
@@ -1173,6 +1198,11 @@ def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
             ActivationEligibilityReason.BEHAVIORAL_RESULT_SCHEMA_INVALID,
             "Behavioral evaluation has no manifest",
         )
+    if not _result_coverage_complete(result):
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE,
+            "Deterministic runtime behavioral coverage is incomplete",
+        )
     if (
         result.evaluation_id != entry.behavioral_evaluation_id
         or manifest.candidate_adapter_hash != entry.behavioral_candidate_adapter_hash
@@ -1209,80 +1239,201 @@ def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
 
 
 def _activation_eligibility(
-    entry: AdapterEntry, require_real_model: bool = False
+    entry: AdapterEntry,
+    policy: BehavioralActivationPolicy = BehavioralActivationPolicy.REAL_MODEL_REQUIRED,
 ) -> ActivationEligibility:
-    base = _base_activation_eligibility(entry)
+    real_required = policy == BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+    deterministic_status = _deterministic_binding_status(entry)
     real_status = _real_model_binding_status(entry)
+    if policy == BehavioralActivationPolicy.DISABLED:
+        ordinary = _ordinary_activation_eligibility(entry)
+        return ActivationEligibility(
+            ordinary.eligible,
+            ordinary.reason,
+            ordinary.detail,
+            False,
+            deterministic_status,
+            real_status,
+            policy,
+        )
+    base = _base_activation_eligibility(entry)
     if not base.eligible:
         return ActivationEligibility(
             base.eligible,
             base.reason,
             base.detail,
-            require_real_model,
-            "failed",
+            real_required,
+            deterministic_status,
             real_status,
+            policy,
         )
-    if require_real_model and real_status != "passed":
-        reason = (
-            ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_UNEVALUATED
-            if real_status == "not_run"
-            else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_FAILED
-            if real_status == "failed"
-            else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
-        )
+    if real_required and real_status != BehavioralEvidenceStatus.PASSED:
+        reasons = {
+            BehavioralEvidenceStatus.NOT_RUN: ActivationEligibilityReason.REAL_MODEL_NOT_RUN,
+            BehavioralEvidenceStatus.FAILED: ActivationEligibilityReason.REAL_MODEL_FAILED,
+            BehavioralEvidenceStatus.STALE: ActivationEligibilityReason.REAL_MODEL_STALE,
+            BehavioralEvidenceStatus.CORRUPT: ActivationEligibilityReason.REAL_MODEL_CORRUPT,
+            BehavioralEvidenceStatus.HASH_MISMATCH: ActivationEligibilityReason.REAL_MODEL_HASH_MISMATCH,
+            BehavioralEvidenceStatus.COVERAGE_INCOMPLETE: ActivationEligibilityReason.REAL_MODEL_COVERAGE_INCOMPLETE,
+        }
         return ActivationEligibility(
             False,
-            reason,
-            f"Required real-model behavioral gate is {real_status}",
+            reasons[real_status],
+            f"Required real-model behavioral gate is {real_status.value}",
             True,
-            "passed",
+            deterministic_status,
             real_status,
+            policy,
         )
     return ActivationEligibility(
         True,
         ActivationEligibilityReason.ELIGIBLE,
         "All required activation gates passed",
-        require_real_model,
-        "passed",
+        real_required,
+        deterministic_status,
         real_status,
+        policy,
     )
 
 
-def _real_model_binding_status(entry: AdapterEntry) -> str:
-    if entry.real_model_behavioral_evaluation_id is None:
-        return "not_run"
-    if entry.real_model_behavioral_artifact_state != "reconciled":
-        return "stale"
-    if entry.real_model_behavioral_evaluation_path is None:
-        return "corrupt"
+def _deterministic_binding_status(entry: AdapterEntry) -> BehavioralEvidenceStatus:
+    return _behavioral_binding_status(entry, real_model=False)
+
+
+def _real_model_binding_status(entry: AdapterEntry) -> BehavioralEvidenceStatus:
+    return _behavioral_binding_status(entry, real_model=True)
+
+
+def _behavioral_binding_status(
+    entry: AdapterEntry, *, real_model: bool
+) -> BehavioralEvidenceStatus:
+    evaluation_id = (
+        entry.real_model_behavioral_evaluation_id
+        if real_model
+        else entry.behavioral_evaluation_id
+    )
+    if evaluation_id is None:
+        return BehavioralEvidenceStatus.NOT_RUN
+    artifact_state = (
+        entry.real_model_behavioral_artifact_state
+        if real_model
+        else entry.behavioral_artifact_state
+    )
+    if artifact_state != "reconciled":
+        return BehavioralEvidenceStatus.STALE
+    evaluation_path = (
+        entry.real_model_behavioral_evaluation_path
+        if real_model
+        else entry.behavioral_evaluation_path
+    )
+    if evaluation_path is None:
+        return BehavioralEvidenceStatus.CORRUPT
     try:
-        result, result_hash = _load_behavioral_result(
-            Path(entry.real_model_behavioral_evaluation_path)
-        )
+        result, result_hash = _load_behavioral_result(Path(evaluation_path))
     except ValueError:
-        return "corrupt"
+        return BehavioralEvidenceStatus.CORRUPT
+    expected_hash = (
+        entry.real_model_behavioral_result_hash
+        if real_model
+        else entry.behavioral_result_hash
+    )
+    if result_hash != expected_hash:
+        return BehavioralEvidenceStatus.HASH_MISMATCH
     manifest = result.manifest
+    expected_runtime = "real_model_runtime" if real_model else "deterministic_runtime"
+    if result.runtime_kind.value != expected_runtime or manifest is None:
+        return BehavioralEvidenceStatus.STALE
+    if not _result_coverage_complete(result):
+        return BehavioralEvidenceStatus.COVERAGE_INCOMPLETE
+    registry_adapter_hash = (
+        entry.real_model_behavioral_candidate_adapter_hash
+        if real_model
+        else entry.behavioral_candidate_adapter_hash
+    )
+    registry_model_revision = (
+        entry.real_model_behavioral_base_model_revision
+        if real_model
+        else entry.behavioral_base_model_revision
+    )
+    registry_subject_revision = (
+        entry.real_model_subject_revision if real_model else entry.subject_revision
+    )
+    registry_fixture_hash = (
+        entry.real_model_fixture_set_hash if real_model else entry.fixture_set_hash
+    )
     if (
-        result.runtime_kind.value != "real_model_runtime"
-        or manifest is None
-        or result.evaluation_id != entry.real_model_behavioral_evaluation_id
-        or result_hash != entry.real_model_behavioral_result_hash
+        result.evaluation_id != evaluation_id
         or manifest.candidate_adapter_hash != entry.adapter_hash
-        or manifest.candidate_adapter_hash
-        != entry.real_model_behavioral_candidate_adapter_hash
+        or manifest.candidate_adapter_hash != registry_adapter_hash
         or manifest.base_model_revision != entry.base_model_revision
-        or manifest.base_model_revision
-        != entry.real_model_behavioral_base_model_revision
-        or manifest.subject_revision != entry.real_model_subject_revision
-        or manifest.fixture_set_hash != entry.real_model_fixture_set_hash
-        or _behavioral_binding_mismatch(entry, result) is not None
+        or manifest.base_model_revision != registry_model_revision
+        or manifest.subject_revision != registry_subject_revision
+        or manifest.fixture_set_hash != registry_fixture_hash
     ):
-        return "stale"
+        return BehavioralEvidenceStatus.STALE
+    mismatch = _behavioral_binding_mismatch(entry, result)
+    if mismatch is not None:
+        return (
+            BehavioralEvidenceStatus.HASH_MISMATCH
+            if mismatch.startswith("Adapter")
+            else BehavioralEvidenceStatus.STALE
+        )
+    registry_gate = (
+        entry.real_model_behavioral_gate_passed
+        if real_model
+        else entry.behavioral_gate_passed
+    )
+    result_gate = (
+        result.real_model_runtime_gate_passed
+        if real_model
+        else result.deterministic_runtime_gate_passed
+    )
     return (
-        "passed"
-        if entry.real_model_behavioral_gate_passed is True
-        and result.real_model_runtime_gate_passed is True
-        else "failed"
+        BehavioralEvidenceStatus.PASSED
+        if registry_gate is True and result_gate is True
+        else BehavioralEvidenceStatus.FAILED
+    )
+
+
+def _result_coverage_complete(result: PairedBehavioralEvaluationResult) -> bool:
+    from kagya.learning.runtime_behavioral_runner import (
+        deterministic_runtime_scenarios,
+    )
+
+    manifest = result.manifest
+    if manifest is None:
+        return False
+    expected_scenarios = deterministic_runtime_scenarios(
+        subject_revision=manifest.subject_revision,
+        runtime_kind=result.runtime_kind,
+    )
+    expected_ids = {item.scenario_id for item in expected_scenarios}
+    expected_dimensions = {
+        item.scenario_id: set(item.dimensions) for item in expected_scenarios
+    }
+    fixture_ids = set(result.fixture_hashes)
+    baseline_results = {
+        item.scenario_id: set(item.dimensions)
+        for item in result.baseline.scenario_results
+    }
+    candidate_results = {
+        item.scenario_id: set(item.dimensions)
+        for item in result.candidate.scenario_results
+    }
+    reproducibility_ids = set(result.reproducibility)
+    baseline_dimensions = {item.dimension for item in result.baseline.dimension_scores}
+    candidate_dimensions = {item.dimension for item in result.candidate.dimension_scores}
+    required_dimensions = {
+        dimension for dimensions in expected_dimensions.values() for dimension in dimensions
+    }
+    return bool(expected_ids) and (
+        expected_ids
+        == fixture_ids
+        == set(baseline_results)
+        == set(candidate_results)
+        == reproducibility_ids
+        and baseline_results == candidate_results == expected_dimensions
+        and baseline_dimensions == candidate_dimensions == required_dimensions
     )
 
 

@@ -5,8 +5,13 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from kagya.api.server import app
-from kagya.config import Settings, load_settings, validate_deployment_hostname
+from kagya.api.server import app, create_app
+from kagya.config import (
+    ProjectEnvironment,
+    Settings,
+    load_settings,
+    validate_deployment_hostname,
+)
 from kagya.config.check import main as config_check_main
 from kagya.config.compatibility import (
     COMPATIBILITY_FIELDS,
@@ -30,6 +35,47 @@ def test_config_yaml_loads_into_typed_settings() -> None:
 
     assert isinstance(settings, Settings)
     assert settings.project.name == read_raw_config()["project"]["name"]
+    assert settings.adapter_registry.behavioral_activation_policy.value == (
+        "deterministic_runtime_only"
+    )
+
+
+def test_production_requires_real_model_behavioral_policy() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["project"]["environment"] = "production"
+
+    with pytest.raises(ValidationError, match="production requires"):
+        Settings.model_validate(raw)
+
+
+def test_unknown_environment_fails_closed() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["project"]["environment"] = "staging"
+
+    with pytest.raises(ValidationError, match="environment"):
+        Settings.model_validate(raw)
+
+
+def test_disabled_behavioral_policy_is_test_only() -> None:
+    raw = deepcopy(read_raw_config())
+    raw["adapter_registry"]["behavioral_activation_policy"] = "disabled"
+
+    with pytest.raises(ValidationError, match="limited to test"):
+        Settings.model_validate(raw)
+
+
+def test_startup_revalidates_copied_production_policy() -> None:
+    settings = load_settings(CONFIG_PATH)
+    invalid = settings.model_copy(
+        update={
+            "project": settings.project.model_copy(
+                update={"environment": ProjectEnvironment.PRODUCTION}
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="production requires"):
+        create_app(invalid)
 
 
 def test_model_ids_come_from_config() -> None:
@@ -71,6 +117,25 @@ def test_legacy_config_migrates_explicitly_to_standalone(tmp_path: Path) -> None
     assert settings.deployment.training.backend.value == "local"
     assert any("standalone/all/local" in note for note in notes)
     assert any("model.revision" in note for note in notes)
+
+
+@pytest.mark.parametrize(
+    ("legacy_value", "expected"),
+    [(True, "real_model_required"), (False, "deterministic_runtime_only")],
+)
+def test_legacy_behavioral_gate_config_migrates_explicitly(
+    tmp_path: Path, legacy_value: bool, expected: str
+) -> None:
+    raw = read_raw_config()
+    del raw["adapter_registry"]["behavioral_activation_policy"]
+    raw["adapter_registry"]["require_real_model_behavioral_gate"] = legacy_value
+    path = tmp_path / "legacy-policy.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    settings, notes = load_settings_with_notes(path)
+
+    assert settings.adapter_registry.behavioral_activation_policy.value == expected
+    assert any("require_real_model_behavioral_gate" in note for note in notes)
 
 
 def test_valid_split_inference_topology_requires_matching_exact_model() -> None:

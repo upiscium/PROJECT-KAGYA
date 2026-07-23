@@ -31,10 +31,14 @@ class FallbackResponseProvider(ResponseProvider):
 
 
 def test_evaluator_promotes_candidate_to_trial_active_with_high_score(tmp_path: Path) -> None:
-    registry = _registry_with_candidate(tmp_path)
-    evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
+    settings, registry = _scored_registry(tmp_path, expected="answer")
+    evaluator = AdapterEvaluator(settings, registry)
 
-    result = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.9)
+    result = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "answer"}),
+        baseline_provider=ResponseProvider({"case": "answer"}),
+    )
 
     assert result.decision == AdapterEvaluationDecision.TRIAL_ACTIVE
     assert registry.lookup("adapter-a").status == AdapterStatus.TRIAL_ACTIVE
@@ -42,40 +46,56 @@ def test_evaluator_promotes_candidate_to_trial_active_with_high_score(tmp_path: 
 
 
 def test_evaluator_rejects_candidate_with_low_score(tmp_path: Path) -> None:
-    registry = _registry_with_candidate(tmp_path)
-    evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
+    settings, registry = _scored_registry(tmp_path, expected="answer")
+    evaluator = AdapterEvaluator(settings, registry)
 
-    result = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.1)
+    result = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "wrong"}),
+        baseline_provider=ResponseProvider({"case": "wrong"}),
+    )
 
     assert result.decision == AdapterEvaluationDecision.REJECTED
     assert registry.lookup("adapter-a").status == AdapterStatus.REJECTED
 
 
 def test_evaluator_keeps_candidate_with_mid_score(tmp_path: Path) -> None:
-    registry = _registry_with_candidate(tmp_path)
-    evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
+    settings, registry = _scored_registry(tmp_path, expected="one two")
+    evaluator = AdapterEvaluator(settings, registry)
 
-    result = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.6)
+    result = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "one"}),
+        baseline_provider=ResponseProvider({"case": "one"}),
+    )
 
     assert result.decision == AdapterEvaluationDecision.CANDIDATE
     assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
 
 
 def test_evaluator_writes_history_and_score_comparison(tmp_path: Path) -> None:
-    registry = _registry_with_candidate(tmp_path)
-    evaluator = AdapterEvaluator(_settings_for_tmp_registry(tmp_path), registry)
+    settings, registry = _scored_registry(tmp_path, expected="one two")
+    evaluator = AdapterEvaluator(settings, registry)
 
-    first = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.7)
-    second = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.5)
+    first = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "one"}),
+        baseline_provider=ResponseProvider({"case": "one"}),
+    )
+    second = evaluator.evaluate(
+        "adapter-a",
+        ResponseProvider({"case": "wrong"}),
+        baseline_provider=ResponseProvider({"case": "one"}),
+    )
 
     assert first.result_path != second.result_path
     result_files = sorted((tmp_path / "eval_results").glob("*.json"))
     assert len(result_files) == 2
     second_data = json.loads(Path(second.result_path).read_text(encoding="utf-8"))
-    assert second.previous_score == 0.7
-    assert second.score_delta == pytest.approx(-0.2)
+    assert second.previous_score == pytest.approx(2 / 3)
+    assert second.score_delta == pytest.approx(-2 / 3)
     assert second.regression is True
-    assert second_data["previous_score"] == 0.7
+    assert second_data["previous_score"] == pytest.approx(2 / 3)
     assert second_data["regression"] is True
     assert second_data["status_before"] == "candidate"
     assert second_data["status_after"] == "candidate"
@@ -220,15 +240,13 @@ def test_evaluator_fails_when_configured_eval_set_is_missing(tmp_path: Path) -> 
     assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
 
 
-def test_evaluator_allows_deterministic_score_when_eval_set_is_missing(tmp_path: Path) -> None:
+def test_evaluator_has_no_deterministic_score_override(tmp_path: Path) -> None:
     settings = _settings_for_tmp_registry(tmp_path, eval_sets=[tmp_path / "missing.json"])
     registry = _registry_with_candidate(tmp_path, settings=settings)
     evaluator = AdapterEvaluator(settings, registry)
 
-    result = evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.9)
-
-    assert result.decision == AdapterEvaluationDecision.TRIAL_ACTIVE
-    assert registry.lookup("adapter-a").status == AdapterStatus.TRIAL_ACTIVE
+    with pytest.raises(TypeError, match="deterministic_score"):
+        evaluator.evaluate("adapter-a", DummyProvider(), deterministic_score=0.9)  # type: ignore[call-arg]
 
 
 def test_evaluator_fails_when_eval_sets_have_no_cases(tmp_path: Path) -> None:
@@ -274,3 +292,15 @@ def _settings_for_tmp_registry(
             )
         }
     )
+
+
+def _scored_registry(
+    tmp_path: Path, *, expected: str
+) -> tuple[Settings, AdapterRegistry]:
+    eval_set_path = tmp_path / "eval_set.json"
+    eval_set_path.write_text(
+        json.dumps({"cases": [{"prompt": "case", "expected": expected}]}),
+        encoding="utf-8",
+    )
+    settings = _settings_for_tmp_registry(tmp_path, eval_sets=[eval_set_path])
+    return settings, _registry_with_candidate(tmp_path, settings=settings)

@@ -73,7 +73,7 @@ from kagya.runtime import (
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the API application from typed settings."""
 
-    app_settings = settings or get_settings()
+    app_settings = Settings.model_validate((settings or get_settings()).model_dump())
     app = FastAPI(title=app_settings.project.name, lifespan=_lifespan(app_settings))
     app.state.settings = app_settings
     app.state.node_role = app_settings.deployment.node.role

@@ -2,7 +2,13 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from kagya.config import BehavioralActivationPolicy
+from kagya.learning.adapter_registry import (
+    ActivationEligibilityReason,
+    BehavioralEvidenceStatus,
+)
 
 
 class AdapterResponse(BaseModel):
@@ -56,6 +62,9 @@ class AdapterResponse(BaseModel):
     )
     activation_eligibility_reason: str = ""
     real_model_behavioral_required: bool = False
+    behavioral_activation_policy: Literal[
+        "real_model_required", "deterministic_runtime_only", "disabled"
+    ] = "real_model_required"
     legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
@@ -67,9 +76,7 @@ class AdapterListResponse(BaseModel):
 
 
 class AdapterEvaluateRequest(BaseModel):
-    deterministic_score: float | None = None
-    deterministic_dimensions: dict[str, float] | None = None
-    deterministic_baselines: dict[str, float] | None = None
+    model_config = ConfigDict(extra="forbid")
 
 
 class AdapterCanaryRequest(BaseModel):
@@ -85,12 +92,12 @@ class AdapterEvaluateResponse(BaseModel):
 
 
 class AdapterBehavioralEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     evaluation_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
     baseline_id: str = Field(default="base-model", min_length=1)
     subject_revision: str = Field(default="issue-133-runtime", min_length=1)
-    runtime_kind: Literal["deterministic_runtime", "real_model_runtime"] = (
-        "deterministic_runtime"
-    )
+    runtime_kind: Literal["deterministic_runtime", "real_model_runtime"] | None = None
 
 
 class AdapterBehavioralEvaluateResponse(BaseModel):
@@ -110,6 +117,24 @@ class AdapterBehavioralEvaluateResponse(BaseModel):
     regression_dimensions: list[str]
     artifact_status: str
     artifact_path: str
+
+
+BehavioralArtifactStatusValue = Literal[
+    "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+]
+
+
+class AdapterBehavioralStatusResponse(BaseModel):
+    adapter_id: str
+    policy: BehavioralActivationPolicy
+    ordinary_gates: dict[str, Literal["passed", "failed", "not_run"]]
+    deterministic_status: BehavioralEvidenceStatus
+    deterministic_artifact: BehavioralArtifactStatusValue
+    real_status: BehavioralEvidenceStatus
+    real_required: bool
+    real_artifact: BehavioralArtifactStatusValue
+    activation_eligible: bool
+    activation_reason: ActivationEligibilityReason
 
 
 class AdapterActivationResponse(BaseModel):

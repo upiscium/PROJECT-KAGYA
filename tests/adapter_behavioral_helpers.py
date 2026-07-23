@@ -13,8 +13,12 @@ from kagya.learning import (
     PublicBehaviorClass,
     ReproducibilityMetadata,
     fixture_set_hash,
+    scenario_fixture_hash,
 )
 from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
+from kagya.learning.runtime_behavioral_runner import (
+    deterministic_runtime_scenarios,
+)
 from kagya.training.artifacts import sha256_file_map
 
 
@@ -117,13 +121,20 @@ def write_runtime_behavioral_result(
         candidate_id=adapter_id,
         candidate_runner=candidate,
     )
+    runtime_scenarios = deterministic_runtime_scenarios(
+        subject_revision="test-subject-revision",
+        runtime_kind=runtime_kind,
+    )
+    runtime_fixture_hashes = {
+        item.scenario_id: scenario_fixture_hash(item) for item in runtime_scenarios
+    }
     manifest_payload: dict[str, object] = {
         "source_commit_sha": "a" * 40,
         "subject_revision": "test-subject-revision",
         "runtime_schema_version": 1,
         "evaluator_schema_version": result.evaluator_version,
-        "fixture_revision": "activation-v1",
-        "fixture_set_hash": fixture_set_hash(result.fixture_hashes),
+        "fixture_revision": runtime_scenarios[0].reproducibility.fixture_revision,
+        "fixture_set_hash": fixture_set_hash(runtime_fixture_hashes),
         "config_hash": "b" * 64,
         "base_model_id": entry.base_model,
         "base_model_revision": entry.base_model_revision or "",
@@ -139,6 +150,29 @@ def write_runtime_behavioral_result(
     manifest_payload.update(manifest_updates or {})
     manifest = BehavioralEvaluationManifest.model_validate(manifest_payload)
     payload = result.model_dump(mode="json")
+    for subject_key in ("baseline", "candidate"):
+        source_scenario = payload[subject_key]["scenario_results"][0]
+        source_dimension = payload[subject_key]["dimension_scores"][0]
+        payload[subject_key]["scenario_results"] = [
+            {
+                **source_scenario,
+                "scenario_id": item.scenario_id,
+                "dimensions": [dimension.value for dimension in item.dimensions],
+            }
+            for item in runtime_scenarios
+        ]
+        dimensions = {
+            dimension for item in runtime_scenarios for dimension in item.dimensions
+        }
+        payload[subject_key]["dimension_scores"] = [
+            {**source_dimension, "dimension": dimension.value}
+            for dimension in sorted(dimensions, key=lambda item: item.value)
+        ]
+    payload["fixture_hashes"] = runtime_fixture_hashes
+    payload["reproducibility"] = {
+        item.scenario_id: item.reproducibility.model_dump(mode="json")
+        for item in runtime_scenarios
+    }
     payload.update(
         {
             "evaluation_id": evaluation_id,
