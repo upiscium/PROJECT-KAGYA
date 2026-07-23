@@ -131,6 +131,46 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
     def derive_structured_motivations(self) -> list[MotivationRecord]:
         """Translate existing structured state into evidence-bound motives."""
         observed: list[MotivationRecord] = []
+        homeostatic = self.persistent_state.motivation_extensions.get(
+            "homeostatic_signal"
+        )
+        if isinstance(homeostatic, dict):
+            revision = homeostatic.get("revision")
+            observed_at = homeostatic.get("observed_at")
+            tension = homeostatic.get("tension")
+            valence = homeostatic.get("valence")
+            arousal = homeostatic.get("arousal")
+            if (
+                isinstance(revision, int)
+                and isinstance(observed_at, str)
+                and isinstance(tension, (int, float))
+                and isinstance(valence, (int, float))
+                and isinstance(arousal, (int, float))
+            ):
+                source_ref = f"homeostatic-state@{revision}"
+                if tension >= 0.6:
+                    observed.append(
+                        self.motivation_dynamics.observe_structured_signal(
+                            MotivationKind.DRIVE,
+                            MotivationSource.HOMEOSTATIC,
+                            "homeostasis:emotion",
+                            signal=float(tension),
+                            uncertainty=0.1,
+                            source_refs=(source_ref,),
+                            observed_at=observed_at,
+                            measurements=(
+                                ("tension", float(tension)),
+                                ("negative_valence", max(0.0, -float(valence))),
+                                ("arousal", float(arousal)),
+                            ),
+                        )
+                    )
+                else:
+                    self.motivation_dynamics.retire_structured_signal(
+                        MotivationSource.HOMEOSTATIC,
+                        "homeostasis:emotion",
+                        source_state_ref=source_ref,
+                    )
         for episode in self.narrative_self.episodes.values():
             if episode.unresolved_tension < 0.4:
                 continue
@@ -145,6 +185,8 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                         f"narrative:{episode.episode_id}",
                         *(f"experience:{item}" for item in episode.experience_ids),
                     ),
+                    observed_at=episode.created_at,
+                    measurements=(("tension", episode.unresolved_tension),),
                 )
             )
         for self_conflict in self.narrative_self.conflicts.values():
@@ -161,6 +203,8 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                         f"self-conflict:{self_conflict.conflict_id}",
                         *self_conflict.evidence_refs,
                     ),
+                    observed_at=self_conflict.created_at,
+                    measurements=(("tension", 0.7),),
                 )
             )
         for projection in self.narrative_self.future_self.values():
@@ -173,9 +217,11 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                 signal=projection.gap,
                 uncertainty=max(0.0, 1.0 - projection.current_level),
                 source_refs=(
-                    f"future-self:{projection.projection_id}",
+                    f"future-self:{projection.projection_id}@{projection.updated_at}",
                     *projection.evidence_refs,
                 ),
+                observed_at=projection.updated_at,
+                measurements=(("gap", projection.gap),),
             )
             self.narrative_self.link_future_motivation(
                 projection.projection_id, motivation.motivation_id
@@ -255,7 +301,10 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                     signal=limitation.confidence,
                     uncertainty=1.0 - limitation.confidence,
                     source_refs=(
-                        f"limitation:{limitation.limitation_id}",
+                        (
+                            f"limitation:{limitation.limitation_id}@"
+                            f"{self.self_model.state.revision}"
+                        ),
                         *limitation.evidence_refs,
                     ),
                 )
@@ -269,7 +318,10 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
                     signal=max(0.4, 1.0 - uncertainty.confidence),
                     uncertainty=uncertainty.confidence,
                     source_refs=(
-                        f"uncertainty:{uncertainty.uncertainty_id}",
+                        (
+                            f"uncertainty:{uncertainty.uncertainty_id}@"
+                            f"{self.self_model.state.revision}"
+                        ),
                         *uncertainty.evidence_refs,
                     ),
                 )
@@ -278,13 +330,35 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
         self._persist_motivation_state()
         return observed
 
+    def record_homeostatic_state(
+        self, *, valence: float, arousal: float, observed_at: datetime | None = None
+    ) -> None:
+        if not -1.0 <= valence <= 1.0 or not 0.0 <= arousal <= 1.0:
+            raise ValueError("homeostatic state must be bounded")
+        current = self.persistent_state.motivation_extensions.get("homeostatic_signal")
+        revision = (
+            int(current.get("revision", 0)) + 1 if isinstance(current, dict) else 0
+        )
+        self.persistent_state.motivation_extensions["homeostatic_signal"] = {
+            "revision": revision,
+            "observed_at": (observed_at or datetime.now(UTC)).isoformat(),
+            "valence": valence,
+            "arousal": arousal,
+            "tension": min(1.0, max(arousal, max(0.0, -valence))),
+            "source": "persisted_emotion_state",
+        }
+        self._persist_motivation_state()
+
     def reevaluate_motivation(
-        self, *, max_goal_proposals: int | None = None
+        self,
+        *,
+        max_goal_proposals: int | None = None,
+        review_at: datetime | None = None,
     ) -> tuple[MotivationEpisode, list[Goal]]:
         event = current_agent_event()
         self.derive_structured_motivations()
         candidates, held_ids = self.motivation_dynamics.goal_candidates(
-            max_goal_proposals
+            max_goal_proposals, review_at=review_at
         )
         goals: list[Goal] = []
         selected_ids: list[str] = []

@@ -959,7 +959,8 @@ class SubjectScheduler:
             outcome = f"simulated:{simulation.simulation_id}@{simulation.revision}"
         elif schedule.kind == WakeUpKind.MOTIVATION_REEVALUATION:
             _, goals = self.main_loop.reevaluate_motivation(
-                max_goal_proposals=goal_budget
+                max_goal_proposals=goal_budget,
+                review_at=max(self.clock(), schedule.wake_at),
             )
             self.main_loop.schedule_motivation_reviews(
                 max(self.clock(), schedule.wake_at)

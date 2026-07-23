@@ -1,5 +1,6 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -25,7 +26,8 @@ from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResul
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import DummyProvider
-from kagya.motivation import MotivationKind, MotivationSource
+from kagya.motivation import MotivationSource
+from kagya.identity import KnownLimitation
 from kagya.runtime import (
     AgentEventType,
     AgentStateStore,
@@ -1961,11 +1963,23 @@ def test_internal_motivation_forms_bounded_intrinsic_goal(tmp_path: Path) -> Non
     assert state.status_code == 200
     assert state.json()["records"]
     assert formed.status_code == 200
-    assert 0 < len(formed.json()["goals"]) <= 2
-    goal = formed.json()["goals"][0]
-    assert goal["goal_type"] == "intrinsic"
-    assert goal["identity_origin"]["actor"] == "self"
-    assert goal["structured_target"]["motivation_id"]
+    assert formed.json()["goals"] == []
+    _, goals = (
+        client.app.state.agent_runtime.submit(
+            AgentEventType.INTRINSIC_GOAL_PROPOSE,
+            source="test.elapsed_motivation_review",
+            handler=lambda: client.app.state.main_loop.reevaluate_motivation(
+                review_at=datetime.now(UTC) + timedelta(seconds=61)
+            ),
+        )
+        .result(timeout=2)
+        .value
+    )
+    assert 0 < len(goals) <= 2
+    goal = goals[0]
+    assert goal.goal_type.value == "intrinsic"
+    assert goal.identity_origin.actor.value == "self"
+    assert goal.structured_target["motivation_id"]
     repeated = client.post("/api/motivation/reevaluate", headers=headers)
     assert repeated.json()["goals"] == []
 
@@ -3330,21 +3344,30 @@ def test_started_autonomy_loop_executes_motivation_through_wal(
     with _client(tmp_path, settings=settings) as client:
         assert client.app.state.autonomy_loop is not None
         loop = client.app.state.main_loop
-        motivation = loop.motivation_dynamics.observe_structured_signal(
-            MotivationKind.DESIRE,
-            MotivationSource.LEARNING,
-            "future-self:runtime-startup",
-            signal=0.8,
-            uncertainty=0.2,
-            source_refs=(
-                "future-self:runtime-startup",
-                "identity-claim:runtime-startup",
-            ),
+        now = datetime.now(UTC)
+
+        def persist_homeostatic_sample(observed_at: datetime) -> None:
+            loop.record_homeostatic_state(
+                valence=-0.7, arousal=0.8, observed_at=observed_at
+            )
+            loop.derive_structured_motivations()
+
+        for seconds_ago in (120, 60):
+            client.app.state.agent_runtime.submit(
+                AgentEventType.EMOTION_TICK,
+                source="test.persisted_homeostatic_state",
+                handler=lambda seconds_ago=seconds_ago: persist_homeostatic_sample(
+                    now - timedelta(seconds=seconds_ago)
+                ),
+            ).result(timeout=2)
+        motivation = next(
+            item
+            for item in loop.motivation_dynamics.list_records()
+            if item.source == MotivationSource.HOMEOSTATIC
         )
 
         cycle = client.app.state.subject_scheduler.run_cycle(
-            datetime.now(UTC)
-            + timedelta(seconds=settings.autonomy.reevaluation_interval_seconds + 1)
+            now + timedelta(seconds=settings.autonomy.reevaluation_interval_seconds + 1)
         )
 
         assert cycle.inferences == 0
@@ -3375,6 +3398,64 @@ def test_started_autonomy_loop_executes_motivation_through_wal(
         )
         assert restored.related_goal_ids
         assert restarted.app.state.subject_scheduler.status().pending_count > 0
+
+
+def test_persisted_social_and_self_model_state_rederive_motives_after_restart(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        loop = client.app.state.main_loop
+
+        def persist_structured_sources() -> tuple[str, str]:
+            loop.add_self_limitation(
+                KnownLimitation(
+                    limitation_id="offline-runtime",
+                    description="Network access is unavailable",
+                    confidence=0.9,
+                    capability_ids=("research",),
+                    tags=("network",),
+                    evidence_refs=("policy:offline",),
+                ),
+                reason="persisted_runtime_constraint",
+            )
+            relationship = loop.relationship_store.ensure_interlocutor("person-137")
+            relationship = loop.relationship_store.link_commitment(
+                "person-137", "commitment:follow-up"
+            )
+            loop.derive_structured_motivations()
+            self_motive = next(
+                item
+                for item in loop.motivation_dynamics.list_records()
+                if item.target_ref == "limitation:offline-runtime"
+            )
+            social_motive = next(
+                item
+                for item in loop.motivation_dynamics.list_records()
+                if item.target_ref == f"relationship:{relationship.relationship_id}"
+            )
+            return self_motive.motivation_id, social_motive.motivation_id
+
+        self_id, social_id = (
+            client.app.state.agent_runtime.submit(
+                AgentEventType.INTRINSIC_GOAL_PROPOSE,
+                source="test.persisted_structured_motivation_sources",
+                handler=persist_structured_sources,
+            )
+            .result(timeout=2)
+            .value
+        )
+
+    with _client(tmp_path, settings=settings) as restarted:
+        records = restarted.app.state.main_loop.motivation_dynamics
+        assert records.get(self_id).source == MotivationSource.LEARNING
+        assert records.get(social_id).source == MotivationSource.SOCIAL
+        assert records.get(self_id).evidence
+        assert records.get(social_id).evidence
+        assert any(
+            ref.startswith("limitation:offline-runtime@")
+            for ref in records.get(self_id).source_refs
+        )
 
 
 def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
@@ -3408,13 +3489,25 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
                 == 200
             )
         loop = client.app.state.main_loop
-        loop.working_memory.restore([])
-        loop.attention_system.candidates.clear()
-        loop.attention_system.compete()
 
-        generated = client.post("/api/motivation/reevaluate", headers=admin_headers())
-        assert generated.status_code == 200
-        goal_id = generated.json()["goals"][0]["goal_id"]
+        def prepare_and_generate() -> tuple[object, list[object]]:
+            loop.working_memory.restore([])
+            loop.attention_system.candidates.clear()
+            loop.attention_system.compete()
+            return loop.reevaluate_motivation(
+                review_at=datetime.now(UTC) + timedelta(seconds=61)
+            )
+
+        _, generated = (
+            client.app.state.agent_runtime.submit(
+                AgentEventType.INTRINSIC_GOAL_PROPOSE,
+                source="test.elapsed_intrinsic_lifecycle",
+                handler=prepare_and_generate,
+            )
+            .result(timeout=2)
+            .value
+        )
+        goal_id = generated[0].goal_id
         proposal = next(
             item
             for item in client.get("/api/goals", headers=admin_headers()).json()[
@@ -3437,20 +3530,41 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
         )
         scheduler = client.app.state.subject_scheduler
         now = datetime.now(UTC) + timedelta(seconds=1)
+
+        def set_information_gate(required: bool) -> None:
+            goal = loop.goal_manager.get(goal_id)
+            loop.goal_manager.goals[goal_id] = replace(goal, needs_information=required)
+            loop._persist_motivation_state()
+
+        client.app.state.agent_runtime.submit(
+            AgentEventType.INTRINSIC_GOAL_DELIBERATE,
+            source="test.defer_intrinsic_goal",
+            handler=lambda: set_information_gate(True),
+        ).result(timeout=2)
         scheduler.run_cycle(now)
+        assert loop.goal_manager.get(goal_id).intrinsic_status.value == "deferred"
+        client.app.state.agent_runtime.submit(
+            AgentEventType.INTRINSIC_GOAL_DELIBERATE,
+            source="test.release_intrinsic_goal",
+            handler=lambda: set_information_gate(False),
+        ).result(timeout=2)
+        redeliberation_at = now + timedelta(
+            seconds=settings.autonomy.reevaluation_interval_seconds + 1
+        )
+        scheduler.run_cycle(redeliberation_at)
         assert loop.goal_manager.get(goal_id).intrinsic_status.value == "endorsed"
-        scheduler.run_cycle(now + timedelta(seconds=1))
+        scheduler.run_cycle(redeliberation_at + timedelta(seconds=1))
         assert loop.plan_store.list_plans(goal_id=goal_id)[0].status.value == "draft"
-        scheduler.run_cycle(now + timedelta(seconds=2))
+        scheduler.run_cycle(redeliberation_at + timedelta(seconds=2))
 
         adopted = loop.goal_manager.get(goal_id)
         assert adopted.intrinsic_status.value == "active"
         assert adopted.status.value == "active"
         assert adopted.endorsement_provenance_refs
         assert loop.plan_store.list_plans(goal_id=goal_id)[0].status.value == "active"
-        scheduler.run_cycle(now + timedelta(seconds=3))
-        scheduler.run_cycle(now + timedelta(seconds=4))
-        scheduler.run_cycle(now + timedelta(seconds=5))
+        scheduler.run_cycle(redeliberation_at + timedelta(seconds=3))
+        scheduler.run_cycle(redeliberation_at + timedelta(seconds=4))
+        scheduler.run_cycle(redeliberation_at + timedelta(seconds=5))
         plan = loop.plan_store.list_plans(goal_id=goal_id)[0]
         assert plan.status.value == "completed"
         assert loop.goal_manager.get(goal_id).status.value == "completed"

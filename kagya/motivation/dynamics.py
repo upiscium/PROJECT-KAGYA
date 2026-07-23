@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from kagya.experience import ExperienceRecord
+from kagya.identity import OriginActor, OriginInputKind
 
 
 class MotivationKind(StrEnum):
@@ -23,6 +24,7 @@ class MotivationSource(StrEnum):
     DELIBERATION = "deliberation"
     SOCIAL = "social"
     LEARNING = "learning"
+    HOMEOSTATIC = "homeostatic"
 
 
 class MotivationStatus(StrEnum):
@@ -31,6 +33,22 @@ class MotivationStatus(StrEnum):
     SATISFIED = "satisfied"
     FAILED = "failed"
     DECAYED = "decayed"
+
+
+@dataclass(frozen=True)
+class MotivationEvidence:
+    evidence_ref: str
+    source_state_ref: str
+    observed_at: str
+    origin_actor: OriginActor
+    origin_input_kind: OriginInputKind
+    measurements: tuple[tuple[str, float], ...]
+
+    def __post_init__(self) -> None:
+        if datetime.fromisoformat(self.observed_at).tzinfo is None:
+            raise ValueError("motivation evidence time must include a timezone")
+        for name, value in self.measurements:
+            _unit(value, f"motivation evidence {name}")
 
 
 @dataclass(frozen=True)
@@ -66,10 +84,11 @@ class MotivationRecord:
     next_review_at: str | None = None
     revision: int = 0
     revisions: tuple[MotivationRevision, ...] = ()
-    schema_version: int = 1
+    evidence: tuple[MotivationEvidence, ...] = ()
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError(
                 f"Unsupported motivation schema version: {self.schema_version}"
             )
@@ -116,7 +135,7 @@ class MotivationEpisode:
 
 
 class MotivationDynamics:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -125,13 +144,19 @@ class MotivationDynamics:
         min_strength: float = 0.5,
         min_persistence: float = 0.4,
         min_evidence_count: int = 2,
+        min_persistence_seconds: float = 60.0,
     ) -> None:
         if max_goal_proposals_per_cycle <= 0 or min_evidence_count <= 0:
             raise ValueError("motivation budgets must be positive")
+        if not math.isfinite(min_persistence_seconds) or min_persistence_seconds < 0:
+            raise ValueError(
+                "minimum persistence seconds must be finite and non-negative"
+            )
         self.max_goal_proposals_per_cycle = max_goal_proposals_per_cycle
         self.min_strength = min_strength
         self.min_persistence = min_persistence
         self.min_evidence_count = min_evidence_count
+        self.min_persistence_seconds = min_persistence_seconds
         self.records: dict[str, MotivationRecord] = {}
         self.episodes: list[MotivationEpisode] = []
 
@@ -147,25 +172,50 @@ class MotivationDynamics:
         target_ref = f"context:{experience.context_id}"
         generated: list[MotivationRecord] = []
         novelty = experience.appraisal.novelty or 0.0
-        if experience.appraisal.novelty_valid and novelty >= 0.35:
+        prediction_error = (
+            0.0
+            if experience.prediction_error is None
+            else 1.0 - math.exp(-experience.prediction_error)
+        )
+        curiosity_allowed = self._curiosity_allowed(experience, target_ref)
+        if curiosity_allowed and (
+            (experience.appraisal.novelty_valid and novelty >= 0.35)
+            or prediction_error >= 0.35
+        ):
+            curiosity_signal = min(
+                1.0,
+                0.45 * (novelty if experience.appraisal.novelty_valid else 0.0)
+                + 0.25 * prediction_error
+                + 0.15 * experience.subjective_salience
+                + 0.15 * (1.0 - experience.appraisal.certainty),
+            )
             generated.append(
                 self._reinforce(
                     MotivationKind.INTEREST,
                     MotivationSource.CURIOSITY,
                     target_ref,
-                    signal=min(
-                        1.0,
-                        0.55 * novelty
-                        + 0.25 * experience.subjective_salience
-                        + 0.2 * (1.0 - experience.appraisal.certainty),
-                    ),
+                    signal=curiosity_signal,
                     uncertainty=1.0 - experience.appraisal.certainty,
                     source_ref=experience_ref,
                     experience_id=experience.experience_id,
                     value_ids=(),
+                    evidence=_experience_evidence(
+                        experience,
+                        experience_ref,
+                        signal=curiosity_signal,
+                        measurements=(
+                            (
+                                "novelty",
+                                novelty if experience.appraisal.novelty_valid else 0.0,
+                            ),
+                            ("prediction_error", prediction_error),
+                            ("uncertainty", 1.0 - experience.appraisal.certainty),
+                        ),
+                    ),
                 )
             )
-        if experience.unresolved_tension >= 0.4:
+        internal_allowed = _is_self_internal(experience)
+        if internal_allowed and experience.unresolved_tension >= 0.4:
             generated.append(
                 self._reinforce(
                     MotivationKind.DRIVE,
@@ -176,9 +226,15 @@ class MotivationDynamics:
                     source_ref=experience_ref,
                     experience_id=experience.experience_id,
                     value_ids=(),
+                    evidence=_experience_evidence(
+                        experience,
+                        experience_ref,
+                        signal=experience.unresolved_tension,
+                        measurements=(("tension", experience.unresolved_tension),),
+                    ),
                 )
             )
-        if experience.appraisal.threat >= 0.5:
+        if internal_allowed and experience.appraisal.threat >= 0.5:
             generated.append(
                 self._reinforce(
                     MotivationKind.AVERSION,
@@ -189,6 +245,12 @@ class MotivationDynamics:
                     source_ref=experience_ref,
                     experience_id=experience.experience_id,
                     value_ids=(),
+                    evidence=_experience_evidence(
+                        experience,
+                        experience_ref,
+                        signal=experience.appraisal.threat,
+                        measurements=(("threat", experience.appraisal.threat),),
+                    ),
                 )
             )
         return generated
@@ -222,6 +284,13 @@ class MotivationDynamics:
             source_ref=source_ref,
             experience_id=None,
             value_ids=related_value_ids,
+            evidence=_structured_evidence(
+                source_ref,
+                observed_at=_now(),
+                signal=gap,
+                uncertainty=uncertainty,
+                measurements=(("gap", gap),),
+            ),
         )
 
     def observe_structured_signal(
@@ -234,6 +303,8 @@ class MotivationDynamics:
         uncertainty: float,
         source_refs: tuple[str, ...],
         value_ids: tuple[str, ...] = (),
+        observed_at: str | None = None,
+        measurements: tuple[tuple[str, float], ...] = (),
     ) -> MotivationRecord:
         """Record durable structured evidence without model interpretation."""
         _unit(signal, "motivation signal")
@@ -241,17 +312,36 @@ class MotivationDynamics:
         evidence_refs = tuple(dict.fromkeys(source_refs))
         if not evidence_refs:
             raise ValueError("structured motivation requires evidence references")
+        evidence = tuple(
+            _structured_evidence(
+                reference,
+                observed_at=observed_at or _now(),
+                signal=signal,
+                uncertainty=uncertainty,
+                measurements=measurements,
+            )
+            for reference in evidence_refs
+        )
+        matching = [
+            record
+            for record in self.records.values()
+            if record.source == source and record.target_ref == target_ref
+        ]
         existing = next(
-            (
-                record
-                for record in self.records.values()
-                if record.source == source
-                and record.target_ref == target_ref
-                and record.status == MotivationStatus.ACTIVE
-            ),
+            (record for record in matching if record.status == MotivationStatus.ACTIVE),
             None,
         )
         if existing is None:
+            terminal = next(
+                (
+                    record
+                    for record in matching
+                    if set(evidence_refs).issubset(record.source_refs)
+                ),
+                None,
+            )
+            if terminal is not None:
+                return terminal
             now = _now()
             record = MotivationRecord(
                 motivation_id=f"motivation-{uuid4()}",
@@ -272,6 +362,7 @@ class MotivationDynamics:
                 status=MotivationStatus.ACTIVE,
                 created_at=now,
                 updated_at=now,
+                evidence=evidence,
             )
             self.records[record.motivation_id] = record
             return record
@@ -298,11 +389,48 @@ class MotivationDynamics:
                 uncertainty=min(existing.uncertainty, uncertainty),
                 evidence_count=existing.evidence_count + len(novel_refs),
                 updated_at=_now(),
+                evidence=(
+                    *existing.evidence,
+                    *(item for item in evidence if item.evidence_ref in novel_refs),
+                ),
             ),
             "structured_evidence",
             novel_refs,
         )
         self.records[existing.motivation_id] = updated
+        return updated
+
+    def retire_structured_signal(
+        self,
+        source: MotivationSource,
+        target_ref: str,
+        *,
+        source_state_ref: str,
+    ) -> MotivationRecord | None:
+        current = next(
+            (
+                record
+                for record in self.records.values()
+                if record.source == source
+                and record.target_ref == target_ref
+                and record.status == MotivationStatus.ACTIVE
+            ),
+            None,
+        )
+        if current is None:
+            return None
+        updated = self._revise(
+            current,
+            replace(
+                current,
+                status=MotivationStatus.DECAYED,
+                strength=0.0,
+                updated_at=_now(),
+            ),
+            "source_signal_retired",
+            (source_state_ref,),
+        )
+        self.records[current.motivation_id] = updated
         return updated
 
     def register_conflict(self, left_id: str, right_id: str) -> None:
@@ -334,13 +462,16 @@ class MotivationDynamics:
         )
 
     def goal_candidates(
-        self, max_candidates: int | None = None
+        self, max_candidates: int | None = None, *, review_at: datetime | None = None
     ) -> tuple[list[GoalFormationCandidate], tuple[str, ...]]:
         limit = self.max_goal_proposals_per_cycle
         if max_candidates is not None:
             if max_candidates < 0:
                 raise ValueError("goal candidate limit must not be negative")
             limit = min(limit, max_candidates)
+        reviewed_at = review_at or datetime.now(UTC)
+        if reviewed_at.tzinfo is None:
+            raise ValueError("motivation review time must include a timezone")
         eligible = [
             record
             for record in self.records.values()
@@ -350,6 +481,10 @@ class MotivationDynamics:
             and record.evidence_count >= self.min_evidence_count
             and record.satiation < 0.9
             and not record.related_goal_ids
+            and (
+                reviewed_at - datetime.fromisoformat(record.created_at)
+            ).total_seconds()
+            >= self.min_persistence_seconds
         ]
         eligible.sort(
             key=lambda item: (item.strength * item.persistence, item.motivation_id),
@@ -565,6 +700,25 @@ class MotivationDynamics:
             updated.append(record)
         return updated
 
+    def _curiosity_allowed(self, experience: ExperienceRecord, target_ref: str) -> bool:
+        origin = experience.identity_origin
+        if _is_self_internal(experience):
+            return True
+        if origin.input_kind in {OriginInputKind.OBSERVATION, OriginInputKind.EVIDENCE}:
+            return True
+        if origin.input_kind != OriginInputKind.REQUEST:
+            return False
+        return any(
+            record.source == MotivationSource.CURIOSITY
+            and record.target_ref == target_ref
+            and any(
+                item.origin_actor == OriginActor.SELF
+                and item.origin_input_kind == OriginInputKind.INTERNAL_STATE
+                for item in record.evidence
+            )
+            for record in self.records.values()
+        )
+
     def to_json(self) -> dict[str, Any]:
         return {
             "schema_version": self.SCHEMA_VERSION,
@@ -577,9 +731,13 @@ class MotivationDynamics:
             self.records = {}
             self.episodes = []
             return
-        if payload.get("schema_version") != self.SCHEMA_VERSION:
+        version = payload.get("schema_version")
+        if version not in {1, self.SCHEMA_VERSION}:
             raise ValueError("Unsupported motivation dynamics schema version")
-        records = [_record_from_json(item) for item in payload.get("records", [])]
+        records = [
+            _record_from_json(_migrate_record_v1(item) if version == 1 else item)
+            for item in payload.get("records", [])
+        ]
         if len(records) != len({record.motivation_id for record in records}):
             raise ValueError("Motivation identifiers must be unique")
         self.records = {record.motivation_id: record for record in records}
@@ -607,18 +765,24 @@ class MotivationDynamics:
         source_ref: str,
         experience_id: str | None,
         value_ids: tuple[str, ...],
+        evidence: MotivationEvidence,
     ) -> MotivationRecord:
+        matching = [
+            record
+            for record in self.records.values()
+            if record.source == source and record.target_ref == target_ref
+        ]
         existing = next(
-            (
-                record
-                for record in self.records.values()
-                if record.source == source
-                and record.target_ref == target_ref
-                and record.status == MotivationStatus.ACTIVE
-            ),
+            (record for record in matching if record.status == MotivationStatus.ACTIVE),
             None,
         )
         if existing is None:
+            terminal = next(
+                (record for record in matching if source_ref in record.source_refs),
+                None,
+            )
+            if terminal is not None:
+                return terminal
             now = _now()
             record = MotivationRecord(
                 motivation_id=f"motivation-{uuid4()}",
@@ -641,6 +805,7 @@ class MotivationDynamics:
                 status=MotivationStatus.ACTIVE,
                 created_at=now,
                 updated_at=now,
+                evidence=(evidence,),
             )
             self.records[record.motivation_id] = record
             return record
@@ -671,6 +836,7 @@ class MotivationDynamics:
                 ),
                 evidence_count=existing.evidence_count + 1,
                 updated_at=_now(),
+                evidence=(*existing.evidence, evidence),
             ),
             "experience_reinforcement",
             (source_ref,),
@@ -707,6 +873,7 @@ def _goal_candidate(record: MotivationRecord) -> GoalFormationCandidate:
         MotivationSource.DELIBERATION: "Clarify a potential conflict",
         MotivationSource.SOCIAL: "Review an active social obligation",
         MotivationSource.LEARNING: "Reduce a known capability gap",
+        MotivationSource.HOMEOSTATIC: "Restore a sustained internal balance",
     }[record.source]
     return GoalFormationCandidate(
         motivation_id=record.motivation_id,
@@ -752,7 +919,66 @@ def _record_from_json(payload: dict[str, Any]) -> MotivationRecord:
         )
         for item in data.get("revisions", ())
     )
+    data["evidence"] = tuple(
+        MotivationEvidence(
+            **{
+                **item,
+                "origin_actor": OriginActor(item["origin_actor"]),
+                "origin_input_kind": OriginInputKind(item["origin_input_kind"]),
+                "measurements": tuple(
+                    tuple(value) for value in item.get("measurements", ())
+                ),
+            }
+        )
+        for item in data.get("evidence", ())
+    )
     return MotivationRecord(**data)
+
+
+def _migrate_record_v1(payload: dict[str, Any]) -> dict[str, Any]:
+    return {**payload, "schema_version": 2, "evidence": []}
+
+
+def _is_self_internal(experience: ExperienceRecord) -> bool:
+    return (
+        experience.identity_origin.actor == OriginActor.SELF
+        and experience.identity_origin.input_kind == OriginInputKind.INTERNAL_STATE
+    )
+
+
+def _experience_evidence(
+    experience: ExperienceRecord,
+    evidence_ref: str,
+    *,
+    signal: float,
+    measurements: tuple[tuple[str, float], ...],
+) -> MotivationEvidence:
+    return MotivationEvidence(
+        evidence_ref=evidence_ref,
+        source_state_ref=f"{evidence_ref}@{experience.revision}",
+        observed_at=experience.created_at,
+        origin_actor=experience.identity_origin.actor,
+        origin_input_kind=experience.identity_origin.input_kind,
+        measurements=(("signal", signal), *measurements),
+    )
+
+
+def _structured_evidence(
+    evidence_ref: str,
+    *,
+    observed_at: str,
+    signal: float,
+    uncertainty: float,
+    measurements: tuple[tuple[str, float], ...],
+) -> MotivationEvidence:
+    return MotivationEvidence(
+        evidence_ref=evidence_ref,
+        source_state_ref=evidence_ref,
+        observed_at=observed_at,
+        origin_actor=OriginActor.SELF,
+        origin_input_kind=OriginInputKind.INTERNAL_STATE,
+        measurements=(("signal", signal), ("uncertainty", uncertainty), *measurements),
+    )
 
 
 def _unit(value: float, name: str) -> None:

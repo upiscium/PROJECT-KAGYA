@@ -459,6 +459,10 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 float(len(working_memory_view.selected)),
             )
             self.refresh_attention(compete=True)
+            self.record_homeostatic_state(
+                valence=emotion_state.valence,
+                arousal=emotion_state.arousal,
+            )
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)

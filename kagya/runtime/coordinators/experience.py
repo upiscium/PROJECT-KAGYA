@@ -138,6 +138,10 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
 
     def advance_time(self, elapsed_seconds: float) -> EmotionUpdate:
         update = self.emotion_engine.advance_time(elapsed_seconds)
+        self.record_homeostatic_state(
+            valence=update.state.valence,
+            arousal=update.state.arousal,
+        )
         self.working_memory.admit(
             working_memory_item(
                 item_id="emotion:current",

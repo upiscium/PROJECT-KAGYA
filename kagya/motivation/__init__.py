@@ -3,6 +3,7 @@
 from kagya.motivation.dynamics import (
     GoalFormationCandidate,
     MotivationDynamics,
+    MotivationEvidence,
     MotivationEpisode,
     MotivationKind,
     MotivationRecord,
@@ -57,6 +58,7 @@ __all__ = [
     "IntrinsicGoalDeliberation",
     "IntrinsicGoalStatus",
     "MotivationDynamics",
+    "MotivationEvidence",
     "MotivationEpisode",
     "MotivationKind",
     "MotivationRecord",
