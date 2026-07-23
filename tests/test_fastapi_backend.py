@@ -649,6 +649,40 @@ def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> No
     assert ("adapter", "approved") in event_pairs
 
 
+def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_artifact(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    register_runtime_candidate(registry, tmp_path, "runtime-api-candidate")
+
+    response = client.post(
+        "/api/adapters/runtime-api-candidate/behavioral-evaluate",
+        headers=admin_headers(),
+        json={
+            "evaluation_id": "runtime-api-evaluation",
+            "runtime_kind": "deterministic_runtime",
+            "baseline_id": "base-model",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["runtime_kind"] == "deterministic_runtime"
+    assert payload["artifact_status"] == "valid"
+    assert payload["artifact_path"] == "behavioral/runtime-api-evaluation.json"
+    entry = registry.lookup("runtime-api-candidate")
+    assert entry is not None
+    assert entry.behavioral_evaluation_id == "runtime-api-evaluation"
+
+    reconciliation = client.post(
+        "/api/evaluations/behavioral-reconciliation", headers=admin_headers()
+    )
+    assert reconciliation.status_code == 200
+    assert reconciliation.json()["artifacts"][0]["status"] == "valid"
+
+
 def test_system_events_include_tool_audit_events(tmp_path: Path) -> None:
     client = _client(tmp_path)
     registry = ToolRegistry()

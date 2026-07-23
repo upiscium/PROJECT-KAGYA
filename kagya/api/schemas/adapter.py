@@ -1,6 +1,6 @@
 """Adapter API schemas."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AdapterResponse(BaseModel):
@@ -65,6 +65,28 @@ class AdapterEvaluateResponse(BaseModel):
     decision: str
     result_path: str
     status: str
+
+
+class AdapterBehavioralEvaluateRequest(BaseModel):
+    evaluation_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
+    baseline_id: str = Field(default="base-model", min_length=1)
+    subject_revision: str = Field(default="issue-133-runtime", min_length=1)
+    runtime_kind: str = Field(
+        default="deterministic_runtime", pattern="^deterministic_runtime$"
+    )
+
+
+class AdapterBehavioralEvaluateResponse(BaseModel):
+    evaluation_id: str
+    adapter_id: str
+    runtime_kind: str
+    activation_gate_passed: bool
+    deterministic_runtime_gate_passed: bool
+    candidate_score: float
+    hard_gate_failures: list[str]
+    regression_dimensions: list[str]
+    artifact_status: str
+    artifact_path: str
 
 
 class AdapterActivationResponse(BaseModel):

@@ -74,3 +74,7 @@ class BehavioralRerunResponse(BaseModel):
     evaluation_id: str
     fixture_hashes_match: bool
     activation_gate_passed: bool
+
+
+class BehavioralArtifactReconciliationResponse(BaseModel):
+    artifacts: list[dict[str, Any]]

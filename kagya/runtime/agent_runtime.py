@@ -28,6 +28,7 @@ class AgentEventType(StrEnum):
     MEMORY_UPDATE = "memory_update"
     ADAPTER_READ = "adapter_read"
     ADAPTER_UPDATE = "adapter_update"
+    BEHAVIORAL_EVALUATE = "behavioral_evaluate"
     STATE_SNAPSHOT = "state_snapshot"
     STATE_EXPORT = "state_export"
     STATE_RESTORE = "state_restore"

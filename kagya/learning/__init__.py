@@ -43,8 +43,28 @@ from kagya.learning.behavioral_evaluation import (
 )
 from kagya.learning.subject_behavioral_suite import (
     DeterministicSubjectRunner,
+    SyntheticTraceRunner,
     run_deterministic_subject_evaluation,
     subject_completion_scenarios,
+)
+from kagya.learning.behavioral_artifacts import (
+    BehavioralArtifactRecord,
+    BehavioralArtifactStatus,
+    BehavioralArtifactStore,
+)
+from kagya.learning.runtime_behavioral_harness import (
+    AuthoritativeTransitionCollector,
+    ControlledClock,
+    ControlledToolEnvironment,
+    DeterministicRuntimeProvider,
+    FailureInjector,
+    InjectedRuntimeFailure,
+    SubjectRuntimeHarness,
+)
+from kagya.learning.runtime_behavioral_runner import (
+    DeterministicRuntimeRunner,
+    deterministic_runtime_scenarios,
+    run_deterministic_runtime_evaluation,
 )
 from kagya.learning.dream_dataset_generator import (
     DreamDatasetGenerator,
@@ -64,6 +84,9 @@ __all__ = [
     "ActivationEligibility",
     "ActivationEligibilityReason",
     "BehavioralEvaluationManifest",
+    "BehavioralArtifactRecord",
+    "BehavioralArtifactStatus",
+    "BehavioralArtifactStore",
     "AdapterEntry",
     "AdapterEvaluationDecision",
     "AdapterEvaluationResult",
@@ -80,8 +103,17 @@ __all__ = [
     "BehavioralRuntimeKind",
     "BehavioralScenario",
     "BehavioralTrace",
+    "AuthoritativeTransitionCollector",
+    "ControlledClock",
+    "ControlledToolEnvironment",
+    "DeterministicRuntimeProvider",
+    "DeterministicRuntimeRunner",
+    "FailureInjector",
+    "InjectedRuntimeFailure",
+    "SubjectRuntimeHarness",
     "DreamDatasetGenerator",
     "DeterministicSubjectRunner",
+    "SyntheticTraceRunner",
     "DreamDatasetRecord",
     "EvalCase",
     "EvalSet",
@@ -102,6 +134,8 @@ __all__ = [
     "fixture_set_hash",
     "load_eval_sets",
     "run_deterministic_subject_evaluation",
+    "run_deterministic_runtime_evaluation",
+    "deterministic_runtime_scenarios",
     "scenario_fixture_hash",
     "subject_completion_scenarios",
     "proactive_outbox_scenarios",

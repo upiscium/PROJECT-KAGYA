@@ -17,12 +17,14 @@ from kagya.api.schemas.evaluation import (
     BehavioralFailureArtifact,
     BehavioralRerunRequest,
     BehavioralRerunResponse,
+    BehavioralArtifactReconciliationResponse,
     EvaluationResultDetail,
     EvaluationResultListResponse,
     EvaluationResultSummary,
 )
 from kagya.config import Settings
 from kagya.learning import (
+    BehavioralArtifactStore,
     run_deterministic_subject_evaluation,
     scenario_fixture_hash,
     subject_completion_scenarios,
@@ -43,13 +45,39 @@ def list_behavioral_evaluations(
     result_dir = settings.adapter_registry.eval_result_dir / "behavioral"
     if not result_dir.exists():
         return BehavioralEvaluationHistoryResponse(results=[])
-    results = [
-        _behavioral_summary(path)
-        for path in result_dir.glob("*.json")
-        if path.is_file()
-    ]
+    results = []
+    for path in result_dir.glob("*.json"):
+        if not path.is_file() or path.name == "artifact_registry.json":
+            continue
+        try:
+            results.append(_behavioral_summary(path))
+        except (
+            HTTPException,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
+            # A corrupt historical artifact is reported by reconciliation and
+            # must not make all otherwise valid history unavailable.
+            continue
     return BehavioralEvaluationHistoryResponse(
         results=sorted(results, key=lambda item: item.created_at, reverse=True)
+    )
+
+
+@router.post(
+    "/behavioral-reconciliation",
+    response_model=BehavioralArtifactReconciliationResponse,
+)
+def reconcile_behavioral_artifacts(
+    settings: Settings = Depends(get_api_settings),
+) -> BehavioralArtifactReconciliationResponse:
+    records = BehavioralArtifactStore(
+        settings.adapter_registry.eval_result_dir
+    ).reconcile()
+    return BehavioralArtifactReconciliationResponse(
+        artifacts=[item.model_dump(mode="json") for item in records]
     )
 
 
@@ -113,16 +141,22 @@ def rerun_behavioral_evaluation(
         raise HTTPException(status_code=409, detail="Evaluation has no rerun metadata")
     first = next(iter(reproducibility.values()))
     if not isinstance(first, dict) or first.get("runtime") != "deterministic_fixture":
-        raise HTTPException(status_code=409, detail="Evaluation runtime is not reproducible")
+        raise HTTPException(
+            status_code=409, detail="Evaluation runtime is not reproducible"
+        )
     subject_revision = str(first.get("subject_revision", ""))
     scenarios = subject_completion_scenarios(subject_revision=subject_revision)
-    expected_hashes = {item.scenario_id: scenario_fixture_hash(item) for item in scenarios}
+    expected_hashes = {
+        item.scenario_id: scenario_fixture_hash(item) for item in scenarios
+    }
     source_hashes = {
-        str(key): str(value) for key, value in _object(source.get("fixture_hashes")).items()
+        str(key): str(value)
+        for key, value in _object(source.get("fixture_hashes")).items()
     }
     if source_hashes != expected_hashes:
         raise HTTPException(
-            status_code=409, detail="Fixture revision or hashes are unavailable for rerun"
+            status_code=409,
+            detail="Fixture revision or hashes are unavailable for rerun",
         )
     baseline = _object(source.get("baseline"))
     candidate = _object(source.get("candidate"))

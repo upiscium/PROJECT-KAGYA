@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from statistics import NormalDist
@@ -71,8 +72,13 @@ class HardGate(StrEnum):
 
 
 class BehavioralRuntimeKind(StrEnum):
-    SYNTHETIC = "synthetic"
-    RUNTIME = "runtime"
+    SYNTHETIC_EVALUATOR_CONTRACT = "synthetic_evaluator_contract"
+    DETERMINISTIC_RUNTIME = "deterministic_runtime"
+
+    # Source compatibility for PR1 callers. Serialized values are intentionally
+    # the precise evidence classes above.
+    SYNTHETIC = "synthetic_evaluator_contract"
+    RUNTIME = "deterministic_runtime"
 
 
 class PublicBehaviorClass(StrEnum):
@@ -147,6 +153,10 @@ class StateTransition(_StrictModel):
     after: JsonValue = None
     evidence_refs: tuple[str, ...] = ()
     side_effect_key: str | None = None
+    event_id: str | None = None
+    event_sequence: int | None = Field(default=None, ge=0)
+    revision_before: int | None = Field(default=None, ge=0)
+    revision_after: int | None = Field(default=None, ge=0)
 
 
 class TransitionExpectation(_StrictModel):
@@ -283,7 +293,9 @@ class PairedBehavioralEvaluationResult(_StrictModel):
     regression_dimensions: tuple[BehavioralDimension, ...]
     threshold_failure_dimensions: tuple[BehavioralDimension, ...]
     activation_gate_passed: bool
-    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC
+    runtime_kind: BehavioralRuntimeKind = (
+        BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+    )
     deterministic_runtime_gate_passed: bool = False
     manifest: BehavioralEvaluationManifest | None = None
     tool_execution_dimensions_complete: Literal[True] = True
@@ -294,7 +306,7 @@ class PairedBehavioralEvaluationResult(_StrictModel):
 
     @model_validator(mode="after")
     def validate_runtime_binding(self) -> PairedBehavioralEvaluationResult:
-        if self.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
+        if self.runtime_kind == BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT:
             if self.manifest is not None:
                 raise ValueError("synthetic behavioral results cannot have a manifest")
             if self.deterministic_runtime_gate_passed:
@@ -646,6 +658,10 @@ class BehavioralEvaluator:
         baseline_runner: ScenarioRunner,
         candidate_id: str,
         candidate_runner: ScenarioRunner,
+        runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT,
+        deterministic_runtime_gate_passed: bool = False,
+        manifest: BehavioralEvaluationManifest | None = None,
+        persist_result: bool = True,
     ) -> PairedBehavioralEvaluationResult:
         if re.fullmatch(r"[A-Za-z0-9_.-]+", evaluation_id) is None:
             raise ValueError("evaluation ID contains unsafe characters")
@@ -710,10 +726,15 @@ class BehavioralEvaluator:
             and not regressions
             and not threshold_failures,
             reproduction_artifacts=tuple(artifacts),
+            runtime_kind=runtime_kind,
+            deterministic_runtime_gate_passed=deterministic_runtime_gate_passed,
+            manifest=manifest,
         )
-        self._write_json(
-            self.result_dir / f"{evaluation_id}.json", result.model_dump(mode="json")
-        )
+        if persist_result:
+            self._write_json(
+                self.result_dir / f"{evaluation_id}.json",
+                result.model_dump(mode="json"),
+            )
         return result
 
     def _evaluate_subject(
@@ -923,10 +944,20 @@ class BehavioralEvaluator:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True),
-            encoding="utf-8",
-        )
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as output:
+                json.dump(payload, output, indent=2, sort_keys=True, ensure_ascii=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _transition_matches(expected: StateTransition, actual: StateTransition) -> bool:

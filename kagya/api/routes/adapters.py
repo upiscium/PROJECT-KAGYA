@@ -1,6 +1,7 @@
 """Adapter lifecycle routes."""
 
 from dataclasses import asdict
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -19,6 +20,8 @@ from kagya.api.schemas.adapter import (
     AdapterEvaluateRequest,
     AdapterCanaryRequest,
     AdapterEvaluateResponse,
+    AdapterBehavioralEvaluateRequest,
+    AdapterBehavioralEvaluateResponse,
     AdapterListResponse,
     AdapterResponse,
     AdapterActivationResponse,
@@ -32,6 +35,7 @@ from kagya.learning import (
     AdapterRegistry,
     AdapterRuntimeManager,
     AdapterStatus,
+    run_deterministic_runtime_evaluation,
 )
 from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -40,6 +44,75 @@ from kagya.runtime import AgentEventType, AgentRuntime
 router = APIRouter(
     prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)]
 )
+
+
+@router.post(
+    "/{adapter_id}/behavioral-evaluate",
+    response_model=AdapterBehavioralEvaluateResponse,
+)
+def behavioral_evaluate_adapter(
+    adapter_id: str,
+    request: AdapterBehavioralEvaluateRequest,
+    settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> AdapterBehavioralEvaluateResponse:
+    entry = registry.lookup(adapter_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown adapter: {adapter_id}")
+    if entry.adapter_hash is None or entry.base_model_revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Adapter lacks cryptographic runtime evaluation provenance",
+        )
+
+    def evaluate() -> tuple:
+        result, artifact_status = run_deterministic_runtime_evaluation(
+            settings,
+            request.evaluation_id,
+            baseline_id=request.baseline_id,
+            candidate_id=adapter_id,
+            candidate_adapter_path=Path(entry.path),
+            candidate_adapter_hash=entry.adapter_hash or "",
+            base_model_revision=entry.base_model_revision or "",
+            subject_revision=request.subject_revision,
+        )
+        if artifact_status != "valid":
+            raise ValueError("Behavioral artifact did not finalize as valid")
+        result_path = (
+            settings.adapter_registry.eval_result_dir
+            / "behavioral"
+            / f"{request.evaluation_id}.json"
+        )
+        registry.apply_behavioral_evaluation(
+            adapter_id,
+            evaluation_id=request.evaluation_id,
+            result_path=result_path,
+        )
+        return result, artifact_status
+
+    try:
+        result, artifact_status = execute_agent_event(
+            runtime,
+            AgentEventType.BEHAVIORAL_EVALUATE,
+            source="api.adapters.behavioral_evaluate",
+            handler=evaluate,
+            payload={"adapter_id": adapter_id, "evaluation_id": request.evaluation_id},
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return AdapterBehavioralEvaluateResponse(
+        evaluation_id=result.evaluation_id,
+        adapter_id=adapter_id,
+        runtime_kind=result.runtime_kind.value,
+        activation_gate_passed=result.activation_gate_passed,
+        deterministic_runtime_gate_passed=result.deterministic_runtime_gate_passed,
+        candidate_score=result.candidate.aggregate_score,
+        hard_gate_failures=[item.value for item in result.candidate.hard_gate_failures],
+        regression_dimensions=[item.value for item in result.regression_dimensions],
+        artifact_status=artifact_status,
+        artifact_path=f"behavioral/{request.evaluation_id}.json",
+    )
 
 
 @router.get("/runtime", response_model=AdapterRuntimeStateResponse)

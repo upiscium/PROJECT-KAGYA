@@ -825,7 +825,10 @@ def _behavioral_binding_mismatch(
 ) -> str | None:
     from kagya.learning.behavioral_evaluation import BehavioralRuntimeKind
 
-    if result.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
+    if (
+        result.runtime_kind
+        == BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+    ):
         return "Synthetic behavioral results cannot bind an adapter"
     manifest = result.manifest
     if manifest is None:
