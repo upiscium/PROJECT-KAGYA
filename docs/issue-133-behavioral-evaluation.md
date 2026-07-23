@@ -9,9 +9,10 @@ Runtime execution reads fixture inputs only. Public behavior is classified after
 
 ## Coverage
 
-- `subject.external-to-reflective-continuity` covers every current `BehavioralDimension`, causal ordering, policy-governed action, exactly-once external effects, and restart continuity.
-- `subject.uncertain-defer-no-mutation` independently checks calibrated defer with no state or external mutation.
-- `subject.counterfactual-replan-after-failure` checks mixed attribution, bounded counterfactual inference, and evidence-linked Plan revision.
+- `runtime.external-observation-closed-loop` covers every current `BehavioralDimension`, causal ordering, policy-governed action, exactly-once external effects, and revisioned domain evidence.
+- `runtime.ambiguous-irreversible-defer` independently checks calibrated defer with no authority or external mutation.
+- `runtime.action-failure-counterfactual-replan` checks mixed attribution, bounded counterfactual inference, and evidence-linked Plan revision.
+- `runtime.commitment-restart-persistence` reconstructs a fresh object graph and verifies accepted responsibility continuity.
 - One adversarial fixture per `HardGate` makes every hard failure independently observable. Aggregate score cannot hide a hard-gate, threshold, or per-dimension regression.
 - A behavioral result bound to an adapter is persisted in the registry. A failed behavioral hard gate or regression clears the adapter activation gate, so approval cannot bypass it.
 
@@ -28,11 +29,11 @@ uv run python -m kagya.learning.subject_behavioral_suite \
   --subject-revision subject-revision
 ```
 
-The formal runtime operation is `POST /api/adapters/{adapter_id}/behavioral-evaluate` with `runtime_kind=deterministic_runtime`. It is serialized as a dedicated operational event. `POST /api/evaluations/behavioral-reconciliation` classifies artifacts as `valid`, `prepared`, `orphan_result`, `orphan_registry_reference`, `hash_mismatch`, or `corrupt`. References are relative to the result root.
+The formal runtime operation is `POST /api/adapters/{adapter_id}/behavioral-evaluate` with `runtime_kind=deterministic_runtime`. Evaluation runs in an isolated graph; only its adapter binding transition is serialized as a dedicated operational event. The artifact saga proceeds through prepared artifact, prepared registry binding, artifact finalization, registry finalization, and cross-registry reconciliation. `POST /api/evaluations/behavioral-reconciliation` classifies artifacts as `valid`, `prepared`, `orphan_result`, `orphan_registry_reference`, `hash_mismatch`, or `corrupt`. References are relative to the result root.
 
 ## Runtime Failure Checkpoints
 
-The deterministic harness exposes `journal_accepted`, `journal_started`, `external_prepare`, `before_wal_append`, `after_wal_append`, `snapshot_temp_fsynced`, `snapshot_replaced`, `before_external_finalize`, `finalize`, `after_external_finalize`, and `before_journal_completed`. Restart always reconstructs a new graph from filesystem state. Journal corruption fails readiness closed; snapshot corruption is reconstructed only from a verified hash-chained WAL.
+The deterministic harness exposes `journal_accepted`, `journal_started`, `external_write`, `external_prepare`, `before_wal_append`, `after_wal_append`, `snapshot_temp_write`, `snapshot_temp_fsync`, `snapshot_atomic_replace`, `before_finalize`, `after_finalize`, and `before_journal_completed`. Restart always reconstructs a new graph from filesystem state. Journal corruption fails readiness closed; snapshot corruption is reconstructed only from a verified hash-chained WAL.
 
 Crash recovery uses `abrupt_stop`, which stops Autonomy and aborts AgentRuntime without draining or invoking an active event completion hook. Recovery then constructs a separate `SubjectRuntimeHarness` from filesystem state.
 
