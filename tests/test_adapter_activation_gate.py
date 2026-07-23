@@ -1,10 +1,11 @@
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import load_settings
+from kagya.config import BehavioralActivationPolicy, load_settings
 from kagya.learning import (
     ActivationEligibilityReason,
     AdapterRegistry,
@@ -56,7 +57,35 @@ def test_valid_runtime_bound_behavioral_result_activates(tmp_path: Path) -> None
     assert registry.activate("candidate").status == AdapterStatus.ACTIVE
 
 
-def test_real_model_gate_is_optional_by_default_and_distinct_when_required(
+def test_production_policy_rejects_missing_real_model_evidence(tmp_path: Path) -> None:
+    registry = _ready(tmp_path)
+    required = _with_real_model_policy(registry)
+
+    eligibility = required.activation_eligibility("candidate")
+
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
+    with pytest.raises(ValueError, match="real_model_not_run"):
+        required.activate("candidate")
+
+
+def test_current_real_model_pass_allows_activation(tmp_path: Path) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        evaluation_id="real-pass",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    registry.approve("candidate")
+    required = _with_real_model_policy(registry)
+
+    assert required.activation_eligibility("candidate").eligible is True
+    assert required.activate("candidate").status == AdapterStatus.ACTIVE
+
+
+def test_development_deterministic_policy_is_explicit_and_real_policy_is_distinct(
     tmp_path: Path,
 ) -> None:
     registry = _ordinary_evaluated(tmp_path)
@@ -71,7 +100,9 @@ def test_real_model_gate_is_optional_by_default_and_distinct_when_required(
     required_settings = registry.settings.model_copy(
         update={
             "adapter_registry": registry.settings.adapter_registry.model_copy(
-                update={"require_real_model_behavioral_gate": True}
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
             )
         }
     )
@@ -79,7 +110,7 @@ def test_real_model_gate_is_optional_by_default_and_distinct_when_required(
     assert required.eligible is False
     assert required.real_model_required is True
     assert (
-        required.reason == ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_UNEVALUATED
+        required.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
     )
 
 
@@ -99,14 +130,16 @@ def test_required_real_model_gate_reports_failed_and_stale_distinctly(
     required_settings = registry.settings.model_copy(
         update={
             "adapter_registry": registry.settings.adapter_registry.model_copy(
-                update={"require_real_model_behavioral_gate": True}
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
             )
         }
     )
     required_registry = AdapterRegistry(required_settings)
     assert (
         required_registry.activation_eligibility("candidate").reason
-        == ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_FAILED
+        == ActivationEligibilityReason.REAL_MODEL_FAILED
     )
 
     bind_runtime_behavioral_result(
@@ -119,7 +152,7 @@ def test_required_real_model_gate_reports_failed_and_stale_distinctly(
     _update_registry_field(registry, "real_model_fixture_set_hash", "f" * 64)
     assert (
         required_registry.activation_eligibility("candidate").reason
-        == ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+        == ActivationEligibilityReason.REAL_MODEL_STALE
     )
 
 
@@ -140,7 +173,9 @@ def test_real_model_activation_revalidates_current_files(
     required_settings = registry.settings.model_copy(
         update={
             "adapter_registry": registry.settings.adapter_registry.model_copy(
-                update={"require_real_model_behavioral_gate": True}
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
             )
         }
     )
@@ -160,11 +195,11 @@ def test_real_model_activation_revalidates_current_files(
 
     eligibility = required_registry.activation_eligibility("candidate")
     assert eligibility.eligible is False
-    assert eligibility.real_model_status == "stale"
+    assert eligibility.real_model_status == "hash_mismatch"
     assert eligibility.reason == (
         ActivationEligibilityReason.ADAPTER_ARTIFACT_MISMATCH
         if mutation == "adapter_content"
-        else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+        else ActivationEligibilityReason.REAL_MODEL_HASH_MISMATCH
     )
 
 
@@ -185,7 +220,9 @@ def test_failed_real_model_gate_still_revalidates_corrupt_result(
     required_settings = registry.settings.model_copy(
         update={
             "adapter_registry": registry.settings.adapter_registry.model_copy(
-                update={"require_real_model_behavioral_gate": True}
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
             )
         }
     )
@@ -193,7 +230,36 @@ def test_failed_real_model_gate_still_revalidates_corrupt_result(
     eligibility = AdapterRegistry(required_settings).activation_eligibility("candidate")
 
     assert eligibility.real_model_status == "corrupt"
-    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_CORRUPT
+
+
+def test_real_model_gate_reports_incomplete_canonical_coverage(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    result_path = bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        evaluation_id="real-incomplete",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["candidate"]["scenario_results"].pop()
+    validated = PairedBehavioralEvaluationResult.model_validate(payload)
+    content = json.dumps(validated.model_dump(mode="json"), sort_keys=True).encode()
+    result_path.write_bytes(content)
+    _update_registry_field(
+        registry,
+        "real_model_behavioral_result_hash",
+        hashlib.sha256(content).hexdigest(),
+    )
+
+    eligibility = _with_real_model_policy(registry).activation_eligibility("candidate")
+
+    assert eligibility.real_model_status == "coverage_incomplete"
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_COVERAGE_INCOMPLETE
 
 
 def test_replaced_adapter_artifact_fails_hash_integrity(tmp_path: Path) -> None:
@@ -453,7 +519,7 @@ def test_legacy_activation_boolean_never_migrates_as_behavioral_authority(
     assert entry is not None
     assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
-    assert entry.schema_version == 7
+    assert entry.schema_version == 8
     assert (
         registry.activation_eligibility("legacy").reason
         == ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED
@@ -521,9 +587,31 @@ def test_schema_v4_behavioral_fields_migrate_to_exact_names(tmp_path: Path) -> N
     entry = registry.lookup("v4")
 
     assert entry is not None
-    assert entry.schema_version == 7
+    assert entry.schema_version == 8
     assert entry.behavioral_candidate_adapter_hash == "f" * 64
     assert entry.behavioral_base_model_revision == "model-revision"
+
+
+def test_schema_v7_real_model_result_does_not_migrate_as_authority(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        evaluation_id="legacy-real",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    payload = json.loads(registry.path.read_text(encoding="utf-8"))
+    payload["adapters"][0]["schema_version"] = 7
+    registry.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    eligibility = _with_real_model_policy(registry).activation_eligibility("candidate")
+
+    assert eligibility.real_model_status == "not_run"
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
 
 
 def _ready(tmp_path: Path) -> AdapterRegistry:
@@ -563,6 +651,19 @@ def _registry(tmp_path: Path) -> AdapterRegistry:
             }
         )
     )
+
+
+def _with_real_model_policy(registry: AdapterRegistry) -> AdapterRegistry:
+    settings = registry.settings.model_copy(
+        update={
+            "adapter_registry": registry.settings.adapter_registry.model_copy(
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
+            )
+        }
+    )
+    return AdapterRegistry(settings)
 
 
 def _update_registry_field(registry: AdapterRegistry, field: str, value: str) -> None:

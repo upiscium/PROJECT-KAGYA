@@ -30,7 +30,7 @@ uv run python -m kagya.learning.subject_behavioral_suite \
   --subject-revision subject-revision
 ```
 
-The formal runtime operation is `POST /api/adapters/{adapter_id}/behavioral-evaluate` with `runtime_kind=deterministic_runtime`. Evaluation runs in an isolated graph; only its adapter binding transition is serialized as a dedicated operational event. The artifact saga proceeds through prepared artifact, prepared registry binding, artifact finalization, registry finalization, and cross-registry reconciliation. `POST /api/evaluations/behavioral-reconciliation` classifies artifacts as `valid`, `prepared`, `orphan_result`, `orphan_registry_reference`, `hash_mismatch`, or `corrupt`. References are relative to the result root.
+The formal runtime operation is `POST /api/adapters/{adapter_id}/behavioral-evaluate`. The server selects the runtime from `adapter_registry.behavioral_activation_policy`; the request has no implicit runtime default. In production the policy and route force `real_model_runtime`. Development may explicitly configure `deterministic_runtime_only`, as the committed development config does. Evaluation runs in an isolated graph; only its adapter binding transition is serialized as a dedicated operational event. The artifact saga proceeds through prepared artifact, prepared registry binding, artifact finalization, registry finalization, and cross-registry reconciliation. `POST /api/evaluations/behavioral-reconciliation` classifies artifacts as `valid`, `prepared`, `orphan_result`, `orphan_registry_reference`, `hash_mismatch`, or `corrupt`. References are relative to the result root.
 
 ## Runtime Failure Checkpoints
 
@@ -52,4 +52,12 @@ KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml \
   uv run pytest tests/test_real_model_behavioral.py -m real_model -v
 ```
 
-Normal CI runs the synthetic evaluator contract, provider factories with fakes, and deterministic runtime suite. A green CI run never claims `real_model_runtime_gate_passed`; only the explicit hardware run can create that evidence. Production activation always requires deterministic runtime evidence. `adapter_registry.require_real_model_behavioral_gate` defaults to `false`; when enabled, missing, failed, corrupt/hash-mismatched, and stale real-model evidence block activation distinctly.
+Normal CI runs the synthetic evaluator contract, provider factories with fakes, and deterministic runtime suite. A green CI run never claims `real_model_runtime_gate_passed`; only the real-model runtime can create that evidence. Production activation requires current ordinary gates, a passed/finalized/reconciled deterministic architecture artifact, and a passed/finalized/reconciled real candidate-model artifact. Missing, failed, stale, corrupt, hash-mismatched, and coverage-incomplete real evidence have distinct bounded status and activation codes.
+
+## Policy And Migration
+
+`behavioral_activation_policy` defaults to `real_model_required`. Recognized environments are `production`, `development`, `test`, and `ci`; unknown environments fail validation. Production accepts only `real_model_required`. `deterministic_runtime_only` is limited to development, test, and CI and must be explicitly configured. `disabled` is limited to explicit test settings.
+
+The config loader maps the removed `require_real_model_behavioral_gate` key explicitly: `true` becomes `real_model_required`, while `false` becomes `deterministic_runtime_only`. New configuration should use only the policy enum. Adapter registry schema v8 does not migrate pre-v8 real-model fields as activation authority. A legacy active adapter may continue running with a warning, but reactivation and rollback promotion use current policy gates.
+
+`POST /api/adapters/{adapter_id}/evaluate` accepts an empty, extra-forbidden request body and always loads separate configured baseline and registered candidate providers over server-owned eval sets. Client-provided scores and dimensions are rejected during schema validation. `GET /api/adapters/{adapter_id}/behavioral-evaluation-status` returns bounded ordinary, deterministic, real-model, artifact, policy, and eligibility states without absolute paths, raw hashes, or private configuration.

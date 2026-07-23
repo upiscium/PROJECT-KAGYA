@@ -132,8 +132,8 @@ adapter_registry:
   max_value_drift: 0.1
   max_behavior_drift: 0.1
   canary_failure_limit: 1
-  # Hardware-gated evidence remains optional unless production policy enables it.
-  require_real_model_behavioral_gate: false
+  # Development explicitly permits architecture-only behavioral activation.
+  behavioral_activation_policy: deterministic_runtime_only
 
 tools:
   path: .kagya/tool_registry.json

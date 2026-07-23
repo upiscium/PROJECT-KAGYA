@@ -55,9 +55,6 @@ class AdapterEvaluator:
         provider: ModelProvider,
         *,
         baseline_provider: ModelProvider | None = None,
-        deterministic_score: float | None = None,
-        deterministic_dimensions: dict[str, float] | None = None,
-        deterministic_baselines: dict[str, float] | None = None,
     ) -> AdapterEvaluationResult:
         entry = self.registry.lookup(adapter_id)
         if entry is None:
@@ -68,38 +65,27 @@ class AdapterEvaluator:
 
         eval_sets = load_eval_sets(
             self.settings.adapter_registry.eval_sets,
-            require_existing=deterministic_score is None,
+            require_existing=True,
         )
         if entry.evaluation_dataset_path is not None:
             eval_sets.append(_load_lineage_holdout(Path(entry.evaluation_dataset_path)))
         case_count = sum(len(eval_set.cases) for eval_set in eval_sets)
-        if deterministic_score is None and case_count == 0:
-            raise ValueError(
-                "No evaluation cases loaded; configure eval sets or provide a deterministic score"
-            )
-        baseline_score: float | None = None
-        if deterministic_score is None:
-            (
-                baseline_score,
-                candidate_score,
-                baseline_dimensions,
-                candidate_dimensions,
-            ) = self._score_pair(
-                provider,
-                baseline_provider or provider,
-                eval_sets,
-            )
-            score_delta = candidate_score - baseline_score
-        else:
-            candidate_score = deterministic_score
-            score_delta = None
-            candidate_dimensions = dict(deterministic_dimensions or {})
-            baseline_dimensions = dict(deterministic_baselines or {})
+        if case_count == 0:
+            raise ValueError("No evaluation cases loaded; configure eval sets")
+        (
+            baseline_score,
+            candidate_score,
+            baseline_dimensions,
+            candidate_dimensions,
+        ) = self._score_pair(
+            provider,
+            baseline_provider or provider,
+            eval_sets,
+        )
+        score_delta = candidate_score - baseline_score
         score = candidate_score
         decision = self._decision(score)
         previous_score = self._previous_score(adapter_id)
-        if deterministic_score is not None:
-            score_delta = None if previous_score is None else score - previous_score
         regression = score_delta is not None and score_delta < 0
         drift_scores = {
             dimension: candidate_dimensions[dimension] - baseline_dimensions[dimension]

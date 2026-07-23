@@ -187,6 +187,7 @@ export type Adapter = {
   behavioral_artifact_hash_match: "passed" | "failed" | "not_run";
   activation_eligibility_reason: string;
   real_model_behavioral_required: boolean;
+  behavioral_activation_policy: "real_model_required" | "deterministic_runtime_only" | "disabled";
   legacy_activation_warning: boolean;
   rollout_state: string;
   canary_failures: number;
@@ -200,6 +201,18 @@ export type AdapterProvenance = { adapter: Adapter; lineage: Adapter[]; activati
 export type AdapterEvaluateResponse = { adapter_id: string; score: number; decision: string; result_path: string; status: string };
 export type AdapterActivationResponse = { action: string; adapter_id: string | null; adapter_hash: string | null; previous_adapter_id: string | null; previous_adapter_hash: string | null; activation_sequence: number };
 export type AdapterRuntimeState = { base_model: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null };
+export type AdapterBehavioralStatus = {
+  adapter_id: string;
+  policy: "real_model_required" | "deterministic_runtime_only" | "disabled";
+  ordinary_gates: Record<string, "passed" | "failed" | "not_run">;
+  deterministic_status: "not_run" | "failed" | "stale" | "corrupt" | "hash_mismatch" | "coverage_incomplete" | "passed";
+  deterministic_artifact: BehavioralArtifactStatus;
+  real_status: "not_run" | "failed" | "stale" | "corrupt" | "hash_mismatch" | "coverage_incomplete" | "passed";
+  real_required: boolean;
+  real_artifact: BehavioralArtifactStatus;
+  activation_eligible: boolean;
+  activation_reason: string;
+};
 export type EvaluationResultSummary = {
   filename: string;
   adapter_id: string;
@@ -554,7 +567,8 @@ export const api = {
   adapters: () => adminRequest<AdapterListResponse>("/adapters"),
   adapterProvenance: (adapterId: string) => adminRequest<AdapterProvenance>(`/adapters/${encodeURIComponent(adapterId)}/provenance`),
   adapterRuntime: () => adminRequest<AdapterRuntimeState>("/adapters/runtime"),
-  evaluateAdapter: (adapterId: string, deterministic_score?: number) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({ deterministic_score }) }),
+  evaluateAdapter: (adapterId: string) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({}) }),
+  adapterBehavioralStatus: (adapterId: string) => adminRequest<AdapterBehavioralStatus>(`/adapters/${encodeURIComponent(adapterId)}/behavioral-evaluation-status`),
   trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),
   approveAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
   activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),

@@ -10,8 +10,18 @@ from fastapi.testclient import TestClient
 import pytest
 
 from kagya.api.server import create_app
-from kagya.config import Settings, load_settings
-from kagya.learning import AdapterRegistry
+from kagya.config import (
+    BehavioralActivationPolicy,
+    ProjectEnvironment,
+    Settings,
+    load_settings,
+)
+from kagya.learning import (
+    AdapterRegistry,
+    BehavioralArtifactStore,
+    BehavioralRuntimeKind,
+)
+from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import DummyProvider
@@ -614,7 +624,7 @@ def test_system_events_include_safe_appraisal_components(tmp_path: Path) -> None
 
 
 def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
+    settings = _settings_with_eval_set(tmp_path)
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
     memory = client.app.state.memory_system
@@ -632,7 +642,7 @@ def test_system_events_include_sleep_and_adapter_lifecycle(tmp_path: Path) -> No
     evaluated = client.post(
         "/api/adapters/adapter-observed/evaluate",
         headers=admin_headers(),
-        json={"deterministic_score": 0.9},
+        json={},
     )
     approved = client.post(
         "/api/adapters/adapter-observed/approve", headers=admin_headers()
@@ -708,6 +718,114 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
     )
     assert reconciliation.status_code == 200
     assert reconciliation.json()["artifacts"][0]["status"] == "valid"
+
+
+def test_adapter_evaluate_rejects_client_deterministic_scores(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    register_runtime_candidate(
+        client.app.state.adapter_registry, tmp_path, "no-client-score"
+    )
+
+    response = client.post(
+        "/api/adapters/no-client-score/evaluate",
+        headers=admin_headers(),
+        json={"deterministic_score": 0.99},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "extra_forbidden"
+
+
+def test_production_behavioral_route_forces_real_model_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "project": _settings(tmp_path).project.model_copy(
+                update={"environment": ProjectEnvironment.PRODUCTION}
+            ),
+            "adapter_registry": _settings(tmp_path).adapter_registry.model_copy(
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
+            ),
+        }
+    )
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    register_runtime_candidate(registry, tmp_path, "production-candidate")
+
+    rejected = client.post(
+        "/api/adapters/production-candidate/behavioral-evaluate",
+        headers=admin_headers(),
+        json={
+            "evaluation_id": "production-deterministic",
+            "runtime_kind": "deterministic_runtime",
+        },
+    )
+    assert rejected.status_code == 403
+
+    def fake_real_runner(
+        settings: Settings, evaluation_id: str, **_: object
+    ) -> tuple[PairedBehavioralEvaluationResult, str]:
+        path = write_runtime_behavioral_result(
+            registry,
+            tmp_path,
+            "production-candidate",
+            evaluation_id=evaluation_id,
+            runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        )
+        result = PairedBehavioralEvaluationResult.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+        artifact = BehavioralArtifactStore(
+            settings.adapter_registry.eval_result_dir
+        ).prepare(evaluation_id, result.model_dump(mode="json"))
+        return result, artifact.status.value
+
+    monkeypatch.setattr(
+        "kagya.api.routes.adapters.run_real_model_runtime_evaluation",
+        fake_real_runner,
+    )
+    response = client.post(
+        "/api/adapters/production-candidate/behavioral-evaluate",
+        headers=admin_headers(),
+        json={"evaluation_id": "production-real"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["runtime_kind"] == "real_model_runtime"
+
+
+def test_behavioral_status_is_bounded_and_redacted(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    registry = client.app.state.adapter_registry
+    register_runtime_candidate(registry, tmp_path, "status-candidate")
+
+    response = client.get(
+        "/api/adapters/status-candidate/behavioral-evaluation-status",
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "adapter_id": "status-candidate",
+        "policy": "deterministic_runtime_only",
+        "ordinary_gates": {
+            "quality": "not_run",
+            "holdout": "not_run",
+            "drift": "not_run",
+        },
+        "deterministic_status": "not_run",
+        "deterministic_artifact": "not_run",
+        "real_status": "not_run",
+        "real_required": False,
+        "real_artifact": "not_run",
+        "activation_eligible": False,
+        "activation_reason": "quality_unevaluated",
+    }
+    assert str(tmp_path) not in response.text
+    assert "hash" not in response.text
 
 
 def test_behavioral_rerun_api_rejects_changed_runtime_artifact(tmp_path: Path) -> None:
@@ -835,7 +953,7 @@ def test_startup_preloads_transformers_provider(tmp_path: Path, monkeypatch) -> 
 
 
 def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
+    settings = _settings_with_eval_set(tmp_path)
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
     candidate = register_runtime_candidate(registry, tmp_path, "adapter-api")
@@ -846,7 +964,7 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     evaluated = client.post(
         "/api/adapters/adapter-api/evaluate",
         headers=admin_headers(),
-        json={"deterministic_score": 0.9},
+        json={},
     )
     assert evaluated.status_code == 200
     assert evaluated.json()["status"] == "trial_active"
@@ -2926,6 +3044,31 @@ def _settings(tmp_path: Path) -> Settings:
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
             ),
+        }
+    )
+
+
+def _settings_with_eval_set(tmp_path: Path) -> Settings:
+    eval_set = tmp_path / "adapter-eval-set.json"
+    eval_set.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "prompt": "adapter evaluation",
+                        "expected": "DummyProvider deterministic response.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    return settings.model_copy(
+        update={
+            "adapter_registry": settings.adapter_registry.model_copy(
+                update={"eval_sets": [eval_set]}
+            )
         }
     )
 
