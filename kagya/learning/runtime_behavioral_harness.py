@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 import json
 from pathlib import Path
 from threading import Lock
@@ -18,7 +19,8 @@ from kagya.external_transaction import ExternalTransactionCoordinator
 from kagya.learning.behavioral_evaluation import (
     BehavioralTrace,
     ActionAttempt,
-    PublicBehaviorClass,
+    RuntimeBehaviorClassifier,
+    RuntimeBehaviorObservation,
     StateTransition,
     TransitionKind,
 )
@@ -107,6 +109,9 @@ class DeterministicRuntimeProvider(DummyProvider):
         if self._responses:
             return self._responses.pop(0)
         return self.response_text
+
+    def queue_responses(self, *responses: str) -> None:
+        self._responses.extend(responses)
 
 
 @dataclass
@@ -197,23 +202,29 @@ class AuthoritativeTransitionCollector:
         self._wal_record_ids = {record.record_id for record in harness.wal_records()}
 
     def capture(
-        self, behavior: PublicBehaviorClass, payload: dict[str, object] | None = None
+        self,
+        visible_response: str | None = None,
+        *,
+        duplicate_retry: bool = False,
+        payload: dict[str, object] | None = None,
     ) -> BehavioralTrace:
         after = self.harness.capture_authoritative_state()
         records = self.harness.journal_records()
         wal_records = self.harness.wal_records()
-        latest = records[-1] if records else None
-        event_id = None if latest is None else latest.event_id
-        sequence = None if latest is None else latest.processing_sequence
-        evidence = self.harness.evidence_references()
+        before_intents = _list_at(self.before, ("domains", "actions", "intents"))
+        after_intents = _list_at(after, ("domains", "actions", "intents"))
+        before_receipts = _list_at(self.before, ("domains", "actions", "receipts"))
+        after_receipts = _list_at(after, ("domains", "actions", "receipts"))
         transitions = tuple(
             [
+                *_domain_record_transitions(self.before, after),
                 *_diff_transitions(
-                    self.before,
-                    after,
-                    evidence=evidence,
-                    event_id=event_id,
-                    event_sequence=sequence,
+                    {
+                        key: value
+                        for key, value in self.before.items()
+                        if key != "domains"
+                    },
+                    {key: value for key, value in after.items() if key != "domains"},
                 ),
                 *(
                     StateTransition(
@@ -244,13 +255,31 @@ class AuthoritativeTransitionCollector:
         )
         attempts = self.harness.action_attempts()
         side_effects = self.harness.side_effect_keys()
+        behavior = RuntimeBehaviorClassifier().classify(
+            RuntimeBehaviorObservation(
+                visible_response=visible_response,
+                before_authoritative_state=self.before,
+                after_authoritative_state=after,
+                new_action_intents=max(0, len(after_intents) - len(before_intents)),
+                new_external_effects=max(0, len(self.harness.tool_environment.calls)),
+                duplicate_retry=duplicate_retry,
+                tool_call_count=len(self.harness.tool_environment.calls),
+                receipt_count=max(0, len(after_receipts) - len(before_receipts)),
+            )
+        )
         return BehavioralTrace(
             final_authoritative_state=after,
             transitions=transitions,
             public_behavior=behavior,
             public_payload=cast(
                 dict[str, JsonValue],
-                _json_value(payload or {"behavior_class": behavior.value}),
+                _json_value(
+                    payload
+                    or {
+                        "response": visible_response or "",
+                        "classified_behavior": behavior.value,
+                    }
+                ),
             ),
             side_effect_keys=side_effects,
             action_attempts=attempts,
@@ -446,20 +475,18 @@ class SubjectRuntimeHarness:
             payload=payload,
         )
 
-    def seed(self, seed: dict[str, object]) -> None:
-        # Seed data is validated through the persisted snapshot schema and an
-        # ordinary runtime event; expectations are never accepted here.
-        json.dumps(seed, allow_nan=False)
+    def abrupt_stop(self) -> None:
+        """Terminate threads without draining or committing active runtime work."""
 
-        def apply(loop: KagyaMainLoop) -> None:
-            loop.persistent_state.extensions["runtime_fixture_seed"] = dict(seed)
-
-        self.execute(AgentEventType.STATE_RESTORE, apply, payload={"seed": "validated"})
-
-    def crash(self) -> None:
-        """Abruptly discard graph ownership without a graceful runtime drain."""
+        graph = self.graph
+        if graph is not None:
+            graph.runtime.abort()
+            graph.autonomy_loop.shutdown()
         self.graph = None
         self.readiness = False
+
+    def crash(self) -> None:
+        self.abrupt_stop()
 
     def restart(self) -> "SubjectRuntimeHarness":
         old_graph = self.graph
@@ -480,10 +507,16 @@ class SubjectRuntimeHarness:
     def capture_trace(
         self,
         collector: AuthoritativeTransitionCollector,
-        behavior: PublicBehaviorClass,
+        visible_response: str | None = None,
+        *,
+        duplicate_retry: bool = False,
         payload: dict[str, object] | None = None,
     ) -> BehavioralTrace:
-        return collector.capture(behavior, payload)
+        return collector.capture(
+            visible_response,
+            duplicate_retry=duplicate_retry,
+            payload=payload,
+        )
 
     def shutdown(self) -> None:
         if self.graph is not None:
@@ -504,6 +537,11 @@ class SubjectRuntimeHarness:
             "experiences": _model_values(graph.main_loop.experience_store),
             "motivations": _model_values(graph.main_loop.motivation_dynamics),
             "goals": _model_values(graph.main_loop.goal_manager),
+            "commitments": _json_value(
+                graph.main_loop.commitment_store.list_commitments()
+            ),
+            "values": _json_value(graph.main_loop.value_system.list_values()),
+            "beliefs": _model_values(graph.main_loop.belief_store),
             "plans": _model_values(graph.main_loop.plan_store),
             "decisions": _model_values(graph.main_loop.decision_store),
             "actions": {
@@ -517,6 +555,9 @@ class SubjectRuntimeHarness:
             "agency": _model_values(graph.main_loop.agency_attribution_store),
             "counterfactuals": _model_values(graph.main_loop.counterfactual_store),
             "outbox": _model_values(graph.outbox),
+            "relationships": _model_values(graph.main_loop.relationship_store),
+            "narrative": _model_values(graph.main_loop.narrative_self),
+            "metacognition": _model_values(graph.main_loop.metacognition),
         }
         return state
 
@@ -632,11 +673,16 @@ def _model_values(value: Any) -> Any:
     for method_name in (
         "list",
         "list_records",
+        "list_values",
         "list_goals",
+        "list_commitments",
         "list_plans",
         "list_current",
+        "list_relationships",
+        "list_assessments",
         "list_intents",
         "list_messages",
+        "to_json",
     ):
         method = getattr(value, method_name, None)
         if callable(method):
@@ -653,6 +699,10 @@ def _model_values(value: Any) -> Any:
 def _json_value(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_value(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -667,9 +717,6 @@ def _diff_transitions(
     after: Any,
     *,
     path: tuple[str, ...] = (),
-    evidence: tuple[str, ...],
-    event_id: str | None,
-    event_sequence: int | None,
 ) -> list[StateTransition]:
     if isinstance(before, dict) and isinstance(after, dict):
         result: list[StateTransition] = []
@@ -681,9 +728,6 @@ def _diff_transitions(
                         path=child,
                         kind=TransitionKind.CREATE,
                         after=after[key],
-                        evidence_refs=evidence,
-                        event_id=event_id,
-                        event_sequence=event_sequence,
                     )
                 )
             elif key not in after:
@@ -692,9 +736,6 @@ def _diff_transitions(
                         path=child,
                         kind=TransitionKind.REMOVE,
                         before=before[key],
-                        evidence_refs=evidence,
-                        event_id=event_id,
-                        event_sequence=event_sequence,
                     )
                 )
             else:
@@ -703,9 +744,6 @@ def _diff_transitions(
                         before[key],
                         after[key],
                         path=child,
-                        evidence=evidence,
-                        event_id=event_id,
-                        event_sequence=event_sequence,
                     )
                 )
         return result
@@ -718,26 +756,226 @@ def _diff_transitions(
         and after[: len(before)] == before
         else TransitionKind.UPDATE
     )
-    revision_before = (
-        before.get("revision")
-        if isinstance(before, dict) and isinstance(before.get("revision"), int)
-        else None
-    )
-    revision_after = (
-        after.get("revision")
-        if isinstance(after, dict) and isinstance(after.get("revision"), int)
-        else None
-    )
     return [
         StateTransition(
             path=path or ("root",),
             kind=kind,
             before=before,
             after=after,
-            evidence_refs=evidence,
-            event_id=event_id,
-            event_sequence=event_sequence,
-            revision_before=revision_before,
-            revision_after=revision_after,
         )
     ]
+
+
+def _domain_record_transitions(
+    before_state: dict[str, Any], after_state: dict[str, Any]
+) -> list[StateTransition]:
+    before_domains = before_state.get("domains", {})
+    after_domains = after_state.get("domains", {})
+    if not isinstance(before_domains, dict) or not isinstance(after_domains, dict):
+        return []
+    transitions: list[StateTransition] = []
+    for domain in sorted(set(before_domains) | set(after_domains)):
+        transitions.extend(
+            _record_container_transitions(
+                before_domains.get(domain),
+                after_domains.get(domain),
+                ("domains", str(domain)),
+            )
+        )
+    return transitions
+
+
+def _record_container_transitions(
+    before: Any, after: Any, path: tuple[str, ...]
+) -> list[StateTransition]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        result: list[StateTransition] = []
+        for key in sorted(set(before) | set(after)):
+            result.extend(
+                _record_container_transitions(
+                    before.get(key), after.get(key), (*path, str(key))
+                )
+            )
+        return result
+    if isinstance(before, list) and isinstance(after, list):
+        before_records = {
+            identifier: item
+            for item in before
+            if isinstance(item, dict)
+            and (identifier := _record_identifier(item)) is not None
+        }
+        after_records = {
+            identifier: item
+            for item in after
+            if isinstance(item, dict)
+            and (identifier := _record_identifier(item)) is not None
+        }
+        if before_records or after_records:
+            result = []
+            for identifier in sorted(set(before_records) | set(after_records)):
+                previous = before_records.get(identifier)
+                current = after_records.get(identifier)
+                if previous == current:
+                    continue
+                record = current if current is not None else previous
+                if record is None:
+                    continue
+                result.append(
+                    StateTransition(
+                        path=(*path, identifier),
+                        kind=(
+                            TransitionKind.CREATE
+                            if previous is None
+                            else TransitionKind.REMOVE
+                            if current is None
+                            else TransitionKind.UPDATE
+                        ),
+                        before=previous,
+                        after=current,
+                        evidence_refs=_record_evidence(record),
+                        event_id=_record_event_id(record),
+                        event_sequence=_record_event_sequence(record),
+                        revision_before=_record_revision(previous),
+                        revision_after=_record_revision(current),
+                    )
+                )
+                result.extend(
+                    _nested_revision_transitions(previous, current, (*path, identifier))
+                )
+            return result
+    return _diff_transitions(before, after, path=path)
+
+
+def _nested_revision_transitions(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    path: tuple[str, ...],
+) -> list[StateTransition]:
+    if after is None:
+        return []
+    result: list[StateTransition] = []
+    previous = before or {}
+    for key, value in after.items():
+        old_value = previous.get(key)
+        if key in {"revisions", "transitions", "deliberations"} and isinstance(
+            value, list
+        ):
+            result.extend(
+                _record_container_transitions(old_value or [], value, (*path, key))
+            )
+    return result
+
+
+def _record_identifier(record: dict[str, Any]) -> str | None:
+    for key in (
+        "experience_id",
+        "motivation_id",
+        "goal_id",
+        "commitment_id",
+        "plan_id",
+        "decision_id",
+        "intent_id",
+        "receipt_id",
+        "observation_id",
+        "verification_id",
+        "attribution_id",
+        "simulation_id",
+        "message_id",
+        "value_id",
+        "belief_id",
+        "relationship_id",
+        "assessment_id",
+        "revision_id",
+        "transition_id",
+        "deliberation_id",
+    ):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    revision = record.get("revision")
+    return f"revision-{revision}" if isinstance(revision, int) else None
+
+
+def _record_revision(record: dict[str, Any] | None) -> int | None:
+    if record is None:
+        return None
+    value = record.get("revision", record.get("to_revision"))
+    return value if isinstance(value, int) else None
+
+
+def _record_evidence(record: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str) and (
+            key.endswith("_ref")
+            or key.endswith("_refs")
+            or key
+            in {
+                "event_id",
+                "source_event_id",
+                "decision_id",
+                "intent_id",
+                "receipt_id",
+                "observation_id",
+                "verification_id",
+            }
+        ):
+            values.append(value)
+
+    visit(record)
+    return tuple(dict.fromkeys(values))
+
+
+def _record_event_id(record: dict[str, Any]) -> str | None:
+    candidates: list[str] = []
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, str) and key in {
+            "event_id",
+            "source_event_id",
+            "triggering_event_id",
+            "proposal_event_id",
+        }:
+            candidates.append(value)
+
+    visit(record)
+    return candidates[-1] if candidates else None
+
+
+def _record_event_sequence(record: dict[str, Any]) -> int | None:
+    values: list[int] = []
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                visit(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, key)
+        elif isinstance(value, int) and key.endswith("event_sequence"):
+            values.append(value)
+
+    visit(record)
+    return max(values) if values else None
+
+
+def _list_at(value: dict[str, Any], path: tuple[str, ...]) -> list[Any]:
+    current: Any = value
+    for item in path:
+        if not isinstance(current, dict):
+            return []
+        current = current.get(item)
+    return current if isinstance(current, list) else []

@@ -6,9 +6,10 @@ from kagya.config import load_settings
 from kagya.learning import (
     AuthoritativeTransitionCollector,
     FailureInjector,
-    PublicBehaviorClass,
     SubjectRuntimeHarness,
 )
+from kagya.identity import OriginActor
+from kagya.motivation import CommitmentStatus
 from kagya.runtime import AgentEventType, JournalLifecycle, hash_snapshot
 from kagya.outbox import OutboxMessageKind
 
@@ -32,30 +33,36 @@ def test_collector_derives_runtime_diff_and_durable_evidence(tmp_path: Path) -> 
     collector = AuthoritativeTransitionCollector(harness)
 
     harness.execute(
-        AgentEventType.STATE_SNAPSHOT,
-        lambda loop: loop.persistent_state.extensions.update(
-            {"collector_probe": {"revision": 1, "status": "observed"}}
+        AgentEventType.GOAL_UPDATE,
+        lambda loop: loop.create_commitment(
+            commitment_id="collector-commitment",
+            description="External proposal",
+            origin_actor=OriginActor.OPERATOR,
+            origin_source_ref="test:external-proposal",
         ),
     )
-    trace = harness.capture_trace(collector, PublicBehaviorClass.NO_OP)
+    harness.execute(
+        AgentEventType.GOAL_UPDATE,
+        lambda loop: loop.accept_commitment(
+            "collector-commitment",
+            self_endorsement="subject_acceptance:collector-commitment",
+        ),
+    )
+    trace = harness.capture_trace(collector)
     harness.shutdown()
 
-    assert any(
-        transition.path == ("extensions", "collector_probe")
-        for transition in trace.transitions
+    transition = next(
+        item
+        for item in trace.transitions
+        if item.path == ("domains", "commitments", "collector-commitment")
     )
-    assert all(
-        transition.event_sequence == 1
-        for transition in trace.transitions
-        if transition.path == ("last_processed_event_sequence",)
-    )
-    evidence = {
-        reference
-        for transition in trace.transitions
+    assert transition.event_sequence == 2
+    assert "test:external-proposal" in transition.evidence_refs
+    assert any("accept" in reference for reference in transition.evidence_refs)
+    assert not any(
+        reference.startswith(("journal:", "wal:"))
         for reference in transition.evidence_refs
-    }
-    assert any(reference.startswith("journal:") for reference in evidence)
-    assert any(reference.startswith("wal:") for reference in evidence)
+    )
 
 
 def test_restart_builds_fresh_graph_and_restores_filesystem_state(
@@ -64,8 +71,9 @@ def test_restart_builds_fresh_graph_and_restores_filesystem_state(
     harness = _harness(tmp_path).create().start()
     harness.execute(
         AgentEventType.GOAL_UPDATE,
-        lambda loop: loop.persistent_state.extensions.update(
-            {"commitment_proposal": {"revision": 1, "status": "proposed"}}
+        lambda loop: loop.create_commitment(
+            commitment_id="restart-commitment",
+            description="Persist responsibility",
         ),
     )
     old_graph = harness.graph
@@ -76,12 +84,9 @@ def test_restart_builds_fresh_graph_and_restores_filesystem_state(
     assert harness.graph is not old_graph
     assert harness.graph is not None
     assert harness.graph.main_loop is not old_loop
-    assert harness.capture_authoritative_state()["extensions"][
-        "commitment_proposal"
-    ] == {
-        "revision": 1,
-        "status": "proposed",
-    }
+    commitments = harness.capture_authoritative_state()["domains"]["commitments"]
+    assert commitments[0]["commitment_id"] == "restart-commitment"
+    assert commitments[0]["status"] == CommitmentStatus.PROPOSED.value
     harness.shutdown()
 
 
@@ -98,7 +103,8 @@ def test_snapshot_committed_before_journal_completion_recovers_without_replay(
                 {"exactly_once": {"count": 1}}
             ),
         )
-    harness.restart()
+    harness.abrupt_stop()
+    harness = _harness(tmp_path).create().start()
 
     state = harness.capture_authoritative_state()
     assert state["extensions"]["exactly_once"]["count"] == 1
@@ -163,7 +169,8 @@ def test_wal_append_failure_leaves_snapshot_uncommitted(tmp_path: Path) -> None:
                 {"must_not_commit": True}
             ),
         )
-    harness.restart()
+    harness.abrupt_stop()
+    harness = _harness(tmp_path).create().start()
 
     assert "must_not_commit" not in harness.capture_authoritative_state()["extensions"]
     assert any(
@@ -171,21 +178,6 @@ def test_wal_append_failure_leaves_snapshot_uncommitted(tmp_path: Path) -> None:
         and record.failure_category == "uncommitted_after_crash"
         for record in harness.journal_records()
     )
-    harness.shutdown()
-
-
-def test_fixture_seed_is_validated_input_not_expected_state(tmp_path: Path) -> None:
-    harness = _harness(tmp_path).create().start()
-    harness.seed({"external_observations": ["one"], "approvals": []})
-
-    assert harness.capture_authoritative_state()["extensions"][
-        "runtime_fixture_seed"
-    ] == {
-        "external_observations": ["one"],
-        "approvals": [],
-    }
-    with pytest.raises((TypeError, ValueError)):
-        harness.seed({"invalid": object()})
     harness.shutdown()
 
 
@@ -203,13 +195,44 @@ def test_external_prepare_then_snapshot_failure_is_compensated_on_restart(
                 "stage an external observation", create_context=True
             ),
         )
-    harness.restart()
+    harness.abrupt_stop()
+    harness = _harness(tmp_path).create().start()
 
     assert harness.graph is not None
     records = harness.graph.external_transactions.records()
     assert records
     assert {record.status.value for record in records} == {"compensated"}
     harness.shutdown()
+
+
+def test_abrupt_stop_terminates_threads_before_fresh_reconstruction(
+    tmp_path: Path,
+) -> None:
+    crashed = _harness(tmp_path).create().start()
+    assert crashed.graph is not None
+    old_graph = crashed.graph
+    crashed.execute(
+        AgentEventType.GOAL_UPDATE,
+        lambda loop: loop.create_commitment(
+            commitment_id="abrupt-commitment",
+            description="Survive abrupt stop",
+        ),
+    )
+
+    crashed.abrupt_stop()
+
+    assert old_graph.runtime.is_alive is False
+    assert old_graph.autonomy_loop._thread is None
+    recovered = _harness(tmp_path).create().start()
+    assert recovered is not crashed
+    assert recovered.graph is not old_graph
+    assert (
+        recovered.capture_authoritative_state()["domains"]["commitments"][0][
+            "commitment_id"
+        ]
+        == "abrupt-commitment"
+    )
+    recovered.shutdown()
 
 
 def test_duplicate_outbox_delivery_input_has_exactly_one_effect(tmp_path: Path) -> None:

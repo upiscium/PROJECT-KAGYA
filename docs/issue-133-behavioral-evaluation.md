@@ -5,6 +5,8 @@ Issue #133 has two deliberately separate deterministic evidence classes.
 - `synthetic_evaluator_contract` uses `SyntheticTraceRunner` only to unit-test scenario schemas, transition matching, dimensions, and hard gates. It copies canonical transitions and therefore cannot bind an adapter, satisfy a production gate, or serve as completion evidence. `DeterministicSubjectRunner` remains only as a deprecated source-compatible alias.
 - `deterministic_runtime` uses `SubjectRuntimeHarness` and fresh baseline/candidate runtime graphs. Actual transitions come from runtime events, before/after state diffs, Journal, WAL, Action evidence, Outbox, and revisioned domain stores. Only a finalized, reconciled `valid` artifact with its immutable manifest can bind the adapter registry.
 
+Runtime execution reads fixture inputs only. Public behavior is classified after PromptBuilder, ModelProvider, and response postprocessing from the visible response plus observed Action and authority state. A model-declared behavior class is rejected when Action or authoritative Value, Goal, Commitment, or Belief state contradicts it. Expected behavior and transition fields are evaluator-only.
+
 ## Coverage
 
 - `subject.external-to-reflective-continuity` covers every current `BehavioralDimension`, causal ordering, policy-governed action, exactly-once external effects, and restart continuity.
@@ -31,6 +33,8 @@ The formal runtime operation is `POST /api/adapters/{adapter_id}/behavioral-eval
 ## Runtime Failure Checkpoints
 
 The deterministic harness exposes `journal_accepted`, `journal_started`, `external_prepare`, `before_wal_append`, `after_wal_append`, `snapshot_temp_fsynced`, `snapshot_replaced`, `before_external_finalize`, `finalize`, `after_external_finalize`, and `before_journal_completed`. Restart always reconstructs a new graph from filesystem state. Journal corruption fails readiness closed; snapshot corruption is reconstructed only from a verified hash-chained WAL.
+
+Crash recovery uses `abrupt_stop`, which stops Autonomy and aborts AgentRuntime without draining or invoking an active event completion hook. Recovery then constructs a separate `SubjectRuntimeHarness` from filesystem state.
 
 ## Real Model
 

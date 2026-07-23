@@ -93,6 +93,34 @@ def test_events_run_in_acceptance_order_with_monotonic_sequences() -> None:
     assert [outcome.value for outcome in outcomes] == execution_order
 
 
+def test_abort_during_handler_skips_completion_hook_and_terminates_worker() -> None:
+    started = Event()
+    release = Event()
+    completed: list[str] = []
+    runtime = AgentRuntime(
+        queue_capacity=2,
+        completion_hook=lambda _event: completed.append("completed") or "0" * 64,
+    )
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.CHAT,
+        source="test.abort",
+        handler=lambda: started.set() or release.wait(2) or "finished",
+    )
+    assert started.wait(1)
+    abort_thread = Thread(target=runtime.abort)
+    abort_thread.start()
+    while runtime.is_accepting:
+        sleep(0.001)
+    release.set()
+    abort_thread.join(timeout=2)
+
+    with pytest.raises(AgentRuntimeStopped, match="abruptly stopped"):
+        future.result(timeout=1)
+    assert completed == []
+    assert runtime.is_alive is False
+
+
 def test_handler_exception_does_not_stop_later_events() -> None:
     runtime = AgentRuntime(queue_capacity=2)
     runtime.start()
@@ -277,9 +305,7 @@ def test_durable_accept_failure_rejects_event_without_running_handler() -> None:
     ran = Event()
 
     with pytest.raises(AgentRuntimeJournalError, match="durably accepted"):
-        runtime.submit(
-            AgentEventType.CHAT, source="test", handler=lambda: ran.set()
-        )
+        runtime.submit(AgentEventType.CHAT, source="test", handler=lambda: ran.set())
     runtime.shutdown()
 
     assert ran.is_set() is False
@@ -302,9 +328,7 @@ def test_durable_completion_failure_fails_stops_runtime() -> None:
         future.result(timeout=1)
     assert runtime.is_accepting is False
     with pytest.raises(AgentRuntimeStopped):
-        runtime.submit(
-            AgentEventType.CHAT, source="test", handler=lambda: "rejected"
-        )
+        runtime.submit(AgentEventType.CHAT, source="test", handler=lambda: "rejected")
     runtime.shutdown()
 
 
@@ -356,9 +380,7 @@ def test_restored_sequence_and_completion_hook_define_commit_boundary() -> None:
     runtime = AgentRuntime(
         queue_capacity=1,
         initial_sequence=8,
-        completion_hook=lambda event: committed.append(
-            event.processing_sequence or 0
-        ),
+        completion_hook=lambda event: committed.append(event.processing_sequence or 0),
     )
     runtime.start()
 

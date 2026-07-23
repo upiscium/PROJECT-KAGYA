@@ -108,6 +108,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         expected_revision: int,
         reason_code: str,
         actor_id: str,
+        evidence_refs: tuple[str, ...] = (),
     ) -> Plan:
         event = current_agent_event()
         plan = self.plan_store.revise(
@@ -116,6 +117,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             expected_revision=expected_revision,
             reason_code=reason_code,
             actor_id=actor_id,
+            evidence_refs=evidence_refs,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
         )

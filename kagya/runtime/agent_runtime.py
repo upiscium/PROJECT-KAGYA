@@ -199,6 +199,7 @@ class AgentRuntime:
         self._state = "created"
         self._sequence = initial_sequence
         self._worker: Thread | None = None
+        self._abort_requested = False
 
     def start(self) -> None:
         with self._state_lock:
@@ -299,6 +300,33 @@ class AgentRuntime:
         with self._state_lock:
             self._state = "stopped"
 
+    def abort(self) -> None:
+        """Stop without draining or invoking completion hooks for active work."""
+
+        with self._state_lock:
+            if self._state in {"stopped", "aborted"}:
+                return
+            self._abort_requested = True
+            self._state = "aborted"
+            worker = self._worker
+        while True:
+            try:
+                pending = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if pending is not _STOP:
+                    envelope = cast(_Envelope[Any], pending)
+                    if not envelope.future.done():
+                        envelope.future.set_exception(
+                            AgentRuntimeStopped("Agent runtime was abruptly stopped")
+                        )
+            finally:
+                self._queue.task_done()
+        self._queue.put(_STOP)
+        if worker is not None:
+            worker.join()
+
     @property
     def is_alive(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
@@ -365,6 +393,14 @@ class AgentRuntime:
                     if can_deliver:
                         envelope.future.set_exception(exc)
                 else:
+                    if self._abort_requested:
+                        if can_deliver and not envelope.future.done():
+                            envelope.future.set_exception(
+                                AgentRuntimeStopped(
+                                    "Agent runtime was abruptly stopped before commit"
+                                )
+                            )
+                        continue
                     try:
                         snapshot_hash = (
                             None
