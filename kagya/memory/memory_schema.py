@@ -71,7 +71,6 @@ class EpisodicMemoryRecord:
     id: str
     user_input: str
     response: str
-    hidden_thought: str = ""
     loss: float = 0.0
     emotion_valence: float = 0.0
     emotion_arousal: float = 0.0

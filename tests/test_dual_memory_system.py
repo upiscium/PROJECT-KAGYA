@@ -38,7 +38,6 @@ def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> Non
     episode_id = memory.save_episodic(
         "I like lunar gardens",
         "Remembering lunar gardens.",
-        hidden_thought="garden affinity",
         loss=0.25,
         emotion_valence=0.7,
         emotion_arousal=0.8,
@@ -48,7 +47,29 @@ def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> Non
 
     assert [record.id for record in context.db1_results] == [episode_id]
     assert context.db1_results[0].record_type == MemoryRecordType.EPISODIC_LOG
-    assert context.db1_results[0].hidden_thought == "garden affinity"
+    assert not hasattr(context.db1_results[0], "hidden_thought")
+
+
+def test_restart_scrubs_legacy_hidden_thought_from_chroma(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    episode_id = memory.save_episodic("legacy input", "visible output")
+    stored = memory.db1.get(ids=[episode_id], include=["metadatas"])
+    metadata = dict(stored["metadatas"][0])
+    metadata["hidden_thought"] = "legacy private thought"
+    memory.db1.update(
+        ids=[episode_id],
+        metadatas=[metadata],
+        documents=[
+            "User: legacy input\nAssistant: visible output\nThought: legacy private thought"
+        ],
+    )
+
+    restarted = _memory(settings)
+    scrubbed = restarted.db1.get(ids=[episode_id], include=["documents", "metadatas"])
+
+    assert "hidden_thought" not in scrubbed["metadatas"][0]
+    assert "legacy private thought" not in scrubbed["documents"][0]
 
 
 def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:

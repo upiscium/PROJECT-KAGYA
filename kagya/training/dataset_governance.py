@@ -62,6 +62,10 @@ class GovernedDatasetRecord:
     context_id: str | None = None
     interlocutor_id: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.thought:
+            raise ValueError("Governed datasets cannot contain teacher thoughts")
+
     def to_json(self) -> dict[str, Any]:
         value = asdict(self)
         value["disposition"] = self.disposition.value
@@ -117,6 +121,10 @@ class DatasetCandidate:
     interlocutor_id: str | None = None
     tags: tuple[str, ...] = ()
     exclusion_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.thought:
+            raise ValueError("Dataset candidates cannot contain teacher thoughts")
 
 
 SensitiveScanner = Callable[[str], list[str]]
@@ -510,6 +518,7 @@ class DatasetGovernanceStore:
 
 def candidate_from_episode(episode: EpisodicMemoryRecord) -> DatasetCandidate:
     metadata = episode.metadata
+    _reject_hidden_teacher_fields(metadata)
     operator = episode.operator_metadata
     consent = str(operator.get("training_consent", metadata.get("training_consent", "runtime_training_allowed")))
     privacy = str(operator.get("privacy", metadata.get("privacy", "internal")))
@@ -546,6 +555,7 @@ def candidate_from_episode(episode: EpisodicMemoryRecord) -> DatasetCandidate:
 
 
 def candidate_from_dream_json(value: dict[str, Any]) -> DatasetCandidate:
+    _reject_hidden_teacher_fields(value)
     source_id = str(value.get("source_id", ""))
     provenance = value.get("provenance")
     if isinstance(provenance, dict):
@@ -573,6 +583,22 @@ def candidate_from_dream_json(value: dict[str, Any]) -> DatasetCandidate:
         privacy=str(value.get("privacy", "internal")),
         validation_status=str(value.get("validation_status", "verified")),
     )
+
+
+def _reject_hidden_teacher_fields(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if normalized == "hiddenthought" or (
+                normalized == "thought" and bool(item)
+            ):
+                raise ValueError("Dataset input contains a forbidden teacher thought")
+            _reject_hidden_teacher_fields(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_hidden_teacher_fields(item)
 
 
 def detect_sensitive_content(text: str) -> list[str]:

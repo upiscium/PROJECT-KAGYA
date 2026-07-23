@@ -13,6 +13,10 @@ from kagya.training import (
     TrainingBundleBuilder,
     TrainingJobRegistry,
 )
+from kagya.training.dataset_governance import (
+    candidate_from_dream_json,
+    candidate_from_episode,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -69,8 +73,7 @@ def test_governance_excludes_policy_records_and_quarantines_sensitive_content(
     assert records["secret"].disposition == DatasetDisposition.QUARANTINED
     assert "credential" in records["secret"].quarantine_reasons
     materialized = b"".join(
-        revision.split_bytes(split)
-        for split in records["safe"].split.__class__
+        revision.split_bytes(split) for split in records["safe"].split.__class__
     ).decode()
     assert "ordinary prompt" in materialized
     assert "private prompt" not in materialized
@@ -92,6 +95,29 @@ def test_sensitive_scanner_failure_is_fail_closed(tmp_path: Path) -> None:
     assert store.get_revision(store.list_revisions()[0]["revision"]).records == (
         record,
     )
+
+
+def test_dataset_boundaries_reject_hidden_teacher_thoughts() -> None:
+    with pytest.raises(ValueError, match="teacher thought"):
+        DatasetCandidate(
+            input="input",
+            output="output",
+            thought="private chain",
+            provenance=DatasetProvenance("episode", "episode-1"),
+        )
+    with pytest.raises(ValueError, match="teacher thought"):
+        candidate_from_dream_json(
+            {"input": "input", "output": "output", "hiddenThought": "private"}
+        )
+    with pytest.raises(ValueError, match="teacher thought"):
+        candidate_from_episode(
+            EpisodicMemoryRecord(
+                id="episode-1",
+                user_input="input",
+                response="output",
+                metadata={"nested": {"hidden_thought": "private"}},
+            )
+        )
 
 
 def test_duplicate_checks_fixed_splits_diff_and_immutable_checksums(

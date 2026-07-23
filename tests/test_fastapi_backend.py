@@ -484,6 +484,54 @@ def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None
     assert data["emotion_update"]["valence_contributions"]
 
 
+def test_debug_hidden_thought_requires_explicit_opt_in_and_is_never_retained(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path)
+
+    disabled = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={"text": "hello", "attachments": []},
+    )
+    assert disabled.status_code == 400
+    assert "debug=true" in disabled.json()["detail"]
+
+    enabled = client.post(
+        "/api/chat/debug",
+        headers=admin_headers(),
+        json={"text": "hello", "attachments": [], "debug": True},
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["hidden_thought"] == "debug thought"
+
+    episode_id = enabled.json()["episode_id"]
+    stored = client.app.state.memory_system.db1.get(
+        ids=[episode_id], include=["documents", "metadatas"]
+    )
+    assert "hidden_thought" not in stored["metadatas"][0]
+    assert "debug thought" not in stored["documents"][0]
+
+    restarted = _client(tmp_path)
+    restored = restarted.app.state.memory_system.get_episodic(episode_id)
+    assert restored is not None
+    assert not hasattr(restored, "hidden_thought")
+
+
+def test_public_chat_rejects_hidden_thought_fields(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/api/chat",
+        json={
+            "text": "hello",
+            "attachments": [],
+            "hidden_thought": "must not cross the public boundary",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "must not cross the public boundary" not in response.text
+
+
 def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
@@ -853,7 +901,6 @@ def test_sleep_endpoint_returns_persistent_async_job(tmp_path: Path) -> None:
     memory.save_episodic(
         "sleep input",
         "sleep output",
-        hidden_thought="sleep thought",
         emotion_arousal=0.9,
     )
 
@@ -895,7 +942,6 @@ def test_memory_api_does_not_expose_hidden_thought(tmp_path: Path) -> None:
     episode_id = memory.save_episodic(
         "memory input",
         "memory output",
-        hidden_thought="private memory thought",
     )
 
     search = client.get(
@@ -1723,6 +1769,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
             "text": "use reviewed beliefs",
             "attachments": [],
             "context_id": context_id,
+            "debug": True,
         },
     )
     assert belief_context.status_code == 200

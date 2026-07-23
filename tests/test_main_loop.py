@@ -93,18 +93,46 @@ def test_dummy_provider_drives_user_input_to_response_end_to_end(
     assert result.adapter_id is None
 
 
-def test_db1_receives_saved_episode_with_hidden_thought(tmp_path: Path) -> None:
+def test_db1_never_persists_extracted_hidden_thought(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = _memory(settings)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result = loop.chat("remember this", debug=True)
-    stored = memory.db1.get(ids=[result.episode_id], include=["metadatas"])
+    stored = memory.db1.get(
+        ids=[result.episode_id], include=["documents", "metadatas"]
+    )
 
     assert stored["ids"] == [result.episode_id]
     assert stored["metadatas"][0]["user_input"] == "remember this"
     assert stored["metadatas"][0]["response"] == "Visible runtime answer."
-    assert stored["metadatas"][0]["hidden_thought"] == "internal runtime thought"
+    assert "hidden_thought" not in stored["metadatas"][0]
+    assert "internal runtime thought" not in stored["documents"][0]
+
+
+def test_experience_decision_and_evaluation_state_restore_without_hidden_thought(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+
+    result = loop.chat("retain structured state", debug=False)
+    persisted = loop.persistent_state
+    restored = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        memory,
+        persistent_state=persisted,
+    )
+
+    assert result.hidden_thought == ""
+    assert result.loss_measurement.valid is True
+    assert restored.experience_store.get(result.experience_id).experience_id == (
+        result.experience_id
+    )
+    assert restored.decision_store.list_records() == []
+    assert "hidden_thought" not in str(persisted)
 
 
 def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
@@ -117,6 +145,7 @@ def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
 
     assert "<think>" not in result.response
     assert "</think>" not in result.response
+    assert result.hidden_thought == ""
 
 
 def test_truncated_think_only_primary_response_uses_fallback(tmp_path: Path) -> None:

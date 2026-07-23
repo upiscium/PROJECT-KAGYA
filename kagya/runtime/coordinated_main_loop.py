@@ -593,7 +593,6 @@ class _MainLoopImplementation:
             episode_id = self.memory_system.save_episodic(
                 user_input,
                 processed_response.visible_response,
-                hidden_thought=processed_response.hidden_thought,
                 loss=loss_measurement.raw_loss
                 if loss_measurement.raw_loss is not None
                 else 0.0,
@@ -724,9 +723,7 @@ class _MainLoopImplementation:
             episode_id=episode_id,
             experience_id=experience.experience_id,
             response=processed_response.visible_response,
-            hidden_thought=processed_response.hidden_thought
-            if debug
-            else processed_response.hidden_thought,
+            hidden_thought=processed_response.hidden_thought if debug else "",
             loss=loss_measurement.raw_loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,

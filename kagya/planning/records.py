@@ -840,17 +840,20 @@ def _unique_codes(values: tuple[str, ...], label: str) -> None:
 
 def _reject_private_fields(value: Any) -> None:
     forbidden = {
-        "hidden_thought",
+        "hiddenthought",
         "prompt",
-        "raw_prompt",
+        "rawprompt",
         "reasoning",
-        "chain_of_thought",
+        "chainofthought",
         "prose",
-        "tool_output",
+        "tooloutput",
     }
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).lower() in forbidden:
+            normalized = "".join(
+                character for character in str(key).lower() if character.isalnum()
+            )
+            if normalized in forbidden:
                 raise ValueError("Plan candidate contains a private or free-form field")
             _reject_private_fields(item)
     elif isinstance(value, list | tuple):

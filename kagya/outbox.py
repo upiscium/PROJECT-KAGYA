@@ -474,9 +474,21 @@ def _urgency(value: OutboxUrgency) -> int:
 
 
 def _contains_private_data(value: Any) -> bool:
-    forbidden = {"hidden_thought", "private_state", "prompt", "turns", "attachments", "event_payload"}
+    forbidden = {
+        "hiddenthought",
+        "privatestate",
+        "prompt",
+        "turns",
+        "attachments",
+        "eventpayload",
+    }
     if isinstance(value, dict):
-        return any(str(key).lower() in forbidden or _contains_private_data(item) for key, item in value.items())
+        return any(
+            "".join(character for character in str(key).lower() if character.isalnum())
+            in forbidden
+            or _contains_private_data(item)
+            for key, item in value.items()
+        )
     if isinstance(value, (list, tuple)):
         return any(_contains_private_data(item) for item in value)
     if isinstance(value, str):

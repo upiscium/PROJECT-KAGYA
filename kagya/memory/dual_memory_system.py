@@ -137,6 +137,7 @@ class DualMemorySystem:
             metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
         )
         self._external_failure_injector: Callable[[str, str], None] | None = None
+        self._scrub_legacy_hidden_thoughts()
         self._backfill_episodic_transactions()
         self._backfill_semantic_records()
 
@@ -145,7 +146,6 @@ class DualMemorySystem:
         user_input: str,
         response: str,
         *,
-        hidden_thought: str = "",
         loss: float = 0.0,
         emotion_valence: float = 0.0,
         emotion_arousal: float = 0.0,
@@ -193,7 +193,6 @@ class DualMemorySystem:
         record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
-            "hidden_thought": hidden_thought,
             "loss": float(loss),
             "emotion_valence": float(emotion_valence),
             "emotion_arousal": float(emotion_arousal),
@@ -244,10 +243,30 @@ class DualMemorySystem:
         }
         self.db1.add(
             ids=[episode_id],
-            documents=[_episodic_document(user_input, response, hidden_thought)],
+            documents=[_episodic_document(user_input, response)],
             metadatas=[record_metadata],
         )
         return episode_id
+
+    def _scrub_legacy_hidden_thoughts(self) -> None:
+        result = self.db1.get(include=["documents", "metadatas"])
+        for record_id, raw_metadata in zip(
+            result.get("ids") or [], result.get("metadatas") or [], strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            if "hidden_thought" not in metadata:
+                continue
+            metadata.pop("hidden_thought", None)
+            document = _episodic_document(
+                str(metadata.get("user_input", "")),
+                str(metadata.get("response", "")),
+            )
+            self.db1.delete(ids=[str(record_id)])
+            self.db1.add(
+                ids=[str(record_id)],
+                documents=[document],
+                metadatas=[metadata],
+            )
 
     def set_external_failure_injector(
         self, injector: Callable[[str, str], None] | None
@@ -1281,10 +1300,8 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _episodic_document(user_input: str, response: str, hidden_thought: str) -> str:
-    return (
-        f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
-    )
+def _episodic_document(user_input: str, response: str) -> str:
+    return f"User: {user_input}\nAssistant: {response}".strip()
 
 
 def _episodic_records_from_query(
@@ -1371,7 +1388,6 @@ def _episodic_record_from_metadata(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
         response=response,
-        hidden_thought=str(metadata.get("hidden_thought", "")),
         loss=loss,
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),

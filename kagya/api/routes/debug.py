@@ -47,7 +47,10 @@ def debug_chat(
     settings: Settings = Depends(get_api_settings),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> DebugChatResponse:
-    """Development-only debug chat gated by the admin token."""
+    """Development-only debug chat gated by admin auth and explicit opt-in."""
+
+    if not request.debug:
+        raise HTTPException(status_code=400, detail="Debug access requires debug=true")
 
     context_id = request.context_id or f"ctx-{uuid4()}"
     try:

@@ -13,7 +13,7 @@ class AttachmentSchema(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     text: str = Field(min_length=1, validation_alias=AliasChoices("text", "message"))
     attachments: list[AttachmentSchema] = Field(default_factory=list)

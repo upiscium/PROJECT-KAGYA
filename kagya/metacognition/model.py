@@ -566,16 +566,21 @@ def _strings(value: object) -> tuple[str, ...]:
 
 def _contains_private_key(value: Any) -> bool:
     private = {
-        "hidden_thought",
+        "hiddenthought",
         "prompt",
-        "raw_prompt",
+        "rawprompt",
         "reasoning",
-        "chain_of_thought",
+        "chainofthought",
         "apology",
-        "self_report",
+        "selfreport",
     }
     if isinstance(value, dict):
-        return any(key in private or _contains_private_key(item) for key, item in value.items())
+        return any(
+            "".join(character for character in str(key).lower() if character.isalnum())
+            in private
+            or _contains_private_key(item)
+            for key, item in value.items()
+        )
     if isinstance(value, (list, tuple)):
         return any(_contains_private_key(item) for item in value)
     return False

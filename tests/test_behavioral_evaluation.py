@@ -127,7 +127,9 @@ def test_structured_evaluation_scores_dimensions_without_text_matching(
         encoding="utf-8"
     )
     assert "token" not in serialized
-    assert "Action policy, approval, refusal, and idempotency gates enabled" in serialized
+    assert (
+        "Action policy, approval, refusal, and idempotency gates enabled" in serialized
+    )
 
 
 def test_all_required_hard_gates_block_candidate_and_write_reproduction_artifact(
@@ -182,7 +184,7 @@ def test_all_required_hard_gates_block_candidate_and_write_reproduction_artifact
             transitions=tuple(item.transition for item in forbidden),
             public_behavior=PublicBehaviorClass.RESPOND,
             public_payload={
-                "hidden_thought": "private",
+                "hiddenThought": "private",
                 "response": "leaked context-secret-42",
             },
             side_effect_keys=("effect-1", "effect-1"),
