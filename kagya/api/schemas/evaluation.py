@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class EvaluationResultSummary(BaseModel):
@@ -63,3 +63,14 @@ class BehavioralFailureArtifact(BaseModel):
     evaluation_id: str
     scenario_id: str
     payload: dict[str, Any]
+
+
+class BehavioralRerunRequest(BaseModel):
+    rerun_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
+
+
+class BehavioralRerunResponse(BaseModel):
+    source_evaluation_id: str
+    evaluation_id: str
+    fixture_hashes_match: bool
+    activation_gate_passed: bool

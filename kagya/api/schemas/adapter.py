@@ -28,6 +28,9 @@ class AdapterResponse(BaseModel):
     holdout_regression: bool = False
     drift_scores: dict[str, float] | None = None
     activation_gate_passed: bool = False
+    behavioral_evaluation_id: str | None = None
+    behavioral_evaluation_path: str | None = None
+    behavioral_gate_passed: bool | None = None
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None

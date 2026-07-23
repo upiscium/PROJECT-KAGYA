@@ -40,6 +40,11 @@ packages = ["kagya"]
 [tool.uv]
 package = true
 
+[tool.pytest.ini_options]
+markers = [
+    "real_model: opt-in integration test requiring a configured local Transformers model",
+]
+
 [dependency-groups]
 dev = [
     "mypy>=1.9.0",

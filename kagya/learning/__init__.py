@@ -30,6 +30,12 @@ from kagya.learning.behavioral_evaluation import (
     proactive_outbox_scenarios,
     agency_attribution_scenarios,
     counterfactual_simulation_scenarios,
+    scenario_fixture_hash,
+)
+from kagya.learning.subject_behavioral_suite import (
+    DeterministicSubjectRunner,
+    run_deterministic_subject_evaluation,
+    subject_completion_scenarios,
 )
 from kagya.learning.dream_dataset_generator import (
     DreamDatasetGenerator,
@@ -62,6 +68,7 @@ __all__ = [
     "BehavioralScenario",
     "BehavioralTrace",
     "DreamDatasetGenerator",
+    "DeterministicSubjectRunner",
     "DreamDatasetRecord",
     "EvalCase",
     "EvalSet",
@@ -80,6 +87,9 @@ __all__ = [
     "TransitionKind",
     "format_training_text",
     "load_eval_sets",
+    "run_deterministic_subject_evaluation",
+    "scenario_fixture_hash",
+    "subject_completion_scenarios",
     "proactive_outbox_scenarios",
     "agency_attribution_scenarios",
     "counterfactual_simulation_scenarios",

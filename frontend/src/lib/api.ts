@@ -167,6 +167,9 @@ export type Adapter = {
   holdout_regression: boolean;
   drift_scores: Record<string, number> | null;
   activation_gate_passed: boolean;
+  behavioral_evaluation_id: string | null;
+  behavioral_evaluation_path: string | null;
+  behavioral_gate_passed: boolean | null;
   rollout_state: string;
   canary_failures: number;
   rollback_target_id: string | null;
@@ -193,6 +196,26 @@ export type EvaluationResultSummary = {
 export type EvaluationResultListResponse = { results: EvaluationResultSummary[] };
 export type AdapterEvaluationHistoryResponse = { adapter_id: string; results: EvaluationResultSummary[] };
 export type EvaluationResultDetail = { filename: string; payload: Record<string, unknown> };
+export type BehavioralEvaluationSummary = {
+  evaluation_id: string;
+  baseline_id: string;
+  candidate_id: string;
+  baseline_score: number;
+  candidate_score: number;
+  baseline_dimensions: Record<string, number>;
+  candidate_dimensions: Record<string, number>;
+  dimension_deltas: Record<string, number>;
+  activation_gate_passed: boolean;
+  regression_dimensions: string[];
+  threshold_failure_dimensions: string[];
+  hard_gate_failures: string[];
+  tool_execution_dimensions_complete: boolean;
+  created_at: string;
+};
+export type BehavioralEvaluationHistoryResponse = { results: BehavioralEvaluationSummary[] };
+export type BehavioralEvaluationDetail = { evaluation_id: string; payload: Record<string, unknown> };
+export type BehavioralFailureArtifact = { evaluation_id: string; scenario_id: string; payload: Record<string, unknown> };
+export type BehavioralRerunResponse = { source_evaluation_id: string; evaluation_id: string; fixture_hashes_match: boolean; activation_gate_passed: boolean };
 export type TrainingJob = {
   job_id: string;
   attempt_id: string;
@@ -512,6 +535,10 @@ export const api = {
   evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
   adapterEvaluationHistory: (adapterId: string) => adminRequest<AdapterEvaluationHistoryResponse>(`/evaluations/adapters/${encodeURIComponent(adapterId)}/history`),
   evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
+  behavioralEvaluations: () => adminRequest<BehavioralEvaluationHistoryResponse>("/evaluations/behavioral"),
+  behavioralEvaluation: (evaluationId: string) => adminRequest<BehavioralEvaluationDetail>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}`),
+  behavioralFailure: (evaluationId: string, scenarioId: string) => adminRequest<BehavioralFailureArtifact>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/failures/${encodeURIComponent(scenarioId)}.json`),
+  rerunBehavioralEvaluation: (evaluationId: string, rerunId: string) => adminRequest<BehavioralRerunResponse>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/rerun`, { method: "POST", body: JSON.stringify({ rerun_id: rerunId }) }),
   systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
   runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),
   eventJournal: () => adminRequest<JournalRecordListResponse>("/system/journal"),

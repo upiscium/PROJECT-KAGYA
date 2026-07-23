@@ -47,6 +47,11 @@ transformers-smoke-fallback config="config.yaml":
     @echo "==> Running opt-in Transformers provider fallback smoke check..."
     uv run python -m kagya.models.transformers_smoke --config {{config}} --check-fallback
 
+# Opt-in structured behavior-class check against a real local model.
+behavioral-real-model config="config.yaml":
+    @echo "==> Running opt-in real-model behavioral check..."
+    uv run python -m kagya.learning.real_model_behavioral --config {{config}}
+
 # Check non-dry-run QLoRA production prerequisites without starting training.
 qlora-prod-check config="config.yaml":
     @echo "==> Checking production QLoRA prerequisites..."

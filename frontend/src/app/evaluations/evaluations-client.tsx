@@ -1,15 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
-import { api, errorMessage, type EvaluationResultSummary } from "@/lib/api";
+import { api, errorMessage, type BehavioralEvaluationSummary, type EvaluationResultSummary } from "@/lib/api";
 import { formatNumber, statusTone } from "@/lib/format";
 
 export function EvaluationsClient() {
+  const queryClient = useQueryClient();
   const results = useQuery({ queryKey: ["evaluations"], queryFn: api.evaluations });
+  const behavioral = useQuery({ queryKey: ["behavioral-evaluations"], queryFn: api.behavioralEvaluations });
   const [selectedFilename, setSelectedFilename] = useState<string | null>(null);
   const selected = selectedFilename ?? results.data?.results[0]?.filename ?? null;
   const detail = useQuery({
@@ -17,6 +19,26 @@ export function EvaluationsClient() {
     queryFn: () => api.evaluationResult(selected ?? ""),
     enabled: selected !== null,
   });
+  const [selectedBehavioralId, setSelectedBehavioralId] = useState<string | null>(null);
+  const behavioralId = selectedBehavioralId ?? (behavioral.data?.results ?? [])[0]?.evaluation_id ?? null;
+  const behavioralDetail = useQuery({
+    queryKey: ["behavioral-evaluation", behavioralId],
+    queryFn: () => api.behavioralEvaluation(behavioralId ?? ""),
+    enabled: behavioralId !== null,
+  });
+  const [failureScenario, setFailureScenario] = useState<string | null>(null);
+  const failure = useQuery({
+    queryKey: ["behavioral-failure", behavioralId, failureScenario],
+    queryFn: () => api.behavioralFailure(behavioralId ?? "", failureScenario ?? ""),
+    enabled: behavioralId !== null && failureScenario !== null,
+  });
+  const rerun = useMutation({
+    mutationFn: () => api.rerunBehavioralEvaluation(behavioralId ?? "", `${behavioralId}.rerun-${Date.now()}`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["behavioral-evaluations"] }),
+  });
+  const artifactPaths = Array.isArray(behavioralDetail.data?.payload.reproduction_artifacts)
+    ? behavioralDetail.data.payload.reproduction_artifacts.filter((item): item is string => typeof item === "string")
+    : [];
 
   return (
     <div className="page">
@@ -26,6 +48,52 @@ export function EvaluationsClient() {
       </header>
       {results.error ? <p className="error">{errorMessage(results.error)}</p> : null}
       {detail.error ? <p className="error">{errorMessage(detail.error)}</p> : null}
+      {behavioral.error ? <p className="error">{errorMessage(behavioral.error)}</p> : null}
+      {behavioralDetail.error ? <p className="error">{errorMessage(behavioralDetail.error)}</p> : null}
+      <section className="stack" aria-labelledby="behavioral-heading">
+        <div className="page-header">
+          <div>
+            <h2 id="behavioral-heading">Subject behavioral gates</h2>
+            <p className="muted">Per-dimension history, hard failures, and reproducible fixture reruns.</p>
+          </div>
+          <Button onClick={() => rerun.mutate()} disabled={!behavioralId || rerun.isPending}>
+            {rerun.isPending ? "Rerunning..." : "Rerun fixture"}
+          </Button>
+        </div>
+        {rerun.error ? <p className="error">{errorMessage(rerun.error)}</p> : null}
+        {rerun.data ? <p className="muted">Rerun {rerun.data.evaluation_id}: hashes {rerun.data.fixture_hashes_match ? "verified" : "mismatched"}</p> : null}
+        <div className="grid">
+          <Card>
+            <CardTitle>Behavioral history</CardTitle>
+            {behavioral.data?.results.length === 0 ? <p className="muted">No behavioral evaluations yet.</p> : null}
+            {(behavioral.data?.results ?? []).map((result) => (
+              <BehavioralRow key={result.evaluation_id} result={result} selected={result.evaluation_id === behavioralId} onSelect={() => { setSelectedBehavioralId(result.evaluation_id); setFailureScenario(null); }} />
+            ))}
+          </Card>
+          <Card>
+            <CardTitle>Dimension deltas</CardTitle>
+            {behavioral.data?.results.find((item) => item.evaluation_id === behavioralId) ? (
+              <div className="dimension-grid">
+                {Object.entries(behavioral.data.results.find((item) => item.evaluation_id === behavioralId)?.dimension_deltas ?? {}).map(([name, delta]) => (
+                  <div className="dimension-cell" key={name}><span>{name.replaceAll("_", " ")}</span><strong>{formatNumber(delta)}</strong></div>
+                ))}
+              </div>
+            ) : <p className="muted">Select a behavioral evaluation.</p>}
+          </Card>
+          <Card className="wide">
+            <CardTitle>Failure artifacts</CardTitle>
+            <div className="action-row">
+              {artifactPaths.map((path) => {
+                const scenario = path.split("/").at(-1)?.replace(/\.json$/, "") ?? "";
+                return <Button key={path} onClick={() => setFailureScenario(scenario)} disabled={scenario === failureScenario}>{scenario}</Button>;
+              })}
+              {artifactPaths.length === 0 ? <p className="muted">No candidate failures in this run.</p> : null}
+            </div>
+            {failure.error ? <p className="error">{errorMessage(failure.error)}</p> : null}
+            {failure.data ? <pre>{JSON.stringify(failure.data.payload, null, 2)}</pre> : null}
+          </Card>
+        </div>
+      </section>
       <div className="grid">
         <Card>
           <CardTitle>Result Files</CardTitle>
@@ -48,6 +116,20 @@ export function EvaluationsClient() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function BehavioralRow({ result, selected, onSelect }: { result: BehavioralEvaluationSummary; selected: boolean; onSelect: () => void }) {
+  return (
+    <article className="record">
+      <div className="metadata-row">
+        <Badge data-tone={result.activation_gate_passed ? "success" : "danger"}>{result.activation_gate_passed ? "gate passed" : "blocked"}</Badge>
+        <span className="mono">{result.evaluation_id}</span>
+      </div>
+      <p>{result.baseline_id} {formatNumber(result.baseline_score)} / {result.candidate_id} {formatNumber(result.candidate_score)}</p>
+      <p className="muted">{new Date(result.created_at).toLocaleString()}</p>
+      <Button onClick={onSelect} disabled={selected}>{selected ? "Selected" : "Inspect"}</Button>
+    </article>
   );
 }
 

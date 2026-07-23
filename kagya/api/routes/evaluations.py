@@ -15,11 +15,18 @@ from kagya.api.schemas.evaluation import (
     BehavioralEvaluationHistoryResponse,
     BehavioralEvaluationSummary,
     BehavioralFailureArtifact,
+    BehavioralRerunRequest,
+    BehavioralRerunResponse,
     EvaluationResultDetail,
     EvaluationResultListResponse,
     EvaluationResultSummary,
 )
 from kagya.config import Settings
+from kagya.learning import (
+    run_deterministic_subject_evaluation,
+    scenario_fixture_hash,
+    subject_completion_scenarios,
+)
 
 
 router = APIRouter(
@@ -87,6 +94,53 @@ def get_behavioral_failure_artifact(
         evaluation_id=evaluation_id,
         scenario_id=scenario_id.removesuffix(".json"),
         payload=redact_private_fields(_read_json_object(path)),
+    )
+
+
+@router.post(
+    "/behavioral/{evaluation_id}/rerun", response_model=BehavioralRerunResponse
+)
+def rerun_behavioral_evaluation(
+    evaluation_id: str,
+    request: BehavioralRerunRequest,
+    settings: Settings = Depends(get_api_settings),
+) -> BehavioralRerunResponse:
+    """Re-execute an immutable built-in deterministic fixture revision."""
+
+    source = _read_json_object(_behavioral_result_path(settings, evaluation_id))
+    reproducibility = _object(source.get("reproducibility"))
+    if not reproducibility:
+        raise HTTPException(status_code=409, detail="Evaluation has no rerun metadata")
+    first = next(iter(reproducibility.values()))
+    if not isinstance(first, dict) or first.get("runtime") != "deterministic_fixture":
+        raise HTTPException(status_code=409, detail="Evaluation runtime is not reproducible")
+    subject_revision = str(first.get("subject_revision", ""))
+    scenarios = subject_completion_scenarios(subject_revision=subject_revision)
+    expected_hashes = {item.scenario_id: scenario_fixture_hash(item) for item in scenarios}
+    source_hashes = {
+        str(key): str(value) for key, value in _object(source.get("fixture_hashes")).items()
+    }
+    if source_hashes != expected_hashes:
+        raise HTTPException(
+            status_code=409, detail="Fixture revision or hashes are unavailable for rerun"
+        )
+    baseline = _object(source.get("baseline"))
+    candidate = _object(source.get("candidate"))
+    try:
+        result = run_deterministic_subject_evaluation(
+            settings.adapter_registry.eval_result_dir,
+            request.rerun_id,
+            baseline_id=str(baseline.get("subject_id", "baseline")),
+            candidate_id=str(candidate.get("subject_id", "candidate")),
+            subject_revision=subject_revision,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return BehavioralRerunResponse(
+        source_evaluation_id=evaluation_id,
+        evaluation_id=result.evaluation_id,
+        fixture_hashes_match=result.fixture_hashes == source_hashes,
+        activation_gate_passed=result.activation_gate_passed,
     )
 
 
