@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.actions import ActionBudget, ActionExecutionLayer, ActionPolicyError
@@ -12,6 +12,7 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_action_execution,
     get_agent_runtime,
+    get_main_loop,
     require_admin,
 )
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -85,14 +86,14 @@ def list_receipts(
 @router.post("/intents", dependencies=[Depends(require_admin)])
 def create_intent(
     body: IntentRequest,
-    execution: ActionExecutionLayer = Depends(get_action_execution),
+    request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _transition(
         runtime,
         AgentEventType.ACTION_INTENT,
         "api.actions.create",
-        lambda: execution.create_from_decision(
+        lambda: get_main_loop(request).action_coordinator.create_intent(
             body.decision_id,
             idempotency_key=body.idempotency_key,
             dry_run=body.dry_run,
