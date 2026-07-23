@@ -12,6 +12,7 @@ from typing import Any, cast
 from pydantic import JsonValue
 
 from kagya.config import Settings
+from kagya.models import ModelProvider
 from kagya.learning.behavioral_artifacts import BehavioralArtifactStore
 from kagya.learning.behavioral_evaluation import (
     BehavioralDimension,
@@ -46,13 +47,14 @@ RUNTIME_FIXTURE_REVISION = "issue-133-deterministic-runtime-v1"
 def deterministic_runtime_scenarios(
     *,
     subject_revision: str,
+    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
 ) -> tuple[BehavioralScenario, ...]:
     metadata = ReproducibilityMetadata(
         subject_revision=subject_revision,
         fixture_revision=RUNTIME_FIXTURE_REVISION,
         seed=133,
         clock=datetime(2026, 7, 23, tzinfo=UTC),
-        runtime="deterministic_runtime",
+        runtime=runtime_kind.value,
     )
     definitions = (
         (
@@ -316,18 +318,20 @@ class RuntimeConnectionDisconnected(RuntimeError):
     pass
 
 
-class DeterministicRuntimeRunner:
+class RuntimeBehavioralRunner:
     def __init__(
         self,
         root: Path,
         settings: Settings,
         subject_id: str,
         *,
+        provider: ModelProvider | None = None,
         disconnect: str | None = None,
     ) -> None:
         self.root = root
         self.settings = settings
         self.subject_id = subject_id
+        self.provider = provider
         self.disconnect = disconnect
         self.last_prompts: tuple[str, ...] = ()
 
@@ -337,6 +341,7 @@ class DeterministicRuntimeRunner:
                 self.root / scenario.scenario_id,
                 self.settings,
                 subject_id=self.subject_id,
+                provider=self.provider,
             )
             .create()
             .start()
@@ -352,7 +357,9 @@ class DeterministicRuntimeRunner:
         duplicate_receipts = 0
         try:
             responses = _string_list(inputs.get("responses"))
-            harness.provider.queue_responses(*responses)
+            queue_responses = getattr(harness.provider, "queue_responses", None)
+            if callable(queue_responses):
+                queue_responses(*responses)
             if event_type in {
                 "external_observation",
                 "ambiguous_irreversible",
@@ -438,7 +445,11 @@ class DeterministicRuntimeRunner:
                 duplicate_receipts = (
                     len(harness.graph.action_execution.list_receipts()) - receipt_count
                 )
-            self.last_prompts = tuple(harness.provider.prompts)
+            self.last_prompts = tuple(getattr(harness.provider, "prompts", ()))
+            if bool(getattr(harness.provider, "fallback_used", False)) or bool(
+                getattr(harness.provider, "last_fallback_used", False)
+            ):
+                raise RuntimeError("behavioral runtime used a fallback model")
             return harness.capture_trace(
                 collector,
                 visible_response,
@@ -449,6 +460,10 @@ class DeterministicRuntimeRunner:
             )
         finally:
             harness.shutdown()
+
+
+class DeterministicRuntimeRunner(RuntimeBehavioralRunner):
+    """Runtime runner using the harness-owned controlled provider by default."""
 
 
 def _submit_external_observations(
@@ -582,6 +597,7 @@ def _manifest(
     base_model_revision: str,
     subject_revision: str,
     fixture_hashes: dict[str, str],
+    evaluator_source: Path | None = None,
 ) -> BehavioralEvaluationManifest:
     adapter_files = {
         (
@@ -590,12 +606,13 @@ def _manifest(
         for path in candidate_adapter_path.rglob("*")
         if path.is_file() and not path.is_symlink()
     }
-    source = Path(__file__).resolve()
+    source = (evaluator_source or Path(__file__)).resolve()
     evaluator_files = {
         path.name: path.read_bytes()
         for path in (
             source,
-            source.with_name("runtime_behavioral_harness.py"),
+            Path(__file__).resolve().with_name("runtime_behavioral_harness.py"),
+            Path(__file__).resolve(),
             source.with_name("behavioral_evaluation.py"),
         )
     }

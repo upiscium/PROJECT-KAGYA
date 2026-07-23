@@ -35,7 +35,13 @@ from kagya.learning import (
     run_deterministic_subject_evaluation,
     scenario_fixture_hash,
     subject_completion_scenarios,
+    BehavioralRuntimeKind,
+    deterministic_runtime_scenarios,
+    run_deterministic_runtime_evaluation,
+    run_real_model_runtime_evaluation,
 )
+from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
+from kagya.learning.runtime_behavioral_runner import _manifest
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
@@ -69,9 +75,19 @@ def list_behavioral_evaluations(
             )
             continue
         try:
+            summary = _behavioral_summary(path)
+            entry = registry.lookup(summary.candidate_id)
+            eligibility = (
+                "not_applicable"
+                if entry is None
+                else registry.activation_eligibility(entry.adapter_id).reason.value
+            )
             results.append(
-                _behavioral_summary(path).model_copy(
-                    update={"artifact_status": record.status.value}
+                summary.model_copy(
+                    update={
+                        "artifact_status": record.status.value,
+                        "activation_eligibility": eligibility,
+                    }
                 )
             )
         except (
@@ -167,10 +183,17 @@ def rerun_behavioral_evaluation(
     evaluation_id: str,
     request: BehavioralRerunRequest,
     settings: Settings = Depends(get_api_settings),
+    registry: AdapterRegistry = Depends(get_adapter_registry),
 ) -> BehavioralRerunResponse:
     """Re-execute an immutable built-in deterministic fixture revision."""
 
     source = _read_json_object(_behavioral_result_path(settings, evaluation_id))
+    runtime_kind = source.get("runtime_kind")
+    if runtime_kind in {
+        BehavioralRuntimeKind.DETERMINISTIC_RUNTIME.value,
+        BehavioralRuntimeKind.REAL_MODEL_RUNTIME.value,
+    }:
+        return _rerun_runtime_evaluation(source, request, settings, registry)
     reproducibility = _object(source.get("reproducibility"))
     if not reproducibility:
         raise HTTPException(status_code=409, detail="Evaluation has no rerun metadata")
@@ -203,12 +226,123 @@ def rerun_behavioral_evaluation(
             candidate_id=str(candidate.get("subject_id", "candidate")),
             subject_revision=subject_revision,
         )
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return BehavioralRerunResponse(
         source_evaluation_id=evaluation_id,
         evaluation_id=result.evaluation_id,
         fixture_hashes_match=result.fixture_hashes == source_hashes,
+        activation_gate_passed=result.activation_gate_passed,
+    )
+
+
+def _rerun_runtime_evaluation(
+    source: dict[str, Any],
+    request: BehavioralRerunRequest,
+    settings: Settings,
+    registry: AdapterRegistry,
+) -> BehavioralRerunResponse:
+    try:
+        original = PairedBehavioralEvaluationResult.model_validate(source)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail="Runtime manifest is missing or invalid"
+        ) from exc
+    manifest = original.manifest
+    assert manifest is not None
+    entry = registry.lookup(manifest.candidate_adapter_id)
+    if entry is None or entry.adapter_hash is None or entry.base_model_revision is None:
+        raise HTTPException(
+            status_code=409, detail="Candidate artifact provenance is unavailable"
+        )
+    runtime_kind = original.runtime_kind
+    scenarios = deterministic_runtime_scenarios(
+        subject_revision=manifest.subject_revision,
+        runtime_kind=runtime_kind,
+    )
+    fixture_hashes = {
+        item.scenario_id: scenario_fixture_hash(item) for item in scenarios
+    }
+    evaluator_source = (
+        Path(__file__).resolve().parents[2]
+        / "learning"
+        / "real_model_runtime_behavioral.py"
+        if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
+        else None
+    )
+    try:
+        current = _manifest(
+            settings,
+            candidate_id=entry.adapter_id,
+            candidate_adapter_path=Path(entry.path),
+            candidate_adapter_hash=entry.adapter_hash,
+            base_model_revision=entry.base_model_revision,
+            subject_revision=manifest.subject_revision,
+            fixture_hashes=fixture_hashes,
+            evaluator_source=evaluator_source,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409, detail="Candidate artifact is missing or differs"
+        ) from exc
+    immutable_fields = (
+        "source_commit_sha",
+        "subject_revision",
+        "runtime_schema_version",
+        "evaluator_schema_version",
+        "fixture_revision",
+        "fixture_set_hash",
+        "config_hash",
+        "base_model_id",
+        "base_model_revision",
+        "base_model_artifact_hash",
+        "candidate_adapter_id",
+        "candidate_adapter_hash",
+        "candidate_adapter_path_hash",
+        "tool_registry_hash",
+        "policy_revision",
+        "state_schema_version",
+        "evaluator_implementation_hash",
+    )
+    mismatches = [
+        name
+        for name in immutable_fields
+        if getattr(current, name) != getattr(manifest, name)
+    ]
+    if original.fixture_hashes != fixture_hashes:
+        mismatches.append("fixture_hashes")
+    if mismatches:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Immutable rerun manifest differs: {', '.join(sorted(set(mismatches)))}; use a new evaluation ID",
+        )
+    runner = (
+        run_real_model_runtime_evaluation
+        if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
+        else run_deterministic_runtime_evaluation
+    )
+    try:
+        result, status = runner(
+            settings,
+            request.rerun_id,
+            baseline_id=original.baseline.subject_id,
+            candidate_id=entry.adapter_id,
+            candidate_adapter_path=Path(entry.path),
+            candidate_adapter_hash=entry.adapter_hash,
+            base_model_revision=entry.base_model_revision,
+            subject_revision=manifest.subject_revision,
+        )
+        if status != "prepared":
+            raise ValueError("Rerun artifact was not prepared")
+        BehavioralArtifactStore(settings.adapter_registry.eval_result_dir).finalize(
+            request.rerun_id
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return BehavioralRerunResponse(
+        source_evaluation_id=original.evaluation_id,
+        evaluation_id=result.evaluation_id,
+        fixture_hashes_match=result.fixture_hashes == original.fixture_hashes,
         activation_gate_passed=result.activation_gate_passed,
     )
 
@@ -292,6 +426,8 @@ def _behavioral_summary(path: Path) -> BehavioralEvaluationSummary:
         raise HTTPException(
             status_code=400, detail=f"Invalid behavioral result: {path.name}"
         )
+    manifest = payload.get("manifest")
+    manifest = manifest if isinstance(manifest, dict) else {}
     return BehavioralEvaluationSummary(
         evaluation_id=str(payload.get("evaluation_id", path.stem)),
         baseline_id=str(baseline.get("subject_id", "")),
@@ -322,6 +458,17 @@ def _behavioral_summary(path: Path) -> BehavioralEvaluationSummary:
                 "created_at",
                 datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(),
             )
+        ),
+        runtime_kind=str(payload.get("runtime_kind", "synthetic_evaluator_contract")),
+        source_commit_sha=_optional_str(manifest.get("source_commit_sha")),
+        adapter_hash=_optional_str(manifest.get("candidate_adapter_hash")),
+        base_model_revision=_optional_str(manifest.get("base_model_revision")),
+        fixture_set_hash=_optional_str(manifest.get("fixture_set_hash")),
+        deterministic_runtime_gate_passed=bool(
+            payload.get("deterministic_runtime_gate_passed", False)
+        ),
+        real_model_runtime_gate_passed=bool(
+            payload.get("real_model_runtime_gate_passed", False)
         ),
     )
 

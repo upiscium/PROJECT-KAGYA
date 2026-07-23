@@ -26,6 +26,7 @@ describe("EvaluationsClient", () => {
           json: async () => ({
             results: [{
               evaluation_id: "behavior-133",
+              runtime_kind: "deterministic_runtime",
               baseline_id: "base",
               candidate_id: "candidate",
               baseline_score: 1,
@@ -99,6 +100,9 @@ describe("EvaluationsClient", () => {
 
     expect(await screen.findByText("adapter-a")).toBeInTheDocument();
     expect(screen.getByText("behavior-133")).toBeInTheDocument();
+    expect(screen.getByText("Synthetic evaluator contract")).toBeInTheDocument();
+    expect(screen.getByText("Deterministic runtime evaluation")).toBeInTheDocument();
+    expect(screen.getByText("Real-model runtime evaluation")).toBeInTheDocument();
     expect(screen.getByText("tool safety")).toBeInTheDocument();
     expect(screen.getByText("adapter-b")).toBeInTheDocument();
     expect(screen.getByText(/-0\.300 regression/)).toBeInTheDocument();

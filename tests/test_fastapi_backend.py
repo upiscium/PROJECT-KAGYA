@@ -42,6 +42,7 @@ from kagya.training import (
 from tests.adapter_behavioral_helpers import (
     bind_runtime_behavioral_result,
     register_runtime_candidate,
+    write_runtime_behavioral_result,
 )
 
 
@@ -692,12 +693,49 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
     assert after.model_dump(exclude={"saved_at", "last_processed_event_sequence"}) == (
         before.model_dump(exclude={"saved_at", "last_processed_event_sequence"})
     )
+    adapter_payload = client.get("/api/adapters", headers=admin_headers()).json()[
+        "adapters"
+    ][0]
+    assert adapter_payload["behavioral_artifact_state"] == "reconciled"
+    assert adapter_payload["deterministic_behavioral_artifact_status"] == "valid"
+    assert adapter_payload["real_model_behavioral_artifact_status"] == "not_run"
+    assert adapter_payload["behavioral_artifact_hash_match"] == "passed"
+    assert not Path(adapter_payload["path"]).is_absolute()
+    assert not Path(adapter_payload["behavioral_evaluation_path"]).is_absolute()
 
     reconciliation = client.post(
         "/api/evaluations/behavioral-reconciliation", headers=admin_headers()
     )
     assert reconciliation.status_code == 200
     assert reconciliation.json()["artifacts"][0]["status"] == "valid"
+
+
+def test_behavioral_rerun_api_rejects_changed_runtime_artifact(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    entry = register_runtime_candidate(registry, tmp_path, "rerun-api-candidate")
+    source = write_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        entry.adapter_id,
+        evaluation_id="rerun-api-original",
+    )
+    behavioral_dir = settings.adapter_registry.eval_result_dir / "behavioral"
+    behavioral_dir.mkdir(parents=True, exist_ok=True)
+    source.replace(behavioral_dir / "rerun-api-original.json")
+    (Path(entry.path) / "adapter_config.json").write_text(
+        '{"adapter_id":"changed"}', encoding="utf-8"
+    )
+
+    response = client.post(
+        "/api/evaluations/behavioral/rerun-api-original/rerun",
+        headers=admin_headers(),
+        json={"rerun_id": "rerun-api-replayed"},
+    )
+
+    assert response.status_code == 409
+    assert "candidate_adapter_path_hash" in response.json()["detail"]
 
 
 def test_system_events_include_tool_audit_events(tmp_path: Path) -> None:

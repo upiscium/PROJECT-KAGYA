@@ -110,6 +110,8 @@ def test_runtime_evaluation_emits_bound_manifest_and_valid_artifact(
     )
 
     assert result.runtime_kind == BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+    assert result.deterministic_runtime_gate_passed is True
+    assert result.real_model_runtime_gate_passed is False
     assert result.manifest is not None
     assert result.manifest.candidate_adapter_hash == adapter_hash
     assert result.baseline.subject_id != result.candidate.subject_id

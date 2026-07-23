@@ -1,5 +1,7 @@
 """Adapter API schemas."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -39,6 +41,21 @@ class AdapterResponse(BaseModel):
     behavioral_base_model_revision: str | None = None
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
+    behavioral_artifact_state: str = "unbound"
+    deterministic_behavioral_artifact_status: Literal[
+        "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+    ] = "not_run"
+    real_model_behavioral_evaluation_id: str | None = None
+    real_model_behavioral_gate_passed: bool | None = None
+    real_model_behavioral_artifact_state: str = "unbound"
+    real_model_behavioral_artifact_status: Literal[
+        "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+    ] = "not_run"
+    behavioral_artifact_hash_match: Literal["passed", "failed", "not_run"] = (
+        "not_run"
+    )
+    activation_eligibility_reason: str = ""
+    real_model_behavioral_required: bool = False
     legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
@@ -71,8 +88,8 @@ class AdapterBehavioralEvaluateRequest(BaseModel):
     evaluation_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
     baseline_id: str = Field(default="base-model", min_length=1)
     subject_revision: str = Field(default="issue-133-runtime", min_length=1)
-    runtime_kind: str = Field(
-        default="deterministic_runtime", pattern="^deterministic_runtime$"
+    runtime_kind: Literal["deterministic_runtime", "real_model_runtime"] = (
+        "deterministic_runtime"
     )
 
 
@@ -82,6 +99,12 @@ class AdapterBehavioralEvaluateResponse(BaseModel):
     runtime_kind: str
     activation_gate_passed: bool
     deterministic_runtime_gate_passed: bool
+    real_model_runtime_gate_passed: bool
+    source_commit_sha: str
+    adapter_hash: str
+    base_model_revision: str
+    fixture_set_hash: str
+    activation_eligibility: str
     candidate_score: float
     hard_gate_failures: list[str]
     regression_dimensions: list[str]

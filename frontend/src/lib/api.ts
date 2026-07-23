@@ -178,11 +178,22 @@ export type Adapter = {
   behavioral_base_model_revision: string | null;
   subject_revision: string | null;
   fixture_set_hash: string | null;
+  behavioral_artifact_state: string;
+  deterministic_behavioral_artifact_status: BehavioralArtifactStatus;
+  real_model_behavioral_evaluation_id: string | null;
+  real_model_behavioral_gate_passed: boolean | null;
+  real_model_behavioral_artifact_state: string;
+  real_model_behavioral_artifact_status: BehavioralArtifactStatus;
+  behavioral_artifact_hash_match: "passed" | "failed" | "not_run";
+  activation_eligibility_reason: string;
+  real_model_behavioral_required: boolean;
   legacy_activation_warning: boolean;
   rollout_state: string;
   canary_failures: number;
   rollback_target_id: string | null;
 };
+
+export type BehavioralArtifactStatus = "not_run" | "prepared" | "valid" | "hash_mismatch" | "corrupt" | "orphan";
 
 export type AdapterListResponse = { adapters: Adapter[] };
 export type AdapterProvenance = { adapter: Adapter; lineage: Adapter[]; activation_history: AdapterActivationResponse[] };
@@ -220,6 +231,14 @@ export type BehavioralEvaluationSummary = {
   hard_gate_failures: string[];
   tool_execution_dimensions_complete: boolean;
   created_at: string;
+  runtime_kind: "synthetic_evaluator_contract" | "deterministic_runtime" | "real_model_runtime";
+  source_commit_sha: string | null;
+  adapter_hash: string | null;
+  base_model_revision: string | null;
+  fixture_set_hash: string | null;
+  deterministic_runtime_gate_passed: boolean;
+  real_model_runtime_gate_passed: boolean;
+  activation_eligibility: string;
 };
 export type BehavioralEvaluationHistoryResponse = { results: BehavioralEvaluationSummary[] };
 export type BehavioralEvaluationDetail = { evaluation_id: string; payload: Record<string, unknown> };

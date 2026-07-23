@@ -1,0 +1,276 @@
+"""Opt-in adapter evaluation through the actual subject and Transformers runtime."""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+from pathlib import Path
+from typing import Callable
+
+from kagya.config import Settings, load_settings
+from kagya.learning.behavioral_artifacts import BehavioralArtifactStore
+from kagya.learning.behavioral_evaluation import (
+    BehavioralEvaluator,
+    BehavioralRuntimeKind,
+    BehavioralScenario,
+    BehavioralTrace,
+    PairedBehavioralEvaluationResult,
+    scenario_fixture_hash,
+)
+from kagya.learning.runtime_behavioral_runner import (
+    RuntimeBehavioralRunner,
+    _manifest,
+    deterministic_runtime_scenarios,
+)
+from kagya.models import ModelProvider, load_model_provider
+
+
+ProviderLoader = Callable[..., ModelProvider]
+
+
+class FallbackRejectingProvider:
+    """Record fallback use across all generations while preserving provider API."""
+
+    def __init__(self, provider: ModelProvider, *, adapter_path: Path | None) -> None:
+        self.provider = provider
+        self.adapter_path = adapter_path
+        self.model_id = getattr(provider, "model_id", None)
+        self.model_revision = getattr(provider, "model_revision", None)
+        self.fallback_used = False
+
+    def generate(self, prompt: str) -> str:
+        value = self.provider.generate(prompt)
+        self.fallback_used = self.fallback_used or bool(
+            getattr(self.provider, "last_fallback_used", False)
+        )
+        return value
+
+    def calculate_loss(self, context_text: str, target_text: str) -> float:
+        return self.provider.calculate_loss(context_text, target_text)
+
+    def get_model(self) -> object:
+        return self.provider.get_model()
+
+    def get_processor(self) -> object:
+        return self.provider.get_processor()
+
+
+def load_real_model_provider_pair(
+    settings: Settings,
+    candidate_adapter_path: Path,
+    *,
+    provider_loader: ProviderLoader = load_model_provider,
+) -> tuple[FallbackRejectingProvider, FallbackRejectingProvider]:
+    """Load an exact base and an exact base plus the registered candidate adapter."""
+
+    baseline = FallbackRejectingProvider(provider_loader(settings), adapter_path=None)
+    candidate = FallbackRejectingProvider(
+        provider_loader(
+            settings,
+            adapter_path=candidate_adapter_path,
+            allow_candidate_adapter=True,
+        ),
+        adapter_path=candidate_adapter_path.resolve(),
+    )
+    if baseline.provider is candidate.provider:
+        raise RuntimeError("baseline and candidate providers must be distinct objects")
+    if (
+        baseline.model_id != candidate.model_id
+        or baseline.model_revision != candidate.model_revision
+        or baseline.model_id != settings.model.primary_id
+        or baseline.model_revision != settings.model.revision
+    ):
+        raise RuntimeError("baseline and candidate base model revisions differ")
+    baseline_provider_adapter = getattr(baseline.provider, "adapter_path", None)
+    candidate_provider_adapter = getattr(candidate.provider, "adapter_path", None)
+    if (
+        baseline.adapter_path == candidate.adapter_path
+        or baseline_provider_adapter is not None
+        or candidate_provider_adapter is None
+        or Path(candidate_provider_adapter).resolve() != candidate.adapter_path
+    ):
+        raise RuntimeError("candidate provider is not distinguished by its adapter")
+    return baseline, candidate
+
+
+def run_real_model_runtime_evaluation(
+    settings: Settings,
+    evaluation_id: str,
+    *,
+    baseline_id: str,
+    candidate_id: str,
+    candidate_adapter_path: Path,
+    candidate_adapter_hash: str,
+    base_model_revision: str,
+    subject_revision: str = "issue-133-real-model-runtime",
+    provider_loader: ProviderLoader = load_model_provider,
+) -> tuple[PairedBehavioralEvaluationResult, str]:
+    if (
+        settings.model.provider != "transformers"
+        and provider_loader is load_model_provider
+    ):
+        raise ValueError(
+            "real-model runtime evaluation requires model.provider=transformers"
+        )
+    if settings.model.revision != base_model_revision:
+        raise ValueError(
+            "configured base model revision differs from candidate provenance"
+        )
+    scenarios = list(
+        deterministic_runtime_scenarios(
+            subject_revision=subject_revision,
+            runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        )
+    )
+    fixture_hashes = {
+        item.scenario_id: scenario_fixture_hash(item) for item in scenarios
+    }
+    manifest = _manifest(
+        settings,
+        candidate_id=candidate_id,
+        candidate_adapter_path=candidate_adapter_path,
+        candidate_adapter_hash=candidate_adapter_hash,
+        base_model_revision=base_model_revision,
+        subject_revision=subject_revision,
+        fixture_hashes=fixture_hashes,
+        evaluator_source=Path(__file__),
+    )
+    run_root = (
+        settings.adapter_registry.eval_result_dir
+        / "behavioral"
+        / "runtime"
+        / evaluation_id
+    )
+    baseline, candidate = load_real_model_provider_pair(
+        settings, candidate_adapter_path, provider_loader=provider_loader
+    )
+    try:
+        # Force the exact primary model before runtime generation. Candidate load
+        # happens only after baseline unload so paired runs fit the same hardware.
+        baseline.get_model()
+        baseline_traces = _run_subject(
+            scenarios, run_root / "baseline", settings, baseline_id, baseline
+        )
+        if baseline.fallback_used:
+            raise RuntimeError("baseline real-model runtime used a fallback model")
+        _unload_provider(baseline)
+        candidate.get_model()
+        candidate_traces = _run_subject(
+            scenarios, run_root / "candidate", settings, candidate_id, candidate
+        )
+        if candidate.fallback_used:
+            raise RuntimeError("candidate real-model runtime used a fallback model")
+    finally:
+        _unload_provider(baseline)
+        _unload_provider(candidate)
+
+    baseline_iterator = iter(baseline_traces)
+    candidate_iterator = iter(candidate_traces)
+    result = BehavioralEvaluator(
+        settings.adapter_registry.eval_result_dir
+    ).evaluate_pair(
+        evaluation_id,
+        scenarios,
+        baseline_id=baseline_id,
+        baseline_runner=lambda _scenario: next(baseline_iterator),
+        candidate_id=candidate_id,
+        candidate_runner=lambda _scenario: next(candidate_iterator),
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        manifest=manifest,
+        persist_result=False,
+    )
+    artifact = BehavioralArtifactStore(
+        settings.adapter_registry.eval_result_dir
+    ).prepare(evaluation_id, result.model_dump(mode="json"))
+    return result, artifact.status.value
+
+
+def _run_subject(
+    scenarios: list[BehavioralScenario],
+    root: Path,
+    settings: Settings,
+    subject_id: str,
+    provider: ModelProvider,
+) -> list[BehavioralTrace]:
+    runner = RuntimeBehavioralRunner(root, settings, subject_id, provider=provider)
+    return [runner(scenario) for scenario in scenarios]
+
+
+def _unload_provider(provider: FallbackRejectingProvider) -> None:
+    wrapped = provider.provider
+    for name in ("model", "processor", "_fallback_model", "_fallback_processor"):
+        if hasattr(wrapped, name):
+            setattr(wrapped, name, None)
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--adapter-id", required=True)
+    parser.add_argument("--evaluation-id", required=True)
+    args = parser.parse_args()
+    if os.environ.get("KAGYA_RUN_REAL_MODEL_BEHAVIORAL") != "1":
+        raise SystemExit("set KAGYA_RUN_REAL_MODEL_BEHAVIORAL=1 to opt in")
+    settings = load_settings(args.config)
+    from kagya.learning.adapter_registry import AdapterRegistry
+
+    entry = AdapterRegistry(settings).lookup(args.adapter_id)
+    if entry is None or entry.adapter_hash is None or entry.base_model_revision is None:
+        raise SystemExit("candidate adapter lacks complete registered provenance")
+    result, status = run_real_model_runtime_evaluation(
+        settings,
+        args.evaluation_id,
+        baseline_id="base-model",
+        candidate_id=entry.adapter_id,
+        candidate_adapter_path=Path(entry.path),
+        candidate_adapter_hash=entry.adapter_hash,
+        base_model_revision=entry.base_model_revision,
+    )
+    if status != "prepared":
+        raise SystemExit("real-model artifact was not prepared")
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    registry = AdapterRegistry(settings)
+    registry.prepare_behavioral_evaluation(
+        entry.adapter_id,
+        evaluation_id=args.evaluation_id,
+        prepared_path=store.prepared_path(args.evaluation_id),
+        final_path=store.final_path(args.evaluation_id),
+    )
+    store.finalize(args.evaluation_id)
+    registry.finalize_behavioral_evaluation(
+        entry.adapter_id, evaluation_id=args.evaluation_id
+    )
+    artifact = next(
+        item
+        for item in store.reconcile(registry)
+        if item.evaluation_id == args.evaluation_id
+    )
+    if artifact.status.value != "valid":
+        raise SystemExit("real-model artifact reconciliation failed")
+    registry.mark_behavioral_evaluation_reconciled(
+        entry.adapter_id, evaluation_id=args.evaluation_id
+    )
+    print(
+        json.dumps(
+            {
+                "runtime_kind": result.runtime_kind,
+                "gate_passed": result.real_model_runtime_gate_passed,
+                "artifact_status": artifact.status.value,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -50,6 +50,14 @@ class BehavioralEvaluationSummary(BaseModel):
     hard_gate_failures: list[str] = Field(default_factory=list)
     tool_execution_dimensions_complete: bool = False
     created_at: str
+    runtime_kind: str = "synthetic_evaluator_contract"
+    source_commit_sha: str | None = None
+    adapter_hash: str | None = None
+    base_model_revision: str | None = None
+    fixture_set_hash: str | None = None
+    deterministic_runtime_gate_passed: bool = False
+    real_model_runtime_gate_passed: bool = False
+    activation_eligibility: str = "not_applicable"
 
 
 class BehavioralEvaluationHistoryResponse(BaseModel):

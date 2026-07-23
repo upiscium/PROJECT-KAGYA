@@ -43,6 +43,7 @@ def bind_runtime_behavioral_result(
     *,
     passed: bool = True,
     evaluation_id: str | None = None,
+    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
 ) -> Path:
     result_path = write_runtime_behavioral_result(
         registry,
@@ -50,6 +51,7 @@ def bind_runtime_behavioral_result(
         adapter_id,
         passed=passed,
         evaluation_id=evaluation_id,
+        runtime_kind=runtime_kind,
     )
     registry.apply_behavioral_evaluation(
         adapter_id,
@@ -70,6 +72,7 @@ def write_runtime_behavioral_result(
     passed: bool = True,
     evaluation_id: str | None = None,
     manifest_updates: dict[str, object] | None = None,
+    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
 ) -> Path:
     entry = registry.lookup(adapter_id)
     assert entry is not None
@@ -139,8 +142,17 @@ def write_runtime_behavioral_result(
     payload.update(
         {
             "evaluation_id": evaluation_id,
-            "runtime_kind": BehavioralRuntimeKind.RUNTIME.value,
-            "deterministic_runtime_gate_passed": True,
+            "runtime_kind": runtime_kind.value,
+            "deterministic_runtime_gate_passed": (
+                passed
+                if runtime_kind == BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+                else False
+            ),
+            "real_model_runtime_gate_passed": (
+                passed
+                if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
+                else False
+            ),
             "manifest": manifest.model_dump(mode="json"),
         }
     )

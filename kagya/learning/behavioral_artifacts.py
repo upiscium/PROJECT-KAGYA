@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -121,11 +122,20 @@ class BehavioralArtifactStore:
 
         records = self._registry()
         adapters = adapter_registry.list() if adapter_registry is not None else []
-        bindings = {
-            entry.behavioral_evaluation_id: entry
-            for entry in adapters
-            if entry.behavioral_evaluation_id is not None
-        }
+        bindings: dict[str, Any] = {}
+        for entry in adapters:
+            if entry.behavioral_evaluation_id is not None:
+                bindings[entry.behavioral_evaluation_id] = entry
+            if entry.real_model_behavioral_evaluation_id is not None:
+                bindings[entry.real_model_behavioral_evaluation_id] = SimpleNamespace(
+                    adapter_id=entry.adapter_id,
+                    adapter_hash=entry.adapter_hash,
+                    base_model_revision=entry.base_model_revision,
+                    behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
+                    behavioral_evaluation_path=entry.real_model_behavioral_evaluation_path,
+                    behavioral_result_hash=entry.real_model_behavioral_result_hash,
+                    behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
+                )
         known_paths = {record.relative_path for record in records.values()}
         reconciled: dict[str, BehavioralArtifactRecord] = {}
         for evaluation_id, record in records.items():
@@ -198,7 +208,7 @@ class BehavioralArtifactStore:
                     and binding.behavioral_artifact_state != "quarantined"
                 ):
                     adapter_registry.quarantine_behavioral_evaluation(
-                        binding.adapter_id
+                        binding.adapter_id, evaluation_id=evaluation_id
                     )
             reconciled[evaluation_id] = record.model_copy(
                 update={
@@ -245,7 +255,9 @@ class BehavioralArtifactStore:
                 and adapter_registry is not None
                 and binding.behavioral_artifact_state != "quarantined"
             ):
-                adapter_registry.quarantine_behavioral_evaluation(binding.adapter_id)
+                adapter_registry.quarantine_behavioral_evaluation(
+                    binding.adapter_id, evaluation_id=evaluation_id
+                )
             missing_relative = Path("behavioral") / f"{evaluation_id}.json"
             reconciled[evaluation_id] = BehavioralArtifactRecord(
                 evaluation_id=evaluation_id,

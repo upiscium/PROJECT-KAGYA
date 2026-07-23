@@ -25,7 +25,7 @@ from kagya.learning.behavioral_evaluation import (
     TransitionKind,
 )
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
-from kagya.models import DummyProvider
+from kagya.models import DummyProvider, ModelProvider
 from kagya.outbox import Outbox
 from kagya.runtime import (
     AgentEvent,
@@ -306,7 +306,7 @@ class SubjectRuntimeHarness:
         *,
         subject_id: str,
         clock: ControlledClock | None = None,
-        provider: DeterministicRuntimeProvider | None = None,
+        provider: ModelProvider | None = None,
         tool_environment: ControlledToolEnvironment | None = None,
         failure_injector: FailureInjector | None = None,
     ) -> None:
@@ -510,8 +510,8 @@ class SubjectRuntimeHarness:
             old_graph.runtime.shutdown()
         self.graph = None
         self.readiness = False
-        # A new provider and every graph object are reconstructed from files.
-        self.provider = DeterministicRuntimeProvider(self.subject_id)
+        # Every graph object is reconstructed from files. The explicitly supplied
+        # provider remains the evaluated subject across the restart boundary.
         self.create()
         if self.readiness:
             self.start()
