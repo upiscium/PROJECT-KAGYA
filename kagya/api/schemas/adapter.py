@@ -35,7 +35,8 @@ class AdapterResponse(BaseModel):
     behavioral_evaluation_path: str | None = None
     behavioral_result_hash: str | None = None
     behavioral_gate_passed: bool | None = None
-    candidate_adapter_hash: str | None = None
+    behavioral_candidate_adapter_hash: str | None = None
+    behavioral_base_model_revision: str | None = None
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
     legacy_activation_warning: bool = False

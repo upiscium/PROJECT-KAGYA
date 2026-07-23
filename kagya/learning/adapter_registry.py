@@ -101,14 +101,15 @@ class AdapterEntry:
     behavioral_evaluation_path: str | None = None
     behavioral_result_hash: str | None = None
     behavioral_gate_passed: bool | None = None
-    candidate_adapter_hash: str | None = None
+    behavioral_candidate_adapter_hash: str | None = None
+    behavioral_base_model_revision: str | None = None
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
     legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 4
+    schema_version: int = 5
 
     @property
     def activation_gate_passed(self) -> bool:
@@ -133,7 +134,7 @@ class AdapterEntry:
     def from_json(cls, data: dict[str, Any]) -> "AdapterEntry":
         status = AdapterStatus(str(data.get("status", data.get("state"))))
         schema_version = int(data.get("schema_version", 1))
-        legacy = schema_version < 4
+        legacy_gate = schema_version < 4
         entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
@@ -183,17 +184,17 @@ class AdapterEntry:
             else None,
             quality_gate_passed=_optional_bool(
                 data.get("activation_gate_passed")
-                if legacy
+                if legacy_gate
                 else data.get("quality_gate_passed")
             ),
             holdout_gate_passed=_optional_bool(
                 data.get("activation_gate_passed")
-                if legacy
+                if legacy_gate
                 else data.get("holdout_gate_passed")
             ),
             drift_gate_passed=_optional_bool(
                 data.get("activation_gate_passed")
-                if legacy
+                if legacy_gate
                 else data.get("drift_gate_passed")
             ),
             behavioral_evaluation_id=_optional_str(
@@ -205,20 +206,34 @@ class AdapterEntry:
             behavioral_result_hash=_optional_str(data.get("behavioral_result_hash")),
             behavioral_gate_passed=(
                 None
-                if legacy or data.get("behavioral_gate_passed") is None
+                if legacy_gate or data.get("behavioral_gate_passed") is None
                 else bool(data["behavioral_gate_passed"])
             ),
-            candidate_adapter_hash=_optional_str(data.get("candidate_adapter_hash")),
+            behavioral_candidate_adapter_hash=_optional_str(
+                data.get(
+                    "behavioral_candidate_adapter_hash",
+                    data.get("candidate_adapter_hash"),
+                )
+            ),
+            behavioral_base_model_revision=_optional_str(
+                data.get("behavioral_base_model_revision")
+                or (
+                    data.get("base_model_revision")
+                    if schema_version == 4
+                    and data.get("behavioral_evaluation_id") is not None
+                    else None
+                )
+            ),
             subject_revision=_optional_str(data.get("subject_revision")),
             fixture_set_hash=_optional_str(data.get("fixture_set_hash")),
             legacy_activation_warning=bool(
                 data.get("legacy_activation_warning", False)
-                or (legacy and status == AdapterStatus.ACTIVE)
+                or (legacy_gate and status == AdapterStatus.ACTIVE)
             ),
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=4,
+            schema_version=5,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -476,8 +491,8 @@ class AdapterRegistry:
                 raise ValueError(mismatch)
             if result.evaluation_id != evaluation_id:
                 raise ValueError("Behavioral evaluation ID mismatch")
-            binding = result.adapter_binding
-            assert binding is not None
+            manifest = result.manifest
+            assert manifest is not None
             return self._replace_locked(
                 entries,
                 adapter_id,
@@ -485,9 +500,10 @@ class AdapterRegistry:
                 behavioral_evaluation_path=str(result_path),
                 behavioral_result_hash=result_hash,
                 behavioral_gate_passed=result.activation_gate_passed,
-                candidate_adapter_hash=binding.candidate_adapter_hash,
-                subject_revision=binding.subject_revision,
-                fixture_set_hash=binding.fixture_set_hash,
+                behavioral_candidate_adapter_hash=manifest.candidate_adapter_hash,
+                behavioral_base_model_revision=manifest.base_model_revision,
+                subject_revision=manifest.subject_revision,
+                fixture_set_hash=manifest.fixture_set_hash,
             )
 
     def activation_eligibility(self, adapter_id: str) -> ActivationEligibility:
@@ -811,24 +827,26 @@ def _behavioral_binding_mismatch(
 
     if result.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
         return "Synthetic behavioral results cannot bind an adapter"
-    binding = result.adapter_binding
-    if binding is None:
-        return "Behavioral evaluation has no adapter binding"
-    if binding.candidate_adapter_id != entry.adapter_id:
+    manifest = result.manifest
+    if manifest is None:
+        return "Behavioral evaluation has no manifest"
+    if manifest.candidate_adapter_id != entry.adapter_id:
         return "Behavioral evaluation candidate ID mismatch"
     if (
         entry.adapter_hash is None
-        or binding.candidate_adapter_hash != entry.adapter_hash
+        or manifest.candidate_adapter_hash != entry.adapter_hash
     ):
         return "Behavioral evaluation candidate adapter hash mismatch"
-    if binding.base_model != entry.base_model:
+    if manifest.base_model_id != entry.base_model:
         return "Behavioral evaluation base model mismatch"
-    if binding.base_model_revision != entry.base_model_revision:
+    if manifest.base_model_revision != entry.base_model_revision:
         return "Behavioral evaluation base model revision mismatch"
-    return _adapter_artifact_mismatch(entry)
+    return _adapter_artifact_mismatch(entry, manifest.candidate_adapter_path_hash)
 
 
-def _adapter_artifact_mismatch(entry: AdapterEntry) -> str | None:
+def _adapter_artifact_mismatch(
+    entry: AdapterEntry, manifest_path_hash: str
+) -> str | None:
     from kagya.training.artifacts import sha256_file_map
 
     if entry.adapter_hash is None:
@@ -844,8 +862,13 @@ def _adapter_artifact_mismatch(entry: AdapterEntry) -> str | None:
         }
     except OSError:
         return "Adapter artifact cannot be read"
-    if not files or sha256_file_map(files) != entry.adapter_hash:
+    if not files:
+        return "Adapter artifact is empty"
+    artifact_hash = sha256_file_map(files)
+    if artifact_hash != entry.adapter_hash:
         return "Adapter artifact hash mismatch"
+    if artifact_hash != manifest_path_hash:
+        return "Behavioral evaluation candidate adapter path hash mismatch"
     return None
 
 
@@ -909,17 +932,19 @@ def _activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
             ActivationEligibilityReason.BEHAVIORAL_RESULT_SYNTHETIC,
             "Synthetic behavioral results cannot authorize activation",
         )
-    binding = result.adapter_binding
-    if binding is None:
+    manifest = result.manifest
+    if manifest is None:
         return _ineligible(
             ActivationEligibilityReason.BEHAVIORAL_RESULT_SCHEMA_INVALID,
-            "Behavioral evaluation has no adapter binding",
+            "Behavioral evaluation has no manifest",
         )
     if (
         result.evaluation_id != entry.behavioral_evaluation_id
-        or binding.candidate_adapter_hash != entry.candidate_adapter_hash
-        or binding.subject_revision != entry.subject_revision
-        or binding.fixture_set_hash != entry.fixture_set_hash
+        or manifest.candidate_adapter_hash
+        != entry.behavioral_candidate_adapter_hash
+        or manifest.base_model_revision != entry.behavioral_base_model_revision
+        or manifest.subject_revision != entry.subject_revision
+        or manifest.fixture_set_hash != entry.fixture_set_hash
         or result.activation_gate_passed != entry.behavioral_gate_passed
     ):
         return _ineligible(

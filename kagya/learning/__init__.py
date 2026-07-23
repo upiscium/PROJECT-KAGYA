@@ -19,7 +19,7 @@ from kagya.learning.adapter_runtime import (
 )
 from kagya.learning.behavioral_evaluation import (
     ActionAttempt,
-    BehavioralAdapterBinding,
+    BehavioralEvaluationManifest,
     BehavioralDimension,
     BehavioralEvaluator,
     BehavioralEvaluatorSpec,
@@ -63,7 +63,7 @@ __all__ = [
     "ActionAttempt",
     "ActivationEligibility",
     "ActivationEligibilityReason",
-    "BehavioralAdapterBinding",
+    "BehavioralEvaluationManifest",
     "AdapterEntry",
     "AdapterEvaluationDecision",
     "AdapterEvaluationResult",

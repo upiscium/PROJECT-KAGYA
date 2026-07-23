@@ -174,7 +174,8 @@ export type Adapter = {
   behavioral_evaluation_path: string | null;
   behavioral_result_hash: string | null;
   behavioral_gate_passed: boolean | null;
-  candidate_adapter_hash: string | null;
+  behavioral_candidate_adapter_hash: string | null;
+  behavioral_base_model_revision: string | null;
   subject_revision: string | null;
   fixture_set_hash: string | null;
   legacy_activation_warning: boolean;

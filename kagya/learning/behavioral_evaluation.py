@@ -246,14 +246,27 @@ class SubjectEvaluation(_StrictModel):
     hard_gate_failures: tuple[HardGate, ...]
 
 
-class BehavioralAdapterBinding(_StrictModel):
+class BehavioralEvaluationManifest(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
     schema_version: Literal[1] = 1
+    source_commit_sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    subject_revision: str = Field(min_length=1)
+    runtime_schema_version: int = Field(ge=1)
+    evaluator_schema_version: int = Field(ge=1)
+    fixture_revision: str = Field(min_length=1)
+    fixture_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_model_id: str = Field(min_length=1)
+    base_model_revision: str = Field(min_length=1)
+    base_model_artifact_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_adapter_id: str = Field(min_length=1)
     candidate_adapter_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    base_model: str = Field(min_length=1)
-    base_model_revision: str = Field(min_length=1)
-    subject_revision: str = Field(min_length=1)
-    fixture_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_adapter_path_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_registry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_revision: str = Field(min_length=1)
+    state_schema_version: int = Field(ge=1)
+    evaluator_implementation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class PairedBehavioralEvaluationResult(_StrictModel):
@@ -272,7 +285,7 @@ class PairedBehavioralEvaluationResult(_StrictModel):
     activation_gate_passed: bool
     runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC
     deterministic_runtime_gate_passed: bool = False
-    adapter_binding: BehavioralAdapterBinding | None = None
+    manifest: BehavioralEvaluationManifest | None = None
     tool_execution_dimensions_complete: Literal[True] = True
     tool_execution_scope_note: str = (
         "Action policy, approval, refusal, and idempotency gates enabled"
@@ -282,8 +295,8 @@ class PairedBehavioralEvaluationResult(_StrictModel):
     @model_validator(mode="after")
     def validate_runtime_binding(self) -> PairedBehavioralEvaluationResult:
         if self.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
-            if self.adapter_binding is not None:
-                raise ValueError("synthetic behavioral results cannot bind an adapter")
+            if self.manifest is not None:
+                raise ValueError("synthetic behavioral results cannot have a manifest")
             if self.deterministic_runtime_gate_passed:
                 raise ValueError(
                     "synthetic behavioral results cannot pass the runtime gate"
@@ -291,17 +304,22 @@ class PairedBehavioralEvaluationResult(_StrictModel):
             return self
         if not self.deterministic_runtime_gate_passed:
             raise ValueError("runtime behavioral result did not pass its runtime gate")
-        if self.adapter_binding is None:
-            raise ValueError("runtime behavioral results require an adapter binding")
-        if self.adapter_binding.candidate_adapter_id != self.candidate.subject_id:
-            raise ValueError("behavioral binding candidate ID mismatch")
-        if self.adapter_binding.fixture_set_hash != fixture_set_hash(
-            self.fixture_hashes
-        ):
-            raise ValueError("behavioral binding fixture set hash mismatch")
+        if self.manifest is None:
+            raise ValueError("runtime behavioral results require a manifest")
+        if self.manifest.candidate_adapter_id != self.candidate.subject_id:
+            raise ValueError("behavioral manifest candidate ID mismatch")
+        if self.manifest.fixture_set_hash != fixture_set_hash(self.fixture_hashes):
+            raise ValueError("behavioral manifest fixture set hash mismatch")
         revisions = {item.subject_revision for item in self.reproducibility.values()}
-        if revisions != {self.adapter_binding.subject_revision}:
-            raise ValueError("behavioral binding subject revision mismatch")
+        if revisions != {self.manifest.subject_revision}:
+            raise ValueError("behavioral manifest subject revision mismatch")
+        fixture_revisions = {
+            item.fixture_revision for item in self.reproducibility.values()
+        }
+        if fixture_revisions != {self.manifest.fixture_revision}:
+            raise ValueError("behavioral manifest fixture revision mismatch")
+        if self.manifest.evaluator_schema_version != self.evaluator_version:
+            raise ValueError("behavioral manifest evaluator schema version mismatch")
         return self
 
 

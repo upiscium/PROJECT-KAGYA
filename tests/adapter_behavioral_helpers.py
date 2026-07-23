@@ -3,8 +3,8 @@ from pathlib import Path
 
 from kagya.learning import (
     AdapterRegistry,
-    BehavioralAdapterBinding,
     BehavioralDimension,
+    BehavioralEvaluationManifest,
     BehavioralEvaluator,
     BehavioralRuntimeKind,
     BehavioralScenario,
@@ -43,6 +43,30 @@ def bind_runtime_behavioral_result(
     *,
     passed: bool = True,
     evaluation_id: str | None = None,
+) -> Path:
+    result_path = write_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        adapter_id,
+        passed=passed,
+        evaluation_id=evaluation_id,
+    )
+    registry.apply_behavioral_evaluation(
+        adapter_id,
+        evaluation_id=evaluation_id or f"runtime-{adapter_id}",
+        result_path=result_path,
+    )
+    return result_path
+
+
+def write_runtime_behavioral_result(
+    registry: AdapterRegistry,
+    tmp_path: Path,
+    adapter_id: str,
+    *,
+    passed: bool = True,
+    evaluation_id: str | None = None,
+    manifest_updates: dict[str, object] | None = None,
 ) -> Path:
     entry = registry.lookup(adapter_id)
     assert entry is not None
@@ -87,30 +111,38 @@ def bind_runtime_behavioral_result(
         candidate_id=adapter_id,
         candidate_runner=candidate,
     )
-    binding = BehavioralAdapterBinding(
-        candidate_adapter_id=adapter_id,
-        candidate_adapter_hash=entry.adapter_hash or "",
-        base_model=entry.base_model,
-        base_model_revision=entry.base_model_revision or "",
-        subject_revision="test-subject-revision",
-        fixture_set_hash=fixture_set_hash(result.fixture_hashes),
-    )
+    manifest_payload: dict[str, object] = {
+        "source_commit_sha": "a" * 40,
+        "subject_revision": "test-subject-revision",
+        "runtime_schema_version": 1,
+        "evaluator_schema_version": result.evaluator_version,
+        "fixture_revision": "activation-v1",
+        "fixture_set_hash": fixture_set_hash(result.fixture_hashes),
+        "config_hash": "b" * 64,
+        "base_model_id": entry.base_model,
+        "base_model_revision": entry.base_model_revision or "",
+        "base_model_artifact_hash": "c" * 64,
+        "candidate_adapter_id": adapter_id,
+        "candidate_adapter_hash": entry.adapter_hash or "",
+        "candidate_adapter_path_hash": entry.adapter_hash or "",
+        "tool_registry_hash": "d" * 64,
+        "policy_revision": "test-policy-v1",
+        "state_schema_version": 1,
+        "evaluator_implementation_hash": "e" * 64,
+    }
+    manifest_payload.update(manifest_updates or {})
+    manifest = BehavioralEvaluationManifest.model_validate(manifest_payload)
     payload = result.model_dump(mode="json")
     payload.update(
         {
             "evaluation_id": evaluation_id,
             "runtime_kind": BehavioralRuntimeKind.RUNTIME.value,
             "deterministic_runtime_gate_passed": True,
-            "adapter_binding": binding.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
         }
     )
     runtime_result = PairedBehavioralEvaluationResult.model_validate(payload)
     result_path = tmp_path / f"{evaluation_id}.json"
     with result_path.open("x", encoding="utf-8") as output:
         json.dump(runtime_result.model_dump(mode="json"), output, sort_keys=True)
-    registry.apply_behavioral_evaluation(
-        adapter_id,
-        evaluation_id=evaluation_id,
-        result_path=result_path,
-    )
     return result_path
