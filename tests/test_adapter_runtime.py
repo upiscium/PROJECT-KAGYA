@@ -11,6 +11,10 @@ from kagya.learning import (
 )
 from kagya.models import DummyProvider
 from kagya.runtime import AgentEventType, AgentRuntime
+from tests.adapter_behavioral_helpers import (
+    bind_runtime_behavioral_result,
+    register_runtime_candidate,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -20,7 +24,7 @@ def test_activation_and_rollback_switch_runtime_at_event_boundaries(
     tmp_path: Path,
 ) -> None:
     registry = _registry(tmp_path)
-    entry = _approved(registry, tmp_path, "adapter-a", "hash-a")
+    entry = _approved(registry, tmp_path, "adapter-a")
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
     manager = _manager(registry, state, tmp_path)
     runtime = AgentRuntime(queue_capacity=4)
@@ -56,7 +60,7 @@ def test_activation_and_rollback_switch_runtime_at_event_boundaries(
     runtime.shutdown()
 
     assert activated.adapter_id == "adapter-a"
-    assert activated.adapter_hash == "hash-a"
+    assert activated.adapter_hash == entry.adapter_hash
     assert activated.activation_sequence == 1
     assert rolled_back.adapter_id is None
     assert rolled_back.activation_sequence == 2
@@ -68,7 +72,7 @@ def test_activation_load_or_registry_failure_keeps_current_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = _registry(tmp_path)
-    entry = _approved(registry, tmp_path, "adapter-a", "hash-a")
+    entry = _approved(registry, tmp_path, "adapter-a")
     base_provider = DummyProvider()
     state = [RuntimeAdapterState(None, None, None, base_provider)]
     manager = _manager(registry, state, tmp_path)
@@ -97,7 +101,7 @@ def test_activation_load_or_registry_failure_keeps_current_runtime(
 
 def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    entry = _approved(registry, tmp_path, "adapter-a", "hash-a")
+    entry = _approved(registry, tmp_path, "adapter-a")
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
     manager = _manager(registry, state, tmp_path)
     manager.stage(entry.adapter_id)
@@ -109,7 +113,7 @@ def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
 
 def test_activation_waits_for_in_flight_event(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    entry = _approved(registry, tmp_path, "adapter-a", "hash-a")
+    entry = _approved(registry, tmp_path, "adapter-a")
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
     manager = _manager(registry, state, tmp_path)
     manager.stage(entry.adapter_id)
@@ -141,8 +145,8 @@ def test_activation_waits_for_in_flight_event(tmp_path: Path) -> None:
 
 def test_concurrent_staging_keeps_each_adapter_provider(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
-    first = _approved(registry, tmp_path, "adapter-a", "hash-a")
-    second = _approved(registry, tmp_path, "adapter-b", "hash-b")
+    first = _approved(registry, tmp_path, "adapter-a")
+    second = _approved(registry, tmp_path, "adapter-b")
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
     manager = _manager(registry, state, tmp_path)
     manager.stage(first.adapter_id)
@@ -201,15 +205,8 @@ def _registry(tmp_path: Path) -> AdapterRegistry:
     return AdapterRegistry(settings)
 
 
-def _approved(
-    registry: AdapterRegistry, tmp_path: Path, adapter_id: str, adapter_hash: str
-):
-    registry.register_candidate(
-        adapter_id=adapter_id,
-        adapter_path=tmp_path / adapter_id,
-        dataset_path=tmp_path / "dataset.jsonl",
-        dataset_hash="dataset",
-        adapter_hash=adapter_hash,
-    )
+def _approved(registry: AdapterRegistry, tmp_path: Path, adapter_id: str):
+    register_runtime_candidate(registry, tmp_path, adapter_id)
     registry.apply_evaluation(adapter_id, score=0.9, result_path=tmp_path / "eval")
+    bind_runtime_behavioral_result(registry, tmp_path, adapter_id)
     return registry.approve(adapter_id)

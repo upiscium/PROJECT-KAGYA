@@ -124,10 +124,15 @@ class AdapterEvaluator:
             delta < -drift_limits[dimension]
             for dimension, delta in drift_scores.items()
         )
-        activation_gate_passed = not (
-            regression or holdout_regression or drift_regression
+        quality_gate_passed = (
+            score >= self.settings.adapter_registry.trial_threshold and not regression
         )
-        if not activation_gate_passed:
+        holdout_gate_passed = not holdout_regression
+        drift_gate_passed = not drift_regression
+        activation_gate_passed = all(
+            (quality_gate_passed, holdout_gate_passed, drift_gate_passed)
+        )
+        if regression or holdout_regression or drift_regression:
             decision = AdapterEvaluationDecision.CANDIDATE
         status_after = decision.value
         result_path = self._write_result(
@@ -155,7 +160,9 @@ class AdapterEvaluator:
             holdout_score=holdout_score,
             holdout_baseline_score=holdout_baseline_score,
             drift_scores=drift_scores,
-            activation_gate_passed=activation_gate_passed,
+            quality_gate_passed=quality_gate_passed,
+            holdout_gate_passed=holdout_gate_passed,
+            drift_gate_passed=drift_gate_passed,
         )
         return AdapterEvaluationResult(
             adapter_id=adapter_id,

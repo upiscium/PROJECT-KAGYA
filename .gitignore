@@ -20,6 +20,7 @@ wheels/
 
 # Runtime artifacts
 .kagya/
+.worktrees/
 
 # local config
 *.local.yaml

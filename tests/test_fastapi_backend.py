@@ -39,6 +39,10 @@ from kagya.training import (
     DatasetGovernanceStore,
     DatasetProvenance,
 )
+from tests.adapter_behavioral_helpers import (
+    bind_runtime_behavioral_result,
+    register_runtime_candidate,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -745,13 +749,7 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     settings = _settings(tmp_path)
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
-    registry.register_candidate(
-        adapter_id="adapter-api",
-        adapter_path=tmp_path / "adapter-api",
-        dataset_path=tmp_path / "dataset.jsonl",
-        dataset_hash="hash",
-        adapter_hash="hash-api",
-    )
+    candidate = register_runtime_candidate(registry, tmp_path, "adapter-api")
 
     invalid = client.post("/api/adapters/adapter-api/activate", headers=admin_headers())
     assert invalid.status_code == 400
@@ -763,6 +761,7 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     )
     assert evaluated.status_code == 200
     assert evaluated.json()["status"] == "trial_active"
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-api")
     approved = client.post("/api/adapters/adapter-api/approve", headers=admin_headers())
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
@@ -786,16 +785,18 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
     )
     assert after_activation_chat.status_code == 200
     assert after_activation_chat.json()["model"]["adapter_id"] == "adapter-api"
-    assert after_activation_chat.json()["model"]["adapter_hash"] == "hash-api"
+    assert (
+        after_activation_chat.json()["model"]["adapter_hash"] == candidate.adapter_hash
+    )
     assert after_activation_chat.json()["model"]["activation_sequence"] > 0
     runtime_state = client.get("/api/adapters/runtime", headers=admin_headers())
     assert runtime_state.json()["adapter_id"] == "adapter-api"
-    assert runtime_state.json()["adapter_hash"] == "hash-api"
+    assert runtime_state.json()["adapter_hash"] == candidate.adapter_hash
     provenance = client.get(
         "/api/adapters/adapter-api/provenance", headers=admin_headers()
     )
     assert provenance.status_code == 200
-    assert provenance.json()["adapter"]["adapter_hash"] == "hash-api"
+    assert provenance.json()["adapter"]["adapter_hash"] == candidate.adapter_hash
     assert provenance.json()["activation_history"][0]["action"] == "activate"
     listed = client.get("/api/adapters", headers=admin_headers())
     assert listed.status_code == 200

@@ -70,6 +70,11 @@ class HardGate(StrEnum):
     OUTBOX_DUPLICATE_DELIVERY = "outbox_duplicate_delivery"
 
 
+class BehavioralRuntimeKind(StrEnum):
+    SYNTHETIC = "synthetic"
+    RUNTIME = "runtime"
+
+
 class PublicBehaviorClass(StrEnum):
     RESPOND = "respond"
     REFUSE = "refuse"
@@ -241,6 +246,29 @@ class SubjectEvaluation(_StrictModel):
     hard_gate_failures: tuple[HardGate, ...]
 
 
+class BehavioralEvaluationManifest(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal[1] = 1
+    source_commit_sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    subject_revision: str = Field(min_length=1)
+    runtime_schema_version: int = Field(ge=1)
+    evaluator_schema_version: int = Field(ge=1)
+    fixture_revision: str = Field(min_length=1)
+    fixture_set_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_model_id: str = Field(min_length=1)
+    base_model_revision: str = Field(min_length=1)
+    base_model_artifact_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_adapter_id: str = Field(min_length=1)
+    candidate_adapter_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_adapter_path_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tool_registry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_revision: str = Field(min_length=1)
+    state_schema_version: int = Field(ge=1)
+    evaluator_implementation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class PairedBehavioralEvaluationResult(_StrictModel):
     schema_version: Literal[1] = 1
     evaluator_version: Literal[1] = 1
@@ -255,11 +283,44 @@ class PairedBehavioralEvaluationResult(_StrictModel):
     regression_dimensions: tuple[BehavioralDimension, ...]
     threshold_failure_dimensions: tuple[BehavioralDimension, ...]
     activation_gate_passed: bool
+    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC
+    deterministic_runtime_gate_passed: bool = False
+    manifest: BehavioralEvaluationManifest | None = None
     tool_execution_dimensions_complete: Literal[True] = True
     tool_execution_scope_note: str = (
         "Action policy, approval, refusal, and idempotency gates enabled"
     )
     reproduction_artifacts: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_runtime_binding(self) -> PairedBehavioralEvaluationResult:
+        if self.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
+            if self.manifest is not None:
+                raise ValueError("synthetic behavioral results cannot have a manifest")
+            if self.deterministic_runtime_gate_passed:
+                raise ValueError(
+                    "synthetic behavioral results cannot pass the runtime gate"
+                )
+            return self
+        if not self.deterministic_runtime_gate_passed:
+            raise ValueError("runtime behavioral result did not pass its runtime gate")
+        if self.manifest is None:
+            raise ValueError("runtime behavioral results require a manifest")
+        if self.manifest.candidate_adapter_id != self.candidate.subject_id:
+            raise ValueError("behavioral manifest candidate ID mismatch")
+        if self.manifest.fixture_set_hash != fixture_set_hash(self.fixture_hashes):
+            raise ValueError("behavioral manifest fixture set hash mismatch")
+        revisions = {item.subject_revision for item in self.reproducibility.values()}
+        if revisions != {self.manifest.subject_revision}:
+            raise ValueError("behavioral manifest subject revision mismatch")
+        fixture_revisions = {
+            item.fixture_revision for item in self.reproducibility.values()
+        }
+        if fixture_revisions != {self.manifest.fixture_revision}:
+            raise ValueError("behavioral manifest fixture revision mismatch")
+        if self.manifest.evaluator_schema_version != self.evaluator_version:
+            raise ValueError("behavioral manifest evaluator schema version mismatch")
+        return self
 
 
 ScenarioRunner = Callable[[BehavioralScenario], BehavioralTrace]
@@ -653,13 +714,6 @@ class BehavioralEvaluator:
         self._write_json(
             self.result_dir / f"{evaluation_id}.json", result.model_dump(mode="json")
         )
-        if self.adapter_registry is not None:
-            self.adapter_registry.apply_behavioral_evaluation(
-                candidate_id,
-                evaluation_id=evaluation_id,
-                result_path=self.result_dir / f"{evaluation_id}.json",
-                gate_passed=result.activation_gate_passed,
-            )
         return result
 
     def _evaluate_subject(
@@ -904,6 +958,13 @@ def scenario_fixture_hash(scenario: BehavioralScenario) -> str:
     """Return the stable hash used by persisted rerun contracts."""
 
     return _fixture_hash(scenario)
+
+
+def fixture_set_hash(fixture_hashes: dict[str, str]) -> str:
+    payload = json.dumps(
+        fixture_hashes, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 _MISSING = object()

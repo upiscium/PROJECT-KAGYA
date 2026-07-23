@@ -492,7 +492,9 @@ def test_deterministic_runner_does_not_trust_modified_expectations(tmp_path: Pat
     assert result.candidate.scenario_results[0].failures[0].code == "public_behavior_mismatch"
 
 
-def test_behavioral_regression_is_bound_to_adapter_activation_gate(tmp_path: Path) -> None:
+def test_synthetic_behavioral_regression_cannot_bind_activation_gate(
+    tmp_path: Path,
+) -> None:
     settings = _settings_for_results(tmp_path)
     registry = AdapterRegistry(settings)
     registry.register_candidate(
@@ -507,10 +509,16 @@ def test_behavioral_regression_is_bound_to_adapter_activation_gate(tmp_path: Pat
     scenario = _scenario(expected_public_behavior=PublicBehaviorClass.NO_OP)
 
     def safe(_: BehavioralScenario) -> BehavioralTrace:
-        return BehavioralTrace(final_authoritative_state=scenario.initial_authoritative_state, public_behavior=PublicBehaviorClass.NO_OP)
+        return BehavioralTrace(
+            final_authoritative_state=scenario.initial_authoritative_state,
+            public_behavior=PublicBehaviorClass.NO_OP,
+        )
 
     def regression(_: BehavioralScenario) -> BehavioralTrace:
-        return BehavioralTrace(final_authoritative_state=scenario.initial_authoritative_state, public_behavior=PublicBehaviorClass.RESPOND)
+        return BehavioralTrace(
+            final_authoritative_state=scenario.initial_authoritative_state,
+            public_behavior=PublicBehaviorClass.RESPOND,
+        )
 
     BehavioralEvaluator(tmp_path, adapter_registry=registry).evaluate_pair(
         "adapter-behavior",
@@ -520,14 +528,20 @@ def test_behavioral_regression_is_bound_to_adapter_activation_gate(tmp_path: Pat
         candidate_id="candidate",
         candidate_runner=regression,
     )
+    with pytest.raises(ValueError, match="Synthetic behavioral results cannot bind"):
+        registry.apply_behavioral_evaluation(
+            "candidate",
+            evaluation_id="adapter-behavior",
+            result_path=tmp_path / "behavioral" / "adapter-behavior.json",
+        )
     entry = registry.lookup("candidate")
 
     assert entry is not None
-    assert entry.behavioral_evaluation_id == "adapter-behavior"
-    assert entry.behavioral_gate_passed is False
+    assert entry.behavioral_evaluation_id is None
+    assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
     registry.approve("candidate")
-    with pytest.raises(ValueError, match="regression gate"):
+    with pytest.raises(ValueError, match="behavioral_unevaluated"):
         registry.activate("candidate")
 
 

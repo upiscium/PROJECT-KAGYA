@@ -14,9 +14,13 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import TYPE_CHECKING, Any
+import warnings
 
 from kagya.config import Settings
+
+if TYPE_CHECKING:
+    from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
 
 
 class AdapterStatus(StrEnum):
@@ -26,6 +30,33 @@ class AdapterStatus(StrEnum):
     ACTIVE = "active"
     REJECTED = "rejected"
     ARCHIVED = "archived"
+
+
+class ActivationEligibilityReason(StrEnum):
+    ELIGIBLE = "eligible"
+    QUALITY_UNEVALUATED = "quality_unevaluated"
+    QUALITY_FAILED = "quality_failed"
+    HOLDOUT_UNEVALUATED = "holdout_unevaluated"
+    HOLDOUT_FAILED = "holdout_failed"
+    DRIFT_UNEVALUATED = "drift_unevaluated"
+    DRIFT_FAILED = "drift_failed"
+    BEHAVIORAL_UNEVALUATED = "behavioral_unevaluated"
+    BEHAVIORAL_FAILED = "behavioral_failed"
+    BEHAVIORAL_RESULT_MISSING = "behavioral_result_missing"
+    BEHAVIORAL_RESULT_CORRUPT = "behavioral_result_corrupt"
+    BEHAVIORAL_RESULT_SCHEMA_INVALID = "behavioral_result_schema_invalid"
+    BEHAVIORAL_RESULT_SYNTHETIC = "behavioral_result_synthetic"
+    BEHAVIORAL_RESULT_STALE = "behavioral_result_stale"
+    BEHAVIORAL_RESULT_TAMPERED = "behavioral_result_tampered"
+    BEHAVIORAL_BINDING_MISMATCH = "behavioral_binding_mismatch"
+    ADAPTER_ARTIFACT_MISMATCH = "adapter_artifact_mismatch"
+
+
+@dataclass(frozen=True)
+class ActivationEligibility:
+    eligible: bool
+    reason: ActivationEligibilityReason
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -63,25 +94,48 @@ class AdapterEntry:
     holdout_baseline_score: float | None = None
     holdout_regression: bool = False
     drift_scores: dict[str, float] | None = None
-    activation_gate_passed: bool = False
+    quality_gate_passed: bool | None = None
+    holdout_gate_passed: bool | None = None
+    drift_gate_passed: bool | None = None
     behavioral_evaluation_id: str | None = None
     behavioral_evaluation_path: str | None = None
+    behavioral_result_hash: str | None = None
     behavioral_gate_passed: bool | None = None
+    behavioral_candidate_adapter_hash: str | None = None
+    behavioral_base_model_revision: str | None = None
+    subject_revision: str | None = None
+    fixture_set_hash: str | None = None
+    legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 3
+    schema_version: int = 5
+
+    @property
+    def activation_gate_passed(self) -> bool:
+        return all(
+            gate is True
+            for gate in (
+                self.quality_gate_passed,
+                self.holdout_gate_passed,
+                self.drift_gate_passed,
+                self.behavioral_gate_passed,
+            )
+        )
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value
         data["state"] = self.status.value
+        data["activation_gate_passed"] = self.activation_gate_passed
         return data
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "AdapterEntry":
         status = AdapterStatus(str(data.get("status", data.get("state"))))
-        return cls(
+        schema_version = int(data.get("schema_version", 1))
+        legacy_gate = schema_version < 4
+        entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
             path=str(data["path"]),
@@ -128,19 +182,67 @@ class AdapterEntry:
             }
             if isinstance(data.get("drift_scores"), dict)
             else None,
-            activation_gate_passed=bool(data.get("activation_gate_passed", False)),
-            behavioral_evaluation_id=_optional_str(data.get("behavioral_evaluation_id")),
-            behavioral_evaluation_path=_optional_str(data.get("behavioral_evaluation_path")),
+            quality_gate_passed=_optional_bool(
+                data.get("activation_gate_passed")
+                if legacy_gate
+                else data.get("quality_gate_passed")
+            ),
+            holdout_gate_passed=_optional_bool(
+                data.get("activation_gate_passed")
+                if legacy_gate
+                else data.get("holdout_gate_passed")
+            ),
+            drift_gate_passed=_optional_bool(
+                data.get("activation_gate_passed")
+                if legacy_gate
+                else data.get("drift_gate_passed")
+            ),
+            behavioral_evaluation_id=_optional_str(
+                data.get("behavioral_evaluation_id")
+            ),
+            behavioral_evaluation_path=_optional_str(
+                data.get("behavioral_evaluation_path")
+            ),
+            behavioral_result_hash=_optional_str(data.get("behavioral_result_hash")),
             behavioral_gate_passed=(
                 None
-                if data.get("behavioral_gate_passed") is None
+                if legacy_gate or data.get("behavioral_gate_passed") is None
                 else bool(data["behavioral_gate_passed"])
+            ),
+            behavioral_candidate_adapter_hash=_optional_str(
+                data.get(
+                    "behavioral_candidate_adapter_hash",
+                    data.get("candidate_adapter_hash"),
+                )
+            ),
+            behavioral_base_model_revision=_optional_str(
+                data.get("behavioral_base_model_revision")
+                or (
+                    data.get("base_model_revision")
+                    if schema_version == 4
+                    and data.get("behavioral_evaluation_id") is not None
+                    else None
+                )
+            ),
+            subject_revision=_optional_str(data.get("subject_revision")),
+            fixture_set_hash=_optional_str(data.get("fixture_set_hash")),
+            legacy_activation_warning=bool(
+                data.get("legacy_activation_warning", False)
+                or (legacy_gate and status == AdapterStatus.ACTIVE)
             ),
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=int(data.get("schema_version", 1)),
+            schema_version=5,
         )
+        if entry.legacy_activation_warning:
+            warnings.warn(
+                f"Legacy active adapter {entry.adapter_id} has no behavioral evaluation; "
+                "it may keep running but cannot be promoted again",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return entry
 
 
 class AdapterRegistry:
@@ -292,7 +394,9 @@ class AdapterRegistry:
         holdout_score: float | None = None,
         holdout_baseline_score: float | None = None,
         drift_scores: dict[str, float] | None = None,
-        activation_gate_passed: bool | None = None,
+        quality_gate_passed: bool | None = None,
+        holdout_gate_passed: bool | None = None,
+        drift_gate_passed: bool | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
@@ -328,11 +432,23 @@ class AdapterRegistry:
                     and holdout_score < holdout_baseline_score
                 ),
                 drift_scores=drift_scores,
-                activation_gate_passed=(
-                    next_status == AdapterStatus.TRIAL_ACTIVE
-                    if activation_gate_passed is None
-                    else activation_gate_passed
+                quality_gate_passed=(
+                    score >= self.settings.adapter_registry.trial_threshold
+                    if quality_gate_passed is None
+                    else quality_gate_passed
                 ),
+                holdout_gate_passed=(
+                    not (
+                        holdout_score is not None
+                        and holdout_baseline_score is not None
+                        and holdout_score < holdout_baseline_score
+                    )
+                    if holdout_gate_passed is None
+                    else holdout_gate_passed
+                ),
+                drift_gate_passed=True
+                if drift_gate_passed is None
+                else drift_gate_passed,
                 rollout_state="shadow"
                 if next_status == AdapterStatus.TRIAL_ACTIVE
                 else next_status.value,
@@ -356,27 +472,44 @@ class AdapterRegistry:
         *,
         evaluation_id: str,
         result_path: str | Path,
-        gate_passed: bool,
     ) -> AdapterEntry:
-        """Bind a behavioral result to the candidate activation gate."""
+        """Bind an immutable runtime behavioral result to an adapter."""
 
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
-            if entry.status not in {AdapterStatus.CANDIDATE, AdapterStatus.TRIAL_ACTIVE}:
+            if entry.status not in {
+                AdapterStatus.CANDIDATE,
+                AdapterStatus.TRIAL_ACTIVE,
+            }:
                 raise ValueError(
                     "Only candidate or trial adapters can receive behavioral gating"
                 )
+            result, result_hash = _load_behavioral_result(Path(result_path))
+            mismatch = _behavioral_binding_mismatch(entry, result)
+            if mismatch is not None:
+                raise ValueError(mismatch)
+            if result.evaluation_id != evaluation_id:
+                raise ValueError("Behavioral evaluation ID mismatch")
+            manifest = result.manifest
+            assert manifest is not None
             return self._replace_locked(
                 entries,
                 adapter_id,
                 behavioral_evaluation_id=evaluation_id,
                 behavioral_evaluation_path=str(result_path),
-                behavioral_gate_passed=gate_passed,
-                activation_gate_passed=(
-                    entry.status == AdapterStatus.TRIAL_ACTIVE and gate_passed
-                ),
+                behavioral_result_hash=result_hash,
+                behavioral_gate_passed=result.activation_gate_passed,
+                behavioral_candidate_adapter_hash=manifest.candidate_adapter_hash,
+                behavioral_base_model_revision=manifest.base_model_revision,
+                subject_revision=manifest.subject_revision,
+                fixture_set_hash=manifest.fixture_set_hash,
             )
+
+    def activation_eligibility(self, adapter_id: str) -> ActivationEligibility:
+        with self._locked(exclusive=False):
+            entry = self._require_locked(self._list_locked(), adapter_id)
+            return _activation_eligibility(entry)
 
     def activate(
         self, adapter_id: str, *, activation_sequence: int | None = None
@@ -385,8 +518,12 @@ class AdapterRegistry:
             current_entries = self._list_locked()
             entry = self._require_locked(current_entries, adapter_id)
             self._ensure_transition(entry.status, AdapterStatus.ACTIVE)
-            if not entry.activation_gate_passed:
-                raise ValueError("Adapter evaluation regression gate has not passed")
+            eligibility = _activation_eligibility(entry)
+            if not eligibility.eligible:
+                raise ValueError(
+                    f"Adapter activation ineligible [{eligibility.reason.value}]: "
+                    f"{eligibility.detail}"
+                )
             previous_active = next(
                 (
                     item.adapter_id
@@ -436,6 +573,13 @@ class AdapterRegistry:
                 AdapterStatus.APPROVED,
             }:
                 raise ValueError("Rollback target is not archived or approved")
+            if target is not None:
+                eligibility = _activation_eligibility(target)
+                if not eligibility.eligible:
+                    raise ValueError(
+                        f"Rollback promotion ineligible [{eligibility.reason.value}]: "
+                        f"{eligibility.detail}"
+                    )
             restored: AdapterEntry | None = None
             entries = []
             now = _now_iso()
@@ -649,6 +793,185 @@ def _optional_float(value: Any) -> float | None:
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _load_behavioral_result(
+    path: Path,
+) -> tuple[PairedBehavioralEvaluationResult, str]:
+    from pydantic import ValidationError
+
+    from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
+
+    try:
+        content = path.read_bytes()
+        payload = json.loads(content)
+    except FileNotFoundError as exc:
+        raise ValueError("Behavioral evaluation result is missing") from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Behavioral evaluation result is corrupt") from exc
+    try:
+        result = PairedBehavioralEvaluationResult.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError("Behavioral evaluation result schema is invalid") from exc
+    return result, hashlib.sha256(content).hexdigest()
+
+
+def _behavioral_binding_mismatch(
+    entry: AdapterEntry, result: PairedBehavioralEvaluationResult
+) -> str | None:
+    from kagya.learning.behavioral_evaluation import BehavioralRuntimeKind
+
+    if result.runtime_kind == BehavioralRuntimeKind.SYNTHETIC:
+        return "Synthetic behavioral results cannot bind an adapter"
+    manifest = result.manifest
+    if manifest is None:
+        return "Behavioral evaluation has no manifest"
+    if manifest.candidate_adapter_id != entry.adapter_id:
+        return "Behavioral evaluation candidate ID mismatch"
+    if (
+        entry.adapter_hash is None
+        or manifest.candidate_adapter_hash != entry.adapter_hash
+    ):
+        return "Behavioral evaluation candidate adapter hash mismatch"
+    if manifest.base_model_id != entry.base_model:
+        return "Behavioral evaluation base model mismatch"
+    if manifest.base_model_revision != entry.base_model_revision:
+        return "Behavioral evaluation base model revision mismatch"
+    return _adapter_artifact_mismatch(entry, manifest.candidate_adapter_path_hash)
+
+
+def _adapter_artifact_mismatch(
+    entry: AdapterEntry, manifest_path_hash: str
+) -> str | None:
+    from kagya.training.artifacts import sha256_file_map
+
+    if entry.adapter_hash is None:
+        return "Adapter has no cryptographic artifact hash"
+    path = Path(entry.path)
+    if not path.is_dir():
+        return "Adapter artifact is missing"
+    try:
+        files = {
+            (Path("adapter") / item.relative_to(path)).as_posix(): item.read_bytes()
+            for item in path.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        }
+    except OSError:
+        return "Adapter artifact cannot be read"
+    if not files:
+        return "Adapter artifact is empty"
+    artifact_hash = sha256_file_map(files)
+    if artifact_hash != entry.adapter_hash:
+        return "Adapter artifact hash mismatch"
+    if artifact_hash != manifest_path_hash:
+        return "Behavioral evaluation candidate adapter path hash mismatch"
+    return None
+
+
+def _ineligible(
+    reason: ActivationEligibilityReason, detail: str
+) -> ActivationEligibility:
+    return ActivationEligibility(False, reason, detail)
+
+
+def _activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
+    gate_checks = (
+        (
+            entry.quality_gate_passed,
+            ActivationEligibilityReason.QUALITY_UNEVALUATED,
+            ActivationEligibilityReason.QUALITY_FAILED,
+            "quality",
+        ),
+        (
+            entry.holdout_gate_passed,
+            ActivationEligibilityReason.HOLDOUT_UNEVALUATED,
+            ActivationEligibilityReason.HOLDOUT_FAILED,
+            "holdout",
+        ),
+        (
+            entry.drift_gate_passed,
+            ActivationEligibilityReason.DRIFT_UNEVALUATED,
+            ActivationEligibilityReason.DRIFT_FAILED,
+            "drift",
+        ),
+    )
+    for gate, missing, failed, name in gate_checks:
+        if gate is None:
+            return _ineligible(missing, f"Adapter {name} gate has not been evaluated")
+        if not gate:
+            return _ineligible(failed, f"Adapter {name} gate failed")
+    if (
+        entry.behavioral_gate_passed is None
+        or entry.behavioral_evaluation_id is None
+        or entry.behavioral_evaluation_path is None
+        or entry.behavioral_result_hash is None
+    ):
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED,
+            "Adapter has no bound behavioral evaluation",
+        )
+    try:
+        result, current_result_hash = _load_behavioral_result(
+            Path(entry.behavioral_evaluation_path)
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "missing" in detail:
+            reason = ActivationEligibilityReason.BEHAVIORAL_RESULT_MISSING
+        elif "schema" in detail:
+            reason = ActivationEligibilityReason.BEHAVIORAL_RESULT_SCHEMA_INVALID
+        else:
+            reason = ActivationEligibilityReason.BEHAVIORAL_RESULT_CORRUPT
+        return _ineligible(reason, detail)
+    if result.runtime_kind.value == "synthetic":
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_RESULT_SYNTHETIC,
+            "Synthetic behavioral results cannot authorize activation",
+        )
+    manifest = result.manifest
+    if manifest is None:
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_RESULT_SCHEMA_INVALID,
+            "Behavioral evaluation has no manifest",
+        )
+    if (
+        result.evaluation_id != entry.behavioral_evaluation_id
+        or manifest.candidate_adapter_hash
+        != entry.behavioral_candidate_adapter_hash
+        or manifest.base_model_revision != entry.behavioral_base_model_revision
+        or manifest.subject_revision != entry.subject_revision
+        or manifest.fixture_set_hash != entry.fixture_set_hash
+        or result.activation_gate_passed != entry.behavioral_gate_passed
+    ):
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_RESULT_STALE,
+            "Behavioral evaluation no longer matches its registry binding",
+        )
+    mismatch = _behavioral_binding_mismatch(entry, result)
+    if mismatch is not None:
+        reason = (
+            ActivationEligibilityReason.ADAPTER_ARTIFACT_MISMATCH
+            if mismatch.startswith("Adapter")
+            else ActivationEligibilityReason.BEHAVIORAL_BINDING_MISMATCH
+        )
+        return _ineligible(reason, mismatch)
+    if current_result_hash != entry.behavioral_result_hash:
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_RESULT_TAMPERED,
+            "Behavioral evaluation result hash mismatch",
+        )
+    if not result.activation_gate_passed:
+        return _ineligible(
+            ActivationEligibilityReason.BEHAVIORAL_FAILED,
+            "Behavioral runtime gate failed",
+        )
+    return ActivationEligibility(
+        True, ActivationEligibilityReason.ELIGIBLE, "All activation gates passed"
+    )
 
 
 def _dataset_record_hashes(path: Path) -> tuple[tuple[str, ...], int]:

@@ -12,6 +12,10 @@ from kagya.learning import (
 )
 from kagya.models import DummyProvider
 from kagya.runtime import AgentEventType, AgentRuntime
+from tests.adapter_behavioral_helpers import (
+    bind_runtime_behavioral_result,
+    register_runtime_candidate,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -170,6 +174,7 @@ def test_canary_failure_limit_accepts_multiple_observations(tmp_path: Path) -> N
     registry.apply_evaluation(
         "candidate", score=0.95, result_path=tmp_path / "eval.json"
     )
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
     registry.approve("candidate")
     registry.activate("candidate")
 
@@ -189,6 +194,7 @@ def test_canary_failure_automatically_rolls_back_without_real_model(
     registry.apply_evaluation(
         "candidate", score=0.95, result_path=tmp_path / "eval.json"
     )
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
     registry.approve("candidate")
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
 
@@ -249,15 +255,7 @@ def _registry(tmp_path: Path, *, canary_failure_limit: int = 1) -> AdapterRegist
 
 
 def _candidate(registry: AdapterRegistry, tmp_path: Path, adapter_id: str):
-    dataset = _dataset(tmp_path / f"{adapter_id}.jsonl", [{"input": adapter_id}])
-    return registry.register_candidate(
-        adapter_id=adapter_id,
-        adapter_path=tmp_path / adapter_id,
-        dataset_path=dataset,
-        dataset_hash=f"dataset-{adapter_id}",
-        base_model_revision="revision-a",
-        adapter_hash=f"hash-{adapter_id}",
-    )
+    return register_runtime_candidate(registry, tmp_path, adapter_id)
 
 
 def _dataset(path: Path, records: list[dict[str, str]]) -> Path:
