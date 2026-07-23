@@ -5,7 +5,13 @@ from kagya.learning.adapter_evaluator import (
     AdapterEvaluationResult,
     AdapterEvaluator,
 )
-from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
+from kagya.learning.adapter_registry import (
+    ActivationEligibility,
+    ActivationEligibilityReason,
+    AdapterEntry,
+    AdapterRegistry,
+    AdapterStatus,
+)
 from kagya.learning.adapter_runtime import (
     AdapterActivationRecord,
     AdapterRuntimeManager,
@@ -13,12 +19,14 @@ from kagya.learning.adapter_runtime import (
 )
 from kagya.learning.behavioral_evaluation import (
     ActionAttempt,
+    BehavioralAdapterBinding,
     BehavioralDimension,
     BehavioralEvaluator,
     BehavioralEvaluatorSpec,
     BehavioralInvariant,
     BehavioralScenario,
     BehavioralTrace,
+    BehavioralRuntimeKind,
     ExternalObservation,
     HardGate,
     InvariantKind,
@@ -30,6 +38,7 @@ from kagya.learning.behavioral_evaluation import (
     proactive_outbox_scenarios,
     agency_attribution_scenarios,
     counterfactual_simulation_scenarios,
+    fixture_set_hash,
     scenario_fixture_hash,
 )
 from kagya.learning.subject_behavioral_suite import (
@@ -52,6 +61,9 @@ from kagya.learning.sleep_consolidation import SleepCycleManager, SleepCycleResu
 
 __all__ = [
     "ActionAttempt",
+    "ActivationEligibility",
+    "ActivationEligibilityReason",
+    "BehavioralAdapterBinding",
     "AdapterEntry",
     "AdapterEvaluationDecision",
     "AdapterEvaluationResult",
@@ -65,6 +77,7 @@ __all__ = [
     "BehavioralEvaluator",
     "BehavioralEvaluatorSpec",
     "BehavioralInvariant",
+    "BehavioralRuntimeKind",
     "BehavioralScenario",
     "BehavioralTrace",
     "DreamDatasetGenerator",
@@ -86,6 +99,7 @@ __all__ = [
     "TransitionExpectation",
     "TransitionKind",
     "format_training_text",
+    "fixture_set_hash",
     "load_eval_sets",
     "run_deterministic_subject_evaluation",
     "scenario_fixture_hash",

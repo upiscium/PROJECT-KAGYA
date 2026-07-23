@@ -8,6 +8,10 @@ import pytest
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry, AdapterStatus
 import kagya.learning.adapter_registry as adapter_registry_module
+from tests.adapter_behavioral_helpers import (
+    bind_runtime_behavioral_result,
+    register_runtime_candidate,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -66,6 +70,7 @@ def test_manual_approval_changes_trial_active_to_approved(tmp_path: Path) -> Non
 def test_activation_changes_approved_to_active(tmp_path: Path) -> None:
     registry = _registry_with_candidate(tmp_path, "adapter-a")
     registry.apply_evaluation("adapter-a", score=0.9, result_path=tmp_path / "eval.json")
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-a")
     registry.approve("adapter-a")
 
     entry = registry.activate("adapter-a")
@@ -76,15 +81,12 @@ def test_activation_changes_approved_to_active(tmp_path: Path) -> None:
 def test_existing_active_adapter_becomes_archived_when_new_adapter_activates(tmp_path: Path) -> None:
     registry = _registry_with_candidate(tmp_path, "adapter-a")
     registry.apply_evaluation("adapter-a", score=0.9, result_path=tmp_path / "eval-a.json")
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-a")
     registry.approve("adapter-a")
     registry.activate("adapter-a")
-    registry.register_candidate(
-        adapter_id="adapter-b",
-        adapter_path=tmp_path / "adapter-b",
-        dataset_path=tmp_path / "dataset-b.jsonl",
-        dataset_hash="hash-b",
-    )
+    register_runtime_candidate(registry, tmp_path, "adapter-b")
     registry.apply_evaluation("adapter-b", score=0.9, result_path=tmp_path / "eval-b.json")
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-b")
     registry.approve("adapter-b")
 
     registry.activate("adapter-b")
@@ -124,13 +126,9 @@ def test_concurrent_candidate_registrations_do_not_lose_updates(tmp_path: Path) 
 def test_concurrent_activation_leaves_exactly_one_active_adapter(tmp_path: Path) -> None:
     registry = AdapterRegistry(_settings_for_tmp_registry(tmp_path))
     for adapter_id in ("adapter-a", "adapter-b"):
-        registry.register_candidate(
-            adapter_id=adapter_id,
-            adapter_path=tmp_path / adapter_id,
-            dataset_path=tmp_path / f"{adapter_id}.jsonl",
-            dataset_hash=adapter_id,
-        )
+        register_runtime_candidate(registry, tmp_path, adapter_id)
         registry.apply_evaluation(adapter_id, score=0.9, result_path=tmp_path / "eval.json")
+        bind_runtime_behavioral_result(registry, tmp_path, adapter_id)
         registry.approve(adapter_id)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -169,12 +167,7 @@ def test_replace_failure_preserves_old_registry_and_cleans_temp_file(
 
 def _registry_with_candidate(tmp_path: Path, adapter_id: str) -> AdapterRegistry:
     registry = AdapterRegistry(_settings_for_tmp_registry(tmp_path))
-    registry.register_candidate(
-        adapter_id=adapter_id,
-        adapter_path=tmp_path / adapter_id,
-        dataset_path=tmp_path / "dataset.jsonl",
-        dataset_hash="hash",
-    )
+    register_runtime_candidate(registry, tmp_path, adapter_id)
     return registry
 
 
