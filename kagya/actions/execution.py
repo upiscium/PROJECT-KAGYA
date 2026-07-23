@@ -11,7 +11,14 @@ import time
 from typing import Any, Callable, Literal, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    model_validator,
+)
 
 from kagya.decision import DecisionStatus
 from kagya.outbox import (
@@ -84,7 +91,9 @@ class DocumentSearchArguments(_StrictModel):
         if self.relative_path is not None:
             path = Path(self.relative_path)
             if path.is_absolute() or ".." in path.parts:
-                raise ValueError("document relative_path must remain under the document root")
+                raise ValueError(
+                    "document relative_path must remain under the document root"
+                )
         return self
 
 
@@ -314,9 +323,13 @@ class ActionExecutionLayer:
     def list_intents(self) -> tuple[ActionIntent, ...]:
         return self._state().intents
 
-    def list_approvals(self, *, pending_only: bool = False) -> tuple[ApprovalRecord, ...]:
+    def list_approvals(
+        self, *, pending_only: bool = False
+    ) -> tuple[ApprovalRecord, ...]:
         values = self._state().approvals
-        return tuple(item for item in values if not pending_only or item.status == "pending")
+        return tuple(
+            item for item in values if not pending_only or item.status == "pending"
+        )
 
     def list_receipts(self) -> tuple[ExecutionReceipt, ...]:
         return self._state().receipts
@@ -324,8 +337,36 @@ class ActionExecutionLayer:
     def list_observations(self) -> tuple[Observation, ...]:
         return self._state().observations
 
+    def list_verifications(self) -> tuple[OutcomeVerification, ...]:
+        return self._state().verifications
+
+    def get_receipt(self, receipt_id: str) -> ExecutionReceipt:
+        receipt = next(
+            (item for item in self._state().receipts if item.receipt_id == receipt_id),
+            None,
+        )
+        if receipt is None:
+            raise ValueError(f"Unknown execution receipt: {receipt_id}")
+        return receipt
+
+    def get_observation(self, observation_id: str) -> Observation:
+        observation = next(
+            (
+                item
+                for item in self._state().observations
+                if item.observation_id == observation_id
+            ),
+            None,
+        )
+        if observation is None:
+            raise ValueError(f"Unknown action observation: {observation_id}")
+        return observation
+
     def get_intent(self, intent_id: str) -> ActionIntent:
-        intent = next((item for item in self._state().intents if item.intent_id == intent_id), None)
+        intent = next(
+            (item for item in self._state().intents if item.intent_id == intent_id),
+            None,
+        )
         if intent is None:
             raise ValueError(f"Unknown action intent: {intent_id}")
         return intent
@@ -345,11 +386,15 @@ class ActionExecutionLayer:
         )
         if duplicate is not None:
             if duplicate.provenance.decision_id != decision_id:
-                raise ActionPolicyError("Idempotency key is already bound to another decision")
+                raise ActionPolicyError(
+                    "Idempotency key is already bound to another decision"
+                )
             return duplicate
         decision = self.main_loop.decision_store.get(decision_id)
         if decision.status != DecisionStatus.AWAITING_OUTCOME:
-            raise ActionPolicyError("Action requires a selected decision awaiting outcome")
+            raise ActionPolicyError(
+                "Action requires a selected decision awaiting outcome"
+            )
         selected = next(
             item.candidate
             for item in decision.considered_candidates
@@ -369,10 +414,7 @@ class ActionExecutionLayer:
         spec, validated = self._validate(tool_name, arguments)
         now = self.clock()
         bounded = budget or ActionBudget()
-        if (
-            bounded.max_risk_class == "read_only"
-            and spec.risk != RiskClass.READ_ONLY
-        ):
+        if bounded.max_risk_class == "read_only" and spec.risk != RiskClass.READ_ONLY:
             raise ActionPolicyError("Tool exceeds the action risk budget")
         digest = _digest(validated)
         policy = PolicyEvaluation(
@@ -385,7 +427,9 @@ class ActionExecutionLayer:
                 "tool_allowlisted",
                 "arguments_schema_valid",
                 "risk_budget_valid",
-                "human_approval_required" if spec.approval_required else "read_only_auto_approved",
+                "human_approval_required"
+                if spec.approval_required
+                else "read_only_auto_approved",
             ),
             argument_digest=digest,
             evaluated_at=now,
@@ -433,13 +477,20 @@ class ActionExecutionLayer:
         )
         approvals = state.approvals
         if approval_id is not None:
-            approvals = (*approvals, ApprovalRecord(
-                approval_id=approval_id,
-                intent_id=intent_id,
-                status="pending",
-                requested_at=now,
-            ))
-        self._save(state.model_copy(update={"intents": (*state.intents, intent), "approvals": approvals}))
+            approvals = (
+                *approvals,
+                ApprovalRecord(
+                    approval_id=approval_id,
+                    intent_id=intent_id,
+                    status="pending",
+                    requested_at=now,
+                ),
+            )
+        self._save(
+            state.model_copy(
+                update={"intents": (*state.intents, intent), "approvals": approvals}
+            )
+        )
         if approval_id is not None:
             self._enqueue_outbox(
                 OutboxMessageKind.APPROVAL_REQUEST,
@@ -452,30 +503,74 @@ class ActionExecutionLayer:
         return intent
 
     def resolve_approval(
-        self, intent_id: str, *, approved: bool, actor_id: str, reason: str | None = None
+        self,
+        intent_id: str,
+        *,
+        approved: bool,
+        actor_id: str,
+        reason: str | None = None,
     ) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
-        if intent.status != IntentStatus.AWAITING_APPROVAL or intent.approval_id is None:
+        if (
+            intent.status != IntentStatus.AWAITING_APPROVAL
+            or intent.approval_id is None
+        ):
             raise ValueError("Action intent is not awaiting approval")
         now = self.clock()
         approvals = tuple(
-            item.model_copy(update={
-                "status": "approved" if approved else "rejected",
-                "resolved_at": now,
-                "actor_id": actor_id,
-                "reason": reason,
-            }) if item.approval_id == intent.approval_id else item
+            item.model_copy(
+                update={
+                    "status": "approved" if approved else "rejected",
+                    "resolved_at": now,
+                    "actor_id": actor_id,
+                    "reason": reason,
+                }
+            )
+            if item.approval_id == intent.approval_id
+            else item
             for item in state.approvals
         )
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.APPROVED if approved else IntentStatus.REJECTED,
-            "updated_at": now,
-            "failure_code": None if approved else "operator_rejected",
-        })
-        self._replace(state, updated, approvals=approvals)
-        if not approved:
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.APPROVED if approved else IntentStatus.REJECTED,
+                "updated_at": now,
+                "failure_code": None if approved else "operator_rejected",
+            }
+        )
+        if approved:
+            self._replace(state, updated, approvals=approvals)
+        else:
+            receipt_id = str(uuid4())
+            observation, verification = self._failure_evidence(
+                intent,
+                receipt_id,
+                ReceiptStatus.CANCELLED,
+                "operator_rejected",
+                now,
+            )
+            receipt = self._receipt(
+                intent,
+                receipt_id,
+                intent.attempts,
+                ReceiptStatus.CANCELLED,
+                now,
+                now,
+                0.0,
+                observation_id=observation.observation_id,
+                verification_id=verification.verification_id,
+                error_code="operator_rejected",
+            )
+            updated = updated.model_copy(update={"receipt_id": receipt_id})
+            self._replace(
+                state,
+                updated,
+                approvals=approvals,
+                receipts=(*state.receipts, receipt),
+                observations=(*state.observations, observation),
+                verifications=(*state.verifications, verification),
+            )
             self._resolve_decision(updated, False, "action_rejected")
         outbox = getattr(self.main_loop, "outbox", None)
         if outbox is not None:
@@ -498,7 +593,9 @@ class ActionExecutionLayer:
         if intent.dry_run:
             raise ActionPolicyError("Dry-run intents cannot execute")
         if intent.status not in {IntentStatus.APPROVED, IntentStatus.RETRY_PENDING}:
-            raise ActionPolicyError(f"Action intent is not executable: {intent.status.value}")
+            raise ActionPolicyError(
+                f"Action intent is not executable: {intent.status.value}"
+            )
         if intent.cost_units_used >= intent.budget.max_cost_units:
             return self._fail(intent, "cost_budget_exhausted", ReceiptStatus.FAILED)
         if intent.attempts >= intent.budget.max_attempts:
@@ -506,19 +603,31 @@ class ActionExecutionLayer:
         spec, arguments = self._validate(intent.tool_name, intent.arguments)
         if spec.approval_required:
             approval = next(
-                (item for item in state.approvals if item.approval_id == intent.approval_id),
+                (
+                    item
+                    for item in state.approvals
+                    if item.approval_id == intent.approval_id
+                ),
                 None,
             )
             if approval is None or approval.status != "approved":
                 raise ActionPolicyError("Approved operator record is required")
-        if intent.deadline_at < self.clock() and intent.status != IntentStatus.RETRY_PENDING:
-            return self._fail(intent, "execution_deadline_expired", ReceiptStatus.TIMED_OUT)
+        if (
+            intent.deadline_at < self.clock()
+            and intent.status != IntentStatus.RETRY_PENDING
+        ):
+            return self._fail(
+                intent, "execution_deadline_expired", ReceiptStatus.TIMED_OUT
+            )
 
         started_at = self.clock()
         started_clock = self.monotonic()
         receipt_id = str(uuid4())
         attempt = intent.attempts + 1
-        if intent.provenance.plan_id is not None and intent.provenance.step_id is not None:
+        if (
+            intent.provenance.plan_id is not None
+            and intent.provenance.step_id is not None
+        ):
             self.main_loop.start_action_plan_step(
                 intent.provenance.plan_id, intent.provenance.step_id
             )
@@ -533,7 +642,10 @@ class ActionExecutionLayer:
             valid, errors = self._validate_result(intent.tool_name, result)
         except Exception as exc:
             self._rollback_partial_effect(intent)
-            retryable = isinstance(exc, (OSError, TimeoutError)) and attempt < intent.budget.max_attempts
+            retryable = (
+                isinstance(exc, (OSError, TimeoutError))
+                and attempt < intent.budget.max_attempts
+            )
             return self._execution_failure(
                 intent,
                 receipt_id,
@@ -562,7 +674,9 @@ class ActionExecutionLayer:
             intent_id=intent.intent_id,
             observation_id=observation_id,
             success=valid,
-            reason="observation_schema_valid" if valid else "observation_schema_invalid",
+            reason="observation_schema_valid"
+            if valid
+            else "observation_schema_invalid",
             verified_at=finished_at,
         )
         receipt = self._receipt(
@@ -577,16 +691,18 @@ class ActionExecutionLayer:
             verification_id=verification_id,
             error_code=None if valid else "result_validation_failed",
         )
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.SUCCEEDED if valid else IntentStatus.FAILED,
-            "attempts": attempt,
-            "cost_units_used": intent.cost_units_used + 1,
-            "updated_at": finished_at,
-            "receipt_id": receipt_id,
-            "retry_at": None,
-            "failure_code": None if valid else "result_validation_failed",
-        })
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.SUCCEEDED if valid else IntentStatus.FAILED,
+                "attempts": attempt,
+                "cost_units_used": intent.cost_units_used + 1,
+                "updated_at": finished_at,
+                "receipt_id": receipt_id,
+                "retry_at": None,
+                "failure_code": None if valid else "result_validation_failed",
+            }
+        )
         state = self._state()
         self._replace(
             state,
@@ -627,19 +743,39 @@ class ActionExecutionLayer:
         }:
             raise ValueError("Action intent cannot be cancelled")
         now = self.clock()
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.CANCELLED,
-            "updated_at": now,
-            "retry_at": None,
-            "failure_code": "cancelled",
-        })
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.CANCELLED,
+                "updated_at": now,
+                "retry_at": None,
+                "failure_code": "cancelled",
+            }
+        )
         state = self._state()
+        receipt_id = str(uuid4())
+        observation, verification = self._failure_evidence(
+            intent, receipt_id, ReceiptStatus.CANCELLED, "cancelled", now
+        )
         receipt = self._receipt(
-            intent, str(uuid4()), intent.attempts, ReceiptStatus.CANCELLED, now, now, 0.0,
+            intent,
+            receipt_id,
+            intent.attempts,
+            ReceiptStatus.CANCELLED,
+            now,
+            now,
+            0.0,
+            observation_id=observation.observation_id,
+            verification_id=verification.verification_id,
             error_code="cancelled",
         )
-        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        self._replace(
+            state,
+            updated,
+            receipts=(*state.receipts, receipt),
+            observations=(*state.observations, observation),
+            verifications=(*state.verifications, verification),
+        )
         self._resolve_decision(updated, False, "action_cancelled")
         return updated
 
@@ -657,7 +793,10 @@ class ActionExecutionLayer:
 
     def compensate(self, intent_id: str) -> ActionIntent:
         intent = self.get_intent(intent_id)
-        if intent.status != IntentStatus.SUCCEEDED or intent.tool_name != "local_notification_enqueue":
+        if (
+            intent.status != IntentStatus.SUCCEEDED
+            or intent.tool_name != "local_notification_enqueue"
+        ):
             raise ActionPolicyError("Action has no available compensation")
         state = self._state()
         notifications = tuple(
@@ -678,12 +817,14 @@ class ActionExecutionLayer:
             0.0,
             compensation_of=intent.receipt_id,
         )
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.COMPENSATED,
-            "updated_at": now,
-            "receipt_id": receipt_id,
-        })
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.COMPENSATED,
+                "updated_at": now,
+                "receipt_id": receipt_id,
+            }
+        )
         self._replace(
             state,
             updated,
@@ -703,7 +844,9 @@ class ActionExecutionLayer:
             )
         return updated
 
-    def _invoke(self, intent: ActionIntent, arguments: dict[str, JsonValue]) -> JsonValue:
+    def _invoke(
+        self, intent: ActionIntent, arguments: dict[str, JsonValue]
+    ) -> JsonValue:
         if intent.tool_name == "restricted_metadata_read":
             values = {
                 "project": {
@@ -727,11 +870,18 @@ class ActionExecutionLayer:
         if intent.tool_name == "local_notification_enqueue":
             state = self._state()
             existing = next(
-                (item for item in state.notifications if item.get("idempotency_key") == intent.idempotency_key),
+                (
+                    item
+                    for item in state.notifications
+                    if item.get("idempotency_key") == intent.idempotency_key
+                ),
                 None,
             )
             if existing is not None:
-                return {"notification_id": existing["notification_id"], "status": existing["status"]}
+                return {
+                    "notification_id": existing["notification_id"],
+                    "status": existing["status"],
+                }
             notification: dict[str, JsonValue] = {
                 "notification_id": str(uuid4()),
                 "idempotency_key": intent.idempotency_key,
@@ -741,7 +891,11 @@ class ActionExecutionLayer:
                 "status": "queued",
                 "created_at": self.clock().isoformat(),
             }
-            self._save(state.model_copy(update={"notifications": (*state.notifications, notification)}))
+            self._save(
+                state.model_copy(
+                    update={"notifications": (*state.notifications, notification)}
+                )
+            )
             self._enqueue_outbox(
                 OutboxMessageKind.ACTION_RESULT,
                 title=str(arguments["title"]),
@@ -749,7 +903,10 @@ class ActionExecutionLayer:
                 deduplication_key=f"local-notification:{intent.idempotency_key}",
                 intent=intent,
             )
-            return {"notification_id": notification["notification_id"], "status": "queued"}
+            return {
+                "notification_id": notification["notification_id"],
+                "status": "queued",
+            }
         raise ActionPolicyError("Tool is not allowlisted")
 
     def _document_search(self, arguments: dict[str, JsonValue]) -> JsonValue:
@@ -758,7 +915,13 @@ class ActionExecutionLayer:
         target = root if relative is None else (root / str(relative)).resolve()
         if target != root and root not in target.parents:
             raise ValueError("document path escaped configured root")
-        files = [target] if target.is_file() else sorted(target.rglob("*")) if target.exists() else []
+        files = (
+            [target]
+            if target.is_file()
+            else sorted(target.rglob("*"))
+            if target.exists()
+            else []
+        )
         query = str(arguments["query"]).casefold()
         limit = cast(int, arguments["max_results"])
         matches: list[dict[str, JsonValue]] = []
@@ -776,11 +939,13 @@ class ActionExecutionLayer:
             text = path.read_text(encoding="utf-8")
             for line_number, line in enumerate(text.splitlines(), 1):
                 if query in line.casefold():
-                    matches.append({
-                        "path": path.relative_to(root).as_posix(),
-                        "line": line_number,
-                        "excerpt": line[:500],
-                    })
+                    matches.append(
+                        {
+                            "path": path.relative_to(root).as_posix(),
+                            "line": line_number,
+                            "excerpt": line[:500],
+                        }
+                    )
                     if len(matches) >= limit:
                         return cast(JsonValue, {"matches": matches, "truncated": True})
         return cast(JsonValue, {"matches": matches, "truncated": False})
@@ -789,7 +954,11 @@ class ActionExecutionLayer:
         if not self.calendar_path.exists():
             return {"events": []}
         raw = json.loads(self.calendar_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or set(raw) != {"schema_version", "events"} or raw["schema_version"] != 1:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"schema_version", "events"}
+            or raw["schema_version"] != 1
+        ):
             raise ValueError("calendar file has invalid schema")
         if not isinstance(raw["events"], list):
             raise ValueError("calendar events must be a list")
@@ -797,7 +966,12 @@ class ActionExecutionLayer:
         ends = datetime.fromisoformat(str(arguments["ends_at"]))
         selected: list[dict[str, JsonValue]] = []
         for item in raw["events"]:
-            if not isinstance(item, dict) or set(item) != {"event_id", "title", "starts_at", "ends_at"}:
+            if not isinstance(item, dict) or set(item) != {
+                "event_id",
+                "title",
+                "starts_at",
+                "ends_at",
+            }:
                 raise ValueError("calendar event has invalid schema")
             event_start = datetime.fromisoformat(str(item["starts_at"]))
             event_end = datetime.fromisoformat(str(item["ends_at"]))
@@ -809,19 +983,29 @@ class ActionExecutionLayer:
         limit = cast(int, arguments["max_results"])
         return cast(JsonValue, {"events": selected[:limit]})
 
-    def _validate(self, tool_name: str, arguments: dict[str, Any]) -> tuple[_ToolSpec, dict[str, JsonValue]]:
+    def _validate(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[_ToolSpec, dict[str, JsonValue]]:
         spec = _TOOLS.get(tool_name)
         if spec is None:
             raise ActionPolicyError("Tool is not allowlisted")
-        if spec.risk in {RiskClass.EXTERNAL_WRITE, RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+        if spec.risk in {
+            RiskClass.EXTERNAL_WRITE,
+            RiskClass.DESTRUCTIVE,
+            RiskClass.HIGH_IMPACT,
+        }:
             raise ActionPolicyError("Tool risk class is not enabled")
         try:
             validated = spec.arguments.model_validate(arguments)
         except ValidationError as exc:
-            raise ActionPolicyError("Tool arguments do not match the strict schema") from exc
+            raise ActionPolicyError(
+                "Tool arguments do not match the strict schema"
+            ) from exc
         return spec, validated.model_dump(mode="json")
 
-    def _validate_result(self, tool_name: str, result: JsonValue) -> tuple[bool, tuple[str, ...]]:
+    def _validate_result(
+        self, tool_name: str, result: JsonValue
+    ) -> tuple[bool, tuple[str, ...]]:
         if not isinstance(result, dict):
             return False, ("result_not_object",)
         required = {
@@ -830,7 +1014,11 @@ class ActionExecutionLayer:
             "calendar_read": {"events"},
             "local_notification_enqueue": {"notification_id", "status"},
         }[tool_name]
-        return (True, ()) if set(result) == required else (False, ("result_fields_invalid",))
+        return (
+            (True, ())
+            if set(result) == required
+            else (False, ("result_fields_invalid",))
+        )
 
     def _rollback_partial_effect(self, intent: ActionIntent) -> None:
         if intent.tool_name != "local_notification_enqueue":
@@ -856,6 +1044,9 @@ class ActionExecutionLayer:
     ) -> ActionIntent:
         now = self.clock()
         status = ReceiptStatus.TIMED_OUT if code == "timeout" else ReceiptStatus.FAILED
+        observation, verification = self._failure_evidence(
+            intent, receipt_id, status, code, now
+        )
         receipt = self._receipt(
             intent,
             receipt_id,
@@ -864,21 +1055,33 @@ class ActionExecutionLayer:
             started_at,
             now,
             (self.monotonic() - started_clock) * 1000,
+            observation_id=observation.observation_id,
+            verification_id=verification.verification_id,
             error_code=code,
         )
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.RETRY_PENDING if retryable else IntentStatus.FAILED,
-            "attempts": attempt,
-            "cost_units_used": intent.cost_units_used + 1,
-            "updated_at": now,
-            "deadline_at": now + timedelta(seconds=intent.budget.timeout_seconds),
-            "retry_at": now + timedelta(seconds=1) if retryable else None,
-            "receipt_id": receipt_id,
-            "failure_code": code,
-        })
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.RETRY_PENDING
+                if retryable
+                else IntentStatus.FAILED,
+                "attempts": attempt,
+                "cost_units_used": intent.cost_units_used + 1,
+                "updated_at": now,
+                "deadline_at": now + timedelta(seconds=intent.budget.timeout_seconds),
+                "retry_at": now + timedelta(seconds=1) if retryable else None,
+                "receipt_id": receipt_id,
+                "failure_code": code,
+            }
+        )
         state = self._state()
-        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        self._replace(
+            state,
+            updated,
+            receipts=(*state.receipts, receipt),
+            observations=(*state.observations, observation),
+            verifications=(*state.verifications, verification),
+        )
         if not retryable:
             self._resolve_decision(updated, False, f"action_{code}")
         self._enqueue_outbox(
@@ -919,22 +1122,44 @@ class ActionExecutionLayer:
             privacy_class=PrivacyClass.OPERATOR,
         )
 
-    def _fail(self, intent: ActionIntent, code: str, status: ReceiptStatus) -> ActionIntent:
+    def _fail(
+        self, intent: ActionIntent, code: str, status: ReceiptStatus
+    ) -> ActionIntent:
         now = self.clock()
         receipt_id = str(uuid4())
-        receipt = self._receipt(
-            intent, receipt_id, intent.attempts, status, now, now, 0.0, error_code=code
+        observation, verification = self._failure_evidence(
+            intent, receipt_id, status, code, now
         )
-        updated = intent.model_copy(update={
-            "revision": intent.revision + 1,
-            "status": IntentStatus.FAILED,
-            "updated_at": now,
-            "retry_at": None,
-            "receipt_id": receipt_id,
-            "failure_code": code,
-        })
+        receipt = self._receipt(
+            intent,
+            receipt_id,
+            intent.attempts,
+            status,
+            now,
+            now,
+            0.0,
+            observation_id=observation.observation_id,
+            verification_id=verification.verification_id,
+            error_code=code,
+        )
+        updated = intent.model_copy(
+            update={
+                "revision": intent.revision + 1,
+                "status": IntentStatus.FAILED,
+                "updated_at": now,
+                "retry_at": None,
+                "receipt_id": receipt_id,
+                "failure_code": code,
+            }
+        )
         state = self._state()
-        self._replace(state, updated, receipts=(*state.receipts, receipt))
+        self._replace(
+            state,
+            updated,
+            receipts=(*state.receipts, receipt),
+            observations=(*state.observations, observation),
+            verifications=(*state.verifications, verification),
+        )
         self._resolve_decision(updated, False, f"action_{code}")
         self._enqueue_outbox(
             OutboxMessageKind.ANOMALY,
@@ -976,7 +1201,40 @@ class ActionExecutionLayer:
             **values,
         )
 
-    def _resolve_decision(self, intent: ActionIntent, success: bool, description: str) -> None:
+    def _failure_evidence(
+        self,
+        intent: ActionIntent,
+        receipt_id: str,
+        status: ReceiptStatus,
+        code: str,
+        observed_at: datetime,
+    ) -> tuple[Observation, OutcomeVerification]:
+        data: dict[str, JsonValue] = {
+            "status": status.value,
+            "error_code": code,
+        }
+        observation = Observation(
+            observation_id=str(uuid4()),
+            intent_id=intent.intent_id,
+            receipt_id=receipt_id,
+            observed_at=observed_at,
+            data=data,
+            result_digest=_digest(data),
+            valid=True,
+        )
+        verification = OutcomeVerification(
+            verification_id=str(uuid4()),
+            intent_id=intent.intent_id,
+            observation_id=observation.observation_id,
+            success=False,
+            reason=f"execution_{code}",
+            verified_at=observed_at,
+        )
+        return observation, verification
+
+    def _resolve_decision(
+        self, intent: ActionIntent, success: bool, description: str
+    ) -> None:
         decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
         if decision.status == DecisionStatus.RESOLVED:
             return
@@ -999,13 +1257,20 @@ class ActionExecutionLayer:
             raise ValueError("Invalid action execution state") from exc
 
     def _save(self, state: ActionState) -> None:
-        self.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        self.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(
+            mode="json"
+        )
 
     def _replace(self, state: ActionState, intent: ActionIntent, **values: Any) -> None:
-        intents = tuple(intent if item.intent_id == intent.intent_id else item for item in state.intents)
+        intents = tuple(
+            intent if item.intent_id == intent.intent_id else item
+            for item in state.intents
+        )
         self._save(state.model_copy(update={"intents": intents, **values}))
 
 
 def _digest(value: JsonValue | dict[str, JsonValue]) -> str:
-    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    serialized = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
     return hashlib.sha256(serialized.encode()).hexdigest()

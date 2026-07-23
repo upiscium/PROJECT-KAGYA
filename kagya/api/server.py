@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from kagya.actions import ActionExecutionLayer
 from kagya.api.routes import (
     actions,
+    attributions,
     adapters,
     attention,
     beliefs,
@@ -163,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.include_router(plans.router)
         app.include_router(decisions.router)
         app.include_router(actions.router)
+        app.include_router(attributions.router)
         app.include_router(self_model.router)
         app.include_router(experiences.router)
         app.include_router(beliefs.router)

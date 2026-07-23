@@ -54,6 +54,18 @@ class OutcomeObservation:
     operator_feedback_ref: str | None
     recorded_at: str
     revision: int = 0
+    attribution_ref: str | None = None
+    self_contribution: float = 1.0
+    controllability: float = 1.0
+    agency_adjusted_success: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "self_contribution",
+            "controllability",
+            "agency_adjusted_success",
+        ):
+            _unit(getattr(self, name), name)
 
 
 @dataclass(frozen=True)
@@ -199,7 +211,9 @@ class Metacognition:
                 len(history) + 2.0
             )
             history_weight = len(history) / (len(history) + 3.0)
-            confidence = (1.0 - history_weight) * confidence + history_weight * historical_accuracy
+            confidence = (
+                1.0 - history_weight
+            ) * confidence + history_weight * historical_accuracy
 
         quality = self._quality(
             cognitive_load,
@@ -224,7 +238,10 @@ class Metacognition:
         elif not capabilities and not evidence:
             boundary = EpistemicBoundary.UNKNOWN
             recommended = _available_choice(
-                available, ActionType.REQUEST_INFORMATION, ActionType.OBSERVE, ActionType.DEFER
+                available,
+                ActionType.REQUEST_INFORMATION,
+                ActionType.OBSERVE,
+                ActionType.DEFER,
             )
             reasons.append("no_authoritative_evidence")
         elif uncertainties or confidence < 0.65:
@@ -243,7 +260,9 @@ class Metacognition:
                 reasons.append("evidence_or_accuracy_insufficient")
         elif quality.estimated_quality < 0.55:
             boundary = EpistemicBoundary.UNCERTAIN
-            recommended = _available_choice(available, ActionType.DEFER, ActionType.DELEGATE)
+            recommended = _available_choice(
+                available, ActionType.DEFER, ActionType.DELEGATE
+            )
             reasons.append("current_cognitive_quality_degraded")
         else:
             boundary = EpistemicBoundary.KNOWN
@@ -274,8 +293,14 @@ class Metacognition:
         *,
         self_model_revision: int,
         cognitive_quality: CognitiveQuality,
+        attribution_ref: str | None = None,
+        self_contribution: float = 1.0,
+        controllability: float = 1.0,
     ) -> MetacognitiveAssessment:
-        if decision.status != DecisionStatus.RESOLVED or decision.actual_outcome is None:
+        if (
+            decision.status != DecisionStatus.RESOLVED
+            or decision.actual_outcome is None
+        ):
             raise ValueError("Post-decision assessment requires an observed outcome")
         pre = self.get(decision.metacognition_pre_assessment_id)
         selected = next(
@@ -290,6 +315,11 @@ class Metacognition:
             else f"feedback:{decision.actual_outcome.feedback_id}@{decision.actual_outcome.feedback_revision}"
         )
         current = self.observations.get(decision.decision_id)
+        adjusted_success = (
+            1.0
+            if decision.actual_outcome.success
+            else max(0.0, 1.0 - self_contribution)
+        )
         observation = OutcomeObservation(
             decision_id=decision.decision_id,
             scope_ids=scopes,
@@ -303,6 +333,10 @@ class Metacognition:
             operator_feedback_ref=feedback_ref,
             recorded_at=decision.actual_outcome.recorded_at,
             revision=0 if current is None else current.revision + 1,
+            attribution_ref=attribution_ref,
+            self_contribution=self_contribution,
+            controllability=controllability,
+            agency_adjusted_success=adjusted_success,
         )
         self.observations[decision.decision_id] = observation
         self._rebuild_hypotheses()
@@ -311,9 +345,9 @@ class Metacognition:
             for item in self.observations.values()
             if set(item.scope_ids).intersection(scopes)
         ]
-        accuracy = (sum(item.success for item in scope_history) + 1.0) / (
-            len(scope_history) + 2.0
-        )
+        accuracy = (
+            sum(item.agency_adjusted_success for item in scope_history) + 1.0
+        ) / (len(scope_history) + 2.0)
         hypothesis_refs = tuple(
             item.hypothesis_id
             for item in self.hypotheses.values()
@@ -329,6 +363,8 @@ class Metacognition:
             )
         )
         reasons = ["prediction_compared_with_observed_outcome"]
+        if attribution_ref is not None:
+            reasons.append("agency_adjusted_outcome_evidence")
         if feedback_ref is not None:
             reasons.append("operator_feedback_calibration")
         if hypothesis_refs:
@@ -387,11 +423,15 @@ class Metacognition:
             "assessments": [asdict(item) for item in self.list_assessments()],
             "observations": [
                 asdict(item)
-                for item in sorted(self.observations.values(), key=lambda value: value.recorded_at)
+                for item in sorted(
+                    self.observations.values(), key=lambda value: value.recorded_at
+                )
             ],
             "hypotheses": [
                 asdict(item)
-                for item in sorted(self.hypotheses.values(), key=lambda value: value.hypothesis_id)
+                for item in sorted(
+                    self.hypotheses.values(), key=lambda value: value.hypothesis_id
+                )
             ],
         }
 
@@ -403,9 +443,15 @@ class Metacognition:
             return
         if payload.get("schema_version") != self.SCHEMA_VERSION:
             raise ValueError("Unsupported metacognition schema version")
-        assessments = [_assessment_from_json(item) for item in payload.get("assessments", [])]
-        observations = [_observation_from_json(item) for item in payload.get("observations", [])]
-        hypotheses = [_hypothesis_from_json(item) for item in payload.get("hypotheses", [])]
+        assessments = [
+            _assessment_from_json(item) for item in payload.get("assessments", [])
+        ]
+        observations = [
+            _observation_from_json(item) for item in payload.get("observations", [])
+        ]
+        hypotheses = [
+            _hypothesis_from_json(item) for item in payload.get("hypotheses", [])
+        ]
         self.assessments = {item.assessment_id: item for item in assessments}
         self.observations = {item.decision_id: item for item in observations}
         self.hypotheses = {item.hypothesis_id: item for item in hypotheses}
@@ -424,7 +470,9 @@ class Metacognition:
         if not math.isfinite(valence) or not -1.0 <= valence <= 1.0:
             raise ValueError("emotion valence must be between minus one and one")
         emotion_influence = max(arousal, max(0.0, -valence))
-        quality = _clamp(1.0 - 0.35 * load - 0.35 * saturation - 0.3 * emotion_influence)
+        quality = _clamp(
+            1.0 - 0.35 * load - 0.35 * saturation - 0.3 * emotion_influence
+        )
         reasons: list[str] = []
         if load >= 0.75:
             reasons.append("high_cognitive_load")
@@ -455,7 +503,9 @@ class Metacognition:
         )
         assessment = MetacognitiveAssessment(
             assessment_id=f"metacognition-{uuid4()}",
-            supersedes_assessment_id=None if previous is None else previous.assessment_id,
+            supersedes_assessment_id=None
+            if previous is None
+            else previous.assessment_id,
             created_at=_now(),
             **values,
         )
@@ -484,11 +534,17 @@ class Metacognition:
                 item for item in self.observations.values() if scope in item.scope_ids
             ]
             patterns = {
-                "recurring_failure": [item for item in observations if not item.success],
+                "recurring_failure": [
+                    item
+                    for item in observations
+                    if not item.success and item.self_contribution >= 0.5
+                ],
                 "optimism_bias": [
                     item
                     for item in observations
-                    if item.prediction_error <= -0.25 and item.predicted_success >= 0.6
+                    if item.prediction_error <= -0.25
+                    and item.predicted_success >= 0.6
+                    and item.self_contribution >= 0.5
                 ],
             }
             for code, matches in patterns.items():
@@ -549,6 +605,7 @@ def _assessment_from_json(payload: dict[str, Any]) -> MetacognitiveAssessment:
 def _observation_from_json(payload: dict[str, Any]) -> OutcomeObservation:
     data = dict(payload)
     data["scope_ids"] = tuple(data.get("scope_ids", ()))
+    data.setdefault("agency_adjusted_success", 1.0 if data.get("success") else 0.0)
     return OutcomeObservation(**data)
 
 
