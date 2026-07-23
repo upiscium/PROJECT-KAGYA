@@ -63,13 +63,9 @@ export function EvaluationsClient() {
         {rerun.error ? <p className="error">{errorMessage(rerun.error)}</p> : null}
         {rerun.data ? <p className="muted">Rerun {rerun.data.evaluation_id}: hashes {rerun.data.fixture_hashes_match ? "verified" : "mismatched"}</p> : null}
         <div className="grid">
-          <Card>
-            <CardTitle>Behavioral history</CardTitle>
-            {behavioral.data?.results.length === 0 ? <p className="muted">No behavioral evaluations yet.</p> : null}
-            {(behavioral.data?.results ?? []).map((result) => (
-              <BehavioralRow key={result.evaluation_id} result={result} selected={result.evaluation_id === behavioralId} onSelect={() => { setSelectedBehavioralId(result.evaluation_id); setFailureScenario(null); }} />
-            ))}
-          </Card>
+          <EvidenceSection title="Synthetic evaluator contract" kind="synthetic_evaluator_contract" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <EvidenceSection title="Deterministic runtime evaluation" kind="deterministic_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <EvidenceSection title="Real-model runtime evaluation" kind="real_model_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
           <Card>
             <CardTitle>Dimension deltas</CardTitle>
             {behavioral.data?.results.find((item) => item.evaluation_id === behavioralId) ? (
@@ -119,11 +115,16 @@ export function EvaluationsClient() {
   );
 }
 
+function EvidenceSection({ title, kind, results, selectedId, onSelect }: { title: string; kind: BehavioralEvaluationSummary["runtime_kind"]; results: BehavioralEvaluationSummary[]; selectedId: string | null; onSelect: (id: string) => void }) {
+  const matching = results.filter((result) => result.runtime_kind === kind);
+  return <Card><CardTitle>{title}</CardTitle>{matching.length === 0 ? <p className="muted">Not run.</p> : matching.map((result) => <BehavioralRow key={result.evaluation_id} result={result} selected={result.evaluation_id === selectedId} onSelect={() => onSelect(result.evaluation_id)} />)}</Card>;
+}
+
 function BehavioralRow({ result, selected, onSelect }: { result: BehavioralEvaluationSummary; selected: boolean; onSelect: () => void }) {
   return (
     <article className="record">
       <div className="metadata-row">
-        <Badge data-tone={result.activation_gate_passed ? "success" : "danger"}>{result.activation_gate_passed ? "gate passed" : "blocked"}</Badge>
+        <Badge data-tone={result.activation_gate_passed ? "success" : "danger"}>{result.runtime_kind === "synthetic_evaluator_contract" ? (result.activation_gate_passed ? "contract passed" : "contract failed") : (result.activation_gate_passed ? "gate passed" : "blocked")}</Badge>
         <span className="mono">{result.evaluation_id}</span>
       </div>
       <p>{result.baseline_id} {formatNumber(result.baseline_score)} / {result.candidate_id} {formatNumber(result.candidate_score)}</p>

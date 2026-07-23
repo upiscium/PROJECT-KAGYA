@@ -50,6 +50,9 @@ class ActivationEligibilityReason(StrEnum):
     BEHAVIORAL_RESULT_TAMPERED = "behavioral_result_tampered"
     BEHAVIORAL_BINDING_MISMATCH = "behavioral_binding_mismatch"
     ADAPTER_ARTIFACT_MISMATCH = "adapter_artifact_mismatch"
+    REAL_MODEL_BEHAVIORAL_UNEVALUATED = "real_model_behavioral_unevaluated"
+    REAL_MODEL_BEHAVIORAL_FAILED = "real_model_behavioral_failed"
+    REAL_MODEL_BEHAVIORAL_STALE = "real_model_behavioral_stale"
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,9 @@ class ActivationEligibility:
     eligible: bool
     reason: ActivationEligibilityReason
     detail: str
+    real_model_required: bool = False
+    deterministic_status: str = "not_run"
+    real_model_status: str = "not_run"
 
 
 @dataclass(frozen=True)
@@ -106,11 +112,20 @@ class AdapterEntry:
     behavioral_artifact_state: str = "unbound"
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
+    real_model_behavioral_evaluation_id: str | None = None
+    real_model_behavioral_evaluation_path: str | None = None
+    real_model_behavioral_result_hash: str | None = None
+    real_model_behavioral_gate_passed: bool | None = None
+    real_model_behavioral_candidate_adapter_hash: str | None = None
+    real_model_behavioral_base_model_revision: str | None = None
+    real_model_subject_revision: str | None = None
+    real_model_fixture_set_hash: str | None = None
+    real_model_behavioral_artifact_state: str = "unbound"
     legacy_activation_warning: bool = False
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 6
+    schema_version: int = 7
 
     @property
     def activation_gate_passed(self) -> bool:
@@ -232,6 +247,33 @@ class AdapterEntry:
             ),
             subject_revision=_optional_str(data.get("subject_revision")),
             fixture_set_hash=_optional_str(data.get("fixture_set_hash")),
+            real_model_behavioral_evaluation_id=_optional_str(
+                data.get("real_model_behavioral_evaluation_id")
+            ),
+            real_model_behavioral_evaluation_path=_optional_str(
+                data.get("real_model_behavioral_evaluation_path")
+            ),
+            real_model_behavioral_result_hash=_optional_str(
+                data.get("real_model_behavioral_result_hash")
+            ),
+            real_model_behavioral_gate_passed=_optional_bool(
+                data.get("real_model_behavioral_gate_passed")
+            ),
+            real_model_behavioral_candidate_adapter_hash=_optional_str(
+                data.get("real_model_behavioral_candidate_adapter_hash")
+            ),
+            real_model_behavioral_base_model_revision=_optional_str(
+                data.get("real_model_behavioral_base_model_revision")
+            ),
+            real_model_subject_revision=_optional_str(
+                data.get("real_model_subject_revision")
+            ),
+            real_model_fixture_set_hash=_optional_str(
+                data.get("real_model_fixture_set_hash")
+            ),
+            real_model_behavioral_artifact_state=str(
+                data.get("real_model_behavioral_artifact_state", "unbound")
+            ),
             legacy_activation_warning=bool(
                 data.get("legacy_activation_warning", False)
                 or (legacy_gate and status == AdapterStatus.ACTIVE)
@@ -239,7 +281,7 @@ class AdapterEntry:
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=6,
+            schema_version=7,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -499,6 +541,20 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
+            if result.runtime_kind.value == "real_model_runtime":
+                return self._replace_locked(
+                    entries,
+                    adapter_id,
+                    real_model_behavioral_evaluation_id=evaluation_id,
+                    real_model_behavioral_evaluation_path=str(result_path),
+                    real_model_behavioral_result_hash=result_hash,
+                    real_model_behavioral_gate_passed=result.real_model_runtime_gate_passed,
+                    real_model_behavioral_candidate_adapter_hash=manifest.candidate_adapter_hash,
+                    real_model_behavioral_base_model_revision=manifest.base_model_revision,
+                    real_model_subject_revision=manifest.subject_revision,
+                    real_model_fixture_set_hash=manifest.fixture_set_hash,
+                    real_model_behavioral_artifact_state="finalized",
+                )
             return self._replace_locked(
                 entries,
                 adapter_id,
@@ -541,6 +597,20 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
+            if result.runtime_kind.value == "real_model_runtime":
+                return self._replace_locked(
+                    entries,
+                    adapter_id,
+                    real_model_behavioral_evaluation_id=evaluation_id,
+                    real_model_behavioral_evaluation_path=str(final_path),
+                    real_model_behavioral_result_hash=result_hash,
+                    real_model_behavioral_gate_passed=result.real_model_runtime_gate_passed,
+                    real_model_behavioral_candidate_adapter_hash=manifest.candidate_adapter_hash,
+                    real_model_behavioral_base_model_revision=manifest.base_model_revision,
+                    real_model_subject_revision=manifest.subject_revision,
+                    real_model_fixture_set_hash=manifest.fixture_set_hash,
+                    real_model_behavioral_artifact_state="prepared",
+                )
             return self._replace_locked(
                 entries,
                 adapter_id,
@@ -563,32 +633,54 @@ class AdapterRegistry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
-            if (
-                entry.behavioral_artifact_state != "prepared"
-                or entry.behavioral_evaluation_id != evaluation_id
-                or entry.behavioral_evaluation_path is None
-            ):
+            real_model = entry.real_model_behavioral_evaluation_id == evaluation_id
+            state = (
+                entry.real_model_behavioral_artifact_state
+                if real_model
+                else entry.behavioral_artifact_state
+            )
+            path = (
+                entry.real_model_behavioral_evaluation_path
+                if real_model
+                else entry.behavioral_evaluation_path
+            )
+            expected_hash = (
+                entry.real_model_behavioral_result_hash
+                if real_model
+                else entry.behavioral_result_hash
+            )
+            if state != "prepared" or path is None:
                 raise ValueError(
                     "Behavioral evaluation has no matching prepared binding"
                 )
-            result, result_hash = _load_behavioral_result(
-                Path(entry.behavioral_evaluation_path)
-            )
-            if result_hash != entry.behavioral_result_hash:
+            result, result_hash = _load_behavioral_result(Path(path))
+            if result_hash != expected_hash:
                 raise ValueError("Behavioral evaluation result hash mismatch")
             mismatch = _behavioral_binding_mismatch(entry, result)
             if mismatch is not None:
                 raise ValueError(mismatch)
-            return self._replace_locked(
-                entries, adapter_id, behavioral_artifact_state="finalized"
+            updates = (
+                {"real_model_behavioral_artifact_state": "finalized"}
+                if real_model
+                else {"behavioral_artifact_state": "finalized"}
             )
+            return self._replace_locked(entries, adapter_id, **updates)
 
-    def quarantine_behavioral_evaluation(self, adapter_id: str) -> AdapterEntry:
+    def quarantine_behavioral_evaluation(
+        self, adapter_id: str, *, evaluation_id: str | None = None
+    ) -> AdapterEntry:
         """Fail closed while retaining enough binding metadata for diagnosis."""
 
         with self._locked(exclusive=True):
             entries = self._list_locked()
-            self._require_locked(entries, adapter_id)
+            entry = self._require_locked(entries, adapter_id)
+            if evaluation_id == entry.real_model_behavioral_evaluation_id:
+                return self._replace_locked(
+                    entries,
+                    adapter_id,
+                    real_model_behavioral_artifact_state="quarantined",
+                    real_model_behavioral_gate_passed=False,
+                )
             return self._replace_locked(
                 entries,
                 adapter_id,
@@ -604,30 +696,45 @@ class AdapterRegistry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
-            if (
-                entry.behavioral_artifact_state != "finalized"
-                or entry.behavioral_evaluation_id != evaluation_id
-                or entry.behavioral_evaluation_path is None
-            ):
+            real_model = entry.real_model_behavioral_evaluation_id == evaluation_id
+            state = (
+                entry.real_model_behavioral_artifact_state
+                if real_model
+                else entry.behavioral_artifact_state
+            )
+            path = (
+                entry.real_model_behavioral_evaluation_path
+                if real_model
+                else entry.behavioral_evaluation_path
+            )
+            expected_hash = (
+                entry.real_model_behavioral_result_hash
+                if real_model
+                else entry.behavioral_result_hash
+            )
+            if state != "finalized" or path is None:
                 raise ValueError(
                     "Behavioral evaluation is not finalized for reconciliation"
                 )
-            result, result_hash = _load_behavioral_result(
-                Path(entry.behavioral_evaluation_path)
-            )
-            if result_hash != entry.behavioral_result_hash:
+            result, result_hash = _load_behavioral_result(Path(path))
+            if result_hash != expected_hash:
                 raise ValueError("Behavioral evaluation result hash mismatch")
             mismatch = _behavioral_binding_mismatch(entry, result)
             if mismatch is not None:
                 raise ValueError(mismatch)
-            return self._replace_locked(
-                entries, adapter_id, behavioral_artifact_state="reconciled"
+            updates = (
+                {"real_model_behavioral_artifact_state": "reconciled"}
+                if real_model
+                else {"behavioral_artifact_state": "reconciled"}
             )
+            return self._replace_locked(entries, adapter_id, **updates)
 
     def activation_eligibility(self, adapter_id: str) -> ActivationEligibility:
         with self._locked(exclusive=False):
             entry = self._require_locked(self._list_locked(), adapter_id)
-            return _activation_eligibility(entry)
+            return _activation_eligibility(
+                entry, self.settings.adapter_registry.require_real_model_behavioral_gate
+            )
 
     def activate(
         self, adapter_id: str, *, activation_sequence: int | None = None
@@ -636,7 +743,9 @@ class AdapterRegistry:
             current_entries = self._list_locked()
             entry = self._require_locked(current_entries, adapter_id)
             self._ensure_transition(entry.status, AdapterStatus.ACTIVE)
-            eligibility = _activation_eligibility(entry)
+            eligibility = _activation_eligibility(
+                entry, self.settings.adapter_registry.require_real_model_behavioral_gate
+            )
             if not eligibility.eligible:
                 raise ValueError(
                     f"Adapter activation ineligible [{eligibility.reason.value}]: "
@@ -692,7 +801,10 @@ class AdapterRegistry:
             }:
                 raise ValueError("Rollback target is not archived or approved")
             if target is not None:
-                eligibility = _activation_eligibility(target)
+                eligibility = _activation_eligibility(
+                    target,
+                    self.settings.adapter_registry.require_real_model_behavioral_gate,
+                )
                 if not eligibility.eligible:
                     raise ValueError(
                         f"Rollback promotion ineligible [{eligibility.reason.value}]: "
@@ -996,7 +1108,7 @@ def _ineligible(
     return ActivationEligibility(False, reason, detail)
 
 
-def _activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
+def _base_activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
     gate_checks = (
         (
             entry.quality_gate_passed,
@@ -1092,8 +1204,85 @@ def _activation_eligibility(entry: AdapterEntry) -> ActivationEligibility:
             "Behavioral runtime gate failed",
         )
     return ActivationEligibility(
-        True, ActivationEligibilityReason.ELIGIBLE, "All activation gates passed"
+        True, ActivationEligibilityReason.ELIGIBLE, "All deterministic gates passed"
     )
+
+
+def _activation_eligibility(
+    entry: AdapterEntry, require_real_model: bool = False
+) -> ActivationEligibility:
+    base = _base_activation_eligibility(entry)
+    real_status = _real_model_binding_status(entry)
+    if not base.eligible:
+        return ActivationEligibility(
+            base.eligible,
+            base.reason,
+            base.detail,
+            require_real_model,
+            "failed",
+            real_status,
+        )
+    if require_real_model and real_status != "passed":
+        reason = (
+            ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_UNEVALUATED
+            if real_status == "not_run"
+            else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_FAILED
+            if real_status == "failed"
+            else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+        )
+        return ActivationEligibility(
+            False,
+            reason,
+            f"Required real-model behavioral gate is {real_status}",
+            True,
+            "passed",
+            real_status,
+        )
+    return ActivationEligibility(
+        True,
+        ActivationEligibilityReason.ELIGIBLE,
+        "All required activation gates passed",
+        require_real_model,
+        "passed",
+        real_status,
+    )
+
+
+def _real_model_binding_status(entry: AdapterEntry) -> str:
+    if entry.real_model_behavioral_evaluation_id is None:
+        return "not_run"
+    if entry.real_model_behavioral_artifact_state != "reconciled":
+        return "stale"
+    if (
+        entry.real_model_behavioral_gate_passed is not True
+        or entry.real_model_behavioral_evaluation_path is None
+    ):
+        return "failed"
+    try:
+        result, result_hash = _load_behavioral_result(
+            Path(entry.real_model_behavioral_evaluation_path)
+        )
+    except ValueError:
+        return "corrupt"
+    manifest = result.manifest
+    if (
+        result.runtime_kind.value != "real_model_runtime"
+        or manifest is None
+        or result.evaluation_id != entry.real_model_behavioral_evaluation_id
+        or result.real_model_runtime_gate_passed is not True
+        or result_hash != entry.real_model_behavioral_result_hash
+        or manifest.candidate_adapter_hash != entry.adapter_hash
+        or manifest.candidate_adapter_hash
+        != entry.real_model_behavioral_candidate_adapter_hash
+        or manifest.base_model_revision != entry.base_model_revision
+        or manifest.base_model_revision
+        != entry.real_model_behavioral_base_model_revision
+        or manifest.subject_revision != entry.real_model_subject_revision
+        or manifest.fixture_set_hash != entry.real_model_fixture_set_hash
+        or _behavioral_binding_mismatch(entry, result) is not None
+    ):
+        return "stale"
+    return "passed"
 
 
 def _dataset_record_hashes(path: Path) -> tuple[tuple[str, ...], int]:

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from kagya.api.routes.evaluations import (
@@ -36,6 +37,10 @@ from kagya.learning import (
     AdapterRegistry,
     run_deterministic_subject_evaluation,
     subject_completion_scenarios,
+)
+from tests.adapter_behavioral_helpers import (
+    register_runtime_candidate,
+    write_runtime_behavioral_result,
 )
 
 
@@ -419,7 +424,9 @@ def test_action_policy_and_approval_are_independent_hard_gates(tmp_path: Path) -
     assert result.activation_gate_passed is False
 
 
-def test_completion_corpus_runs_external_causal_chain_across_restart(tmp_path: Path) -> None:
+def test_completion_corpus_runs_external_causal_chain_across_restart(
+    tmp_path: Path,
+) -> None:
     scenarios = subject_completion_scenarios(subject_revision="revision-133")
 
     assert {dimension for item in scenarios for dimension in item.dimensions} == set(
@@ -473,7 +480,9 @@ def test_completion_corpus_exposes_every_hard_failure(tmp_path: Path) -> None:
     assert result.activation_gate_passed is False
 
 
-def test_deterministic_runner_does_not_trust_modified_expectations(tmp_path: Path) -> None:
+def test_deterministic_runner_does_not_trust_modified_expectations(
+    tmp_path: Path,
+) -> None:
     scenario = subject_completion_scenarios()[1]
     modified = scenario.model_copy(
         update={"expected_public_behavior": PublicBehaviorClass.RESPOND}
@@ -489,7 +498,10 @@ def test_deterministic_runner_does_not_trust_modified_expectations(tmp_path: Pat
     )
 
     assert result.candidate.scenario_results[0].passed is False
-    assert result.candidate.scenario_results[0].failures[0].code == "public_behavior_mismatch"
+    assert (
+        result.candidate.scenario_results[0].failures[0].code
+        == "public_behavior_mismatch"
+    )
 
 
 def test_synthetic_behavioral_regression_cannot_bind_activation_gate(
@@ -562,6 +574,34 @@ def test_behavioral_rerun_api_replays_known_fixture_hashes(tmp_path: Path) -> No
     assert response.evaluation_id == "reproduced"
     assert response.fixture_hashes_match is True
     assert response.activation_gate_passed is True
+
+
+def test_runtime_rerun_rejects_changed_candidate_artifact_with_409(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_results(tmp_path)
+    registry = AdapterRegistry(settings)
+    entry = register_runtime_candidate(registry, tmp_path, "candidate")
+    source = write_runtime_behavioral_result(
+        registry, tmp_path, "candidate", evaluation_id="runtime-original"
+    )
+    behavioral_dir = tmp_path / "behavioral"
+    behavioral_dir.mkdir(exist_ok=True)
+    source.replace(behavioral_dir / "runtime-original.json")
+    (Path(entry.path) / "adapter_config.json").write_text(
+        '{"adapter_id":"changed"}', encoding="utf-8"
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        rerun_behavioral_evaluation(
+            "runtime-original",
+            BehavioralRerunRequest(rerun_id="runtime-rerun"),
+            settings,
+            registry,
+        )
+
+    assert raised.value.status_code == 409
+    assert "candidate_adapter_path_hash" in str(raised.value.detail)
 
 
 def _scenario(

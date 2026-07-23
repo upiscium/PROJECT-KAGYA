@@ -37,6 +37,7 @@ from kagya.learning import (
     AdapterStatus,
     BehavioralArtifactStore,
     run_deterministic_runtime_evaluation,
+    run_real_model_runtime_evaluation,
 )
 from kagya.models import ModelProvider, load_model_provider
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -68,7 +69,12 @@ def behavioral_evaluate_adapter(
         )
 
     try:
-        result, artifact_status = run_deterministic_runtime_evaluation(
+        evaluation_runner = (
+            run_real_model_runtime_evaluation
+            if request.runtime_kind == "real_model_runtime"
+            else run_deterministic_runtime_evaluation
+        )
+        result, artifact_status = evaluation_runner(
             settings,
             request.evaluation_id,
             baseline_id=request.baseline_id,
@@ -113,14 +119,23 @@ def behavioral_evaluate_adapter(
             handler=bind_and_finalize,
             payload={"adapter_id": adapter_id, "evaluation_id": request.evaluation_id},
         ).value
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    manifest = result.manifest
+    assert manifest is not None
+    eligibility = registry.activation_eligibility(adapter_id)
     return AdapterBehavioralEvaluateResponse(
         evaluation_id=result.evaluation_id,
         adapter_id=adapter_id,
         runtime_kind=result.runtime_kind.value,
         activation_gate_passed=result.activation_gate_passed,
         deterministic_runtime_gate_passed=result.deterministic_runtime_gate_passed,
+        real_model_runtime_gate_passed=result.real_model_runtime_gate_passed,
+        source_commit_sha=manifest.source_commit_sha,
+        adapter_hash=manifest.candidate_adapter_hash,
+        base_model_revision=manifest.base_model_revision,
+        fixture_set_hash=manifest.fixture_set_hash,
+        activation_eligibility=eligibility.reason.value,
         candidate_score=result.candidate.aggregate_score,
         hard_gate_failures=[item.value for item in result.candidate.hard_gate_failures],
         regression_dimensions=[item.value for item in result.regression_dimensions],
@@ -178,7 +193,12 @@ def list_adapters(
         source="api.adapters.list",
         handler=registry.list,
     ).value
-    return AdapterListResponse(adapters=[adapter_response(entry) for entry in entries])
+    return AdapterListResponse(
+        adapters=[
+            adapter_response(entry, registry.activation_eligibility(entry.adapter_id))
+            for entry in entries
+        ]
+    )
 
 
 @router.post("/{adapter_id}/evaluate", response_model=AdapterEvaluateResponse)
@@ -450,7 +470,9 @@ def _record_adapter_transition(
     )
 
 
-def adapter_response(entry: AdapterEntry) -> AdapterResponse:
+def adapter_response(
+    entry: AdapterEntry, eligibility: object | None = None
+) -> AdapterResponse:
     return AdapterResponse(
         adapter_id=entry.adapter_id,
         base_model=entry.base_model,
@@ -478,7 +500,11 @@ def adapter_response(entry: AdapterEntry) -> AdapterResponse:
         quality_gate_passed=entry.quality_gate_passed,
         holdout_gate_passed=entry.holdout_gate_passed,
         drift_gate_passed=entry.drift_gate_passed,
-        activation_gate_passed=entry.activation_gate_passed,
+        activation_gate_passed=(
+            entry.activation_gate_passed
+            if eligibility is None
+            else bool(getattr(eligibility, "eligible", False))
+        ),
         behavioral_evaluation_id=entry.behavioral_evaluation_id,
         behavioral_evaluation_path=entry.behavioral_evaluation_path,
         behavioral_result_hash=entry.behavioral_result_hash,
@@ -487,6 +513,15 @@ def adapter_response(entry: AdapterEntry) -> AdapterResponse:
         behavioral_base_model_revision=entry.behavioral_base_model_revision,
         subject_revision=entry.subject_revision,
         fixture_set_hash=entry.fixture_set_hash,
+        real_model_behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
+        real_model_behavioral_gate_passed=entry.real_model_behavioral_gate_passed,
+        real_model_behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
+        activation_eligibility_reason=str(
+            getattr(getattr(eligibility, "reason", ""), "value", "")
+        ),
+        real_model_behavioral_required=bool(
+            getattr(eligibility, "real_model_required", False)
+        ),
         legacy_activation_warning=entry.legacy_activation_warning,
         rollout_state=entry.rollout_state,
         canary_failures=entry.canary_failures,

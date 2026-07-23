@@ -47,10 +47,10 @@ transformers-smoke-fallback config="config.yaml":
     @echo "==> Running opt-in Transformers provider fallback smoke check..."
     uv run python -m kagya.models.transformers_smoke --config {{config}} --check-fallback
 
-# Opt-in structured behavior-class check against a real local model.
-behavioral-real-model config="config.yaml":
-    @echo "==> Running opt-in real-model behavioral check..."
-    uv run python -m kagya.learning.real_model_behavioral --config {{config}}
+# Opt-in actual subject runtime evaluation against a base model and candidate adapter.
+behavioral-real-model config adapter_id evaluation_id:
+    @echo "==> Running opt-in real-model subject runtime evaluation..."
+    KAGYA_RUN_REAL_MODEL_BEHAVIORAL=1 uv run python -m kagya.learning.real_model_runtime_behavioral --config {{config}} --adapter-id {{adapter_id}} --evaluation-id {{evaluation_id}}
 
 # Deterministic real-runtime behavioral harness and recovery checks.
 behavioral-runtime:

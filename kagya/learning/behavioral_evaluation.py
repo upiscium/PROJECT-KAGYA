@@ -74,6 +74,7 @@ class HardGate(StrEnum):
 class BehavioralRuntimeKind(StrEnum):
     SYNTHETIC_EVALUATOR_CONTRACT = "synthetic_evaluator_contract"
     DETERMINISTIC_RUNTIME = "deterministic_runtime"
+    REAL_MODEL_RUNTIME = "real_model_runtime"
 
     # Source compatibility for PR1 callers. Serialized values are intentionally
     # the precise evidence classes above.
@@ -376,6 +377,7 @@ class PairedBehavioralEvaluationResult(_StrictModel):
         BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
     )
     deterministic_runtime_gate_passed: bool = False
+    real_model_runtime_gate_passed: bool = False
     manifest: BehavioralEvaluationManifest | None = None
     tool_execution_dimensions_complete: Literal[True] = True
     tool_execution_scope_note: str = (
@@ -392,6 +394,8 @@ class PairedBehavioralEvaluationResult(_StrictModel):
                 raise ValueError(
                     "synthetic behavioral results cannot pass the runtime gate"
                 )
+            if self.real_model_runtime_gate_passed:
+                raise ValueError("synthetic results cannot pass the real-model gate")
             return self
         if self.manifest is None:
             raise ValueError("runtime behavioral results require a manifest")
@@ -409,6 +413,16 @@ class PairedBehavioralEvaluationResult(_StrictModel):
             raise ValueError("behavioral manifest fixture revision mismatch")
         if self.manifest.evaluator_schema_version != self.evaluator_version:
             raise ValueError("behavioral manifest evaluator schema version mismatch")
+        if self.deterministic_runtime_gate_passed != (
+            self.runtime_kind == BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+            and self.activation_gate_passed
+        ):
+            raise ValueError("deterministic gate does not match runtime evidence")
+        if self.real_model_runtime_gate_passed != (
+            self.runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
+            and self.activation_gate_passed
+        ):
+            raise ValueError("real-model gate does not match runtime evidence")
         return self
 
 
@@ -805,6 +819,12 @@ class BehavioralEvaluator:
             runtime_kind=runtime_kind,
             deterministic_runtime_gate_passed=(
                 runtime_kind == BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+                and not (set(candidate.hard_gate_failures) & set(self.spec.hard_gates))
+                and not regressions
+                and not threshold_failures
+            ),
+            real_model_runtime_gate_passed=(
+                runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
                 and not (set(candidate.hard_gate_failures) & set(self.spec.hard_gates))
                 and not regressions
                 and not threshold_failures

@@ -34,11 +34,18 @@ export function AdaptersClient() {
 }
 
 function AdapterRow({ adapter, busy, onAction }: { adapter: Adapter; busy: boolean; onAction: (action: Action) => void }) {
-  return <article className="record"><h3>{adapter.adapter_id}</h3><p className="mono">{adapter.path}</p><p>Parent: {adapter.parent_adapter_id ?? "base model"}</p><p>Rollout: {adapter.rollout_state} · activation {formatGate(adapter.activation_gate_passed)}</p><p>Gates: quality {formatGate(adapter.quality_gate_passed)} · holdout {formatGate(adapter.holdout_gate_passed)} · drift {formatGate(adapter.drift_gate_passed)} · behavioral {formatGate(adapter.behavioral_gate_passed)}</p>{adapter.legacy_activation_warning ? <p className="error">Legacy active adapter has no behavioral evaluation; reactivation and rollback promotion are blocked.</p> : null}<p>Dataset overlap: {adapter.dataset_overlap_count} ({Math.round(adapter.dataset_overlap_ratio * 100)}%) · repeats {adapter.dataset_repetition_count}</p><p>Holdout: {adapter.holdout_score ?? "n/a"}{adapter.holdout_regression ? " (regression)" : ""}</p><p>Drift: {formatDrift(adapter.drift_scores)}</p><p>Score: {adapter.eval_score ?? "n/a"}</p><a href={`/admin-proxy/adapters/${encodeURIComponent(adapter.adapter_id)}/provenance`} target="_blank" rel="noreferrer">Export provenance</a><div className="action-row">{actions.map((item) => <Button key={item} disabled={busy} onClick={() => onAction(item)}>{item}</Button>)}</div></article>;
+  return <article className="record"><h3>{adapter.adapter_id}</h3><p>Parent: {adapter.parent_adapter_id ?? "base model"}</p><p>Quality: {formatGate(adapter.quality_gate_passed)}</p><p>Holdout: {formatGate(adapter.holdout_gate_passed)}</p><p>Drift: {formatGate(adapter.drift_gate_passed)}</p><p>Behavioral deterministic: {formatGate(adapter.behavioral_gate_passed)}</p><p>Behavioral real: {formatGate(adapter.real_model_behavioral_gate_passed)}{adapter.real_model_behavioral_required ? " (required)" : " (optional)"}</p><p>Artifact hash: {artifactStatus(adapter)}</p><p>Activation eligibility: {adapter.activation_eligibility_reason || "not evaluated"}</p>{adapter.legacy_activation_warning ? <p className="error">Legacy active adapter has no behavioral evaluation; reactivation and rollback promotion are blocked.</p> : null}<p>Dataset overlap: {adapter.dataset_overlap_count} ({Math.round(adapter.dataset_overlap_ratio * 100)}%) · repeats {adapter.dataset_repetition_count}</p><p>Drift scores: {formatDrift(adapter.drift_scores)}</p><p>Score: {adapter.eval_score ?? "n/a"}</p><a href={`/admin-proxy/adapters/${encodeURIComponent(adapter.adapter_id)}/provenance`} target="_blank" rel="noreferrer">Export provenance</a><div className="action-row">{actions.map((item) => <Button key={item} disabled={busy} onClick={() => onAction(item)}>{item}</Button>)}</div></article>;
 }
 
 function formatGate(value: boolean | null): string {
-  return value === true ? "passed" : value === false ? "failed" : "pending";
+  return value === true ? "passed" : value === false ? "failed" : "not run";
+}
+
+function artifactStatus(adapter: Adapter): string {
+  if (adapter.real_model_behavioral_artifact_state === "quarantined") return "corrupt";
+  if (adapter.activation_eligibility_reason.includes("artifact_mismatch")) return "hash-mismatch";
+  if (adapter.activation_eligibility_reason.includes("corrupt")) return "corrupt";
+  return adapter.adapter_hash ? adapter.adapter_hash : "not run";
 }
 
 function formatDrift(scores: Record<string, number> | null): string {

@@ -65,8 +65,13 @@ from kagya.learning.runtime_behavioral_harness import (
 )
 from kagya.learning.runtime_behavioral_runner import (
     DeterministicRuntimeRunner,
+    RuntimeBehavioralRunner,
     deterministic_runtime_scenarios,
     run_deterministic_runtime_evaluation,
+)
+from kagya.learning.real_model_runtime_behavioral import (
+    load_real_model_provider_pair,
+    run_real_model_runtime_evaluation,
 )
 from kagya.learning.dream_dataset_generator import (
     DreamDatasetGenerator,
@@ -112,6 +117,7 @@ __all__ = [
     "ControlledToolEnvironment",
     "DeterministicRuntimeProvider",
     "DeterministicRuntimeRunner",
+    "RuntimeBehavioralRunner",
     "FailureInjector",
     "InjectedRuntimeFailure",
     "SubjectRuntimeHarness",
@@ -139,6 +145,8 @@ __all__ = [
     "load_eval_sets",
     "run_deterministic_subject_evaluation",
     "run_deterministic_runtime_evaluation",
+    "run_real_model_runtime_evaluation",
+    "load_real_model_provider_pair",
     "deterministic_runtime_scenarios",
     "scenario_fixture_hash",
     "subject_completion_scenarios",

@@ -253,6 +253,7 @@ class AdapterRegistrySettings(StrictBaseModel):
     max_value_drift: float = Field(default=0.1, ge=0.0, le=1.0)
     max_behavior_drift: float = Field(default=0.1, ge=0.0, le=1.0)
     canary_failure_limit: int = Field(default=1, ge=1)
+    require_real_model_behavioral_gate: bool = False
 
 
 class ToolRegistrySettings(StrictBaseModel):
