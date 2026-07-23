@@ -1253,11 +1253,8 @@ def _real_model_binding_status(entry: AdapterEntry) -> str:
         return "not_run"
     if entry.real_model_behavioral_artifact_state != "reconciled":
         return "stale"
-    if (
-        entry.real_model_behavioral_gate_passed is not True
-        or entry.real_model_behavioral_evaluation_path is None
-    ):
-        return "failed"
+    if entry.real_model_behavioral_evaluation_path is None:
+        return "corrupt"
     try:
         result, result_hash = _load_behavioral_result(
             Path(entry.real_model_behavioral_evaluation_path)
@@ -1269,7 +1266,6 @@ def _real_model_binding_status(entry: AdapterEntry) -> str:
         result.runtime_kind.value != "real_model_runtime"
         or manifest is None
         or result.evaluation_id != entry.real_model_behavioral_evaluation_id
-        or result.real_model_runtime_gate_passed is not True
         or result_hash != entry.real_model_behavioral_result_hash
         or manifest.candidate_adapter_hash != entry.adapter_hash
         or manifest.candidate_adapter_hash
@@ -1282,7 +1278,12 @@ def _real_model_binding_status(entry: AdapterEntry) -> str:
         or _behavioral_binding_mismatch(entry, result) is not None
     ):
         return "stale"
-    return "passed"
+    return (
+        "passed"
+        if entry.real_model_behavioral_gate_passed is True
+        and result.real_model_runtime_gate_passed is True
+        else "failed"
+    )
 
 
 def _dataset_record_hashes(path: Path) -> tuple[tuple[str, ...], int]:

@@ -178,9 +178,13 @@ export type Adapter = {
   behavioral_base_model_revision: string | null;
   subject_revision: string | null;
   fixture_set_hash: string | null;
+  behavioral_artifact_state: string;
+  deterministic_behavioral_artifact_status: BehavioralArtifactStatus;
   real_model_behavioral_evaluation_id: string | null;
   real_model_behavioral_gate_passed: boolean | null;
   real_model_behavioral_artifact_state: string;
+  real_model_behavioral_artifact_status: BehavioralArtifactStatus;
+  behavioral_artifact_hash_match: "passed" | "failed" | "not_run";
   activation_eligibility_reason: string;
   real_model_behavioral_required: boolean;
   legacy_activation_warning: boolean;
@@ -188,6 +192,8 @@ export type Adapter = {
   canary_failures: number;
   rollback_target_id: string | null;
 };
+
+export type BehavioralArtifactStatus = "not_run" | "prepared" | "valid" | "hash_mismatch" | "corrupt" | "orphan";
 
 export type AdapterListResponse = { adapters: Adapter[] };
 export type AdapterProvenance = { adapter: Adapter; lineage: Adapter[]; activation_history: AdapterActivationResponse[] };

@@ -693,6 +693,15 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
     assert after.model_dump(exclude={"saved_at", "last_processed_event_sequence"}) == (
         before.model_dump(exclude={"saved_at", "last_processed_event_sequence"})
     )
+    adapter_payload = client.get("/api/adapters", headers=admin_headers()).json()[
+        "adapters"
+    ][0]
+    assert adapter_payload["behavioral_artifact_state"] == "reconciled"
+    assert adapter_payload["deterministic_behavioral_artifact_status"] == "valid"
+    assert adapter_payload["real_model_behavioral_artifact_status"] == "not_run"
+    assert adapter_payload["behavioral_artifact_hash_match"] == "passed"
+    assert not Path(adapter_payload["path"]).is_absolute()
+    assert not Path(adapter_payload["behavioral_evaluation_path"]).is_absolute()
 
     reconciliation = client.post(
         "/api/evaluations/behavioral-reconciliation", headers=admin_headers()

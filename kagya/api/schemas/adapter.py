@@ -41,9 +41,19 @@ class AdapterResponse(BaseModel):
     behavioral_base_model_revision: str | None = None
     subject_revision: str | None = None
     fixture_set_hash: str | None = None
+    behavioral_artifact_state: str = "unbound"
+    deterministic_behavioral_artifact_status: Literal[
+        "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+    ] = "not_run"
     real_model_behavioral_evaluation_id: str | None = None
     real_model_behavioral_gate_passed: bool | None = None
     real_model_behavioral_artifact_state: str = "unbound"
+    real_model_behavioral_artifact_status: Literal[
+        "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+    ] = "not_run"
+    behavioral_artifact_hash_match: Literal["passed", "failed", "not_run"] = (
+        "not_run"
+    )
     activation_eligibility_reason: str = ""
     real_model_behavioral_required: bool = False
     legacy_activation_warning: bool = False

@@ -123,6 +123,79 @@ def test_required_real_model_gate_reports_failed_and_stale_distinctly(
     )
 
 
+@pytest.mark.parametrize("mutation", ["adapter_content", "result_hash"])
+def test_real_model_activation_revalidates_current_files(
+    tmp_path: Path, mutation: str
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    result_path = bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        evaluation_id="real-current-files",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    registry.approve("candidate")
+    required_settings = registry.settings.model_copy(
+        update={
+            "adapter_registry": registry.settings.adapter_registry.model_copy(
+                update={"require_real_model_behavioral_gate": True}
+            )
+        }
+    )
+    required_registry = AdapterRegistry(required_settings)
+    assert required_registry.activation_eligibility("candidate").eligible is True
+
+    entry = registry.lookup("candidate")
+    assert entry is not None
+    if mutation == "adapter_content":
+        (Path(entry.path) / "adapter_config.json").write_text(
+            '{"adapter_id":"replaced"}', encoding="utf-8"
+        )
+    else:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        payload["created_at"] = "2026-07-24T00:00:00Z"
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    eligibility = required_registry.activation_eligibility("candidate")
+    assert eligibility.eligible is False
+    assert eligibility.real_model_status == "stale"
+    assert eligibility.reason == (
+        ActivationEligibilityReason.ADAPTER_ARTIFACT_MISMATCH
+        if mutation == "adapter_content"
+        else ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+    )
+
+
+def test_failed_real_model_gate_still_revalidates_corrupt_result(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    result_path = bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        passed=False,
+        evaluation_id="real-failed-corrupt",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    result_path.write_text("{", encoding="utf-8")
+    required_settings = registry.settings.model_copy(
+        update={
+            "adapter_registry": registry.settings.adapter_registry.model_copy(
+                update={"require_real_model_behavioral_gate": True}
+            )
+        }
+    )
+
+    eligibility = AdapterRegistry(required_settings).activation_eligibility("candidate")
+
+    assert eligibility.real_model_status == "corrupt"
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_BEHAVIORAL_STALE
+
+
 def test_replaced_adapter_artifact_fails_hash_integrity(tmp_path: Path) -> None:
     registry = _ready(tmp_path)
     entry = registry.lookup("candidate")

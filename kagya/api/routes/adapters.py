@@ -2,6 +2,7 @@
 
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -36,6 +37,8 @@ from kagya.learning import (
     AdapterRuntimeManager,
     AdapterStatus,
     BehavioralArtifactStore,
+    BehavioralArtifactRecord,
+    BehavioralArtifactStatus,
     run_deterministic_runtime_evaluation,
     run_real_model_runtime_evaluation,
 )
@@ -46,6 +49,11 @@ from kagya.runtime import AgentEventType, AgentRuntime
 router = APIRouter(
     prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)]
 )
+
+ArtifactStatusValue = Literal[
+    "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
+]
+ArtifactHashMatch = Literal["passed", "failed", "not_run"]
 
 
 @router.post(
@@ -184,6 +192,7 @@ def adapter_provenance(
 
 @router.get("", response_model=AdapterListResponse)
 def list_adapters(
+    settings: Settings = Depends(get_api_settings),
     registry: AdapterRegistry = Depends(get_adapter_registry),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> AdapterListResponse:
@@ -193,9 +202,19 @@ def list_adapters(
         source="api.adapters.list",
         handler=registry.list,
     ).value
+    artifacts = {
+        item.evaluation_id: item
+        for item in BehavioralArtifactStore(
+            settings.adapter_registry.eval_result_dir
+        ).reconcile(registry)
+    }
     return AdapterListResponse(
         adapters=[
-            adapter_response(entry, registry.activation_eligibility(entry.adapter_id))
+            adapter_response(
+                entry,
+                registry.activation_eligibility(entry.adapter_id),
+                artifacts=artifacts,
+            )
             for entry in entries
         ]
     )
@@ -471,17 +490,73 @@ def _record_adapter_transition(
 
 
 def adapter_response(
-    entry: AdapterEntry, eligibility: object | None = None
+    entry: AdapterEntry,
+    eligibility: object | None = None,
+    *,
+    artifacts: dict[str, BehavioralArtifactRecord] | None = None,
 ) -> AdapterResponse:
+    deterministic_artifact = _artifact_status(
+        entry.behavioral_evaluation_id,
+        entry.behavioral_artifact_state,
+        artifacts,
+    )
+    real_artifact = _artifact_status(
+        entry.real_model_behavioral_evaluation_id,
+        entry.real_model_behavioral_artifact_state,
+        artifacts,
+    )
+    reason = str(getattr(getattr(eligibility, "reason", ""), "value", ""))
+    if deterministic_artifact == "valid":
+        if reason in {
+            "behavioral_result_missing",
+        }:
+            deterministic_artifact = "orphan"
+        elif reason in {
+            "behavioral_result_corrupt",
+            "behavioral_result_schema_invalid",
+        }:
+            deterministic_artifact = "corrupt"
+        elif reason in {
+            "behavioral_result_stale",
+            "behavioral_result_tampered",
+            "behavioral_binding_mismatch",
+            "adapter_artifact_mismatch",
+        }:
+            deterministic_artifact = "hash_mismatch"
+    real_validation = str(getattr(eligibility, "real_model_status", "not_run"))
+    if real_artifact == "valid" and real_validation == "corrupt":
+        real_artifact = "corrupt"
+    elif real_artifact == "valid" and real_validation == "stale":
+        real_artifact = "hash_mismatch"
+    evaluated_artifacts = [
+        status
+        for status, evaluation_id in (
+            (deterministic_artifact, entry.behavioral_evaluation_id),
+            (real_artifact, entry.real_model_behavioral_evaluation_id),
+        )
+        if evaluation_id is not None
+    ]
+    hash_match: ArtifactHashMatch = (
+        "not_run"
+        if not evaluated_artifacts
+        else "failed"
+        if any(
+            status in {"hash_mismatch", "corrupt", "orphan"}
+            for status in evaluated_artifacts
+        )
+        else "passed"
+        if all(status == "valid" for status in evaluated_artifacts)
+        else "not_run"
+    )
     return AdapterResponse(
         adapter_id=entry.adapter_id,
         base_model=entry.base_model,
-        path=entry.path,
+        path=_safe_path_reference(entry.path) or "",
         status=entry.status.value,
-        dataset_path=entry.dataset_path,
+        dataset_path=_safe_path_reference(entry.dataset_path) or "",
         dataset_hash=entry.dataset_hash,
         eval_score=entry.eval_score,
-        eval_result_path=entry.eval_result_path,
+        eval_result_path=_safe_path_reference(entry.eval_result_path),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
         notes=entry.notes,
@@ -506,19 +581,23 @@ def adapter_response(
             else bool(getattr(eligibility, "eligible", False))
         ),
         behavioral_evaluation_id=entry.behavioral_evaluation_id,
-        behavioral_evaluation_path=entry.behavioral_evaluation_path,
+        behavioral_evaluation_path=_safe_path_reference(
+            entry.behavioral_evaluation_path
+        ),
         behavioral_result_hash=entry.behavioral_result_hash,
         behavioral_gate_passed=entry.behavioral_gate_passed,
         behavioral_candidate_adapter_hash=entry.behavioral_candidate_adapter_hash,
         behavioral_base_model_revision=entry.behavioral_base_model_revision,
         subject_revision=entry.subject_revision,
         fixture_set_hash=entry.fixture_set_hash,
+        behavioral_artifact_state=entry.behavioral_artifact_state,
+        deterministic_behavioral_artifact_status=deterministic_artifact,
         real_model_behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
         real_model_behavioral_gate_passed=entry.real_model_behavioral_gate_passed,
         real_model_behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
-        activation_eligibility_reason=str(
-            getattr(getattr(eligibility, "reason", ""), "value", "")
-        ),
+        real_model_behavioral_artifact_status=real_artifact,
+        behavioral_artifact_hash_match=hash_match,
+        activation_eligibility_reason=reason,
         real_model_behavioral_required=bool(
             getattr(eligibility, "real_model_required", False)
         ),
@@ -527,3 +606,36 @@ def adapter_response(
         canary_failures=entry.canary_failures,
         rollback_target_id=entry.rollback_target_id,
     )
+
+
+def _artifact_status(
+    evaluation_id: str | None,
+    binding_state: str,
+    artifacts: dict[str, BehavioralArtifactRecord] | None,
+) -> ArtifactStatusValue:
+    if evaluation_id is None:
+        return "not_run"
+    if artifacts is None:
+        binding_statuses: dict[str, ArtifactStatusValue] = {
+            "prepared": "prepared",
+            "finalized": "valid",
+            "reconciled": "valid",
+            "quarantined": "corrupt",
+        }
+        return binding_statuses.get(binding_state, "orphan")
+    record = artifacts.get(evaluation_id)
+    if record is None:
+        return "orphan"
+    reconciled_statuses: dict[BehavioralArtifactStatus, ArtifactStatusValue] = {
+        BehavioralArtifactStatus.VALID: "valid",
+        BehavioralArtifactStatus.PREPARED: "prepared",
+        BehavioralArtifactStatus.HASH_MISMATCH: "hash_mismatch",
+        BehavioralArtifactStatus.CORRUPT: "corrupt",
+        BehavioralArtifactStatus.ORPHAN_RESULT: "orphan",
+        BehavioralArtifactStatus.ORPHAN_REGISTRY_REFERENCE: "orphan",
+    }
+    return reconciled_statuses[record.status]
+
+
+def _safe_path_reference(value: str | None) -> str | None:
+    return None if value is None else Path(value).name
