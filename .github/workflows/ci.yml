@@ -24,8 +24,8 @@ jobs:
           enable-cache: true
       - name: Install dependencies
         run: uv sync --locked
-      - name: Backend tests
-        run: uv run pytest tests/ -v
+      - name: Deterministic backend tests (real-model suite excluded)
+        run: uv run pytest tests/ -v -m "not real_model"
       - name: Ruff
         run: uv run ruff check kagya tests
       - name: Mypy

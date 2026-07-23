@@ -10,9 +10,12 @@ import json
 from pathlib import Path
 import re
 from statistics import NormalDist
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+
+if TYPE_CHECKING:
+    from kagya.learning.adapter_registry import AdapterRegistry
 
 
 SCENARIO_SCHEMA_VERSION = 1
@@ -567,9 +570,11 @@ class BehavioralEvaluator:
         result_dir: Path,
         *,
         spec: BehavioralEvaluatorSpec | None = None,
+        adapter_registry: AdapterRegistry | None = None,
     ) -> None:
         self.result_dir = result_dir / "behavioral"
         self.spec = spec or BehavioralEvaluatorSpec()
+        self.adapter_registry = adapter_registry
 
     def evaluate_pair(
         self,
@@ -648,6 +653,13 @@ class BehavioralEvaluator:
         self._write_json(
             self.result_dir / f"{evaluation_id}.json", result.model_dump(mode="json")
         )
+        if self.adapter_registry is not None:
+            self.adapter_registry.apply_behavioral_evaluation(
+                candidate_id,
+                evaluation_id=evaluation_id,
+                result_path=self.result_dir / f"{evaluation_id}.json",
+                gate_passed=result.activation_gate_passed,
+            )
         return result
 
     def _evaluate_subject(
@@ -886,6 +898,12 @@ def _fixture_hash(scenario: BehavioralScenario) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def scenario_fixture_hash(scenario: BehavioralScenario) -> str:
+    """Return the stable hash used by persisted rerun contracts."""
+
+    return _fixture_hash(scenario)
 
 
 _MISSING = object()

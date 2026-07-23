@@ -64,6 +64,9 @@ class AdapterEntry:
     holdout_regression: bool = False
     drift_scores: dict[str, float] | None = None
     activation_gate_passed: bool = False
+    behavioral_evaluation_id: str | None = None
+    behavioral_evaluation_path: str | None = None
+    behavioral_gate_passed: bool | None = None
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
@@ -126,6 +129,13 @@ class AdapterEntry:
             if isinstance(data.get("drift_scores"), dict)
             else None,
             activation_gate_passed=bool(data.get("activation_gate_passed", False)),
+            behavioral_evaluation_id=_optional_str(data.get("behavioral_evaluation_id")),
+            behavioral_evaluation_path=_optional_str(data.get("behavioral_evaluation_path")),
+            behavioral_gate_passed=(
+                None
+                if data.get("behavioral_gate_passed") is None
+                else bool(data["behavioral_gate_passed"])
+            ),
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
@@ -338,6 +348,34 @@ class AdapterRegistry:
                 adapter_id,
                 status=AdapterStatus.APPROVED,
                 notes=notes or entry.notes,
+            )
+
+    def apply_behavioral_evaluation(
+        self,
+        adapter_id: str,
+        *,
+        evaluation_id: str,
+        result_path: str | Path,
+        gate_passed: bool,
+    ) -> AdapterEntry:
+        """Bind a behavioral result to the candidate activation gate."""
+
+        with self._locked(exclusive=True):
+            entries = self._list_locked()
+            entry = self._require_locked(entries, adapter_id)
+            if entry.status not in {AdapterStatus.CANDIDATE, AdapterStatus.TRIAL_ACTIVE}:
+                raise ValueError(
+                    "Only candidate or trial adapters can receive behavioral gating"
+                )
+            return self._replace_locked(
+                entries,
+                adapter_id,
+                behavioral_evaluation_id=evaluation_id,
+                behavioral_evaluation_path=str(result_path),
+                behavioral_gate_passed=gate_passed,
+                activation_gate_passed=(
+                    entry.status == AdapterStatus.TRIAL_ACTIVE and gate_passed
+                ),
             )
 
     def activate(

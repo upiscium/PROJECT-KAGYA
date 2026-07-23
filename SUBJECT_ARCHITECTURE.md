@@ -46,6 +46,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Metacognition | Track evidence-backed knowledge/competence boundaries, calibrated confidence, cognitive quality, and recurring error hypotheses | `extensions.metacognition` | Declared capability evidence, resolved Decision outcomes, attention/emotion/load state, and structured operator feedback | `tests/test_metacognition.py` |
 | Identity origin | Separate self endorsement, external evidence/request, and imposed constraints | Embedded in Goal, Commitment, Value evidence/history, identity proposal, and Decision provenance | Typed origin plus explicit endorsement transition | `tests/test_identity_origin.py` |
 | Adapter lifecycle | Register, evaluate, approve, activate, and roll back local adapters | `.kagya/adapter_registry.json` and immutable evaluation artifacts | Paired baseline/candidate evaluation and explicit approval | `tests/test_adapter_registry.py`, `tests/test_adapter_evaluator.py` |
+| Behavioral evaluation | Gate subject-level safety and continuity independently of generated prose | `.kagya/eval_results/behavioral` | Versioned deterministic fixtures or explicit opt-in real-model structured classes | `tests/test_behavioral_evaluation.py`, `tests/test_real_model_behavioral.py` |
 
 ## Decision Flow
 
@@ -139,3 +140,5 @@ cd frontend && npm test -- --run && npm run build
 ```
 
 The private deployment still requires one Uvicorn worker. Multiple workers create multiple process-local runtimes and therefore violate the single-subject authority boundary.
+
+Issue #133 completion details, rerun contracts, and the hardware-gated real-model command are documented in `docs/issue-133-behavioral-evaluation.md`.

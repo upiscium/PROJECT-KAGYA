@@ -9,7 +9,9 @@ from kagya.api.routes.evaluations import (
     get_behavioral_evaluation,
     get_behavioral_failure_artifact,
     list_behavioral_evaluations,
+    rerun_behavioral_evaluation,
 )
+from kagya.api.schemas.evaluation import BehavioralRerunRequest
 from kagya.config import Settings, load_settings
 from kagya.learning import (
     ActionAttempt,
@@ -30,6 +32,10 @@ from kagya.learning import (
     proactive_outbox_scenarios,
     agency_attribution_scenarios,
     counterfactual_simulation_scenarios,
+    DeterministicSubjectRunner,
+    AdapterRegistry,
+    run_deterministic_subject_evaluation,
+    subject_completion_scenarios,
 )
 
 
@@ -413,6 +419,137 @@ def test_action_policy_and_approval_are_independent_hard_gates(tmp_path: Path) -
     assert result.activation_gate_passed is False
 
 
+def test_completion_corpus_runs_external_causal_chain_across_restart(tmp_path: Path) -> None:
+    scenarios = subject_completion_scenarios(subject_revision="revision-133")
+
+    assert {dimension for item in scenarios for dimension in item.dimensions} == set(
+        BehavioralDimension
+    )
+    assert {
+        expectation.hard_gate
+        for item in scenarios
+        for expectation in item.expected_transitions
+        if expectation.hard_gate is not None
+    } == set(HardGate)
+
+    result = BehavioralEvaluator(tmp_path).evaluate_pair(
+        "completion",
+        list(scenarios),
+        baseline_id="baseline",
+        baseline_runner=DeterministicSubjectRunner(tmp_path / "baseline-state.json"),
+        candidate_id="candidate",
+        candidate_runner=DeterministicSubjectRunner(tmp_path / "candidate-state.json"),
+    )
+
+    assert result.activation_gate_passed is True
+    assert result.candidate.aggregate_score == 1.0
+    DeterministicSubjectRunner(tmp_path / "full-chain-state.json")(scenarios[0])
+    state = json.loads((tmp_path / "full-chain-state.json").read_text(encoding="utf-8"))
+    assert state["runtime"]["restart_sequence"] == 9
+    assert state["actions"]["action-1"] == "executed"
+    assert state["motivation"]["interest"] == "satiated"
+
+
+def test_completion_corpus_exposes_every_hard_failure(tmp_path: Path) -> None:
+    scenarios = list(subject_completion_scenarios())
+    safe = DeterministicSubjectRunner(tmp_path / "safe.json")
+
+    def violating(scenario: BehavioralScenario) -> BehavioralTrace:
+        trace = safe(scenario)
+        if not scenario.scenario_id.startswith("hard-gate."):
+            return trace
+        return trace.model_copy(update={"transitions": ()})
+
+    result = BehavioralEvaluator(tmp_path).evaluate_pair(
+        "all-hard-failures",
+        scenarios,
+        baseline_id="baseline",
+        baseline_runner=safe,
+        candidate_id="candidate",
+        candidate_runner=violating,
+    )
+
+    assert set(result.candidate.hard_gate_failures) == set(HardGate)
+    assert result.activation_gate_passed is False
+
+
+def test_deterministic_runner_does_not_trust_modified_expectations(tmp_path: Path) -> None:
+    scenario = subject_completion_scenarios()[1]
+    modified = scenario.model_copy(
+        update={"expected_public_behavior": PublicBehaviorClass.RESPOND}
+    )
+
+    result = BehavioralEvaluator(tmp_path).evaluate_pair(
+        "expectation-drift",
+        [modified],
+        baseline_id="baseline",
+        baseline_runner=DeterministicSubjectRunner(tmp_path / "baseline.json"),
+        candidate_id="candidate",
+        candidate_runner=DeterministicSubjectRunner(tmp_path / "candidate.json"),
+    )
+
+    assert result.candidate.scenario_results[0].passed is False
+    assert result.candidate.scenario_results[0].failures[0].code == "public_behavior_mismatch"
+
+
+def test_behavioral_regression_is_bound_to_adapter_activation_gate(tmp_path: Path) -> None:
+    settings = _settings_for_results(tmp_path)
+    registry = AdapterRegistry(settings)
+    registry.register_candidate(
+        adapter_id="candidate",
+        adapter_path=tmp_path / "candidate",
+        dataset_path=tmp_path / "dataset.jsonl",
+        dataset_hash="dataset",
+    )
+    registry.apply_evaluation(
+        "candidate", score=1.0, result_path=tmp_path / "score.json"
+    )
+    scenario = _scenario(expected_public_behavior=PublicBehaviorClass.NO_OP)
+
+    def safe(_: BehavioralScenario) -> BehavioralTrace:
+        return BehavioralTrace(final_authoritative_state=scenario.initial_authoritative_state, public_behavior=PublicBehaviorClass.NO_OP)
+
+    def regression(_: BehavioralScenario) -> BehavioralTrace:
+        return BehavioralTrace(final_authoritative_state=scenario.initial_authoritative_state, public_behavior=PublicBehaviorClass.RESPOND)
+
+    BehavioralEvaluator(tmp_path, adapter_registry=registry).evaluate_pair(
+        "adapter-behavior",
+        [scenario],
+        baseline_id="baseline",
+        baseline_runner=safe,
+        candidate_id="candidate",
+        candidate_runner=regression,
+    )
+    entry = registry.lookup("candidate")
+
+    assert entry is not None
+    assert entry.behavioral_evaluation_id == "adapter-behavior"
+    assert entry.behavioral_gate_passed is False
+    assert entry.activation_gate_passed is False
+    registry.approve("candidate")
+    with pytest.raises(ValueError, match="regression gate"):
+        registry.activate("candidate")
+
+
+def test_behavioral_rerun_api_replays_known_fixture_hashes(tmp_path: Path) -> None:
+    run_deterministic_subject_evaluation(
+        tmp_path,
+        "original",
+        baseline_id="baseline",
+        candidate_id="candidate",
+        subject_revision="revision-133",
+    )
+    response = rerun_behavioral_evaluation(
+        "original",
+        BehavioralRerunRequest(rerun_id="reproduced"),
+        _settings_for_results(tmp_path),
+    )
+
+    assert response.evaluation_id == "reproduced"
+    assert response.fixture_hashes_match is True
+    assert response.activation_gate_passed is True
+
+
 def _scenario(
     *,
     scenario_id: str = "scenario",
@@ -458,7 +595,10 @@ def _settings_for_results(tmp_path: Path) -> Settings:
     return settings.model_copy(
         update={
             "adapter_registry": settings.adapter_registry.model_copy(
-                update={"eval_result_dir": tmp_path}
+                update={
+                    "path": tmp_path / "adapter_registry.json",
+                    "eval_result_dir": tmp_path,
+                }
             )
         }
     )
