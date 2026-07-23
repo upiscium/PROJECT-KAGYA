@@ -11,6 +11,7 @@ Runtime execution reads fixture inputs only. Public behavior is classified after
 ## Coverage
 
 - Coverage is defined by the immutable `issue-133-coverage-v1` manifest, not by scenario dimension labels. Every `BehavioralDimension` names explicit required runtime scenario IDs, runtime kinds, associated hard gates, and a minimum passed count.
+- Hard-gate coverage requires runner-emitted `BehavioralTrace.verified_hard_gates` from the concrete attack path in both baseline and candidate, intersected with the manifest scenario requirement. Fixture labels and synthetic traces cannot provide this authority.
 - `runtime.external-observation-closed-loop` covers only the causal dimensions it concretely asserts; focused runtime scenarios cover the remaining dimensions and adversarial boundaries.
 - `runtime.ambiguous-irreversible-defer` independently checks calibrated defer with no authority or external mutation.
 - `runtime.action-failure-counterfactual-replan` checks mixed attribution, bounded counterfactual inference, and evidence-linked Plan revision.

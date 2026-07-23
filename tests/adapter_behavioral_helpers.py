@@ -163,9 +163,11 @@ def write_runtime_behavioral_result(
                 "dimensions": [dimension.value for dimension in item.dimensions],
                 "runtime_kind": runtime_kind.value,
                 "evaluated_hard_gates": (
-                    []
-                    if item.public_behavior_hard_gate is None
-                    else [item.public_behavior_hard_gate.value]
+                    [
+                        requirement.hard_gate.value
+                        for requirement in BEHAVIORAL_COVERAGE_MANIFEST.hard_gate_requirements
+                        if requirement.required_scenario_id == item.scenario_id
+                    ]
                 ),
             }
             for item in runtime_scenarios

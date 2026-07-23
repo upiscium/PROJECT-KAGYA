@@ -220,6 +220,13 @@ class BehavioralTrace(_StrictModel):
     public_payload: dict[str, JsonValue] = Field(default_factory=dict)
     side_effect_keys: tuple[str, ...] = ()
     action_attempts: tuple["ActionAttempt", ...] = ()
+    verified_hard_gates: tuple[HardGate, ...] = ()
+
+    @model_validator(mode="after")
+    def require_unique_verified_hard_gates(self) -> "BehavioralTrace":
+        if len(self.verified_hard_gates) != len(set(self.verified_hard_gates)):
+            raise ValueError("verified hard gates must be unique")
+        return self
 
 
 class ActionAttempt(_StrictModel):
@@ -831,12 +838,16 @@ class BehavioralEvaluator:
             baseline,
             candidate,
         )
-        quality_gate_passed = not (
-            set(candidate.hard_gate_failures) & set(self.spec.hard_gates)
-        ) and not regressions and not threshold_failures
         runtime_coverage_required = runtime_kind != BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
-        activation_gate_passed = quality_gate_passed and (
-            coverage.complete if runtime_coverage_required else True
+        activation_gate_passed = _activation_gate_passes(
+            coverage_complete=(
+                coverage.complete if runtime_coverage_required else True
+            ),
+            hard_gate_failures=tuple(
+                set(candidate.hard_gate_failures) & set(self.spec.hard_gates)
+            ),
+            regression_dimensions=regressions,
+            threshold_failure_dimensions=threshold_failures,
         )
         result = PairedBehavioralEvaluationResult(
             evaluation_id=evaluation_id,
@@ -1099,20 +1110,8 @@ class BehavioralEvaluator:
             failures=tuple(failures),
             hard_gate_failures=gates,
             runtime_kind=runtime_kind,
-            evaluated_hard_gates=tuple(
-                sorted(
-                    {
-                        gate
-                        for gate in (
-                            scenario.public_behavior_hard_gate,
-                            *(item.hard_gate for item in scenario.expected_transitions),
-                            *(item.hard_gate for item in scenario.forbidden_transitions),
-                            *(item.hard_gate for item in scenario.invariants),
-                        )
-                        if gate is not None
-                    },
-                    key=str,
-                )
+            evaluated_hard_gates=_verified_manifest_hard_gates(
+                scenario.scenario_id, trace, runtime_kind
             ),
         )
 
@@ -1132,9 +1131,24 @@ class BehavioralEvaluator:
             scenario = scenario_by_id[candidate_result.scenario_id]
             relative = Path("failures") / evaluation_id / f"{scenario.scenario_id}.json"
             scenario_payload = scenario.model_dump(mode="json")
-            if scenario.public_behavior_hard_gate == HardGate.HIDDEN_THOUGHT:
+            if HardGate.HIDDEN_THOUGHT in _manifest_hard_gates_for_scenario(
+                scenario.scenario_id
+            ):
                 scenario_payload = _redact_markers(
-                    scenario_payload, scenario.forbidden_public_markers
+                    scenario_payload,
+                    tuple(
+                        dict.fromkeys(
+                            (
+                                *scenario.forbidden_public_markers,
+                                *_string_leaves(
+                                    [
+                                        observation.parameters
+                                        for observation in scenario.observations
+                                    ]
+                                ),
+                            )
+                        )
+                    ),
                 )
             self._write_json(
                 self.result_dir / relative,
@@ -1320,3 +1334,55 @@ def _redact_markers(value: Any, markers: tuple[str, ...]) -> Any:
                 redacted = redacted.replace(marker, "[redacted]")
         return redacted
     return value
+
+
+def _verified_manifest_hard_gates(
+    scenario_id: str,
+    trace: BehavioralTrace,
+    runtime_kind: BehavioralRuntimeKind,
+) -> tuple[HardGate, ...]:
+    if runtime_kind == BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT:
+        return ()
+    required = _manifest_hard_gates_for_scenario(scenario_id, runtime_kind)
+    return tuple(sorted(required & set(trace.verified_hard_gates), key=str))
+
+
+def _manifest_hard_gates_for_scenario(
+    scenario_id: str,
+    runtime_kind: BehavioralRuntimeKind | None = None,
+) -> set[HardGate]:
+    from kagya.learning.behavioral_coverage import BEHAVIORAL_COVERAGE_MANIFEST
+
+    return {
+        item.hard_gate
+        for item in BEHAVIORAL_COVERAGE_MANIFEST.hard_gate_requirements
+        if item.required_scenario_id == scenario_id
+        and (runtime_kind is None or runtime_kind in item.required_runtime_kinds)
+    }
+
+
+def _string_leaves(value: Any) -> tuple[str, ...]:
+    if isinstance(value, dict):
+        return tuple(
+            item
+            for child in value.values()
+            for item in _string_leaves(child)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(item for child in value for item in _string_leaves(child))
+    return (value,) if isinstance(value, str) and value else ()
+
+
+def _activation_gate_passes(
+    *,
+    coverage_complete: bool,
+    hard_gate_failures: tuple[HardGate, ...],
+    regression_dimensions: tuple[BehavioralDimension, ...],
+    threshold_failure_dimensions: tuple[BehavioralDimension, ...],
+) -> bool:
+    return (
+        coverage_complete
+        and not hard_gate_failures
+        and not regression_dimensions
+        and not threshold_failure_dimensions
+    )

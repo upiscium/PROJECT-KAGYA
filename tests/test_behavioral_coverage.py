@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from kagya.config import load_settings
 from kagya.learning.behavioral_coverage import (
     BEHAVIORAL_COVERAGE_MANIFEST,
     evaluate_behavioral_coverage,
@@ -25,8 +26,12 @@ from kagya.learning.behavioral_evaluation import (
     ReproducibilityMetadata,
     ScenarioEvaluation,
     SubjectEvaluation,
+    _activation_gate_passes,
 )
-from kagya.learning.runtime_behavioral_runner import deterministic_runtime_scenarios
+from kagya.learning.runtime_behavioral_runner import (
+    DeterministicRuntimeRunner,
+    deterministic_runtime_scenarios,
+)
 
 
 REQUIRED_SCENARIO_IDS = {
@@ -147,6 +152,101 @@ def test_failed_executed_scenario_is_failed_not_not_evaluated() -> None:
     assert coverage.complete is True
 
 
+def test_complete_execution_cannot_activate_a_failed_dimension() -> None:
+    assert (
+        _activation_gate_passes(
+            coverage_complete=True,
+            hard_gate_failures=(),
+            regression_dimensions=(),
+            threshold_failure_dimensions=(BehavioralDimension.BELIEF_REVISION,),
+        )
+        is False
+    )
+
+
+def test_fixture_gate_label_without_runtime_proof_is_not_evaluated(
+    tmp_path: Path,
+) -> None:
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="proof-test")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    ).model_copy(update={"public_behavior_hard_gate": HardGate.HIDDEN_THOUGHT})
+    trace = BehavioralTrace(
+        final_authoritative_state=scenario.initial_authoritative_state,
+        public_behavior=PublicBehaviorClass.REFUSE,
+        verified_hard_gates=(HardGate.HIDDEN_THOUGHT,),
+    )
+
+    evaluated = BehavioralEvaluator(tmp_path)._evaluate_scenario(
+        scenario,
+        trace,
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+    )
+
+    assert evaluated.evaluated_hard_gates == ()
+
+
+def test_stripping_actual_runner_proof_makes_required_gate_missing(
+    tmp_path: Path,
+) -> None:
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="proof-strip")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
+    trace = DeterministicRuntimeRunner(
+        tmp_path / "runtime",
+        load_settings(Path(__file__).parents[1] / "config.yaml"),
+        "candidate",
+    )(scenario)
+    assert trace.verified_hard_gates == (HardGate.IDENTITY_BOUNDARY,)
+
+    evaluated = BehavioralEvaluator(tmp_path / "evaluation")._evaluate_scenario(
+        scenario,
+        trace.model_copy(update={"verified_hard_gates": ()}),
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+    )
+
+    assert evaluated.evaluated_hard_gates == ()
+    baseline = _subject("baseline", BehavioralRuntimeKind.DETERMINISTIC_RUNTIME)
+    candidate = _subject("candidate", BehavioralRuntimeKind.DETERMINISTIC_RUNTIME)
+    candidate = candidate.model_copy(
+        update={
+            "scenario_results": tuple(
+                evaluated if item.scenario_id == scenario.scenario_id else item
+                for item in candidate.scenario_results
+            )
+        }
+    )
+    coverage = evaluate_behavioral_coverage(
+        baseline, candidate, BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+    )
+    assert coverage.complete is False
+    assert HardGate.IDENTITY_BOUNDARY in coverage.missing_hard_gates
+
+
+def test_synthetic_trace_proof_is_never_authoritative(tmp_path: Path) -> None:
+    scenario = next(
+        item
+        for item in deterministic_runtime_scenarios(subject_revision="synthetic-proof")
+        if item.scenario_id == "runtime.identity-boundary-attack"
+    )
+    trace = BehavioralTrace(
+        final_authoritative_state=scenario.initial_authoritative_state,
+        public_behavior=PublicBehaviorClass.REFUSE,
+        verified_hard_gates=(HardGate.IDENTITY_BOUNDARY,),
+    )
+
+    evaluated = BehavioralEvaluator(tmp_path)._evaluate_scenario(
+        scenario,
+        trace,
+        runtime_kind=BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT,
+    )
+
+    assert evaluated.evaluated_hard_gates == ()
+
+
 def test_hidden_thought_sentinel_is_redacted_from_failure_artifact(
     tmp_path: Path,
 ) -> None:
@@ -164,7 +264,7 @@ def test_hidden_thought_sentinel_is_redacted_from_failure_artifact(
             ),
         ),
         expected_public_behavior=PublicBehaviorClass.RESPOND,
-        public_behavior_hard_gate=HardGate.HIDDEN_THOUGHT,
+        public_behavior_hard_gate=None,
         forbidden_public_markers=(sentinel,),
         reproducibility=ReproducibilityMetadata(
             subject_revision="coverage-test",
@@ -217,9 +317,10 @@ def _subject(
             hard_gate_failures=(),
             runtime_kind=runtime_kind,
             evaluated_hard_gates=tuple(
-                gate
-                for gate in (scenario.public_behavior_hard_gate,)
-                if gate is not None and gate not in removed_gates
+                requirement.hard_gate
+                for requirement in BEHAVIORAL_COVERAGE_MANIFEST.hard_gate_requirements
+                if requirement.required_scenario_id == scenario.scenario_id
+                and requirement.hard_gate not in removed_gates
             ),
         )
         for scenario in scenarios
