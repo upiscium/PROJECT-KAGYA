@@ -10,6 +10,11 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndByte
 
 from kagya.config import Settings
 from kagya.attachments import ProcessedImageAttachment, validate_image_attachments
+from kagya.artifact_provenance import (
+    build_adapter_artifact_manifest,
+    build_model_artifact_manifest,
+    verify_attached_adapter_config,
+)
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
@@ -44,6 +49,12 @@ class TransformersProvider:
         self.allow_archived_adapter = allow_archived_adapter
         self.last_model_id = self.model_id
         self.last_fallback_used = False
+        self.generation_count = 0
+        self.resolved_model_revision: str | None = None
+        self.resolved_processor_revision: str | None = None
+        self.model_artifact_manifest_hash: str | None = None
+        self.model_artifact_manifest: Any | None = None
+        self.adapter_artifact_manifest_hash: str | None = None
         if model is not None and adapter_path is not None:
             self.attach_adapter(adapter_path)
 
@@ -51,9 +62,11 @@ class TransformersProvider:
         self.last_model_id = self.model_id
         self.last_fallback_used = False
         try:
-            return self._generate_with(
+            value = self._generate_with(
                 prompt, self._get_primary_model(), self._get_primary_processor()
             )
+            self.generation_count += 1
+            return value
         except Exception:
             return self.generate_fallback(prompt)
 
@@ -93,7 +106,11 @@ class TransformersProvider:
         )
         images = [attachment.image for attachment in image_attachments or []]
         try:
-            inputs = processor(text=rendered, images=images, return_tensors="pt") if images else processor(text=rendered, return_tensors="pt")
+            inputs = (
+                processor(text=rendered, images=images, return_tensors="pt")
+                if images
+                else processor(text=rendered, return_tensors="pt")
+            )
         except TypeError:
             inputs = processor(text=rendered, return_tensors="pt")
         inputs = self._move_inputs_to_model_device(inputs, model)
@@ -180,9 +197,16 @@ class TransformersProvider:
             allow_archived=self.allow_archived_adapter,
         ):
             raise ValueError("Adapter path is not approved by the adapter registry")
+        manifest = build_adapter_artifact_manifest(
+            Path(adapter_path),
+            base_model_name=self.model_id,
+            base_model_revision=self.model_revision,
+        )
         if self.model is None:
             self.model = self._load_model(self.model_id)
         self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
+        verify_attached_adapter_config(self.model, manifest)
+        self.adapter_artifact_manifest_hash = manifest.sha256
         self._adapter_attached = True
 
     def _get_primary_processor(self) -> Any:
@@ -190,6 +214,8 @@ class TransformersProvider:
             self.processor = AutoProcessor.from_pretrained(
                 self.model_id, revision=self.processor_revision
             )
+            self.resolved_processor_revision = _resolved_revision(self.processor)
+            self._refresh_model_manifest()
         return self.processor
 
     def _get_primary_model(self) -> Any:
@@ -231,7 +257,33 @@ class TransformersProvider:
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-        return AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
+        model = AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
+        if model_id == self.model_id:
+            self.resolved_model_revision = _resolved_revision(model)
+            self._refresh_model_manifest()
+        return model
+
+    def _refresh_model_manifest(self) -> None:
+        if (
+            self.resolved_model_revision is None
+            or self.resolved_processor_revision is None
+        ):
+            return
+        snapshot = _snapshot_path(
+            self.model, self.processor, self.model_id, self.model_revision
+        )
+        if snapshot is None:
+            return
+        manifest = build_model_artifact_manifest(
+            snapshot,
+            model_id=self.model_id,
+            requested_revision=self.model_revision,
+            resolved_revision=self.resolved_model_revision,
+            processor_requested_revision=self.processor_revision,
+            processor_resolved_revision=self.resolved_processor_revision,
+        )
+        self.model_artifact_manifest_hash = manifest.sha256
+        self.model_artifact_manifest = manifest
 
     def _tokenize(self, text: str) -> dict[str, torch.Tensor]:
         encoded = self._get_primary_processor()(text=text, return_tensors="pt")
@@ -269,7 +321,9 @@ def is_registry_approved_adapter(
     for entry in _iter_registry_entries(registry_data):
         path = entry.get("path")
         state = entry.get("state")
-        allowed_states = LOADABLE_ADAPTER_STATES | ({"candidate"} if allow_candidate else set())
+        allowed_states = LOADABLE_ADAPTER_STATES | (
+            {"candidate"} if allow_candidate else set()
+        )
         if allow_archived:
             allowed_states.add("archived")
         if path is None or state not in allowed_states:
@@ -313,3 +367,37 @@ def _plain_generation_prompt(prompt: str) -> str:
             "Assistant:",
         ]
     )
+
+
+def _resolved_revision(value: Any) -> str | None:
+    candidates = (
+        getattr(getattr(value, "config", None), "_commit_hash", None),
+        getattr(value, "_commit_hash", None),
+        getattr(value, "init_kwargs", {}).get("_commit_hash")
+        if isinstance(getattr(value, "init_kwargs", None), dict)
+        else None,
+    )
+    return next((str(item) for item in candidates if item), None)
+
+
+def _snapshot_path(
+    model: Any, processor: Any, model_id: str, revision: str
+) -> Path | None:
+    candidates = (
+        getattr(getattr(model, "config", None), "_name_or_path", None),
+        getattr(processor, "name_or_path", None),
+    )
+    local = next(
+        (path for item in candidates if item and (path := Path(str(item))).is_dir()),
+        None,
+    )
+    if local is not None:
+        return local
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(model_id, revision=revision, local_files_only=True)
+        )
+    except (ImportError, OSError):
+        return None

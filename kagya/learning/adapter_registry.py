@@ -14,10 +14,15 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 import warnings
 
-from kagya.config import BehavioralActivationPolicy, Settings
+from kagya.config import (
+    BehavioralActivationPolicy,
+    ProjectEnvironment,
+    Settings,
+)
 
 if TYPE_CHECKING:
     from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
@@ -57,6 +62,11 @@ class ActivationEligibilityReason(StrEnum):
     REAL_MODEL_CORRUPT = "real_model_corrupt"
     REAL_MODEL_HASH_MISMATCH = "real_model_hash_mismatch"
     REAL_MODEL_COVERAGE_INCOMPLETE = "real_model_coverage_incomplete"
+    SOURCE_PROVENANCE_INVALID = "source_provenance_invalid"
+    MODEL_PROVENANCE_MISMATCH = "model_provenance_mismatch"
+    PROCESSOR_PROVENANCE_MISMATCH = "processor_provenance_mismatch"
+    ADAPTER_PROVENANCE_MISMATCH = "adapter_provenance_mismatch"
+    EVALUATOR_PROVENANCE_MISMATCH = "evaluator_provenance_mismatch"
 
 
 class BehavioralEvidenceStatus(StrEnum):
@@ -142,7 +152,7 @@ class AdapterEntry:
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 9
+    schema_version: int = 10
 
     @property
     def activation_gate_passed(self) -> bool:
@@ -170,6 +180,7 @@ class AdapterEntry:
         legacy_gate = schema_version < 4
         legacy_registry = schema_version < 8
         legacy_coverage = schema_version < 9
+        legacy_provenance = schema_version < 10
         entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
@@ -280,7 +291,9 @@ class AdapterEntry:
             else _optional_bool(data.get("real_model_behavioral_gate_passed")),
             real_model_behavioral_candidate_adapter_hash=None
             if legacy_registry
-            else _optional_str(data.get("real_model_behavioral_candidate_adapter_hash")),
+            else _optional_str(
+                data.get("real_model_behavioral_candidate_adapter_hash")
+            ),
             real_model_behavioral_base_model_revision=None
             if legacy_registry
             else _optional_str(data.get("real_model_behavioral_base_model_revision")),
@@ -291,7 +304,7 @@ class AdapterEntry:
             if legacy_registry
             else _optional_str(data.get("real_model_fixture_set_hash")),
             real_model_behavioral_artifact_state="unbound"
-            if legacy_registry
+            if legacy_registry or legacy_provenance
             else str(data.get("real_model_behavioral_artifact_state", "unbound")),
             deterministic_coverage_complete=None
             if legacy_coverage
@@ -306,7 +319,7 @@ class AdapterEntry:
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=9,
+            schema_version=10 if schema_version >= 10 else 9,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -763,9 +776,15 @@ class AdapterRegistry:
     def activation_eligibility(self, adapter_id: str) -> ActivationEligibility:
         with self._locked(exclusive=False):
             entry = self._require_locked(self._list_locked(), adapter_id)
-            return _activation_eligibility(
+            eligibility = _activation_eligibility(
                 entry, self.settings.adapter_registry.behavioral_activation_policy
             )
+            if (
+                eligibility.eligible
+                and self.settings.project.environment == ProjectEnvironment.PRODUCTION
+            ):
+                return _production_provenance_eligibility(entry)
+            return eligibility
 
     def activate(
         self, adapter_id: str, *, activation_sequence: int | None = None
@@ -777,6 +796,11 @@ class AdapterRegistry:
             eligibility = _activation_eligibility(
                 entry, self.settings.adapter_registry.behavioral_activation_policy
             )
+            if (
+                eligibility.eligible
+                and self.settings.project.environment == ProjectEnvironment.PRODUCTION
+            ):
+                eligibility = _production_provenance_eligibility(entry)
             if not eligibility.eligible:
                 raise ValueError(
                     f"Adapter activation ineligible [{eligibility.reason.value}]: "
@@ -836,6 +860,12 @@ class AdapterRegistry:
                     target,
                     self.settings.adapter_registry.behavioral_activation_policy,
                 )
+                if (
+                    eligibility.eligible
+                    and self.settings.project.environment
+                    == ProjectEnvironment.PRODUCTION
+                ):
+                    eligibility = _production_provenance_eligibility(target)
                 if not eligibility.eligible:
                     raise ValueError(
                         f"Rollback promotion ineligible [{eligibility.reason.value}]: "
@@ -1443,7 +1473,11 @@ def _result_coverage_complete(result: PairedBehavioralEvaluationResult) -> bool:
         result.baseline, result.candidate, result.runtime_kind
     )
     return (
-        expected_ids == fixture_ids == baseline_ids == candidate_ids == reproducibility_ids
+        expected_ids
+        == fixture_ids
+        == baseline_ids
+        == candidate_ids
+        == reproducibility_ids
         and manifest.coverage_manifest_revision == BEHAVIORAL_COVERAGE_MANIFEST.revision
         and manifest.coverage_manifest_hash == BEHAVIORAL_COVERAGE_MANIFEST.sha256
         and result.coverage_manifest_revision == BEHAVIORAL_COVERAGE_MANIFEST.revision
@@ -1454,6 +1488,209 @@ def _result_coverage_complete(result: PairedBehavioralEvaluationResult) -> bool:
         and result.executed_scenarios == coverage.executed_scenarios
         and coverage.complete
     )
+
+
+def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibility:
+    """Re-read production evidence and current artifacts before activation."""
+
+    from kagya._build_info import SourceRevisionStatus, resolve_source_build_info
+    from kagya.artifact_provenance import (
+        build_adapter_artifact_manifest,
+        require_immutable_revision,
+    )
+    from kagya.learning.runtime_behavioral_runner import current_evaluator_hash
+
+    paths = (
+        entry.behavioral_evaluation_path,
+        entry.real_model_behavioral_evaluation_path,
+    )
+    try:
+        results = [_load_behavioral_result(Path(path))[0] for path in paths if path]
+    except ValueError as exc:
+        return _ineligible(
+            ActivationEligibilityReason.SOURCE_PROVENANCE_INVALID, str(exc)
+        )
+    if len(results) != 2 or any(result.manifest is None for result in results):
+        return _ineligible(
+            ActivationEligibilityReason.SOURCE_PROVENANCE_INVALID,
+            "Production evidence has no schema v10 provenance",
+        )
+    source = resolve_source_build_info()
+    for result in results:
+        manifest = result.manifest
+        assert manifest is not None
+        if (
+            manifest.schema_version != 10
+            or manifest.source_revision_status != SourceRevisionStatus.VERIFIED.value
+            or source.status != SourceRevisionStatus.VERIFIED
+            or manifest.source_commit_sha != source.commit_sha
+            or manifest.source_tree_hash != source.tree_hash
+        ):
+            return _ineligible(
+                ActivationEligibilityReason.SOURCE_PROVENANCE_INVALID,
+                "Source provenance is unknown, dirty, or changed",
+            )
+        try:
+            require_immutable_revision(
+                manifest.base_model_revision_requested or "", "requested base revision"
+            )
+            require_immutable_revision(
+                manifest.processor_revision_requested or "",
+                "requested processor revision",
+            )
+        except ValueError as exc:
+            return _ineligible(
+                ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH, str(exc)
+            )
+        if (
+            manifest.base_model_revision_resolved
+            != manifest.base_model_revision_requested
+        ):
+            return _ineligible(
+                ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+                "Loaded model revision differs from the requested commit",
+            )
+        if (
+            manifest.processor_revision_resolved
+            != manifest.processor_revision_requested
+        ):
+            return _ineligible(
+                ActivationEligibilityReason.PROCESSOR_PROVENANCE_MISMATCH,
+                "Loaded processor revision differs from the requested commit",
+            )
+        if (
+            manifest.model_artifact_manifest is None
+            or manifest.model_artifact_manifest_hash
+            != manifest.model_artifact_manifest.sha256
+        ):
+            return _ineligible(
+                ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+                "Model artifact manifest is missing or invalid",
+            )
+        if manifest.evaluator_implementation_hash != current_evaluator_hash(
+            result.runtime_kind
+        ):
+            return _ineligible(
+                ActivationEligibilityReason.EVALUATOR_PROVENANCE_MISMATCH,
+                "Evaluator implementation changed after evaluation",
+            )
+    real_result = next(
+        result
+        for result in results
+        if result.runtime_kind.value == "real_model_runtime"
+    )
+    if (
+        real_result.baseline_generation_count < 1
+        or real_result.candidate_generation_count < 1
+        or real_result.provider_fallback_used
+    ):
+        return _ineligible(
+            ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+            "Real-model provider generation provenance is invalid",
+        )
+    real_manifest = real_result.manifest
+    assert real_manifest is not None
+    try:
+        current_adapter = build_adapter_artifact_manifest(
+            Path(entry.path),
+            base_model_name=entry.base_model,
+            base_model_revision=entry.base_model_revision,
+        )
+    except ValueError as exc:
+        return _ineligible(
+            ActivationEligibilityReason.ADAPTER_PROVENANCE_MISMATCH, str(exc)
+        )
+    if (
+        real_manifest.adapter_artifact_manifest is None
+        or current_adapter != real_manifest.adapter_artifact_manifest
+        or current_adapter.sha256 != real_manifest.adapter_artifact_manifest_hash
+    ):
+        return _ineligible(
+            ActivationEligibilityReason.ADAPTER_PROVENANCE_MISMATCH,
+            "Adapter config, weights, or PEFT provenance changed",
+        )
+    try:
+        snapshot = _local_model_snapshot(
+            real_manifest.base_model_id,
+            real_manifest.base_model_revision_resolved or "",
+        )
+        current_model = _cached_model_manifest(
+            snapshot,
+            expected_hash=real_manifest.model_artifact_manifest_hash or "",
+            model_id=real_manifest.base_model_id,
+            requested_revision=real_manifest.base_model_revision_requested or "",
+            resolved_revision=real_manifest.base_model_revision_resolved or "",
+            processor_requested_revision=real_manifest.processor_revision_requested
+            or "",
+            processor_resolved_revision=real_manifest.processor_revision_resolved or "",
+        )
+    except (OSError, ValueError) as exc:
+        return _ineligible(
+            ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH, str(exc)
+        )
+    if current_model != real_manifest.model_artifact_manifest:
+        return _ineligible(
+            ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+            "Model config, processor, weights, or quantization changed",
+        )
+    return ActivationEligibility(
+        True,
+        ActivationEligibilityReason.ELIGIBLE,
+        "All production provenance checks passed",
+        True,
+        BehavioralEvidenceStatus.PASSED,
+        BehavioralEvidenceStatus.PASSED,
+        BehavioralActivationPolicy.REAL_MODEL_REQUIRED,
+    )
+
+
+def _local_model_snapshot(model_id: str, revision: str) -> Path:
+    local = Path(model_id)
+    if local.is_dir():
+        return local
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(model_id, revision=revision, local_files_only=True)
+        )
+    except (ImportError, OSError) as exc:
+        raise ValueError("Resolved model snapshot is unavailable") from exc
+
+
+_MODEL_MANIFEST_CACHE_LOCK = Lock()
+_MODEL_MANIFEST_CACHE: dict[
+    tuple[str, str], tuple[tuple[tuple[str, int, int, int, int], ...], Any]
+] = {}
+
+
+def _cached_model_manifest(
+    snapshot: Path, *, expected_hash: str, **manifest_kwargs: str
+) -> Any:
+    """Avoid rehashing immutable weights unless fail-closed file metadata changes."""
+
+    from kagya.artifact_provenance import build_model_artifact_manifest
+
+    metadata = tuple(
+        (
+            path.relative_to(snapshot).as_posix(),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_ino,
+        )
+        for path in sorted(item for item in snapshot.rglob("*") if item.is_file())
+        for stat in (path.stat(),)
+    )
+    key = (str(snapshot.resolve()), expected_hash)
+    with _MODEL_MANIFEST_CACHE_LOCK:
+        cached = _MODEL_MANIFEST_CACHE.get(key)
+        if cached is not None and cached[0] == metadata:
+            return cached[1]
+    manifest = build_model_artifact_manifest(snapshot, **manifest_kwargs)
+    with _MODEL_MANIFEST_CACHE_LOCK:
+        _MODEL_MANIFEST_CACHE[key] = (metadata, manifest)
+    return manifest
 
 
 def _dataset_record_hashes(path: Path) -> tuple[tuple[str, ...], int]:

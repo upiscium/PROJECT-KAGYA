@@ -71,6 +71,9 @@ def list_behavioral_evaluations(
                     artifact_status=record.status.value,
                     quarantine_error="Artifact quarantined by integrity reconciliation",
                     created_at=record.updated_at.isoformat(),
+                    evaluation_state=record.state.value,
+                    failure_code=record.failure_code,
+                    artifact_integrity=record.status.value,
                 )
             )
             continue
@@ -87,6 +90,9 @@ def list_behavioral_evaluations(
                     update={
                         "artifact_status": record.status.value,
                         "activation_eligibility": eligibility,
+                        "evaluation_state": record.state.value,
+                        "failure_code": record.failure_code,
+                        "artifact_integrity": record.status.value,
                     }
                 )
             )
@@ -103,6 +109,9 @@ def list_behavioral_evaluations(
                     artifact_status="corrupt",
                     quarantine_error="Artifact could not be safely decoded",
                     created_at=record.updated_at.isoformat(),
+                    evaluation_state=record.state.value,
+                    failure_code=record.failure_code,
+                    artifact_integrity="corrupt",
                 )
             )
     return BehavioralEvaluationHistoryResponse(
@@ -283,10 +292,14 @@ def _rerun_runtime_evaluation(
         )
     except (OSError, ValueError) as exc:
         raise HTTPException(
-            status_code=409, detail="Candidate artifact is missing or differs"
+            status_code=409,
+            detail="Candidate artifact is missing or differs: candidate_adapter_path_hash",
         ) from exc
     immutable_fields = (
         "source_commit_sha",
+        "source_revision_status",
+        "source_tree_hash",
+        "build_id",
         "subject_revision",
         "runtime_schema_version",
         "evaluator_schema_version",
@@ -295,10 +308,18 @@ def _rerun_runtime_evaluation(
         "config_hash",
         "base_model_id",
         "base_model_revision",
+        "base_model_revision_requested",
+        "base_model_revision_resolved",
+        "processor_revision_requested",
+        "processor_revision_resolved",
         "base_model_artifact_hash",
+        "model_artifact_manifest_hash",
+        "model_artifact_manifest",
         "candidate_adapter_id",
         "candidate_adapter_hash",
         "candidate_adapter_path_hash",
+        "adapter_artifact_manifest_hash",
+        "adapter_artifact_manifest",
         "tool_registry_hash",
         "policy_revision",
         "state_schema_version",
@@ -470,6 +491,14 @@ def _behavioral_summary(path: Path) -> BehavioralEvaluationSummary:
         real_model_runtime_gate_passed=bool(
             payload.get("real_model_runtime_gate_passed", False)
         ),
+        source_integrity=str(manifest.get("source_revision_status", "unknown")),
+        model_integrity=(
+            "verified"
+            if manifest.get("model_artifact_manifest_hash")
+            and manifest.get("base_model_revision_resolved")
+            else "unknown"
+        ),
+        artifact_integrity="valid",
     )
 
 

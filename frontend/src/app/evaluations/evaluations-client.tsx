@@ -128,6 +128,8 @@ function BehavioralRow({ result, selected, onSelect }: { result: BehavioralEvalu
         <span className="mono">{result.evaluation_id}</span>
       </div>
       <p>{result.baseline_id} {formatNumber(result.baseline_score)} / {result.candidate_id} {formatNumber(result.candidate_score)}</p>
+      <p>Artifact: {result.artifact_integrity} · Source: {result.source_integrity} · Model: {result.model_integrity}</p>
+      <p>State: {result.evaluation_state}{result.failure_code ? ` (${result.failure_code})` : ""}</p>
       <p className="muted">{new Date(result.created_at).toLocaleString()}</p>
       <Button onClick={onSelect} disabled={selected}>{selected ? "Selected" : "Inspect"}</Button>
     </article>

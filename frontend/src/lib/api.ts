@@ -256,6 +256,11 @@ export type BehavioralEvaluationSummary = {
   deterministic_runtime_gate_passed: boolean;
   real_model_runtime_gate_passed: boolean;
   activation_eligibility: string;
+  evaluation_state: "pending" | "running" | "prepared" | "finalized" | "reconciled" | "failed";
+  failure_code: string | null;
+  source_integrity: "verified" | "unknown" | "dirty";
+  model_integrity: "verified" | "unknown" | "mismatch";
+  artifact_integrity: string;
 };
 export type BehavioralEvaluationHistoryResponse = { results: BehavioralEvaluationSummary[] };
 export type BehavioralEvaluationDetail = { evaluation_id: string; payload: Record<string, unknown> };

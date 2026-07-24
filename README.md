@@ -394,6 +394,14 @@ Model loss is treated as a calibrated, model-specific novelty measurement rather
 
 ## Private Deployment
 
+Production builds must inject immutable source provenance. Set
+`KAGYA_SOURCE_COMMIT_SHA` to the 40-hex source commit,
+`KAGYA_SOURCE_TREE_HASH` to its Git tree hash, and `KAGYA_BUILD_ID` to a bounded
+build identifier. Development runs resolve Git metadata locally and record a
+`dirty` or `unknown` status rather than inventing a source revision. Production
+behavioral evaluation and activation reject anything other than verified source
+metadata.
+
 PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
 
 The backend uses one process-local agent event queue to serialize chat, sleep, memory administration, and adapter lifecycle operations. Run exactly one Uvicorn worker; multiple workers would create independent subjects and independent event sequences. `api.agent_queue_capacity` bounds waiting work. A full queue returns HTTP 429, shutdown stops accepting work and drains accepted events, and an accepted event continues even if its client disconnects.
