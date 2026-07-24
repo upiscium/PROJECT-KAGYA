@@ -6,7 +6,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from kagya.actions import ActionBudget, ActionExecutionLayer, ActionPolicyError
+from kagya.actions import (
+    ActionBudget,
+    ActionExecutionLayer,
+    ActionPolicyError,
+    ActionValidationRecord,
+)
 from kagya.api.dependencies import (
     AdminActor,
     execute_agent_event,
@@ -194,4 +199,17 @@ def _transition(
         ).value
     except (ValueError, ActionPolicyError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(value, ActionValidationRecord):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "action_arguments_invalid",
+                "validation_id": value.validation_id,
+                "validation_error_codes": [
+                    code.value for code in value.validation_error_codes
+                ],
+                "validation_schema_revision": value.validation_schema_revision,
+                "canonical_arguments_digest": value.canonical_arguments_digest,
+            },
+        )
     return value.model_dump(mode="json")

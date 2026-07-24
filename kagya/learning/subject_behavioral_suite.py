@@ -315,6 +315,7 @@ class SyntheticTraceRunner:
                     tool_name="verified_external_write",
                     risk_class="external_write",
                     arguments_valid=True,
+                    authoritative=False,
                     policy_allowed=True,
                     approval_required=False,
                     approved=False,

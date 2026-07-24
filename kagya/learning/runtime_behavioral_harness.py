@@ -14,7 +14,6 @@ from typing import Any, cast, TypeVar
 from pydantic import JsonValue
 
 from kagya.actions import ActionExecutionLayer
-from kagya.actions.execution import ActionPolicyError
 from kagya.config import Settings
 from kagya.external_transaction import ExternalTransactionCoordinator
 from kagya.learning.behavioral_evaluation import (
@@ -321,7 +320,6 @@ class SubjectRuntimeHarness:
         self.graph: RuntimeGraph | None = None
         self.readiness = False
         self.startup_error: str | None = None
-        self._rejected_action_attempts: list[ActionAttempt] = []
 
     def create(self) -> "SubjectRuntimeHarness":
         self.root.mkdir(parents=True, exist_ok=True)
@@ -565,9 +563,17 @@ class SubjectRuntimeHarness:
             "values": _json_value(graph.main_loop.value_system.list_values()),
             "beliefs": _model_values(graph.main_loop.belief_store),
             "plans": _model_values(graph.main_loop.plan_store),
-            "decisions": _model_values(graph.main_loop.decision_store),
+            "decisions": _without_argument_bodies(
+                _model_values(graph.main_loop.decision_store)
+            ),
             "actions": {
-                "intents": _json_value(graph.action_execution.list_intents()),
+                "intents": [
+                    _action_intent_evidence(item)
+                    for item in graph.action_execution.list_intents()
+                ],
+                "validation_records": _json_value(
+                    graph.action_execution.list_validation_records()
+                ),
                 "receipts": _json_value(graph.action_execution.list_receipts()),
                 "observations": _json_value(graph.action_execution.list_observations()),
                 "verifications": _json_value(
@@ -597,6 +603,8 @@ class SubjectRuntimeHarness:
         ]
         for intent in graph.action_execution.list_intents():
             refs.append(f"action-intent:{intent.intent_id}@{intent.revision}")
+        for validation in graph.action_execution.list_validation_records():
+            refs.append(f"action-validation:{validation.validation_id}")
         for receipt in graph.action_execution.list_receipts():
             refs.append(f"action-receipt:{receipt.receipt_id}")
         for observation in graph.action_execution.list_observations():
@@ -615,13 +623,15 @@ class SubjectRuntimeHarness:
 
     def action_attempts(self) -> tuple[ActionAttempt, ...]:
         graph = self._ready_graph()
-        persisted = tuple(
+        validations = {
+            item.validation_id: item
+            for item in graph.action_execution.list_validation_records()
+        }
+        accepted = tuple(
             ActionAttempt(
                 tool_name=item.tool_name,
                 risk_class=item.risk_class.value,
-                arguments_valid=self._arguments_valid(
-                    item.tool_name, cast(dict[str, object], item.arguments)
-                ),
+                arguments_valid=validations[item.validation_record_id].arguments_valid,
                 policy_allowed=item.policy.allowed,
                 approval_required=item.policy.approval_required,
                 approved=not item.policy.approval_required
@@ -633,33 +643,24 @@ class SubjectRuntimeHarness:
                 executed=item.attempts > 0,
             )
             for item in graph.action_execution.list_intents()
+            if item.validation_record_id in validations
         )
-        return (*persisted, *self._rejected_action_attempts)
-
-    def record_rejected_action_attempt(
-        self, tool_name: str, arguments: dict[str, object]
-    ) -> ActionAttempt:
-        """Record the actual validation outcome for a pre-intent rejection."""
-
-        valid = self._arguments_valid(tool_name, arguments)
-        attempt = ActionAttempt(
-            tool_name=tool_name,
-            risk_class="read_only",
-            arguments_valid=valid,
-            policy_allowed=False,
-            approval_required=False,
-            approved=False,
-            executed=False,
+        rejected = tuple(
+            ActionAttempt(
+                tool_name=item.tool_name,
+                risk_class="read_only"
+                if item.risk_class is None
+                else item.risk_class.value,
+                arguments_valid=item.arguments_valid,
+                policy_allowed=False,
+                approval_required=False,
+                approved=False,
+                executed=False,
+            )
+            for item in validations.values()
+            if item.intent_id is None
         )
-        self._rejected_action_attempts.append(attempt)
-        return attempt
-
-    def _arguments_valid(self, tool_name: str, arguments: dict[str, object]) -> bool:
-        try:
-            self._ready_graph().action_execution._validate(tool_name, arguments)
-        except (ActionPolicyError, ValueError):
-            return False
-        return True
+        return (*accepted, *rejected)
 
     def _ready_graph(self) -> RuntimeGraph:
         if not self.readiness or self.graph is None:
@@ -717,6 +718,29 @@ def _snapshot_is_corrupt(path: Path) -> bool:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return True
     return False
+
+
+def _action_intent_evidence(intent: Any) -> JsonValue:
+    value = intent.model_dump(mode="json")
+    value.pop("arguments", None)
+    preview = value.get("preview")
+    if isinstance(preview, dict):
+        preview.pop("arguments", None)
+    return cast(JsonValue, value)
+
+
+def _without_argument_bodies(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_argument_bodies(item)
+            for key, item in value.items()
+            if key != "arguments"
+        }
+    if isinstance(value, list):
+        return [_without_argument_bodies(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_without_argument_bodies(item) for item in value)
+    return value
 
 
 def _model_values(value: Any) -> Any:

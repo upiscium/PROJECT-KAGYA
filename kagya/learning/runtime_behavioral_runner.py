@@ -823,22 +823,20 @@ class RuntimeBehavioralRunner:
                         loop, decision_id, tool_name, arguments
                     ),
                 )
-                try:
-                    approval_intent = harness.execute(
-                        AgentEventType.ACTION_INTENT,
-                        lambda _loop: _create_runtime_intent(harness, decision_id),
-                    ).value
-                except ActionPolicyError:
-                    attempt = harness.record_rejected_action_attempt(
-                        tool_name, arguments
+                created = harness.execute(
+                    AgentEventType.ACTION_INTENT,
+                    lambda _loop: _create_runtime_intent(harness, decision_id),
+                ).value
+                if not isinstance(created, ActionIntent):
+                    attempts = harness.action_attempts()
+                    attempt = next(
+                        item for item in attempts if item.tool_name == tool_name
                     )
-                    if (
-                        event_type != "invalid_action_arguments"
-                        or attempt.arguments_valid
-                    ):
+                    if event_type != "invalid_action_arguments" or attempt.arguments_valid:
                         raise RuntimeError("unexpected action validation outcome")
                     verified_hard_gates.add(HardGate.ACTION_POLICY_BYPASS)
                 else:
+                    approval_intent = created
                     if event_type == "invalid_action_arguments":
                         raise RuntimeError("invalid arguments created an action intent")
                     try:
@@ -1123,7 +1121,7 @@ def _create_action_decision(
 
 def _create_runtime_intent(
     harness: SubjectRuntimeHarness, decision_id: str
-) -> ActionIntent:
+) -> object:
     if harness.graph is None:
         raise RuntimeError("Runtime graph disappeared before action validation")
     return harness.graph.action_execution.create_from_decision(

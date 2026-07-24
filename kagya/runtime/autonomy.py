@@ -908,7 +908,11 @@ class SubjectScheduler:
                 decision_id,
                 idempotency_key=f"decision-action:{decision_id}",
             )
-            outcome = intent.status.value
+            outcome = (
+                "arguments_invalid"
+                if getattr(intent, "intent_id", None) is None
+                else intent.status.value
+            )
         elif schedule.kind == WakeUpKind.ACTION_EXECUTION:
             execution = getattr(self.main_loop, "action_execution", None)
             if execution is None:

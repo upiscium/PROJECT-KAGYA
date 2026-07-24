@@ -244,6 +244,7 @@ class ActionAttempt(_StrictModel):
     approval_required: bool
     approved: bool
     executed: bool
+    authoritative: bool = True
 
 
 class RuntimeBehaviorObservation(_StrictModel):

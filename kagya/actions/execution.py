@@ -138,6 +138,43 @@ class ActionProvenance(_StrictModel):
     step_id: str | None = None
 
 
+class ActionValidationErrorCode(StrEnum):
+    TOOL_NOT_ALLOWLISTED = "tool_not_allowlisted"
+    RISK_CLASS_DISABLED = "risk_class_disabled"
+    ARGUMENTS_SCHEMA_INVALID = "arguments_schema_invalid"
+    ARGUMENT_PATH_OUT_OF_SCOPE = "argument_path_out_of_scope"
+    ARGUMENT_SCOPE_INVALID = "argument_scope_invalid"
+
+
+class ActionValidationRecord(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    validation_id: str
+    intent_id: str | None = None
+    tool_name: str
+    risk_class: RiskClass | None = None
+    arguments_valid: bool
+    validation_schema_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    validation_error_codes: tuple[ActionValidationErrorCode, ...] = Field(
+        default=(), max_length=4
+    )
+    validated_event_id: str
+    validated_event_sequence: int = Field(ge=1)
+    canonical_arguments_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    validated_at: datetime
+
+    @model_validator(mode="after")
+    def valid_result(self) -> "ActionValidationRecord":
+        if self.arguments_valid == bool(self.validation_error_codes):
+            raise ValueError("Action validation result and error codes disagree")
+        if len(self.validation_error_codes) != len(set(self.validation_error_codes)):
+            raise ValueError("Action validation error codes must be unique")
+        if (self.intent_id is not None) != self.arguments_valid:
+            raise ValueError("Action validation intent binding disagrees with result")
+        return self
+
+
 class PolicyEvaluation(_StrictModel):
     schema_version: Literal[1] = 1
     evaluation_id: str
@@ -192,6 +229,7 @@ class ActionIntent(_StrictModel):
     approval_id: str | None = None
     receipt_id: str | None = None
     failure_code: str | None = None
+    validation_record_id: str | None = None
 
 
 class Observation(_StrictModel):
@@ -239,8 +277,9 @@ class ExecutionReceipt(_StrictModel):
 
 
 class ActionState(_StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     intents: tuple[ActionIntent, ...] = ()
+    validation_records: tuple[ActionValidationRecord, ...] = ()
     approvals: tuple[ApprovalRecord, ...] = ()
     receipts: tuple[ExecutionReceipt, ...] = ()
     observations: tuple[Observation, ...] = ()
@@ -300,6 +339,13 @@ _TOOLS = {
     ),
 }
 
+_VALIDATION_SCHEMA_REVISIONS = {
+    "restricted_metadata_read": 1,
+    "document_search": 1,
+    "calendar_read": 1,
+    "local_notification_enqueue": 1,
+}
+
 
 class ActionExecutionLayer:
     """Fail-closed action state machine owned by the subject runtime."""
@@ -322,6 +368,9 @@ class ActionExecutionLayer:
 
     def list_intents(self) -> tuple[ActionIntent, ...]:
         return self._state().intents
+
+    def list_validation_records(self) -> tuple[ActionValidationRecord, ...]:
+        return self._state().validation_records
 
     def list_approvals(
         self, *, pending_only: bool = False
@@ -371,6 +420,19 @@ class ActionExecutionLayer:
             raise ValueError(f"Unknown action intent: {intent_id}")
         return intent
 
+    def get_validation_record(self, validation_id: str) -> ActionValidationRecord:
+        record = next(
+            (
+                item
+                for item in self._state().validation_records
+                if item.validation_id == validation_id
+            ),
+            None,
+        )
+        if record is None:
+            raise ValueError(f"Unknown action validation record: {validation_id}")
+        return record
+
     def create_from_decision(
         self,
         decision_id: str,
@@ -378,7 +440,10 @@ class ActionExecutionLayer:
         idempotency_key: str,
         dry_run: bool = False,
         budget: ActionBudget | None = None,
-    ) -> ActionIntent:
+    ) -> ActionIntent | ActionValidationRecord:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("Action validation requires an authoritative AgentRuntime event")
         state = self._state()
         duplicate = next(
             (item for item in state.intents if item.idempotency_key == idempotency_key),
@@ -411,8 +476,35 @@ class ActionExecutionLayer:
         arguments = contract.get("arguments")
         if not isinstance(tool_name, str) or not isinstance(arguments, dict):
             raise ActionPolicyError("Selected action contract has invalid types")
-        spec, validated = self._validate(tool_name, arguments)
         now = self.clock()
+        intent_id = str(uuid4())
+        spec, validated, error_codes = self._validate_arguments(tool_name, arguments)
+        validation = ActionValidationRecord(
+            validation_id=str(uuid4()),
+            intent_id=intent_id if validated is not None else None,
+            tool_name=tool_name,
+            risk_class=None if spec is None else spec.risk,
+            arguments_valid=validated is not None,
+            validation_schema_revision=_validation_schema_revision(tool_name, spec),
+            validation_error_codes=error_codes,
+            validated_event_id=event.event_id,
+            validated_event_sequence=event.processing_sequence,
+            canonical_arguments_digest=_digest(
+                validated
+                if validated is not None
+                else cast(dict[str, JsonValue], arguments)
+            ),
+            validated_at=now,
+        )
+        if validated is None or spec is None:
+            self._save(
+                state.model_copy(
+                    update={
+                        "validation_records": (*state.validation_records, validation)
+                    }
+                )
+            )
+            return validation
         bounded = budget or ActionBudget()
         if bounded.max_risk_class == "read_only" and spec.risk != RiskClass.READ_ONLY:
             raise ActionPolicyError("Tool exceeds the action risk budget")
@@ -434,7 +526,6 @@ class ActionExecutionLayer:
             argument_digest=digest,
             evaluated_at=now,
         )
-        intent_id = str(uuid4())
         approval_id = str(uuid4()) if spec.approval_required and not dry_run else None
         intent = ActionIntent(
             intent_id=intent_id,
@@ -474,6 +565,7 @@ class ActionExecutionLayer:
             updated_at=now,
             deadline_at=now + timedelta(seconds=bounded.timeout_seconds),
             approval_id=approval_id,
+            validation_record_id=validation.validation_id,
         )
         approvals = state.approvals
         if approval_id is not None:
@@ -488,7 +580,11 @@ class ActionExecutionLayer:
             )
         self._save(
             state.model_copy(
-                update={"intents": (*state.intents, intent), "approvals": approvals}
+                update={
+                    "intents": (*state.intents, intent),
+                    "validation_records": (*state.validation_records, validation),
+                    "approvals": approvals,
+                }
             )
         )
         if approval_id is not None:
@@ -588,6 +684,7 @@ class ActionExecutionLayer:
     def execute(self, intent_id: str) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
+        arguments = self._validated_arguments_for_execution(intent)
         if intent.status == IntentStatus.SUCCEEDED:
             return intent
         if intent.dry_run:
@@ -600,7 +697,9 @@ class ActionExecutionLayer:
             return self._fail(intent, "cost_budget_exhausted", ReceiptStatus.FAILED)
         if intent.attempts >= intent.budget.max_attempts:
             return self._fail(intent, "retry_budget_exhausted", ReceiptStatus.FAILED)
-        spec, arguments = self._validate(intent.tool_name, intent.arguments)
+        spec = _TOOLS.get(intent.tool_name)
+        if spec is None:
+            raise ActionPolicyError("Action validation schema is no longer available")
         if spec.approval_required:
             approval = next(
                 (
@@ -983,25 +1082,61 @@ class ActionExecutionLayer:
         limit = cast(int, arguments["max_results"])
         return cast(JsonValue, {"events": selected[:limit]})
 
-    def _validate(
+    def _validate_arguments(
         self, tool_name: str, arguments: dict[str, Any]
-    ) -> tuple[_ToolSpec, dict[str, JsonValue]]:
+    ) -> tuple[
+        _ToolSpec | None,
+        dict[str, JsonValue] | None,
+        tuple[ActionValidationErrorCode, ...],
+    ]:
         spec = _TOOLS.get(tool_name)
         if spec is None:
-            raise ActionPolicyError("Tool is not allowlisted")
+            return None, None, (ActionValidationErrorCode.TOOL_NOT_ALLOWLISTED,)
         if spec.risk in {
             RiskClass.EXTERNAL_WRITE,
             RiskClass.DESTRUCTIVE,
             RiskClass.HIGH_IMPACT,
         }:
-            raise ActionPolicyError("Tool risk class is not enabled")
+            return spec, None, (ActionValidationErrorCode.RISK_CLASS_DISABLED,)
         try:
             validated = spec.arguments.model_validate(arguments)
         except ValidationError as exc:
-            raise ActionPolicyError(
-                "Tool arguments do not match the strict schema"
-            ) from exc
-        return spec, validated.model_dump(mode="json")
+            return spec, None, _validation_error_codes(tool_name, exc)
+        return spec, validated.model_dump(mode="json"), ()
+
+    def _validated_arguments_for_execution(
+        self, intent: ActionIntent
+    ) -> dict[str, JsonValue]:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise ActionPolicyError("Action execution requires an authoritative event")
+        if intent.validation_record_id is None:
+            raise ActionPolicyError("Action intent has no validation record")
+        try:
+            record = self.get_validation_record(intent.validation_record_id)
+        except ValueError as exc:
+            raise ActionPolicyError("Action intent validation record is missing") from exc
+        if not record.arguments_valid or record.validation_error_codes:
+            raise ActionPolicyError("Action intent validation is invalid")
+        if record.intent_id != intent.intent_id or record.tool_name != intent.tool_name:
+            raise ActionPolicyError("Action intent validation binding is inconsistent")
+        if (
+            event.event_id == record.validated_event_id
+            or event.processing_sequence <= record.validated_event_sequence
+        ):
+            raise ActionPolicyError("Action execution event is inconsistent with validation")
+        spec = _TOOLS.get(intent.tool_name)
+        current_revision = _validation_schema_revision(intent.tool_name, spec)
+        if current_revision != record.validation_schema_revision:
+            raise ActionPolicyError("Action intent validation schema revision is stale")
+        digest = _digest(intent.arguments)
+        if (
+            digest != record.canonical_arguments_digest
+            or digest != intent.policy.argument_digest
+            or _digest(intent.preview.arguments) != digest
+        ):
+            raise ActionPolicyError("Action intent arguments changed after validation")
+        return intent.arguments
 
     def _validate_result(
         self, tool_name: str, result: JsonValue
@@ -1252,6 +1387,8 @@ class ActionExecutionLayer:
             self._save(state)
             return state
         try:
+            if isinstance(raw, dict) and raw.get("schema_version") == 1:
+                raw = {**raw, "schema_version": 2, "validation_records": []}
             return ActionState.model_validate(raw)
         except ValidationError as exc:
             raise ValueError("Invalid action execution state") from exc
@@ -1274,3 +1411,38 @@ def _digest(value: JsonValue | dict[str, JsonValue]) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _validation_schema_revision(tool_name: str, spec: _ToolSpec | None) -> str:
+    schema: JsonValue = (
+        {"tool_name": tool_name, "available": False}
+        if spec is None
+        else cast(
+            JsonValue,
+            {
+                "tool_name": tool_name,
+                "arguments_schema": spec.arguments.model_json_schema(),
+                "validator_revision": _VALIDATION_SCHEMA_REVISIONS.get(tool_name, 0),
+            },
+        )
+    )
+    return _digest(schema)
+
+
+def _validation_error_codes(
+    tool_name: str, error: ValidationError
+) -> tuple[ActionValidationErrorCode, ...]:
+    messages = " ".join(str(item.get("msg", "")) for item in error.errors())
+    locations = {str(part) for item in error.errors() for part in item.get("loc", ())}
+    codes: list[ActionValidationErrorCode] = []
+    if tool_name == "document_search" and (
+        "relative_path" in locations or "document relative_path" in messages
+    ):
+        codes.append(ActionValidationErrorCode.ARGUMENT_PATH_OUT_OF_SCOPE)
+    if tool_name == "restricted_metadata_read" and (
+        {"namespace", "key"} & locations or "namespace" in messages
+    ):
+        codes.append(ActionValidationErrorCode.ARGUMENT_SCOPE_INVALID)
+    if not codes:
+        codes.append(ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID)
+    return tuple(codes)

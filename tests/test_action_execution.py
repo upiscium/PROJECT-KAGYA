@@ -4,12 +4,14 @@ from typing import Any
 
 import pytest
 
+import kagya.actions.execution as action_execution
 from kagya.actions import (
     ACTION_STATE_KEY,
     ActionBudget,
     ActionExecutionLayer,
     ActionPolicyError,
     ActionState,
+    ActionValidationRecord,
     IntentStatus,
     ReceiptStatus,
 )
@@ -137,19 +139,38 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
-    intent = layer.create_from_decision(
-        "decision-notify", idempotency_key="notification-1"
-    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.notification.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-notify", idempotency_key="notification-1"
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
 
     assert intent.status == IntentStatus.AWAITING_APPROVAL
     assert len(layer.list_approvals(pending_only=True)) == 1
     with pytest.raises(ActionPolicyError, match="not executable"):
-        layer.execute(intent.intent_id)
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.notification.unapproved",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
 
-    approved = layer.resolve_approval(
-        intent.intent_id, approved=True, actor_id="operator-1"
-    )
-    completed = layer.execute(approved.intent_id)
+    approved = runtime.execute(
+        AgentEventType.ACTION_APPROVAL,
+        source="test.notification.approval",
+        handler=lambda: layer.resolve_approval(
+            intent.intent_id, approved=True, actor_id="operator-1"
+        ),
+    ).value
+    completed = runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.notification.execute",
+        handler=lambda: layer.execute(approved.intent_id),
+    ).value
     assert completed.status == IntentStatus.SUCCEEDED
     state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
     assert len(state.notifications) == 1
@@ -162,7 +183,14 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     restored = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
-    assert restored.execute(completed.intent_id).receipt_id == completed.receipt_id
+    assert (
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.notification.duplicate",
+            handler=lambda: restored.execute(completed.intent_id),
+        ).value.receipt_id
+        == completed.receipt_id
+    )
     assert len(ActionState.model_validate(
         loop.persistent_state.extensions[ACTION_STATE_KEY]
     ).notifications) == 1
@@ -179,6 +207,7 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     outcome = loop.decision_store.get("decision-notify").actual_outcome
     assert outcome is not None and outcome.compensated
     assert outcome.compensation_receipt_id == compensated.receipt_id
+    runtime.shutdown()
 
 
 def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
@@ -189,8 +218,17 @@ def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
-    with pytest.raises(ActionPolicyError, match="not allowlisted"):
-        layer.create_from_decision("decision-shell", idempotency_key="shell-1")
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    shell_rejection = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.invalid.shell",
+        handler=lambda: layer.create_from_decision(
+            "decision-shell", idempotency_key="shell-1"
+        ),
+    ).value
+    assert isinstance(shell_rejection, ActionValidationRecord)
+    assert shell_rejection.arguments_valid is False
 
     _decision(
         loop,
@@ -198,8 +236,20 @@ def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
         "document_search",
         {"query": "x", "relative_path": "../secret"},
     )
-    with pytest.raises(ActionPolicyError, match="strict schema"):
-        layer.create_from_decision("decision-invalid", idempotency_key="invalid-1")
+    invalid = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.invalid.path",
+        handler=lambda: layer.create_from_decision(
+            "decision-invalid", idempotency_key="invalid-1"
+        ),
+    ).value
+    assert isinstance(invalid, ActionValidationRecord)
+    assert invalid.arguments_valid is False
+    assert tuple(code.value for code in invalid.validation_error_codes) == (
+        "argument_path_out_of_scope",
+    )
+    assert layer.list_intents() == ()
+    assert layer.list_receipts() == ()
 
     _decision(
         loop,
@@ -207,13 +257,22 @@ def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
         "restricted_metadata_read",
         {"namespace": "runtime", "key": "node_id"},
     )
-    preview = layer.create_from_decision(
-        "decision-preview", idempotency_key="preview-1", dry_run=True
-    )
+    preview = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.preview.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-preview", idempotency_key="preview-1", dry_run=True
+        ),
+    ).value
+    assert not isinstance(preview, ActionValidationRecord)
     assert preview.status == IntentStatus.DRY_RUN
     assert not layer.list_receipts()
     with pytest.raises(ActionPolicyError, match="Dry-run"):
-        layer.execute(preview.intent_id)
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.preview.execute",
+            handler=lambda: layer.execute(preview.intent_id),
+        )
 
     _decision(
         loop,
@@ -222,8 +281,12 @@ def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
         {"namespace": "project", "key": "name"},
     )
     with pytest.raises(ActionPolicyError, match="another decision"):
-        layer.create_from_decision(
-            "decision-collision", idempotency_key="preview-1"
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.collision.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-collision", idempotency_key="preview-1"
+            ),
         )
 
     loop.persistent_state.extensions[ACTION_STATE_KEY] = {"schema_version": 99}
@@ -231,6 +294,7 @@ def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
         ActionExecutionLayer(
             loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
         )
+    runtime.shutdown()
 
 
 def test_retry_is_bounded_and_cancellable(tmp_path: Path) -> None:
@@ -244,24 +308,40 @@ def test_retry_is_bounded_and_cancellable(tmp_path: Path) -> None:
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
-    intent = layer.create_from_decision(
-        "decision-retry",
-        idempotency_key="retry-1",
-        budget=ActionBudget(max_attempts=2),
-    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.retry.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-retry",
+            idempotency_key="retry-1",
+            budget=ActionBudget(max_attempts=2),
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
 
     def unavailable(_: object, __: object) -> object:
         raise OSError("temporarily unavailable")
 
     layer._invoke = unavailable  # type: ignore[method-assign]
-    retrying = layer.execute(intent.intent_id)
+    retrying = runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.retry.execute",
+        handler=lambda: layer.execute(intent.intent_id),
+    ).value
     assert retrying.status == IntentStatus.RETRY_PENDING
     assert retrying.attempts == 1
     cancelled = layer.cancel(intent.intent_id)
     assert cancelled.status == IntentStatus.CANCELLED
     assert loop.decision_store.get("decision-retry").actual_outcome is not None
     with pytest.raises(ActionPolicyError, match="not executable"):
-        layer.execute(intent.intent_id)
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.retry.cancelled",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
+    runtime.shutdown()
 
 
 def test_rejection_records_structured_verification_for_later_attribution(
@@ -277,9 +357,16 @@ def test_rejection_records_structured_verification_for_later_attribution(
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
-    intent = layer.create_from_decision(
-        "decision-rejected", idempotency_key="rejected-1"
-    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.rejected.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-rejected", idempotency_key="rejected-1"
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
 
     rejected = layer.resolve_approval(
         intent.intent_id,
@@ -298,6 +385,173 @@ def test_rejection_records_structured_verification_for_later_attribution(
     }
     assert verification.observation_id == observation.observation_id
     assert verification.success is False
+    runtime.shutdown()
+
+
+def test_action_validation_requires_event_and_missing_record_rejects_before_call(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-missing-validation",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    with pytest.raises(RuntimeError, match="authoritative AgentRuntime event"):
+        layer.create_from_decision(
+            "decision-missing-validation", idempotency_key="missing-validation"
+        )
+
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.validation.missing.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-missing-validation", idempotency_key="missing-validation"
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
+    with pytest.raises(ActionPolicyError, match="authoritative event"):
+        layer.execute(intent.intent_id)
+    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    missing = intent.model_copy(update={"validation_record_id": None})
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={"intents": (missing,)}
+    ).model_dump(mode="json")
+    called = False
+
+    def invoke(_: object, __: object) -> object:
+        nonlocal called
+        called = True
+        return {}
+
+    layer._invoke = invoke  # type: ignore[method-assign]
+    with pytest.raises(ActionPolicyError, match="no validation record"):
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.validation.missing.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
+    assert called is False
+    assert layer.list_receipts() == ()
+    runtime.shutdown()
+
+
+def test_action_validation_rejects_argument_mutation_and_schema_change(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-stale",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.validation.stale.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-stale", idempotency_key="stale"
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
+    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    tampered = intent.model_copy(
+        update={"arguments": {"namespace": "project", "key": "environment"}}
+    )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={"intents": (tampered,)}
+    ).model_dump(mode="json")
+    with pytest.raises(ActionPolicyError, match="changed after validation"):
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.validation.tampered.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
+    assert layer.list_receipts() == ()
+
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+    revision = action_execution._VALIDATION_SCHEMA_REVISIONS[
+        "restricted_metadata_read"
+    ]
+    action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] += 1
+    try:
+        with pytest.raises(ActionPolicyError, match="schema revision is stale"):
+            runtime.execute(
+                AgentEventType.ACTION_EXECUTE,
+                source="test.validation.schema-changed.execute",
+                handler=lambda: layer.execute(intent.intent_id),
+            )
+    finally:
+        action_execution._VALIDATION_SCHEMA_REVISIONS[
+            "restricted_metadata_read"
+        ] = revision
+        runtime.shutdown()
+    assert layer.list_receipts() == ()
+
+
+def test_action_validation_rejects_record_binding_and_event_mismatch(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-mismatch",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.validation.mismatch.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-mismatch", idempotency_key="mismatch"
+        ),
+    ).value
+    assert not isinstance(intent, ActionValidationRecord)
+    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    record = state.validation_records[0]
+
+    mismatched = record.model_copy(update={"intent_id": "another-intent"})
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={"validation_records": (mismatched,)}
+    ).model_dump(mode="json")
+    with pytest.raises(ActionPolicyError, match="binding is inconsistent"):
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.validation.binding-mismatch.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
+    assert layer.list_receipts() == ()
+
+    future_event = record.model_copy(
+        update={"validated_event_sequence": record.validated_event_sequence + 100}
+    )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={"validation_records": (future_event,)}
+    ).model_dump(mode="json")
+    with pytest.raises(ActionPolicyError, match="event is inconsistent"):
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.validation.event-mismatch.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        )
+    assert layer.list_receipts() == ()
+    runtime.shutdown()
 
 
 def _decision(
