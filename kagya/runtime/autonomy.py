@@ -170,6 +170,7 @@ class SubjectScheduler:
         self.reevaluation_interval_seconds = reevaluation_interval_seconds
         self.telemetry = telemetry
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._clock_origin = self.clock()
         self._lock = RLock()
         self._accepting = True
         self._last_cycle: SchedulerCycle | None = None
@@ -378,10 +379,11 @@ class SubjectScheduler:
                 IntrinsicGoalStatus.PROPOSAL,
                 IntrinsicGoalStatus.DEFERRED,
             }:
+                changed_at = self._domain_changed_at(goal.updated_at)
                 wake_at = (
-                    datetime.fromisoformat(goal.updated_at)
+                    changed_at
                     if intrinsic_status == IntrinsicGoalStatus.PROPOSAL
-                    else datetime.fromisoformat(goal.updated_at)
+                    else changed_at
                     + timedelta(seconds=self.reevaluation_interval_seconds)
                 )
                 schedules.append(
@@ -403,7 +405,7 @@ class SubjectScheduler:
                     self._derived(
                         f"{intrinsic_kind.value}:{goal.goal_id}:{goal.updated_at}",
                         intrinsic_kind,
-                        datetime.fromisoformat(goal.updated_at),
+                        self._domain_changed_at(goal.updated_at),
                         goal.goal_id,
                     )
                 )
@@ -424,7 +426,7 @@ class SubjectScheduler:
                 else None
             )
             if kind is not None:
-                wake_at = datetime.fromisoformat(goal.updated_at) + timedelta(
+                wake_at = self._domain_changed_at(goal.updated_at) + timedelta(
                     seconds=self.reevaluation_interval_seconds
                 )
                 schedules.append(
@@ -455,7 +457,7 @@ class SubjectScheduler:
                 CommitmentFulfillability.AT_RISK,
                 CommitmentFulfillability.IMPOSSIBLE,
             }:
-                wake_at = datetime.fromisoformat(commitment.updated_at) + timedelta(
+                wake_at = self._domain_changed_at(commitment.updated_at) + timedelta(
                     seconds=self.reevaluation_interval_seconds
                 )
                 schedules.append(
@@ -469,7 +471,7 @@ class SubjectScheduler:
         for decision in self.main_loop.decision_store.list_records(
             DecisionStatus.AWAITING_OUTCOME
         ):
-            wake_at = datetime.fromisoformat(decision.updated_at) + timedelta(
+            wake_at = self._domain_changed_at(decision.updated_at) + timedelta(
                 seconds=self.reevaluation_interval_seconds
             )
             schedules.append(
@@ -504,7 +506,7 @@ class SubjectScheduler:
                         self._derived(
                             f"action-intent:{decision.decision_id}",
                             WakeUpKind.ACTION_INTENT,
-                            datetime.fromisoformat(decision.updated_at),
+                            self._domain_changed_at(decision.updated_at),
                             decision.decision_id,
                         )
                     )
@@ -539,7 +541,7 @@ class SubjectScheduler:
                         self._derived(
                             f"agency-attribution:{intent.intent_id}:{intent.revision}",
                             WakeUpKind.AGENCY_ATTRIBUTION,
-                            intent.updated_at,
+                            self._domain_changed_at(intent.updated_at),
                             intent.intent_id,
                         )
                     )
@@ -585,7 +587,7 @@ class SubjectScheduler:
                         self._derived(
                             f"counterfactual:{current_attribution.attribution_id}:{current_attribution.revision}",
                             WakeUpKind.COUNTERFACTUAL_SIMULATION,
-                            current_attribution.updated_at,
+                            self._domain_changed_at(current_attribution.updated_at),
                             current_attribution.attribution_id,
                         )
                     )
@@ -594,7 +596,7 @@ class SubjectScheduler:
                         self._derived(
                             f"action-execution:{intent.intent_id}:{intent.updated_at.isoformat()}",
                             WakeUpKind.ACTION_EXECUTION,
-                            intent.updated_at,
+                            self._domain_changed_at(intent.updated_at),
                             intent.intent_id,
                         )
                     )
@@ -657,7 +659,7 @@ class SubjectScheduler:
                             self._derived(
                                 f"action-decision:{uuid5(NAMESPACE_URL, target)}",
                                 WakeUpKind.ACTION_DECISION,
-                                plan.updated_at,
+                                self._domain_changed_at(plan.updated_at),
                                 target,
                             )
                         )
@@ -677,9 +679,9 @@ class SubjectScheduler:
                         state.status == StepStatus.IN_PROGRESS
                         and state.started_at is not None
                     ):
-                        timeout_at = state.started_at + timedelta(
-                            seconds=definition.timeout_seconds
-                        )
+                        timeout_at = self._domain_changed_at(
+                            state.started_at
+                        ) + timedelta(seconds=definition.timeout_seconds)
                         schedules.append(
                             self._derived(
                                 f"step-timeout:{target}:{timeout_at.isoformat()}",
@@ -712,7 +714,7 @@ class SubjectScheduler:
         schedules: list[WakeUpSchedule] = []
 
         def add(target: str, changed_at: str, *, suffix: str = "") -> None:
-            wake_at = datetime.fromisoformat(changed_at) + timedelta(
+            wake_at = self._domain_changed_at(changed_at) + timedelta(
                 seconds=self.reevaluation_interval_seconds
             )
             schedules.append(
@@ -733,7 +735,7 @@ class SubjectScheduler:
             review_at = (
                 datetime.fromisoformat(record.next_review_at)
                 if record.next_review_at is not None
-                else datetime.fromisoformat(record.updated_at)
+                else self._domain_changed_at(record.updated_at)
                 + timedelta(seconds=self.reevaluation_interval_seconds)
             )
             schedules.append(
@@ -744,7 +746,7 @@ class SubjectScheduler:
                     record.target_ref,
                 )
             )
-            decay_at = datetime.fromisoformat(record.updated_at) + timedelta(
+            decay_at = self._domain_changed_at(record.updated_at) + timedelta(
                 seconds=self.reevaluation_interval_seconds
             )
             schedules.append(
@@ -808,6 +810,14 @@ class SubjectScheduler:
                     self_model.state.updated_at,
                 )
         return schedules
+
+    def _domain_changed_at(self, value: str | datetime) -> datetime:
+        changed_at = datetime.fromisoformat(value) if isinstance(value, str) else value
+        if changed_at.tzinfo is None:
+            raise ValueError("Domain change timestamps must include a timezone")
+        if changed_at > self.clock():
+            return self._clock_origin
+        return changed_at
 
     def _derived(
         self, schedule_id: str, kind: WakeUpKind, wake_at: datetime, target_id: str

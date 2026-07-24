@@ -1,6 +1,8 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 
@@ -129,6 +131,7 @@ def _scheduler(
     *,
     max_events: int = 2,
     max_inferences: int = 1,
+    clock: Callable[[], datetime] | None = None,
 ) -> SubjectScheduler:
     return SubjectScheduler(
         runtime,
@@ -139,6 +142,7 @@ def _scheduler(
             max_wall_seconds=1.0,
         ),
         reevaluation_interval_seconds=60.0,
+        clock=clock,
     )
 
 
@@ -337,6 +341,81 @@ def test_persistent_motivation_wakes_are_budgeted_and_journaled(
         if item["status"] == ScheduleStatus.COMPLETED.value
     }
     assert outcomes == {"reevaluated", "decayed"}
+    runtime.shutdown()
+
+
+def test_skewed_domain_changes_use_scheduler_time_but_explicit_boundaries_do_not(
+    tmp_path: Path,
+) -> None:
+    scheduler_now = datetime(2026, 7, 24, tzinfo=UTC)
+    current = scheduler_now
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    record = loop.motivation_dynamics.observe_structured_signal(
+        MotivationKind.DESIRE,
+        MotivationSource.LEARNING,
+        "future-self:clock-skew",
+        signal=0.8,
+        uncertainty=0.2,
+        source_refs=("experience:clock-skew-1", "experience:clock-skew-2"),
+    )
+    loop.motivation_dynamics.records[record.motivation_id] = replace(
+        record, updated_at=(scheduler_now + timedelta(hours=12)).isoformat()
+    )
+    explicit_review = scheduler_now + timedelta(hours=3)
+    review_record = loop.motivation_dynamics.observe_structured_signal(
+        MotivationKind.INTEREST,
+        MotivationSource.CURIOSITY,
+        "future-self:explicit-review",
+        signal=0.2,
+        uncertainty=0.8,
+        source_refs=("experience:explicit-review",),
+    )
+    loop.motivation_dynamics.records[review_record.motivation_id] = replace(
+        review_record,
+        updated_at=(scheduler_now + timedelta(hours=12)).isoformat(),
+        next_review_at=explicit_review.isoformat(),
+    )
+    deadline = scheduler_now + timedelta(hours=2)
+    loop.goal_manager.goals["boundary-goal"] = SimpleNamespace(
+        goal_id="boundary-goal",
+        status=GoalStatus.ACTIVE,
+        deadline=deadline.isoformat(),
+        needs_information=False,
+        updated_at=(scheduler_now + timedelta(hours=12)).isoformat(),
+    )
+    scheduler = _scheduler(
+        runtime,
+        loop,
+        max_events=3,
+        max_inferences=0,
+        clock=lambda: current,
+    )
+
+    schedules = scheduler._all_schedules()
+    reevaluation = next(
+        item
+        for item in schedules
+        if item.kind == WakeUpKind.MOTIVATION_REEVALUATION
+        and item.target_id == record.target_ref
+    )
+    goal_deadline = next(
+        item for item in schedules if item.kind == WakeUpKind.GOAL_DEADLINE
+    )
+    review = next(
+        item
+        for item in schedules
+        if item.kind == WakeUpKind.MOTIVATION_REEVALUATION
+        and item.target_id == review_record.target_ref
+    )
+
+    assert reevaluation.wake_at == scheduler_now + timedelta(seconds=60)
+    assert goal_deadline.wake_at == deadline
+    assert review.wake_at == explicit_review
+    current = scheduler_now + timedelta(seconds=61)
+    cycle = scheduler.run_cycle()
+    assert cycle.result == CycleResult.PROCESSED
+    assert loop.generated_goals == 1
     runtime.shutdown()
 
 
