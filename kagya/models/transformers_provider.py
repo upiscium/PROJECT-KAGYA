@@ -1,12 +1,17 @@
 """Hugging Face Transformers-backed model provider."""
 
-import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 import errno
-from pathlib import Path
-import shutil
-from typing import Any
+import fcntl
 import hashlib
 import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import threading
+from typing import Any
 from uuid import uuid4
 
 import torch
@@ -24,6 +29,7 @@ from kagya.artifact_provenance import (
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
+_SNAPSHOT_PUBLICATION_LOCK = threading.Lock()
 
 
 class TransformersProvider:
@@ -221,27 +227,35 @@ class TransformersProvider:
         ):
             raise ValueError("Adapter path is not approved by the adapter registry")
         if expected_adapter_hash is None or expected_adapter_manifest is None:
-            raise ValueError("Adapter load requires registry hash and artifact manifest")
+            raise ValueError(
+                "Adapter load requires registry hash and artifact manifest"
+            )
+        _require_linux_procfs()
         snapshot = _verified_adapter_snapshot(
             self.settings,
             Path(adapter_path),
             expected_adapter_hash=expected_adapter_hash,
             expected_manifest=expected_adapter_manifest,
         )
-        _verify_adapter_artifact(
-            snapshot,
-            expected_adapter_hash=expected_adapter_hash,
-            expected_manifest=expected_adapter_manifest,
-        )
         if self.model is None:
             self.model = self._load_model(self.model_id)
-        self.model = PeftModel.from_pretrained(self.model, str(snapshot))
-        snapshot_manifest, snapshot_hash = _verify_adapter_artifact(
-            snapshot,
-            expected_adapter_hash=expected_adapter_hash,
-            expected_manifest=expected_adapter_manifest,
-        )
-        verify_attached_adapter_config(self.model, snapshot_manifest)
+        snapshot_fd = _open_adapter_snapshot(snapshot)
+        snapshot_path = Path(f"/proc/self/fd/{snapshot_fd}")
+        try:
+            _verify_adapter_artifact(
+                snapshot_path,
+                expected_adapter_hash=expected_adapter_hash,
+                expected_manifest=expected_adapter_manifest,
+            )
+            self.model = PeftModel.from_pretrained(self.model, str(snapshot_path))
+            snapshot_manifest, snapshot_hash = _verify_adapter_artifact(
+                snapshot_path,
+                expected_adapter_hash=expected_adapter_hash,
+                expected_manifest=expected_adapter_manifest,
+            )
+            verify_attached_adapter_config(self.model, snapshot_manifest)
+        finally:
+            os.close(snapshot_fd)
         self.adapter_artifact_manifest_hash = snapshot_manifest.sha256
         self.adapter_artifact_manifest = snapshot_manifest
         self.adapter_snapshot_manifest_hash = snapshot_manifest.sha256
@@ -367,46 +381,85 @@ def _verified_adapter_snapshot(
     runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(runtime_root, 0o700)
     target = runtime_root / source_hash
-    if target.exists():
-        _verify_adapter_artifact(
-            target,
-            expected_adapter_hash=expected_adapter_hash,
-            expected_manifest=expected_manifest,
-        )
-        return target
-
-    temporary = runtime_root / f".{source_hash}.{uuid4().hex}.tmp"
-    temporary.mkdir(mode=0o700)
-    try:
-        for item in _adapter_files(source):
-            relative = item.relative_to(source)
-            destination = temporary / relative
-            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with item.open("rb") as source_file, destination.open("xb") as target_file:
-                shutil.copyfileobj(source_file, target_file)
-        if _adapter_file_state(source) != source_state:
-            raise RuntimeError("Adapter source changed while creating runtime snapshot")
-        _verify_adapter_artifact(
-            temporary,
-            expected_adapter_hash=source_hash,
-            expected_manifest=source_manifest,
-        )
-        _make_snapshot_read_only(temporary)
-        try:
-            temporary.rename(target)
-        except OSError as exc:
-            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not target.exists():
-                raise
+    with _snapshot_publication_lock(runtime_root):
+        if target.exists():
             _verify_adapter_artifact(
                 target,
                 expected_adapter_hash=expected_adapter_hash,
                 expected_manifest=expected_manifest,
             )
-        return target
-    finally:
-        if temporary.exists():
-            _make_snapshot_writable(temporary)
-            shutil.rmtree(temporary)
+            return target
+
+        temporary = runtime_root / f".{source_hash}.{uuid4().hex}.tmp"
+        temporary.mkdir(mode=0o700)
+        try:
+            for item in _adapter_files(source):
+                relative = item.relative_to(source)
+                destination = temporary / relative
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with (
+                    item.open("rb") as source_file,
+                    destination.open("xb") as target_file,
+                ):
+                    shutil.copyfileobj(source_file, target_file)
+            if _adapter_file_state(source) != source_state:
+                raise RuntimeError(
+                    "Adapter source changed while creating runtime snapshot"
+                )
+            _verify_adapter_artifact(
+                temporary,
+                expected_adapter_hash=source_hash,
+                expected_manifest=source_manifest,
+            )
+            _make_snapshot_read_only(temporary)
+            try:
+                temporary.rename(target)
+            except OSError as exc:
+                if (
+                    exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}
+                    or not target.exists()
+                ):
+                    raise
+                _verify_adapter_artifact(
+                    target,
+                    expected_adapter_hash=expected_adapter_hash,
+                    expected_manifest=expected_manifest,
+                )
+            return target
+        finally:
+            if temporary.exists():
+                _make_snapshot_writable(temporary)
+                shutil.rmtree(temporary)
+
+
+@contextmanager
+def _snapshot_publication_lock(runtime_root: Path) -> Iterator[None]:
+    lock_path = runtime_root / ".publication.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    with (
+        _SNAPSHOT_PUBLICATION_LOCK,
+        os.fdopen(os.open(lock_path, flags, 0o600), "a+b") as lock_file,
+    ):
+        os.fchmod(lock_file.fileno(), 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _open_adapter_snapshot(snapshot: Path) -> int:
+    _require_linux_procfs()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    try:
+        return os.open(snapshot, flags)
+    except OSError as exc:
+        raise RuntimeError("Verified adapter snapshot is unavailable") from exc
+
+
+def _require_linux_procfs() -> None:
+    if sys.platform != "linux" or not Path("/proc/self/fd").is_dir():
+        raise RuntimeError("Secure adapter loading requires Linux procfs")
 
 
 def _verify_adapter_artifact(
@@ -415,6 +468,7 @@ def _verify_adapter_artifact(
     expected_adapter_hash: str,
     expected_manifest: AdapterArtifactManifest,
 ) -> tuple[AdapterArtifactManifest, str]:
+    adapter_files = _adapter_files(path)
     manifest = build_adapter_artifact_manifest(
         path,
         base_model_name=expected_manifest.base_model_name,
@@ -422,7 +476,7 @@ def _verify_adapter_artifact(
     )
     files = {
         (Path("adapter") / item.relative_to(path)).as_posix(): item.read_bytes()
-        for item in _adapter_files(path)
+        for item in adapter_files
     }
     adapter_hash = _adapter_file_map_hash(files)
     if manifest != expected_manifest or manifest.sha256 != expected_manifest.sha256:
@@ -434,10 +488,7 @@ def _verify_adapter_artifact(
 
 def _adapter_file_map_hash(files: dict[str, bytes]) -> str:
     canonical = b"".join(
-        relative.encode()
-        + b"\0"
-        + hashlib.sha256(content).hexdigest().encode()
-        + b"\n"
+        relative.encode() + b"\0" + hashlib.sha256(content).hexdigest().encode() + b"\n"
         for relative, content in sorted(files.items())
     )
     return hashlib.sha256(canonical).hexdigest()
@@ -558,9 +609,7 @@ def _resolved_revision(value: Any) -> str | None:
     return next((str(item) for item in candidates if item), None)
 
 
-def _snapshot_path(
-    artifact: Any, model_id: str, revision: str
-) -> Path | None:
+def _snapshot_path(artifact: Any, model_id: str, revision: str) -> Path | None:
     candidates = (
         getattr(getattr(artifact, "config", None), "_name_or_path", None),
         getattr(artifact, "name_or_path", None),
