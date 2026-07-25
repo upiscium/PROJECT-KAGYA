@@ -7,6 +7,7 @@ from fnmatch import fnmatchcase
 from hmac import compare_digest
 from ipaddress import ip_address
 import os
+from pathlib import Path
 from threading import RLock
 from typing import Callable, TypeVar
 from uuid import uuid4
@@ -468,13 +469,24 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
     registry = get_adapter_registry(request)
 
     def load(entry: AdapterEntry | None) -> ModelProvider:
-        return load_model_provider(
+        provider = load_model_provider(
             settings,
             adapter_path=None if entry is None else entry.path,
             allow_archived_adapter=(
                 entry is not None and entry.status == AdapterStatus.ARCHIVED
             ),
         )
+        if entry is not None and settings.model.provider == "dummy":
+            from kagya.artifact_provenance import build_adapter_artifact_manifest
+
+            manifest = build_adapter_artifact_manifest(
+                Path(entry.path),
+                base_model_name=entry.base_model,
+                base_model_revision=entry.base_model_revision,
+            )
+            provider.adapter_artifact_manifest = manifest  # type: ignore[attr-defined]
+            provider.adapter_artifact_manifest_hash = manifest.sha256  # type: ignore[attr-defined]
+        return provider
 
     def switch(
         provider: ModelProvider, entry: AdapterEntry | None, sequence: int | None

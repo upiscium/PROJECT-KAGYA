@@ -55,6 +55,7 @@ class TransformersProvider:
         self.model_artifact_manifest_hash: str | None = None
         self.model_artifact_manifest: Any | None = None
         self.adapter_artifact_manifest_hash: str | None = None
+        self.adapter_artifact_manifest: Any | None = None
         if model is not None and adapter_path is not None:
             self.attach_adapter(adapter_path)
 
@@ -207,6 +208,7 @@ class TransformersProvider:
         self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
         verify_attached_adapter_config(self.model, manifest)
         self.adapter_artifact_manifest_hash = manifest.sha256
+        self.adapter_artifact_manifest = manifest
         self._adapter_attached = True
 
     def _get_primary_processor(self) -> Any:
@@ -269,13 +271,17 @@ class TransformersProvider:
             or self.resolved_processor_revision is None
         ):
             return
-        snapshot = _snapshot_path(
-            self.model, self.processor, self.model_id, self.model_revision
+        model_snapshot = _snapshot_path(
+            self.model, self.model_id, self.resolved_model_revision
         )
-        if snapshot is None:
+        processor_snapshot = _snapshot_path(
+            self.processor, self.model_id, self.resolved_processor_revision
+        )
+        if model_snapshot is None or processor_snapshot is None:
             return
         manifest = build_model_artifact_manifest(
-            snapshot,
+            model_snapshot,
+            processor_snapshot=processor_snapshot,
             model_id=self.model_id,
             requested_revision=self.model_revision,
             resolved_revision=self.resolved_model_revision,
@@ -381,11 +387,11 @@ def _resolved_revision(value: Any) -> str | None:
 
 
 def _snapshot_path(
-    model: Any, processor: Any, model_id: str, revision: str
+    artifact: Any, model_id: str, revision: str
 ) -> Path | None:
     candidates = (
-        getattr(getattr(model, "config", None), "_name_or_path", None),
-        getattr(processor, "name_or_path", None),
+        getattr(getattr(artifact, "config", None), "_name_or_path", None),
+        getattr(artifact, "name_or_path", None),
     )
     local = next(
         (path for item in candidates if item and (path := Path(str(item))).is_dir()),

@@ -479,7 +479,6 @@ def test_action_validation_rejects_argument_mutation_and_schema_change(
             handler=lambda: layer.execute(intent.intent_id),
         )
     assert layer.list_receipts() == ()
-
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
     revision = action_execution._VALIDATION_SCHEMA_REVISIONS[
         "restricted_metadata_read"
@@ -499,6 +498,194 @@ def test_action_validation_rejects_argument_mutation_and_schema_change(
         runtime.shutdown()
     assert layer.list_receipts() == ()
 
+
+def test_successful_execution_is_idempotent_after_validation_schema_change(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-idempotent-schema",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.idempotent.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-idempotent-schema", idempotency_key="idempotent-schema"
+        ),
+    ).value
+    completed = runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.idempotent.execute",
+        handler=lambda: layer.execute(intent.intent_id),
+    ).value
+    revision = action_execution._VALIDATION_SCHEMA_REVISIONS[
+        "restricted_metadata_read"
+    ]
+    action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] += 1
+    try:
+        duplicate = runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.idempotent.duplicate",
+            handler=lambda: layer.execute(intent.intent_id),
+        ).value
+    finally:
+        action_execution._VALIDATION_SCHEMA_REVISIONS[
+            "restricted_metadata_read"
+        ] = revision
+        runtime.shutdown()
+
+    assert duplicate.receipt_id == completed.receipt_id
+    assert len(layer.list_receipts()) == 1
+
+
+def test_valid_argument_record_is_persisted_before_risk_budget_rejection(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-risk-budget",
+        "local_notification_enqueue",
+        {"channel": "local", "title": "Review", "body": "Bounded body"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        with pytest.raises(ActionPolicyError, match="risk budget"):
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.risk-budget",
+                handler=lambda: layer.create_from_decision(
+                    "decision-risk-budget",
+                    idempotency_key="risk-budget",
+                    budget=ActionBudget(max_risk_class="read_only"),
+                ),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert layer.list_validation_records()[0].arguments_valid is True
+    assert layer.list_intents() == ()
+    assert "Bounded body" not in layer.list_validation_records()[0].model_dump_json()
+
+
+def test_malformed_action_contract_gets_bounded_validation_evidence(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(loop, "decision-malformed", "document_search", "sensitive-body")
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        rejected = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.malformed-contract",
+            handler=lambda: layer.create_from_decision(
+                "decision-malformed", idempotency_key="malformed-contract"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert isinstance(rejected, ActionValidationRecord)
+    assert [code.value for code in rejected.validation_error_codes] == [
+        "action_contract_invalid"
+    ]
+    assert "sensitive-body" not in rejected.model_dump_json()
+    assert layer.list_intents() == ()
+
+
+def test_non_object_action_contract_gets_bounded_validation_evidence(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(loop, "decision-non-object", "document_search", {})
+    decision = loop.decision_store.get("decision-non-object")
+    selected = next(
+        item
+        for item in decision.considered_candidates
+        if item.candidate.candidate_id == decision.selected_candidate_id
+    )
+    selected.candidate.parameters["action"] = "private malformed value"
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        rejected = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.non-object-contract",
+            handler=lambda: layer.create_from_decision(
+                "decision-non-object", idempotency_key="non-object-contract"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert isinstance(rejected, ActionValidationRecord)
+    assert rejected.validation_error_codes == (
+        action_execution.ActionValidationErrorCode.ACTION_CONTRACT_INVALID,
+    )
+    assert "private malformed value" not in rejected.model_dump_json()
+    assert layer.list_intents() == ()
+
+
+def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-legacy",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.legacy.intent",
+        handler=lambda: layer.create_from_decision(
+            "decision-legacy", idempotency_key="legacy"
+        ),
+    ).value
+    runtime.shutdown()
+    raw = loop.persistent_state.extensions[ACTION_STATE_KEY]
+    raw["schema_version"] = 1
+    raw.pop("validation_records")
+
+    restored = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+
+    migrated = restored.get_intent(intent.intent_id)
+    assert migrated.status == IntentStatus.REJECTED
+    assert migrated.failure_code == "legacy_unvalidated_intent"
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 2
+    persisted_revision = migrated.revision
+
+    restarted = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    assert restarted.get_intent(intent.intent_id).revision == persisted_revision
 
 def test_action_validation_rejects_record_binding_and_event_mismatch(
     tmp_path: Path,

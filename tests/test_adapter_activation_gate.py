@@ -1,11 +1,14 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import BehavioralActivationPolicy, load_settings
+from kagya._build_info import SourceRevisionStatus
+from kagya.artifact_provenance import build_model_artifact_manifest
+from kagya.config import BehavioralActivationPolicy, ProjectEnvironment, load_settings
 from kagya.learning import (
     ActivationEligibilityReason,
     AdapterRegistry,
@@ -15,6 +18,8 @@ from kagya.learning import (
 )
 from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
 from kagya.learning.behavioral_coverage import BEHAVIORAL_COVERAGE_MANIFEST
+from kagya.learning.runtime_behavioral_runner import current_evaluator_hash
+from kagya.training.artifacts import sha256_file_map
 from tests.adapter_behavioral_helpers import (
     bind_runtime_behavioral_result,
     register_runtime_candidate,
@@ -557,7 +562,10 @@ def test_legacy_activation_boolean_never_migrates_as_behavioral_authority(
     assert entry is not None
     assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
-    assert entry.schema_version == 9
+    assert entry.schema_version == 10
+    assert json.loads(registry.path.read_text(encoding="utf-8"))["adapters"][0][
+        "schema_version"
+    ] == 10
     assert (
         registry.activation_eligibility("legacy").reason
         == ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED
@@ -625,7 +633,7 @@ def test_schema_v4_behavioral_fields_migrate_to_exact_names(tmp_path: Path) -> N
     entry = registry.lookup("v4")
 
     assert entry is not None
-    assert entry.schema_version == 9
+    assert entry.schema_version == 10
     assert entry.behavioral_candidate_adapter_hash == "f" * 64
     assert entry.behavioral_base_model_revision == "model-revision"
 
@@ -650,6 +658,178 @@ def test_schema_v7_real_model_result_does_not_migrate_as_authority(
 
     assert eligibility.real_model_status == "not_run"
     assert eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
+
+
+def test_schema_v9_migration_persists_v10_and_accepts_new_real_evidence(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    payload = json.loads(registry.path.read_text(encoding="utf-8"))
+    payload["adapters"][0]["schema_version"] = 9
+    registry.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    migrated = AdapterRegistry(registry.settings)
+    entry = migrated.lookup("candidate")
+    assert entry is not None and entry.schema_version == 10
+    assert json.loads(migrated.path.read_text(encoding="utf-8"))["adapters"][0][
+        "schema_version"
+    ] == 10
+
+    bind_runtime_behavioral_result(
+        migrated,
+        tmp_path,
+        "candidate",
+        evaluation_id="new-real-after-v9",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+    )
+    rebound = migrated.lookup("candidate")
+    assert rebound is not None
+    assert rebound.real_model_behavioral_evaluation_id == "new-real-after-v9"
+    assert rebound.real_model_behavioral_artifact_state == "reconciled"
+
+
+def test_production_full_eligibility_requires_coherent_deterministic_and_real_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_commit = "1" * 40
+    processor_commit = "2" * 40
+    source_commit = "3" * 40
+    source_tree = "4" * 40
+    base = load_settings(CONFIG_PATH)
+    settings = base.model_copy(
+        update={
+            "project": base.project.model_copy(
+                update={"environment": ProjectEnvironment.PRODUCTION}
+            ),
+            "model": base.model.model_copy(
+                update={
+                    "primary_id": "production-model",
+                    "revision": model_commit,
+                    "processor_revision": processor_commit,
+                }
+            ),
+            "adapter_registry": base.adapter_registry.model_copy(
+                update={
+                    "path": tmp_path / "registry.json",
+                    "eval_result_dir": tmp_path / "evaluations",
+                    "eval_sets": [],
+                    "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED,
+                }
+            ),
+        }
+    )
+    adapter = tmp_path / "candidate"
+    adapter.mkdir()
+    config = b'{"peft_type":"LORA"}'
+    (adapter / "adapter_config.json").write_bytes(config)
+    registry = AdapterRegistry(settings)
+    registry.register_candidate(
+        adapter_id="candidate",
+        adapter_path=adapter,
+        dataset_path=tmp_path / "dataset.jsonl",
+        dataset_hash="dataset",
+        base_model="production-model",
+        base_model_revision=model_commit,
+        adapter_hash=sha256_file_map({"adapter/adapter_config.json": config}),
+    )
+    registry.apply_evaluation("candidate", score=0.9, result_path=tmp_path / "ordinary")
+    common = {
+        "source_commit_sha": source_commit,
+        "source_revision_status": "verified",
+        "source_tree_hash": source_tree,
+        "base_model_revision_requested": model_commit,
+        "processor_revision_requested": processor_commit,
+    }
+    bind_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        manifest_updates={
+            **common,
+            "evaluator_implementation_hash": current_evaluator_hash(
+                BehavioralRuntimeKind.DETERMINISTIC_RUNTIME
+            ),
+        },
+    )
+    model_snapshot = tmp_path / "model-snapshot"
+    processor_snapshot = tmp_path / "processor-snapshot"
+    model_snapshot.mkdir()
+    processor_snapshot.mkdir()
+    (model_snapshot / "config.json").write_bytes(b"{}")
+    (model_snapshot / "model.safetensors").write_bytes(b"weights")
+    (processor_snapshot / "tokenizer.json").write_bytes(b"{}")
+    model_manifest = build_model_artifact_manifest(
+        model_snapshot,
+        processor_snapshot=processor_snapshot,
+        model_id="production-model",
+        requested_revision=model_commit,
+        resolved_revision=model_commit,
+        processor_requested_revision=processor_commit,
+        processor_resolved_revision=processor_commit,
+    )
+    real_path = write_runtime_behavioral_result(
+        registry,
+        tmp_path,
+        "candidate",
+        evaluation_id="production-real",
+        runtime_kind=BehavioralRuntimeKind.REAL_MODEL_RUNTIME,
+        manifest_updates={
+            **common,
+            "base_model_revision_resolved": model_commit,
+            "processor_revision_resolved": processor_commit,
+            "model_artifact_manifest_hash": model_manifest.sha256,
+            "model_artifact_manifest": model_manifest.model_dump(mode="json"),
+            "evaluator_implementation_hash": current_evaluator_hash(
+                BehavioralRuntimeKind.REAL_MODEL_RUNTIME
+            ),
+        },
+    )
+    real_payload = json.loads(real_path.read_text(encoding="utf-8"))
+    real_payload["baseline_generation_count"] = 1
+    real_payload["candidate_generation_count"] = 1
+    real_path.write_text(json.dumps(real_payload), encoding="utf-8")
+    registry.apply_behavioral_evaluation(
+        "candidate", evaluation_id="production-real", result_path=real_path
+    )
+    registry.mark_behavioral_evaluation_reconciled(
+        "candidate", evaluation_id="production-real"
+    )
+    registry.approve("candidate")
+    monkeypatch.setattr(
+        "kagya._build_info.resolve_source_build_info",
+        lambda: SimpleNamespace(
+            status=SourceRevisionStatus.VERIFIED,
+            commit_sha=source_commit,
+            tree_hash=source_tree,
+        ),
+    )
+    monkeypatch.setattr(
+        "kagya.learning.adapter_registry._local_model_snapshot",
+        lambda _model_id, revision: (
+            model_snapshot if revision == model_commit else processor_snapshot
+        ),
+    )
+
+    eligibility = registry.activation_eligibility("candidate")
+
+    assert eligibility.eligible is True
+
+    entry = registry.lookup("candidate")
+    assert entry is not None and entry.behavioral_evaluation_path is not None
+    deterministic_path = Path(entry.behavioral_evaluation_path)
+    deterministic_payload = json.loads(deterministic_path.read_text(encoding="utf-8"))
+    deterministic_payload["manifest"]["processor_revision_requested"] = "5" * 40
+    deterministic_path.write_text(json.dumps(deterministic_payload), encoding="utf-8")
+    registry_payload = json.loads(registry.path.read_text(encoding="utf-8"))
+    registry_payload["adapters"][0]["behavioral_result_hash"] = hashlib.sha256(
+        deterministic_path.read_bytes()
+    ).hexdigest()
+    registry.path.write_text(json.dumps(registry_payload), encoding="utf-8")
+
+    mismatch = AdapterRegistry(settings).activation_eligibility("candidate")
+    assert mismatch.eligible is False
+    assert mismatch.reason == ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH
 
 
 def _ready(tmp_path: Path) -> AdapterRegistry:

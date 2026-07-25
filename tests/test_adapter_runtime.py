@@ -4,6 +4,7 @@ from threading import Event
 import pytest
 
 from kagya.config import load_settings
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.learning import (
     AdapterRegistry,
     AdapterRuntimeManager,
@@ -184,13 +185,54 @@ def _manager(registry, state, tmp_path: Path) -> AdapterRuntimeManager:
             provider,
         )
 
+    def load(entry):
+        provider = DummyProvider()
+        if entry is not None:
+            manifest = build_adapter_artifact_manifest(
+                Path(entry.path),
+                base_model_name=entry.base_model,
+                base_model_revision=entry.base_model_revision,
+            )
+            provider.adapter_artifact_manifest = manifest
+            provider.adapter_artifact_manifest_hash = manifest.sha256
+        return provider
+
     return AdapterRuntimeManager(
         registry,
-        provider_loader=lambda entry: DummyProvider(),
+        provider_loader=load,
         runtime_switch=switch,
         runtime_snapshot=lambda: state[0],
         history_path=tmp_path / "activations.json",
     )
+
+
+def test_activation_rejects_loaded_adapter_replaced_before_authoritative_switch(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    adapter_config = Path(entry.path) / "adapter_config.json"
+    original = adapter_config.read_bytes()
+    adapter_config.write_bytes(b'{"adapter_id":"different-loaded-adapter"}')
+    state = [RuntimeAdapterState(None, None, None, DummyProvider())]
+    manager = _manager(registry, state, tmp_path)
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    adapter_config.write_bytes(original)
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        with pytest.raises(ValueError, match="Loaded provider adapter manifest"):
+            runtime.execute(
+                AgentEventType.ADAPTER_UPDATE,
+                source="test.toctou",
+                handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert state[0].adapter_id is None
+    assert registry.lookup(entry.adapter_id).status.value == "approved"
 
 
 def _registry(tmp_path: Path) -> AdapterRegistry:

@@ -168,12 +168,9 @@ def test_cross_registry_reconciliation_is_idempotent_and_fail_closed(
     )
     first = store.reconcile(registry)
     second = store.reconcile(registry)
-    assert [item.status for item in first] == [BehavioralArtifactStatus.PREPARED]
-    assert [item.status for item in second] == [BehavioralArtifactStatus.PREPARED]
-    assert registry.activation_eligibility("candidate").eligible is False
-
-    registry.finalize_behavioral_evaluation("candidate", evaluation_id="cross-registry")
-    assert store.reconcile(registry)[0].status == BehavioralArtifactStatus.VALID
+    assert [item.status for item in first] == [BehavioralArtifactStatus.VALID]
+    assert [item.status for item in second] == [BehavioralArtifactStatus.VALID]
+    assert registry.lookup("candidate").behavioral_artifact_state == "reconciled"
 
     store.final_path("cross-registry").unlink()
     assert store.reconcile(registry)[0].status == (
@@ -235,9 +232,9 @@ def test_cross_registry_reconciliation_classifies_orphan_and_binding_mismatch(
     ("boundary", "expected_status", "expected_binding_state"),
     (
         ("prepared", BehavioralArtifactStatus.PREPARED, "unbound"),
-        ("bound", BehavioralArtifactStatus.PREPARED, "prepared"),
-        ("artifact_finalized", BehavioralArtifactStatus.PREPARED, "prepared"),
-        ("registry_finalized", BehavioralArtifactStatus.VALID, "finalized"),
+        ("bound", BehavioralArtifactStatus.VALID, "reconciled"),
+        ("artifact_finalized", BehavioralArtifactStatus.VALID, "reconciled"),
+        ("registry_finalized", BehavioralArtifactStatus.VALID, "reconciled"),
     ),
 )
 def test_behavioral_saga_crash_boundaries_never_grant_activation(
@@ -284,3 +281,39 @@ def test_behavioral_saga_crash_boundaries_never_grant_activation(
     assert record.status == expected_status
     assert entry.behavioral_artifact_state == expected_binding_state
     assert restarted_registry.activation_eligibility("candidate").eligible is False
+
+
+def test_old_invalid_evidence_cannot_quarantine_a_new_binding(tmp_path: Path) -> None:
+    settings = load_settings(CONFIG_PATH).model_copy(
+        update={
+            "adapter_registry": load_settings(CONFIG_PATH).adapter_registry.model_copy(
+                update={
+                    "eval_result_dir": tmp_path / "results",
+                    "path": tmp_path / "adapters.json",
+                }
+            )
+        }
+    )
+    registry = AdapterRegistry(settings)
+    register_runtime_candidate(registry, tmp_path, "candidate")
+    old = write_runtime_behavioral_result(
+        registry, tmp_path, "candidate", evaluation_id="old"
+    )
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    store.commit("old", json.loads(old.read_text(encoding="utf-8")))
+    new = write_runtime_behavioral_result(
+        registry, tmp_path, "candidate", evaluation_id="new"
+    )
+    store.prepare("new", json.loads(new.read_text(encoding="utf-8")))
+    registry.prepare_behavioral_evaluation(
+        "candidate",
+        evaluation_id="new",
+        prepared_path=store.prepared_path("new"),
+        final_path=store.final_path("new"),
+    )
+    store.final_path("old").write_text("{corrupt", encoding="utf-8")
+
+    store.reconcile(registry, quarantine_invalid=True)
+
+    assert registry.lookup("candidate").behavioral_evaluation_id == "new"
+    assert registry.lookup("candidate").behavioral_artifact_state == "reconciled"

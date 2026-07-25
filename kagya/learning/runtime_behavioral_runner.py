@@ -974,8 +974,11 @@ def _submit_external_observations(
 def _advance_scheduler(harness: SubjectRuntimeHarness, inputs: dict[str, Any]) -> None:
     if harness.graph is None:
         raise RuntimeError("Runtime graph disappeared during scenario")
+    cycles = int(inputs.get("scheduler_cycles", 0))
+    if cycles:
+        harness.graph.scheduler.status()
     harness.clock.advance(float(inputs.get("advance_seconds", 0.0)))
-    for _ in range(int(inputs.get("scheduler_cycles", 0))):
+    for _ in range(cycles):
         harness.graph.scheduler.run_cycle(harness.clock.advance(1.0))
 
 
@@ -1222,6 +1225,7 @@ def _manifest(
     tool_content = tool_path.read_bytes() if tool_path.is_file() else b'{"tools":[]}'
     source_info = resolve_source_build_info(source.parents[2])
     return BehavioralEvaluationManifest(
+        schema_version=10,
         source_commit_sha=source_info.commit_sha,
         source_revision_status=source_info.status.value,
         source_tree_hash=source_info.tree_hash,

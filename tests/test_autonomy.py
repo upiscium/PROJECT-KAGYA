@@ -6,6 +6,7 @@ from typing import Callable
 
 import pytest
 
+from kagya.decision import DecisionStatus
 from kagya.motivation import (
     CommitmentFulfillability,
     CommitmentStatus,
@@ -256,6 +257,67 @@ def test_due_action_execution_is_processed_once_through_runtime(tmp_path: Path) 
     )
 
 
+def test_invalid_scheduled_action_resolves_once_as_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    runtime, _ = _runtime(tmp_path / "journal.jsonl")
+    loop = _MainLoop()
+    decision = SimpleNamespace(
+        decision_id="invalid-action-decision",
+        status=DecisionStatus.AWAITING_OUTCOME,
+        updated_at=now,
+        selected_candidate_id="invalid-action",
+        considered_candidates=(
+            SimpleNamespace(
+                candidate=SimpleNamespace(
+                    candidate_id="invalid-action",
+                    parameters={"action": {"tool_name": "document_search"}},
+                )
+            ),
+        ),
+    )
+
+    class _Decisions:
+        records = {decision.decision_id: decision}
+
+        def list_records(self, status: object) -> list[object]:
+            return [item for item in self.records.values() if item.status == status]
+
+        def get(self, decision_id: str) -> object:
+            return self.records[decision_id]
+
+    class _Actions:
+        calls = 0
+
+        def list_intents(self) -> list[object]:
+            return []
+
+        def create_from_decision(self, decision_id: str, **_: object) -> object:
+            assert decision_id == decision.decision_id
+            self.calls += 1
+            return SimpleNamespace(validation_id="bounded-validation")
+
+    loop.decision_store = _Decisions()
+    loop.action_execution = _Actions()
+
+    def record_outcome(decision_id: str, **_: object) -> None:
+        assert decision_id == decision.decision_id
+        decision.status = DecisionStatus.RESOLVED
+
+    loop.record_decision_outcome = record_outcome
+    scheduler = _scheduler(runtime, loop)
+
+    first = scheduler.run_cycle(now)
+    second = scheduler.run_cycle(now + timedelta(seconds=1))
+    runtime.shutdown()
+
+    assert first.result == CycleResult.PROCESSED
+    assert second.result == CycleResult.NO_ACTION
+    assert loop.action_execution.calls == 1
+    assert decision.status == DecisionStatus.RESOLVED
+
+
 def test_due_goal_deadline_is_reevaluated_through_runtime(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     runtime, journal = _runtime(tmp_path / "journal.jsonl")
@@ -410,10 +472,34 @@ def test_skewed_domain_changes_use_scheduler_time_but_explicit_boundaries_do_not
     )
 
     assert reevaluation.wake_at == scheduler_now + timedelta(seconds=60)
+    schedule_id = reevaluation.schedule_id
+    current = scheduler_now + timedelta(seconds=30)
+    still_pending = next(
+        item
+        for item in scheduler._all_schedules()
+        if item.kind == WakeUpKind.MOTIVATION_REEVALUATION
+        and item.target_id == record.target_ref
+    )
+    restarted = _scheduler(
+        runtime,
+        loop,
+        max_events=3,
+        max_inferences=0,
+        clock=lambda: current,
+    )
+    after_restart = next(
+        item
+        for item in restarted._all_schedules()
+        if item.kind == WakeUpKind.MOTIVATION_REEVALUATION
+        and item.target_id == record.target_ref
+    )
+    assert still_pending.schedule_id == after_restart.schedule_id == schedule_id
+    assert still_pending.wake_at == reevaluation.wake_at
+    assert after_restart.wake_at == current + timedelta(seconds=60)
     assert goal_deadline.wake_at == deadline
     assert review.wake_at == explicit_review
-    current = scheduler_now + timedelta(seconds=61)
-    cycle = scheduler.run_cycle()
+    current = scheduler_now + timedelta(seconds=91)
+    cycle = restarted.run_cycle()
     assert cycle.result == CycleResult.PROCESSED
     assert loop.generated_goals == 1
     runtime.shutdown()

@@ -156,9 +156,23 @@ class BehavioralArtifactStore:
             )
         ):
             failure_code = "evaluation_failed"
-        return self._transition(
-            evaluation_id, BehavioralEvaluationState.FAILED, failure_code=failure_code
-        )
+        with self._locked():
+            records = self._registry_locked()
+            record = records.get(evaluation_id)
+            if record is None:
+                raise ValueError(f"Unknown behavioral evaluation: {evaluation_id}")
+            self.prepared_path(evaluation_id).unlink(missing_ok=True)
+            record = record.model_copy(
+                update={
+                    "state": BehavioralEvaluationState.FAILED,
+                    "status": BehavioralArtifactStatus.ORPHAN_REGISTRY_REFERENCE,
+                    "failure_code": failure_code,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            records[evaluation_id] = record
+            self._write_registry_locked(records)
+            return record
 
     def commit(
         self, evaluation_id: str, payload: dict[str, Any]
@@ -312,6 +326,21 @@ class BehavioralArtifactStore:
                     path = self.result_dir / record.relative_path
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     pass
+            if (
+                record.state == BehavioralEvaluationState.PREPARED
+                and not prepared.exists()
+                and path.is_file()
+                and self._file_status(path, record.sha256)
+                == BehavioralArtifactStatus.VALID
+            ):
+                record = record.model_copy(
+                    update={
+                        "status": BehavioralArtifactStatus.VALID,
+                        "state": BehavioralEvaluationState.FINALIZED,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                records[evaluation_id] = record
             status = record.status
             if record.state == BehavioralEvaluationState.PREPARED:
                 status = BehavioralArtifactStatus.PREPARED
@@ -324,6 +353,47 @@ class BehavioralArtifactStore:
             elif record.state != BehavioralEvaluationState.FAILED:
                 status = BehavioralArtifactStatus.ORPHAN_REGISTRY_REFERENCE
             if adapter_registry is not None:
+                if binding is not None:
+                    try:
+                        with self.adapter_lock(binding.adapter_id, blocking=False):
+                            binding = self._fresh_binding(
+                                adapter_registry, binding.adapter_id, evaluation_id
+                            )
+                            if (
+                                binding is not None
+                                and record.state
+                                == BehavioralEvaluationState.FINALIZED
+                                and binding.behavioral_artifact_state == "prepared"
+                            ):
+                                adapter_registry.finalize_behavioral_evaluation(
+                                    binding.adapter_id, evaluation_id=evaluation_id
+                                )
+                                binding = self._fresh_binding(
+                                    adapter_registry, binding.adapter_id, evaluation_id
+                                )
+                            if binding is not None and path.is_file():
+                                status = self._cross_registry_status(
+                                    record, path, binding
+                                )
+                            if (
+                                binding is not None
+                                and status == BehavioralArtifactStatus.VALID
+                                and binding.behavioral_artifact_state == "finalized"
+                            ):
+                                adapter_registry.mark_behavioral_evaluation_reconciled(
+                                    binding.adapter_id, evaluation_id=evaluation_id
+                                )
+                                binding = self._fresh_binding(
+                                    adapter_registry, binding.adapter_id, evaluation_id
+                                )
+                                record = record.model_copy(
+                                    update={
+                                        "state": BehavioralEvaluationState.RECONCILED,
+                                        "updated_at": datetime.now(UTC),
+                                    }
+                                )
+                    except BehavioralArtifactBusyError:
+                        pass
                 if binding is None and status == BehavioralArtifactStatus.VALID:
                     status = BehavioralArtifactStatus.ORPHAN_RESULT
                 elif binding is not None and status not in {
@@ -412,6 +482,26 @@ class BehavioralArtifactStore:
             )
         self._write_registry_locked(reconciled)
         return tuple(sorted(reconciled.values(), key=lambda item: item.evaluation_id))
+
+    def _fresh_binding(
+        self, adapter_registry: Any, adapter_id: str, evaluation_id: str
+    ) -> Any | None:
+        entry = adapter_registry.lookup(adapter_id)
+        if entry is None:
+            return None
+        if entry.behavioral_evaluation_id == evaluation_id:
+            return entry
+        if entry.real_model_behavioral_evaluation_id != evaluation_id:
+            return None
+        return SimpleNamespace(
+            adapter_id=entry.adapter_id,
+            adapter_hash=entry.adapter_hash,
+            base_model_revision=entry.base_model_revision,
+            behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
+            behavioral_evaluation_path=entry.real_model_behavioral_evaluation_path,
+            behavioral_result_hash=entry.real_model_behavioral_result_hash,
+            behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
+        )
 
     def _adapter_lease_active(self, adapter_key: str | None) -> bool:
         if adapter_key is None:

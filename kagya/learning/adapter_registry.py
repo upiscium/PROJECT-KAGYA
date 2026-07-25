@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -14,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from threading import Lock
 from typing import TYPE_CHECKING, Any
 import warnings
 
@@ -319,7 +318,7 @@ class AdapterEntry:
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=10 if schema_version >= 10 else 9,
+            schema_version=10,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -338,6 +337,22 @@ class AdapterRegistry:
         self.settings = settings
         self.path = settings.adapter_registry.path
         self._lock_path = Path(f"{self.path}.lock")
+        if self.path.exists():
+            with self._locked(exclusive=True):
+                with self.path.open("r", encoding="utf-8") as registry_file:
+                    raw = json.load(registry_file)
+                adapters = raw.get("adapters", []) if isinstance(raw, dict) else []
+                if any(
+                    isinstance(item, dict) and int(item.get("schema_version", 1)) < 10
+                    for item in adapters
+                ):
+                    self._write_locked(
+                        [
+                            AdapterEntry.from_json(item)
+                            for item in adapters
+                            if isinstance(item, dict)
+                        ]
+                    )
 
     def register_candidate(
         self,
@@ -428,7 +443,7 @@ class AdapterRegistry:
             return entry
 
     def list(self) -> list[AdapterEntry]:
-        with self._locked(exclusive=False):
+        with self._locked(exclusive=True):
             return self._list_locked()
 
     def _list_locked(self) -> builtins.list[AdapterEntry]:
@@ -437,16 +452,22 @@ class AdapterRegistry:
         with self.path.open("r", encoding="utf-8") as registry_file:
             data = json.load(registry_file)
         adapters = data.get("adapters", []) if isinstance(data, dict) else []
-        return [
+        entries = [
             AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)
         ]
+        if any(
+            isinstance(item, dict) and int(item.get("schema_version", 1)) < 10
+            for item in adapters
+        ):
+            self._write_locked(entries)
+        return entries
 
     def lookup(self, adapter_id: str) -> AdapterEntry | None:
-        with self._locked(exclusive=False):
+        with self._locked(exclusive=True):
             return self._lookup_locked(self._list_locked(), adapter_id)
 
     def lineage(self, adapter_id: str) -> builtins.list[AdapterEntry]:
-        with self._locked(exclusive=False):
+        with self._locked(exclusive=True):
             entries = self._list_locked()
             self._require_locked(entries, adapter_id)
             return self._lineage_locked(entries, adapter_id)
@@ -460,7 +481,7 @@ class AdapterRegistry:
         parent_adapter_id: str | None,
         parent_adapter_hash: str | None,
     ) -> None:
-        with self._locked(exclusive=False):
+        with self._locked(exclusive=True):
             self._validate_lineage_locked(
                 self._list_locked(),
                 adapter_id=adapter_id,
@@ -716,6 +737,8 @@ class AdapterRegistry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
+            if evaluation_id is None:
+                return entry
             if evaluation_id == entry.real_model_behavioral_evaluation_id:
                 return self._replace_locked(
                     entries,
@@ -724,6 +747,8 @@ class AdapterRegistry:
                     real_model_behavioral_gate_passed=False,
                     real_model_coverage_complete=False,
                 )
+            if evaluation_id != entry.behavioral_evaluation_id:
+                return entry
             return self._replace_locked(
                 entries,
                 adapter_id,
@@ -774,7 +799,7 @@ class AdapterRegistry:
             return self._replace_locked(entries, adapter_id, **updates)
 
     def activation_eligibility(self, adapter_id: str) -> ActivationEligibility:
-        with self._locked(exclusive=False):
+        with self._locked(exclusive=True):
             entry = self._require_locked(self._list_locked(), adapter_id)
             eligibility = _activation_eligibility(
                 entry, self.settings.adapter_registry.behavioral_activation_policy
@@ -787,7 +812,13 @@ class AdapterRegistry:
             return eligibility
 
     def activate(
-        self, adapter_id: str, *, activation_sequence: int | None = None
+        self,
+        adapter_id: str,
+        *,
+        activation_sequence: int | None = None,
+        loaded_adapter_manifest_hash: str | None = None,
+        loaded_adapter_manifest: Any | None = None,
+        runtime_switch: Callable[[AdapterEntry], None] | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
             current_entries = self._list_locked()
@@ -806,6 +837,14 @@ class AdapterRegistry:
                     f"Adapter activation ineligible [{eligibility.reason.value}]: "
                     f"{eligibility.detail}"
                 )
+            if runtime_switch is not None:
+                mismatch = _loaded_activation_mismatch(
+                    entry,
+                    loaded_adapter_manifest_hash=loaded_adapter_manifest_hash,
+                    loaded_adapter_manifest=loaded_adapter_manifest,
+                )
+                if mismatch is not None:
+                    raise ValueError(mismatch)
             previous_active = next(
                 (
                     item.adapter_id
@@ -837,6 +876,8 @@ class AdapterRegistry:
                 else:
                     entries.append(existing)
             assert activated is not None
+            if runtime_switch is not None:
+                runtime_switch(entry)
             self._write_locked(entries)
             return activated
 
@@ -1132,6 +1173,12 @@ def _behavioral_binding_mismatch(
         return "Behavioral evaluation base model mismatch"
     if manifest.base_model_revision != entry.base_model_revision:
         return "Behavioral evaluation base model revision mismatch"
+    if (
+        manifest.adapter_artifact_manifest is None
+        or manifest.adapter_artifact_manifest_hash
+        != manifest.adapter_artifact_manifest.sha256
+    ):
+        return "Adapter behavioral evidence has no current artifact manifest"
     return _adapter_artifact_mismatch(entry, manifest.candidate_adapter_path_hash)
 
 
@@ -1515,6 +1562,14 @@ def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibi
             ActivationEligibilityReason.SOURCE_PROVENANCE_INVALID,
             "Production evidence has no schema v10 provenance",
         )
+    if {result.runtime_kind.value for result in results} != {
+        "deterministic_runtime",
+        "real_model_runtime",
+    }:
+        return _ineligible(
+            ActivationEligibilityReason.SOURCE_PROVENANCE_INVALID,
+            "Production requires distinct deterministic and real-model evidence",
+        )
     source = resolve_source_build_info()
     for result in results:
         manifest = result.manifest
@@ -1542,31 +1597,32 @@ def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibi
             return _ineligible(
                 ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH, str(exc)
             )
-        if (
-            manifest.base_model_revision_resolved
-            != manifest.base_model_revision_requested
-        ):
-            return _ineligible(
-                ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
-                "Loaded model revision differs from the requested commit",
-            )
-        if (
-            manifest.processor_revision_resolved
-            != manifest.processor_revision_requested
-        ):
-            return _ineligible(
-                ActivationEligibilityReason.PROCESSOR_PROVENANCE_MISMATCH,
-                "Loaded processor revision differs from the requested commit",
-            )
-        if (
-            manifest.model_artifact_manifest is None
-            or manifest.model_artifact_manifest_hash
-            != manifest.model_artifact_manifest.sha256
-        ):
-            return _ineligible(
-                ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
-                "Model artifact manifest is missing or invalid",
-            )
+        if result.runtime_kind.value == "real_model_runtime":
+            if (
+                manifest.base_model_revision_resolved
+                != manifest.base_model_revision_requested
+            ):
+                return _ineligible(
+                    ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+                    "Loaded model revision differs from the requested commit",
+                )
+            if (
+                manifest.processor_revision_resolved
+                != manifest.processor_revision_requested
+            ):
+                return _ineligible(
+                    ActivationEligibilityReason.PROCESSOR_PROVENANCE_MISMATCH,
+                    "Loaded processor revision differs from the requested commit",
+                )
+            if (
+                manifest.model_artifact_manifest is None
+                or manifest.model_artifact_manifest_hash
+                != manifest.model_artifact_manifest.sha256
+            ):
+                return _ineligible(
+                    ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+                    "Model artifact manifest is missing or invalid",
+                )
         if manifest.evaluator_implementation_hash != current_evaluator_hash(
             result.runtime_kind
         ):
@@ -1590,6 +1646,26 @@ def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibi
         )
     real_manifest = real_result.manifest
     assert real_manifest is not None
+    deterministic_manifest = next(
+        result.manifest
+        for result in results
+        if result.runtime_kind.value == "deterministic_runtime"
+    )
+    assert deterministic_manifest is not None
+    if (
+        deterministic_manifest.base_model_revision_requested
+        != real_manifest.base_model_revision_requested
+        or deterministic_manifest.base_model_revision
+        != real_manifest.base_model_revision_requested
+        or real_manifest.base_model_revision_resolved
+        != deterministic_manifest.base_model_revision
+        or deterministic_manifest.processor_revision_requested
+        != real_manifest.processor_revision_requested
+    ):
+        return _ineligible(
+            ActivationEligibilityReason.MODEL_PROVENANCE_MISMATCH,
+            "Deterministic requested revisions differ from real-model provenance",
+        )
     try:
         current_adapter = build_adapter_artifact_manifest(
             Path(entry.path),
@@ -1610,12 +1686,17 @@ def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibi
             "Adapter config, weights, or PEFT provenance changed",
         )
     try:
-        snapshot = _local_model_snapshot(
+        model_snapshot = _local_model_snapshot(
             real_manifest.base_model_id,
             real_manifest.base_model_revision_resolved or "",
         )
+        processor_snapshot = _local_model_snapshot(
+            real_manifest.base_model_id,
+            real_manifest.processor_revision_resolved or "",
+        )
         current_model = _cached_model_manifest(
-            snapshot,
+            model_snapshot,
+            processor_snapshot=processor_snapshot,
             expected_hash=real_manifest.model_artifact_manifest_hash or "",
             model_id=real_manifest.base_model_id,
             requested_revision=real_manifest.base_model_revision_requested or "",
@@ -1644,6 +1725,45 @@ def _production_provenance_eligibility(entry: AdapterEntry) -> ActivationEligibi
     )
 
 
+def _loaded_activation_mismatch(
+    entry: AdapterEntry,
+    *,
+    loaded_adapter_manifest_hash: str | None,
+    loaded_adapter_manifest: Any | None,
+) -> str | None:
+    from kagya.artifact_provenance import build_adapter_artifact_manifest
+
+    if loaded_adapter_manifest is None or loaded_adapter_manifest_hash is None:
+        return "Loaded provider has no cryptographic adapter manifest"
+    try:
+        current = build_adapter_artifact_manifest(
+            Path(entry.path),
+            base_model_name=entry.base_model,
+            base_model_revision=entry.base_model_revision,
+        )
+    except ValueError as exc:
+        return str(exc)
+    if loaded_adapter_manifest != current or loaded_adapter_manifest_hash != current.sha256:
+        return "Loaded provider adapter manifest differs from the current registry artifact"
+    paths = (
+        entry.behavioral_evaluation_path,
+        entry.real_model_behavioral_evaluation_path,
+    )
+    try:
+        evidence = [_load_behavioral_result(Path(path))[0] for path in paths if path]
+    except ValueError as exc:
+        return str(exc)
+    for result in evidence:
+        manifest = result.manifest
+        if (
+            manifest is None
+            or manifest.adapter_artifact_manifest != current
+            or manifest.adapter_artifact_manifest_hash != current.sha256
+        ):
+            return "Loaded provider adapter manifest differs from behavioral evidence"
+    return None
+
+
 def _local_model_snapshot(model_id: str, revision: str) -> Path:
     local = Path(model_id)
     if local.is_dir():
@@ -1658,38 +1778,22 @@ def _local_model_snapshot(model_id: str, revision: str) -> Path:
         raise ValueError("Resolved model snapshot is unavailable") from exc
 
 
-_MODEL_MANIFEST_CACHE_LOCK = Lock()
-_MODEL_MANIFEST_CACHE: dict[
-    tuple[str, str], tuple[tuple[tuple[str, int, int, int, int], ...], Any]
-] = {}
-
-
 def _cached_model_manifest(
-    snapshot: Path, *, expected_hash: str, **manifest_kwargs: str
+    snapshot: Path,
+    *,
+    processor_snapshot: Path,
+    expected_hash: str,
+    **manifest_kwargs: str,
 ) -> Any:
-    """Avoid rehashing immutable weights unless fail-closed file metadata changes."""
+    """Rehash behavior-affecting files before every production activation."""
 
     from kagya.artifact_provenance import build_model_artifact_manifest
 
-    metadata = tuple(
-        (
-            path.relative_to(snapshot).as_posix(),
-            stat.st_size,
-            stat.st_mtime_ns,
-            stat.st_ctime_ns,
-            stat.st_ino,
-        )
-        for path in sorted(item for item in snapshot.rglob("*") if item.is_file())
-        for stat in (path.stat(),)
+    manifest = build_model_artifact_manifest(
+        snapshot, processor_snapshot=processor_snapshot, **manifest_kwargs
     )
-    key = (str(snapshot.resolve()), expected_hash)
-    with _MODEL_MANIFEST_CACHE_LOCK:
-        cached = _MODEL_MANIFEST_CACHE.get(key)
-        if cached is not None and cached[0] == metadata:
-            return cached[1]
-    manifest = build_model_artifact_manifest(snapshot, **manifest_kwargs)
-    with _MODEL_MANIFEST_CACHE_LOCK:
-        _MODEL_MANIFEST_CACHE[key] = (metadata, manifest)
+    if manifest.sha256 != expected_hash:
+        raise ValueError("Cached model artifact content differs from evaluation")
     return manifest
 
 

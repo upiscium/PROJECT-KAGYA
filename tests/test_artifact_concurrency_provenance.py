@@ -1,5 +1,6 @@
 import json
 import multiprocessing
+import os
 from pathlib import Path
 from threading import Barrier, Thread
 import time
@@ -20,6 +21,7 @@ from kagya.learning import (
     BehavioralArtifactStore,
     BehavioralEvaluationState,
 )
+from kagya.learning.adapter_registry import _cached_model_manifest
 
 
 def _prepare_process(
@@ -176,6 +178,7 @@ def test_interrupted_preprepare_state_is_failed_not_permanently_running(
 
     assert record.state == BehavioralEvaluationState.FAILED
     assert record.failure_code == "interrupted_before_prepare"
+    assert record.status == BehavioralArtifactStatus.ORPHAN_REGISTRY_REFERENCE
 
 
 def test_reconcile_does_not_fail_a_currently_locked_running_evaluation(
@@ -195,27 +198,34 @@ def test_canonical_manifests_detect_model_processor_weight_quant_and_adapter_cha
 ) -> None:
     commit = "a" * 40
     snapshot = tmp_path / "snapshot"
+    processor_snapshot = tmp_path / "processor-snapshot"
     snapshot.mkdir()
+    processor_snapshot.mkdir()
     for name, content in {
         "config.json": b"{}",
-        "processor_config.json": b"{}",
         "model.safetensors": b"weights",
         "quantization_config.json": b'{"bits":4}',
     }.items():
         (snapshot / name).write_bytes(content)
+    (snapshot / "custom_behavior.rules").write_bytes(b"rule=v1")
+    (processor_snapshot / "processor_config.json").write_bytes(b"{}")
+    (processor_snapshot / "chat_template.jinja").write_bytes(b"{{ messages }}")
+    (processor_snapshot / "tokenizer.tiktoken").write_bytes(b"token data")
     first = build_model_artifact_manifest(
         snapshot,
+        processor_snapshot=processor_snapshot,
         model_id="model",
         requested_revision=commit,
         resolved_revision=commit,
         processor_requested_revision=commit,
         processor_resolved_revision=commit,
     )
-    (snapshot / "processor_config.json").write_text(
+    (processor_snapshot / "processor_config.json").write_text(
         '{"changed":true}', encoding="utf-8"
     )
     second = build_model_artifact_manifest(
         snapshot,
+        processor_snapshot=processor_snapshot,
         model_id="model",
         requested_revision=commit,
         resolved_revision=commit,
@@ -223,9 +233,15 @@ def test_canonical_manifests_detect_model_processor_weight_quant_and_adapter_cha
         processor_resolved_revision=commit,
     )
     assert first.sha256 != second.sha256
+    assert "custom_behavior.rules" in {
+        item.filename for item in first.metadata_files
+    }
+    assert "tokenizer.tiktoken" in {
+        item.filename for item in first.processor_files
+    }
     assert all(
         not Path(item.filename).is_absolute()
-        for item in second.metadata_files + second.weight_files
+        for item in second.metadata_files + second.processor_files + second.weight_files
     )
 
     adapter = tmp_path / "adapter"
@@ -237,6 +253,44 @@ def test_canonical_manifests_detect_model_processor_weight_quant_and_adapter_cha
     adapter_first = build_adapter_artifact_manifest(adapter)
     (adapter / "adapter_model.safetensors").write_bytes(b"changed")
     assert adapter_first.sha256 != build_adapter_artifact_manifest(adapter).sha256
+
+
+def test_model_manifest_revalidation_detects_same_metadata_content_mutation(
+    tmp_path: Path,
+) -> None:
+    commit = "a" * 40
+    model = tmp_path / "model"
+    processor = tmp_path / "processor"
+    model.mkdir()
+    processor.mkdir()
+    config = model / "config.json"
+    config.write_bytes(b'{"mode":"a"}')
+    (model / "model.safetensors").write_bytes(b"weights")
+    (processor / "tokenizer.json").write_bytes(b'{"token":"a"}')
+    manifest = build_model_artifact_manifest(
+        model,
+        processor_snapshot=processor,
+        model_id="model",
+        requested_revision=commit,
+        resolved_revision=commit,
+        processor_requested_revision=commit,
+        processor_resolved_revision=commit,
+    )
+    stat = config.stat()
+    config.write_bytes(b'{"mode":"b"}')
+    os.utime(config, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    with pytest.raises(ValueError, match="content differs"):
+        _cached_model_manifest(
+            model,
+            processor_snapshot=processor,
+            expected_hash=manifest.sha256,
+            model_id="model",
+            requested_revision=commit,
+            resolved_revision=commit,
+            processor_requested_revision=commit,
+            processor_resolved_revision=commit,
+        )
 
 
 @pytest.mark.parametrize("revision", ["main", "master", "latest", "feature", "a" * 39])

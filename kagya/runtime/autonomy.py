@@ -170,7 +170,7 @@ class SubjectScheduler:
         self.reevaluation_interval_seconds = reevaluation_interval_seconds
         self.telemetry = telemetry
         self.clock = clock or (lambda: datetime.now(UTC))
-        self._clock_origin = self.clock()
+        self._domain_clock_anchors: dict[str, datetime] = {}
         self._lock = RLock()
         self._accepting = True
         self._last_cycle: SchedulerCycle | None = None
@@ -388,7 +388,7 @@ class SubjectScheduler:
                 )
                 schedules.append(
                     self._derived(
-                        f"intrinsic-deliberation:{goal.goal_id}:{wake_at.isoformat()}",
+                        f"intrinsic-deliberation:{goal.goal_id}:{goal.updated_at}",
                         WakeUpKind.INTRINSIC_DELIBERATION,
                         wake_at,
                         goal.goal_id,
@@ -431,7 +431,7 @@ class SubjectScheduler:
                 )
                 schedules.append(
                     self._derived(
-                        f"{kind.value}:{goal.goal_id}:{wake_at.isoformat()}",
+                        f"{kind.value}:{goal.goal_id}:{goal.updated_at}",
                         kind,
                         wake_at,
                         goal.goal_id,
@@ -462,7 +462,7 @@ class SubjectScheduler:
                 )
                 schedules.append(
                     self._derived(
-                        f"commitment-reevaluation:{commitment.commitment_id}:{wake_at.isoformat()}",
+                        f"commitment-reevaluation:{commitment.commitment_id}:{commitment.updated_at}",
                         WakeUpKind.COMMITMENT_REEVALUATION,
                         wake_at,
                         commitment.commitment_id,
@@ -476,7 +476,7 @@ class SubjectScheduler:
             )
             schedules.append(
                 self._derived(
-                    f"decision-outcome:{decision.decision_id}:{wake_at.isoformat()}",
+                    f"decision-outcome:{decision.decision_id}:{decision.updated_at}",
                     WakeUpKind.DECISION_OUTCOME,
                     wake_at,
                     decision.decision_id,
@@ -684,7 +684,7 @@ class SubjectScheduler:
                         ) + timedelta(seconds=definition.timeout_seconds)
                         schedules.append(
                             self._derived(
-                                f"step-timeout:{target}:{timeout_at.isoformat()}",
+                                f"step-timeout:{target}:{state.started_at.isoformat()}",
                                 WakeUpKind.STEP_TIMEOUT,
                                 timeout_at,
                                 target,
@@ -740,7 +740,7 @@ class SubjectScheduler:
             )
             schedules.append(
                 self._derived(
-                    f"motivation-reevaluation:{record.motivation_id}:{review_at.isoformat()}",
+                    f"motivation-reevaluation:{record.motivation_id}:{record.next_review_at or record.updated_at}",
                     WakeUpKind.MOTIVATION_REEVALUATION,
                     review_at,
                     record.target_ref,
@@ -751,7 +751,7 @@ class SubjectScheduler:
             )
             schedules.append(
                 self._derived(
-                    f"motivation-decay:{record.motivation_id}:{decay_at.isoformat()}",
+                    f"motivation-decay:{record.motivation_id}:{record.updated_at}",
                     WakeUpKind.MOTIVATION_DECAY,
                     decay_at,
                     record.motivation_id,
@@ -815,8 +815,10 @@ class SubjectScheduler:
         changed_at = datetime.fromisoformat(value) if isinstance(value, str) else value
         if changed_at.tzinfo is None:
             raise ValueError("Domain change timestamps must include a timezone")
-        if changed_at > self.clock():
-            return self._clock_origin
+        now = self.clock()
+        if changed_at > now:
+            raw = changed_at.isoformat()
+            return self._domain_clock_anchors.setdefault(raw, now)
         return changed_at
 
     def _derived(
@@ -923,6 +925,15 @@ class SubjectScheduler:
                 if getattr(intent, "intent_id", None) is None
                 else intent.status.value
             )
+            if getattr(intent, "intent_id", None) is None:
+                decision = self.main_loop.decision_store.get(decision_id)
+                if decision.status == DecisionStatus.AWAITING_OUTCOME:
+                    self.main_loop.record_decision_outcome(
+                        decision_id,
+                        description="action_validation_rejected",
+                        utility=-1.0,
+                        success=False,
+                    )
         elif schedule.kind == WakeUpKind.ACTION_EXECUTION:
             execution = getattr(self.main_loop, "action_execution", None)
             if execution is None:

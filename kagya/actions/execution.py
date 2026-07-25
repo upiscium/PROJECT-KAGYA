@@ -139,6 +139,7 @@ class ActionProvenance(_StrictModel):
 
 
 class ActionValidationErrorCode(StrEnum):
+    ACTION_CONTRACT_INVALID = "action_contract_invalid"
     TOOL_NOT_ALLOWLISTED = "tool_not_allowlisted"
     RISK_CLASS_DISABLED = "risk_class_disabled"
     ARGUMENTS_SCHEMA_INVALID = "arguments_schema_invalid"
@@ -465,19 +466,55 @@ class ActionExecutionLayer:
             for item in decision.considered_candidates
             if item.candidate.candidate_id == decision.selected_candidate_id
         )
-        if set(selected.parameters) != {"action"} or not isinstance(
-            selected.parameters["action"], dict
-        ):
-            raise ActionPolicyError("Selected candidate has no strict action contract")
-        contract = selected.parameters["action"]
-        if set(contract) != {"tool_name", "arguments"}:
-            raise ActionPolicyError("Selected action contract contains invalid fields")
+        malformed_parameters = (
+            not set(selected.parameters) <= {"action", "value_effects"}
+            or "action" not in selected.parameters
+            or not isinstance(selected.parameters["action"], dict)
+        )
+        contract = (
+            selected.parameters["action"] if not malformed_parameters else {}
+        )
         tool_name = contract.get("tool_name")
         arguments = contract.get("arguments")
-        if not isinstance(tool_name, str) or not isinstance(arguments, dict):
-            raise ActionPolicyError("Selected action contract has invalid types")
         now = self.clock()
         intent_id = str(uuid4())
+        if (
+            malformed_parameters
+            or set(contract) != {"tool_name", "arguments"}
+            or not isinstance(tool_name, str)
+            or not isinstance(arguments, dict)
+        ):
+            bounded_tool_name = (
+                tool_name[:128] if isinstance(tool_name, str) else "invalid_action"
+            )
+            validation = ActionValidationRecord(
+                validation_id=str(uuid4()),
+                tool_name=bounded_tool_name,
+                arguments_valid=False,
+                validation_schema_revision=_validation_schema_revision(
+                    bounded_tool_name, _TOOLS.get(bounded_tool_name)
+                ),
+                validation_error_codes=(
+                    ActionValidationErrorCode.ACTION_CONTRACT_INVALID,
+                ),
+                validated_event_id=event.event_id,
+                validated_event_sequence=event.processing_sequence,
+                canonical_arguments_digest=_digest(
+                    cast(dict[str, JsonValue], arguments)
+                    if isinstance(arguments, dict)
+                    else {"invalid_contract": True}
+                ),
+                validated_at=now,
+            )
+            self._save(
+                state.model_copy(
+                    update={
+                        "validation_records": (*state.validation_records, validation)
+                    }
+                )
+            )
+            return validation
+        assert isinstance(tool_name, str) and isinstance(arguments, dict)
         spec, validated, error_codes = self._validate_arguments(tool_name, arguments)
         validation = ActionValidationRecord(
             validation_id=str(uuid4()),
@@ -507,6 +544,13 @@ class ActionExecutionLayer:
             return validation
         bounded = budget or ActionBudget()
         if bounded.max_risk_class == "read_only" and spec.risk != RiskClass.READ_ONLY:
+            self._save(
+                state.model_copy(
+                    update={
+                        "validation_records": (*state.validation_records, validation)
+                    }
+                )
+            )
             raise ActionPolicyError("Tool exceeds the action risk budget")
         digest = _digest(validated)
         policy = PolicyEvaluation(
@@ -684,9 +728,11 @@ class ActionExecutionLayer:
     def execute(self, intent_id: str) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
-        arguments = self._validated_arguments_for_execution(intent)
-        if intent.status == IntentStatus.SUCCEEDED:
+        if intent.status == IntentStatus.SUCCEEDED and self._succeeded_receipt_valid(
+            state, intent
+        ):
             return intent
+        arguments = self._validated_arguments_for_execution(intent)
         if intent.dry_run:
             raise ActionPolicyError("Dry-run intents cannot execute")
         if intent.status not in {IntentStatus.APPROVED, IntentStatus.RETRY_PENDING}:
@@ -1387,9 +1433,59 @@ class ActionExecutionLayer:
             self._save(state)
             return state
         try:
-            if isinstance(raw, dict) and raw.get("schema_version") == 1:
+            migrated = isinstance(raw, dict) and raw.get("schema_version") == 1
+            if migrated:
                 raw = {**raw, "schema_version": 2, "validation_records": []}
-            return ActionState.model_validate(raw)
+            state = ActionState.model_validate(raw)
+            if migrated:
+                pending = {
+                    IntentStatus.AWAITING_APPROVAL,
+                    IntentStatus.APPROVED,
+                    IntentStatus.DRY_RUN,
+                    IntentStatus.EXECUTING,
+                    IntentStatus.RETRY_PENDING,
+                }
+                intents = []
+                for intent in state.intents:
+                    safe_success = (
+                        intent.status == IntentStatus.SUCCEEDED
+                        and self._succeeded_receipt_valid(state, intent)
+                    )
+                    if intent.status in pending or (
+                        intent.status == IntentStatus.SUCCEEDED and not safe_success
+                    ):
+                        intent = intent.model_copy(
+                            update={
+                                "revision": intent.revision + 1,
+                                "status": IntentStatus.REJECTED,
+                                "failure_code": "legacy_unvalidated_intent",
+                                "retry_at": None,
+                                "updated_at": self.clock(),
+                            }
+                        )
+                    intents.append(intent)
+                rejected_ids = {
+                    item.intent_id
+                    for item in intents
+                    if item.failure_code == "legacy_unvalidated_intent"
+                }
+                approvals = tuple(
+                    item.model_copy(
+                        update={
+                            "status": "rejected",
+                            "resolved_at": self.clock(),
+                            "reason": "legacy_unvalidated_intent",
+                        }
+                    )
+                    if item.intent_id in rejected_ids and item.status == "pending"
+                    else item
+                    for item in state.approvals
+                )
+                state = state.model_copy(
+                    update={"intents": tuple(intents), "approvals": approvals}
+                )
+                self._save(state)
+            return state
         except ValidationError as exc:
             raise ValueError("Invalid action execution state") from exc
 
@@ -1404,6 +1500,52 @@ class ActionExecutionLayer:
             for item in state.intents
         )
         self._save(state.model_copy(update={"intents": intents, **values}))
+
+    def _succeeded_receipt_valid(
+        self, state: ActionState, intent: ActionIntent
+    ) -> bool:
+        if intent.receipt_id is None:
+            return False
+        receipt = next(
+            (item for item in state.receipts if item.receipt_id == intent.receipt_id),
+            None,
+        )
+        if (
+            receipt is None
+            or receipt.status != ReceiptStatus.SUCCEEDED
+            or receipt.intent_id != intent.intent_id
+            or receipt.idempotency_key != intent.idempotency_key
+            or receipt.decision_id != intent.provenance.decision_id
+            or receipt.observation_id is None
+            or receipt.verification_id is None
+        ):
+            return False
+        observation = next(
+            (
+                item
+                for item in state.observations
+                if item.observation_id == receipt.observation_id
+            ),
+            None,
+        )
+        verification = next(
+            (
+                item
+                for item in state.verifications
+                if item.verification_id == receipt.verification_id
+            ),
+            None,
+        )
+        return bool(
+            observation is not None
+            and observation.intent_id == intent.intent_id
+            and observation.receipt_id == receipt.receipt_id
+            and observation.valid
+            and verification is not None
+            and verification.intent_id == intent.intent_id
+            and verification.observation_id == observation.observation_id
+            and verification.success
+        )
 
 
 def _digest(value: JsonValue | dict[str, JsonValue]) -> str:

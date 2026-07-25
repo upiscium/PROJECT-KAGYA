@@ -30,6 +30,7 @@ class ModelArtifactManifest(BaseModel):
     processor_requested_revision: str
     processor_resolved_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     metadata_files: tuple[ProvenanceFile, ...]
+    processor_files: tuple[ProvenanceFile, ...]
     weight_files: tuple[ProvenanceFile, ...]
     quantization_files: tuple[ProvenanceFile, ...]
 
@@ -67,7 +68,15 @@ _MODEL_METADATA = {
     "model_index.json",
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "spiece.model",
+    "tokenizer.model",
+    "chat_template.jinja",
 }
+
+_WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".pt", ".pth")
 
 
 def require_immutable_revision(value: str, label: str) -> str:
@@ -79,6 +88,7 @@ def require_immutable_revision(value: str, label: str) -> str:
 def build_model_artifact_manifest(
     snapshot: Path,
     *,
+    processor_snapshot: Path | None = None,
     model_id: str,
     requested_revision: str,
     resolved_revision: str,
@@ -90,22 +100,26 @@ def build_model_artifact_manifest(
         processor_resolved_revision, "resolved processor revision"
     )
     metadata: list[ProvenanceFile] = []
+    processor_files: list[ProvenanceFile] = []
     weights: list[ProvenanceFile] = []
     quantization: list[ProvenanceFile] = []
-    for path in sorted(item for item in snapshot.rglob("*") if item.is_file()):
+    for path in _regular_files(snapshot):
         relative = path.relative_to(snapshot).as_posix()
         record = _file_record(path, relative)
         lowered = path.name.casefold()
         if "quant" in lowered or "gptq" in lowered or "awq" in lowered:
             quantization.append(record)
-        elif lowered.endswith((".safetensors", ".bin", ".pt", ".pth")):
+        elif lowered.endswith(_WEIGHT_EXTENSIONS):
             weights.append(record)
-        elif (
-            path.name in _MODEL_METADATA
-            or "tokenizer" in lowered
-            or "processor" in lowered
-        ):
+        else:
             metadata.append(record)
+    processor_root = (processor_snapshot or snapshot).resolve()
+    for path in _regular_files(processor_root):
+        lowered = path.name.casefold()
+        if not lowered.endswith(_WEIGHT_EXTENSIONS):
+            processor_files.append(
+                _file_record(path, path.relative_to(processor_root).as_posix())
+            )
     if not weights:
         raise ValueError("Model snapshot contains no weight files")
     return ModelArtifactManifest(
@@ -115,6 +129,7 @@ def build_model_artifact_manifest(
         processor_requested_revision=processor_requested_revision,
         processor_resolved_revision=processor_resolved_revision,
         metadata_files=tuple(metadata),
+        processor_files=tuple(processor_files),
         weight_files=tuple(weights),
         quantization_files=tuple(quantization),
     )
@@ -195,6 +210,10 @@ def verify_attached_adapter_config(
         actual_value != expected_value for actual_value, expected_value in comparisons
     ):
         raise RuntimeError("Attached PEFT config does not match adapter manifest")
+
+
+def _regular_files(root: Path) -> list[Path]:
+    return sorted(item for item in root.rglob("*") if item.is_file())
 
 
 def _file_record(path: Path, relative: str) -> ProvenanceFile:

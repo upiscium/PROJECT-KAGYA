@@ -402,12 +402,14 @@ class BehavioralEvaluationManifest(_StrictModel):
     def migrate_pre_v10_manifest(cls, value: Any) -> Any:
         if not isinstance(value, dict) or "schema_version" in value:
             return value
+        if "source_revision_status" in value:
+            return {"schema_version": 10, **value}
         migrated = dict(value)
         base_revision = migrated.get("base_model_revision")
         migrated.update(
             {
                 "schema_version": 10,
-                "source_revision_status": "verified",
+                "source_revision_status": "unknown",
                 "source_tree_hash": None,
                 "build_id": None,
                 "base_model_revision_requested": base_revision,
