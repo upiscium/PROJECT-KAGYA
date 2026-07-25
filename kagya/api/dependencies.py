@@ -7,6 +7,7 @@ from fnmatch import fnmatchcase
 from hmac import compare_digest
 from ipaddress import ip_address
 import os
+from pathlib import Path
 from threading import RLock
 from typing import Callable, TypeVar
 from uuid import uuid4
@@ -15,6 +16,7 @@ from fastapi import Header, HTTPException, Request, status
 
 from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.actions import ActionExecutionLayer
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.config import Settings, TrainingBackendType, get_settings
 from kagya.learning import (
     AdapterEntry,
@@ -468,13 +470,31 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
     registry = get_adapter_registry(request)
 
     def load(entry: AdapterEntry | None) -> ModelProvider:
-        return load_model_provider(
+        manifest = (
+            None
+            if entry is None
+            else build_adapter_artifact_manifest(
+                Path(entry.path),
+                base_model_name=entry.base_model,
+                base_model_revision=entry.base_model_revision,
+            )
+        )
+        provider = load_model_provider(
             settings,
             adapter_path=None if entry is None else entry.path,
             allow_archived_adapter=(
                 entry is not None and entry.status == AdapterStatus.ARCHIVED
             ),
+            expected_adapter_hash=None if entry is None else entry.adapter_hash,
+            expected_adapter_manifest=manifest,
         )
+        if entry is not None and settings.model.provider == "dummy":
+            assert manifest is not None
+            provider.adapter_artifact_manifest = manifest  # type: ignore[attr-defined]
+            provider.adapter_artifact_manifest_hash = manifest.sha256  # type: ignore[attr-defined]
+            provider.adapter_snapshot_manifest_hash = manifest.sha256  # type: ignore[attr-defined]
+            provider.adapter_snapshot_hash = entry.adapter_hash  # type: ignore[attr-defined]
+        return provider
 
     def switch(
         provider: ModelProvider, entry: AdapterEntry | None, sequence: int | None
@@ -665,8 +685,16 @@ def _get_runtime_model_provider(
             getattr(request.app.state, "model_provider", None) is None
             or provider_adapter_id != active_adapter.adapter_id
         ):
+            manifest = build_adapter_artifact_manifest(
+                Path(active_adapter.path),
+                base_model_name=active_adapter.base_model,
+                base_model_revision=active_adapter.base_model_revision,
+            )
             request.app.state.model_provider = load_model_provider(
-                settings, adapter_path=active_adapter.path
+                settings,
+                adapter_path=active_adapter.path,
+                expected_adapter_hash=active_adapter.adapter_hash,
+                expected_adapter_manifest=manifest,
             )
             request.app.state.model_provider_adapter_id = active_adapter.adapter_id
         return request.app.state.model_provider

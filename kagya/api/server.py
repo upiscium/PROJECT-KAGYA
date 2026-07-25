@@ -3,6 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 import time
 
 import uvicorn
@@ -12,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from kagya.actions import ActionExecutionLayer
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.api.routes import (
     actions,
     attributions,
@@ -279,8 +281,25 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             and active_adapter is not None
             else None
         )
+        adapter_manifest = (
+            None
+            if active_adapter is None or adapter_path is None
+            else build_adapter_artifact_manifest(
+                Path(active_adapter.path),
+                base_model_name=active_adapter.base_model,
+                base_model_revision=active_adapter.base_model_revision,
+            )
+        )
+        active_adapter_hash = (
+            None if active_adapter is None else active_adapter.adapter_hash
+        )
         provider = (
-            load_model_provider(settings, adapter_path=adapter_path)
+            load_model_provider(
+                settings,
+                adapter_path=adapter_path,
+                expected_adapter_hash=active_adapter_hash,
+                expected_adapter_manifest=adapter_manifest,
+            )
             if adapter_path is not None
             else load_model_provider(settings)
         )

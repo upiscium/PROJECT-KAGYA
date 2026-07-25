@@ -9,7 +9,12 @@ import os
 from pathlib import Path
 from typing import Callable
 
-from kagya.config import Settings, load_settings
+from kagya.config import ProjectEnvironment, Settings, load_settings
+from kagya.artifact_provenance import (
+    AdapterArtifactManifest,
+    build_adapter_artifact_manifest,
+    require_immutable_revision,
+)
 from kagya.learning.behavioral_artifacts import BehavioralArtifactStore
 from kagya.learning.behavioral_evaluation import (
     BehavioralEvaluator,
@@ -39,9 +44,11 @@ class FallbackRejectingProvider:
         self.model_id = getattr(provider, "model_id", None)
         self.model_revision = getattr(provider, "model_revision", None)
         self.fallback_used = False
+        self.generation_count = 0
 
     def generate(self, prompt: str) -> str:
         value = self.provider.generate(prompt)
+        self.generation_count += 1
         self.fallback_used = self.fallback_used or bool(
             getattr(self.provider, "last_fallback_used", False)
         )
@@ -61,17 +68,24 @@ def load_real_model_provider_pair(
     settings: Settings,
     candidate_adapter_path: Path,
     *,
+    candidate_adapter_hash: str | None = None,
+    candidate_adapter_manifest: AdapterArtifactManifest | None = None,
     provider_loader: ProviderLoader = load_model_provider,
 ) -> tuple[FallbackRejectingProvider, FallbackRejectingProvider]:
     """Load an exact base and an exact base plus the registered candidate adapter."""
 
     baseline = FallbackRejectingProvider(provider_loader(settings), adapter_path=None)
+    candidate_kwargs: dict[str, object] = {
+        "adapter_path": candidate_adapter_path,
+        "allow_candidate_adapter": True,
+    }
+    if candidate_adapter_hash is not None and candidate_adapter_manifest is not None:
+        candidate_kwargs.update(
+            expected_adapter_hash=candidate_adapter_hash,
+            expected_adapter_manifest=candidate_adapter_manifest,
+        )
     candidate = FallbackRejectingProvider(
-        provider_loader(
-            settings,
-            adapter_path=candidate_adapter_path,
-            allow_candidate_adapter=True,
-        ),
+        provider_loader(settings, **candidate_kwargs),
         adapter_path=candidate_adapter_path.resolve(),
     )
     if baseline.provider is candidate.provider:
@@ -118,6 +132,11 @@ def run_real_model_runtime_evaluation(
         raise ValueError(
             "configured base model revision differs from candidate provenance"
         )
+    if settings.project.environment == ProjectEnvironment.PRODUCTION:
+        require_immutable_revision(settings.model.revision, "requested base revision")
+        require_immutable_revision(
+            settings.model.processor_revision, "requested processor revision"
+        )
     scenarios = list(
         deterministic_runtime_scenarios(
             subject_revision=subject_revision,
@@ -127,36 +146,91 @@ def run_real_model_runtime_evaluation(
     fixture_hashes = {
         item.scenario_id: scenario_fixture_hash(item) for item in scenarios
     }
-    manifest = _manifest(
-        settings,
-        candidate_id=candidate_id,
-        candidate_adapter_path=candidate_adapter_path,
-        candidate_adapter_hash=candidate_adapter_hash,
-        base_model_revision=base_model_revision,
-        subject_revision=subject_revision,
-        fixture_hashes=fixture_hashes,
-        evaluator_source=Path(__file__),
-    )
     run_root = (
         settings.adapter_registry.eval_result_dir
         / "behavioral"
         / "runtime"
         / evaluation_id
     )
+    candidate_adapter_manifest = build_adapter_artifact_manifest(
+        candidate_adapter_path,
+        base_model_name=settings.model.primary_id,
+        base_model_revision=base_model_revision,
+    )
     baseline, candidate = load_real_model_provider_pair(
-        settings, candidate_adapter_path, provider_loader=provider_loader
+        settings,
+        candidate_adapter_path,
+        candidate_adapter_hash=candidate_adapter_hash,
+        candidate_adapter_manifest=candidate_adapter_manifest,
+        provider_loader=provider_loader,
     )
     try:
         # Force the exact primary model before runtime generation. Candidate load
         # happens only after baseline unload so paired runs fit the same hardware.
         baseline.get_model()
+        baseline.get_processor()
+        resolved_model = getattr(baseline.provider, "resolved_model_revision", None)
+        resolved_processor = getattr(
+            baseline.provider, "resolved_processor_revision", None
+        )
+        model_manifest_hash = getattr(
+            baseline.provider, "model_artifact_manifest_hash", None
+        )
+        model_manifest = getattr(baseline.provider, "model_artifact_manifest", None)
         baseline_traces = _run_subject(
             scenarios, run_root / "baseline", settings, baseline_id, baseline
         )
         if baseline.fallback_used:
             raise RuntimeError("baseline real-model runtime used a fallback model")
         _unload_provider(baseline)
+
         candidate.get_model()
+        candidate.get_processor()
+        candidate_resolved_model = getattr(
+            candidate.provider, "resolved_model_revision", None
+        )
+        candidate_resolved_processor = getattr(
+            candidate.provider, "resolved_processor_revision", None
+        )
+        if (
+            resolved_model != candidate_resolved_model
+            or resolved_processor != candidate_resolved_processor
+            or resolved_model != settings.model.revision
+            or resolved_processor != settings.model.processor_revision
+        ):
+            raise RuntimeError("Loaded provider resolved revision mismatch")
+        if model_manifest_hash is None or model_manifest_hash != getattr(
+            candidate.provider, "model_artifact_manifest_hash", None
+        ):
+            raise RuntimeError("Loaded provider model artifact manifest mismatch")
+        expected_adapter_manifest_hash = getattr(
+            candidate.provider, "adapter_artifact_manifest_hash", None
+        )
+        if expected_adapter_manifest_hash is None:
+            raise RuntimeError("Loaded provider did not verify adapter provenance")
+        manifest = _manifest(
+            settings,
+            candidate_id=candidate_id,
+            candidate_adapter_path=candidate_adapter_path,
+            candidate_adapter_hash=candidate_adapter_hash,
+            base_model_revision=base_model_revision,
+            subject_revision=subject_revision,
+            fixture_hashes=fixture_hashes,
+            evaluator_source=Path(__file__),
+            base_model_revision_resolved=resolved_model,
+            processor_revision_resolved=resolved_processor,
+            model_artifact_manifest_hash=model_manifest_hash,
+            model_artifact_manifest=model_manifest,
+        )
+        if manifest.adapter_artifact_manifest_hash != expected_adapter_manifest_hash:
+            raise RuntimeError("Loaded provider adapter artifact manifest mismatch")
+        if (
+            settings.project.environment == ProjectEnvironment.PRODUCTION
+            and manifest.source_revision_status != "verified"
+        ):
+            raise RuntimeError(
+                "Production evaluation requires verified source provenance"
+            )
         candidate_traces = _run_subject(
             scenarios, run_root / "candidate", settings, candidate_id, candidate
         )
@@ -181,6 +255,15 @@ def run_real_model_runtime_evaluation(
         manifest=manifest,
         persist_result=False,
     )
+    result = result.model_copy(
+        update={
+            "baseline_generation_count": baseline.generation_count,
+            "candidate_generation_count": candidate.generation_count,
+            "provider_fallback_used": baseline.fallback_used or candidate.fallback_used,
+        }
+    )
+    if result.baseline_generation_count < 1 or result.candidate_generation_count < 1:
+        raise RuntimeError("Both real-model providers must generate at least once")
     artifact = BehavioralArtifactStore(
         settings.adapter_registry.eval_result_dir
     ).prepare(evaluation_id, result.model_dump(mode="json"))
@@ -224,42 +307,50 @@ def main() -> None:
     settings = load_settings(args.config)
     from kagya.learning.adapter_registry import AdapterRegistry
 
-    entry = AdapterRegistry(settings).lookup(args.adapter_id)
+    registry = AdapterRegistry(settings)
+    entry = registry.lookup(args.adapter_id)
     if entry is None or entry.adapter_hash is None or entry.base_model_revision is None:
         raise SystemExit("candidate adapter lacks complete registered provenance")
-    result, status = run_real_model_runtime_evaluation(
-        settings,
-        args.evaluation_id,
-        baseline_id="base-model",
-        candidate_id=entry.adapter_id,
-        candidate_adapter_path=Path(entry.path),
-        candidate_adapter_hash=entry.adapter_hash,
-        base_model_revision=entry.base_model_revision,
-    )
-    if status != "prepared":
-        raise SystemExit("real-model artifact was not prepared")
     store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
-    registry = AdapterRegistry(settings)
-    registry.prepare_behavioral_evaluation(
-        entry.adapter_id,
-        evaluation_id=args.evaluation_id,
-        prepared_path=store.prepared_path(args.evaluation_id),
-        final_path=store.final_path(args.evaluation_id),
-    )
-    store.finalize(args.evaluation_id)
-    registry.finalize_behavioral_evaluation(
-        entry.adapter_id, evaluation_id=args.evaluation_id
-    )
-    artifact = next(
-        item
-        for item in store.reconcile(registry)
-        if item.evaluation_id == args.evaluation_id
-    )
-    if artifact.status.value != "valid":
-        raise SystemExit("real-model artifact reconciliation failed")
-    registry.mark_behavioral_evaluation_reconciled(
-        entry.adapter_id, evaluation_id=args.evaluation_id
-    )
+    with store.adapter_lock(entry.adapter_id, blocking=False):
+        store.begin(args.evaluation_id, adapter_key=entry.adapter_id)
+        store.mark_running(args.evaluation_id)
+        try:
+            result, status = run_real_model_runtime_evaluation(
+                settings,
+                args.evaluation_id,
+                baseline_id="base-model",
+                candidate_id=entry.adapter_id,
+                candidate_adapter_path=Path(entry.path),
+                candidate_adapter_hash=entry.adapter_hash,
+                base_model_revision=entry.base_model_revision,
+            )
+            if status != "prepared":
+                raise RuntimeError("real-model artifact was not prepared")
+            registry.prepare_behavioral_evaluation(
+                entry.adapter_id,
+                evaluation_id=args.evaluation_id,
+                prepared_path=store.prepared_path(args.evaluation_id),
+                final_path=store.final_path(args.evaluation_id),
+            )
+            store.finalize(args.evaluation_id)
+            registry.finalize_behavioral_evaluation(
+                entry.adapter_id, evaluation_id=args.evaluation_id
+            )
+            artifact = next(
+                item
+                for item in store.reconcile(registry)
+                if item.evaluation_id == args.evaluation_id
+            )
+            if artifact.status.value != "valid":
+                raise RuntimeError("real-model artifact reconciliation failed")
+            registry.mark_behavioral_evaluation_reconciled(
+                entry.adapter_id, evaluation_id=args.evaluation_id
+            )
+            store.mark_reconciled(args.evaluation_id)
+        except (OSError, ValueError, RuntimeError):
+            store.fail(args.evaluation_id, "evaluation_failed")
+            raise
     print(
         json.dumps(
             {

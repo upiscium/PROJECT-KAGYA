@@ -98,18 +98,33 @@ class AdapterRuntimeManager:
             if previous.adapter_id is None
             else self.registry.lookup(previous.adapter_id)
         )
-        self.runtime_switch(staged_provider, entry, event.processing_sequence)
         try:
-            switched = self.runtime_snapshot()
-            if (
-                switched.provider is not staged_provider
-                or switched.adapter_id != entry.adapter_id
-                or switched.adapter_hash != entry.adapter_hash
-                or switched.activation_sequence != event.processing_sequence
-            ):
-                raise RuntimeError("runtime did not adopt the staged adapter")
+            def authoritative_switch(fresh: AdapterEntry) -> None:
+                self.runtime_switch(
+                    staged_provider, fresh, event.processing_sequence
+                )
+                switched = self.runtime_snapshot()
+                if (
+                    switched.provider is not staged_provider
+                    or switched.adapter_id != fresh.adapter_id
+                    or switched.adapter_hash != fresh.adapter_hash
+                    or switched.activation_sequence != event.processing_sequence
+                ):
+                    raise RuntimeError("runtime did not adopt the staged adapter")
+
             activated = self.registry.activate(
-                adapter_id, activation_sequence=event.processing_sequence
+                adapter_id,
+                activation_sequence=event.processing_sequence,
+                loaded_adapter_manifest_hash=getattr(
+                    staged_provider, "adapter_snapshot_manifest_hash", None
+                ),
+                loaded_adapter_manifest=getattr(
+                    staged_provider, "adapter_artifact_manifest", None
+                ),
+                loaded_adapter_hash=getattr(
+                    staged_provider, "adapter_snapshot_hash", None
+                ),
+                runtime_switch=authoritative_switch,
             )
         except Exception:
             self.runtime_switch(

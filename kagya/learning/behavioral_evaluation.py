@@ -12,8 +12,13 @@ from pathlib import Path
 import re
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from kagya.artifact_provenance import (
+    AdapterArtifactManifest,
+    ModelArtifactManifest,
+)
 
 if TYPE_CHECKING:
     from kagya.learning.adapter_registry import AdapterRegistry
@@ -21,7 +26,7 @@ if TYPE_CHECKING:
 
 SCENARIO_SCHEMA_VERSION = 1
 EVALUATOR_SCHEMA_VERSION = 1
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 10
 
 
 class _StrictModel(BaseModel):
@@ -239,6 +244,7 @@ class ActionAttempt(_StrictModel):
     approval_required: bool
     approved: bool
     executed: bool
+    authoritative: bool = True
 
 
 class RuntimeBehaviorObservation(_StrictModel):
@@ -332,7 +338,9 @@ class ScenarioEvaluation(_StrictModel):
     passed: bool
     failures: tuple[CheckFailure, ...]
     hard_gate_failures: tuple[HardGate, ...]
-    runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+    runtime_kind: BehavioralRuntimeKind = (
+        BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+    )
     evaluated_hard_gates: tuple[HardGate, ...] = ()
 
 
@@ -357,8 +365,11 @@ class SubjectEvaluation(_StrictModel):
 class BehavioralEvaluationManifest(_StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal[1] = 1
-    source_commit_sha: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    schema_version: Literal[10] = 10
+    source_commit_sha: str | None = Field(pattern=r"^[0-9a-f]{40}$")
+    source_revision_status: Literal["verified", "unknown", "dirty"]
+    source_tree_hash: str | None = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    build_id: str | None = Field(max_length=128)
     subject_revision: str = Field(min_length=1)
     runtime_schema_version: int = Field(ge=1)
     evaluator_schema_version: int = Field(ge=1)
@@ -367,10 +378,18 @@ class BehavioralEvaluationManifest(_StrictModel):
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     base_model_id: str = Field(min_length=1)
     base_model_revision: str = Field(min_length=1)
+    base_model_revision_requested: str | None
+    base_model_revision_resolved: str | None = Field(pattern=r"^[0-9a-f]{40}$")
+    processor_revision_requested: str | None
+    processor_revision_resolved: str | None = Field(pattern=r"^[0-9a-f]{40}$")
     base_model_artifact_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_artifact_manifest_hash: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    model_artifact_manifest: ModelArtifactManifest | None
     candidate_adapter_id: str = Field(min_length=1)
     candidate_adapter_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_adapter_path_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_artifact_manifest_hash: str | None = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_artifact_manifest: AdapterArtifactManifest | None
     tool_registry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     policy_revision: str = Field(min_length=1)
     state_schema_version: int = Field(ge=1)
@@ -378,9 +397,36 @@ class BehavioralEvaluationManifest(_StrictModel):
     coverage_manifest_revision: str = Field(min_length=1)
     coverage_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_pre_v10_manifest(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "schema_version" in value:
+            return value
+        if "source_revision_status" in value:
+            return {"schema_version": 10, **value}
+        migrated = dict(value)
+        base_revision = migrated.get("base_model_revision")
+        migrated.update(
+            {
+                "schema_version": 10,
+                "source_revision_status": "unknown",
+                "source_tree_hash": None,
+                "build_id": None,
+                "base_model_revision_requested": base_revision,
+                "base_model_revision_resolved": None,
+                "processor_revision_requested": base_revision,
+                "processor_revision_resolved": None,
+                "model_artifact_manifest_hash": None,
+                "model_artifact_manifest": None,
+                "adapter_artifact_manifest_hash": None,
+                "adapter_artifact_manifest": None,
+            }
+        )
+        return migrated
+
 
 class PairedBehavioralEvaluationResult(_StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[10] = 10
     evaluator_version: Literal[1] = 1
     evaluation_id: str = Field(pattern=r"^[A-Za-z0-9_.-]+$")
     created_at: datetime
@@ -410,6 +456,9 @@ class PairedBehavioralEvaluationResult(_StrictModel):
         "Action policy, approval, refusal, and idempotency gates enabled"
     )
     reproduction_artifacts: tuple[str, ...] = ()
+    baseline_generation_count: int = Field(default=0, ge=0)
+    candidate_generation_count: int = Field(default=0, ge=0)
+    provider_fallback_used: bool = False
 
     @model_validator(mode="after")
     def validate_runtime_binding(self) -> PairedBehavioralEvaluationResult:
@@ -838,7 +887,9 @@ class BehavioralEvaluator:
             baseline,
             candidate,
         )
-        runtime_coverage_required = runtime_kind != BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+        runtime_coverage_required = (
+            runtime_kind != BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT
+        )
         activation_gate_passed = _activation_gate_passes(
             coverage_complete=(
                 coverage.complete if runtime_coverage_required else True
@@ -903,13 +954,16 @@ class BehavioralEvaluator:
             for scenario, trace in zip(scenarios, traces)
         )
         dimension_scores = []
-        scored_dimensions = {item for scenario in scenarios for item in scenario.dimensions}
+        scored_dimensions = {
+            item for scenario in scenarios for item in scenario.dimensions
+        }
         requirements = None
         if runtime_kind != BehavioralRuntimeKind.SYNTHETIC_EVALUATOR_CONTRACT:
             from kagya.learning.behavioral_coverage import BEHAVIORAL_COVERAGE_MANIFEST
 
             requirements = {
-                item.dimension: item for item in BEHAVIORAL_COVERAGE_MANIFEST.requirements
+                item.dimension: item
+                for item in BEHAVIORAL_COVERAGE_MANIFEST.requirements
             }
         dimensions = set(requirements or scored_dimensions)
         for dimension in sorted(dimensions, key=str):
@@ -1169,7 +1223,7 @@ class BehavioralEvaluator:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
         try:
             with temporary.open("x", encoding="utf-8") as output:
                 json.dump(payload, output, indent=2, sort_keys=True, ensure_ascii=True)
@@ -1363,11 +1417,7 @@ def _manifest_hard_gates_for_scenario(
 
 def _string_leaves(value: Any) -> tuple[str, ...]:
     if isinstance(value, dict):
-        return tuple(
-            item
-            for child in value.values()
-            for item in _string_leaves(child)
-        )
+        return tuple(item for child in value.values() for item in _string_leaves(child))
     if isinstance(value, (list, tuple)):
         return tuple(item for child in value for item in _string_leaves(child))
     return (value,) if isinstance(value, str) and value else ()

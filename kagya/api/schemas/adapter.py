@@ -57,15 +57,13 @@ class AdapterResponse(BaseModel):
     real_model_behavioral_evaluation_id: str | None = None
     real_model_behavioral_gate_passed: bool | None = None
     real_model_behavioral_artifact_state: str = "unbound"
-    real_model_coverage_status: Literal[
-        "complete", "incomplete", "not_evaluated"
-    ] = "not_evaluated"
+    real_model_coverage_status: Literal["complete", "incomplete", "not_evaluated"] = (
+        "not_evaluated"
+    )
     real_model_behavioral_artifact_status: Literal[
         "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
     ] = "not_run"
-    behavioral_artifact_hash_match: Literal["passed", "failed", "not_run"] = (
-        "not_run"
-    )
+    behavioral_artifact_hash_match: Literal["passed", "failed", "not_run"] = "not_run"
     activation_eligibility_reason: str = ""
     real_model_behavioral_required: bool = False
     behavioral_activation_policy: Literal[
@@ -113,7 +111,7 @@ class AdapterBehavioralEvaluateResponse(BaseModel):
     activation_gate_passed: bool
     deterministic_runtime_gate_passed: bool
     real_model_runtime_gate_passed: bool
-    source_commit_sha: str
+    source_commit_sha: str | None
     adapter_hash: str
     base_model_revision: str
     fixture_set_hash: str

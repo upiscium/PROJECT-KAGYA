@@ -6,6 +6,7 @@ from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
@@ -37,6 +38,7 @@ from kagya.learning import (
     AdapterRuntimeManager,
     AdapterStatus,
     BehavioralArtifactStore,
+    BehavioralArtifactBusyError,
     BehavioralArtifactRecord,
     BehavioralArtifactStatus,
     run_deterministic_runtime_evaluation,
@@ -79,77 +81,33 @@ def behavioral_evaluate_adapter(
             detail="Adapter lacks cryptographic runtime evaluation provenance",
         )
 
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    reserved = False
     try:
-        policy = settings.adapter_registry.behavioral_activation_policy
-        if policy == BehavioralActivationPolicy.DISABLED:
-            raise HTTPException(
-                status_code=403, detail="Behavioral evaluation is disabled by policy"
+        with store.adapter_lock(adapter_id, blocking=False):
+            store.begin(request.evaluation_id, adapter_key=adapter_id)
+            reserved = True
+            store.mark_running(request.evaluation_id)
+            result, artifact_status = _run_and_bind_behavioral_evaluation(
+                settings=settings,
+                registry=registry,
+                runtime=runtime,
+                store=store,
+                adapter_id=adapter_id,
+                request=request,
+                entry_path=Path(entry.path),
+                adapter_hash=entry.adapter_hash,
+                base_model_revision=entry.base_model_revision,
             )
-        runtime_kind = (
-            "real_model_runtime"
-            if policy == BehavioralActivationPolicy.REAL_MODEL_REQUIRED
-            else "deterministic_runtime"
-        )
-        if request.runtime_kind is not None and request.runtime_kind != runtime_kind:
-            raise HTTPException(
-                status_code=(
-                    403
-                    if settings.project.environment == ProjectEnvironment.PRODUCTION
-                    else 409
-                ),
-                detail=f"Behavioral runtime kind is fixed by policy to {runtime_kind}",
-            )
-        evaluation_runner = (
-            run_real_model_runtime_evaluation
-            if runtime_kind == "real_model_runtime"
-            else run_deterministic_runtime_evaluation
-        )
-        result, artifact_status = evaluation_runner(
-            settings,
-            request.evaluation_id,
-            baseline_id=request.baseline_id,
-            candidate_id=adapter_id,
-            candidate_adapter_path=Path(entry.path),
-            candidate_adapter_hash=entry.adapter_hash or "",
-            base_model_revision=entry.base_model_revision or "",
-            subject_revision=request.subject_revision,
-        )
-        if artifact_status != "prepared":
-            raise ValueError("Behavioral artifact did not enter prepared state")
-        store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
-
-        def bind_and_finalize() -> str:
-            registry.prepare_behavioral_evaluation(
-                adapter_id,
-                evaluation_id=request.evaluation_id,
-                prepared_path=store.prepared_path(request.evaluation_id),
-                final_path=store.final_path(request.evaluation_id),
-            )
-            store.finalize(request.evaluation_id)
-            registry.finalize_behavioral_evaluation(
-                adapter_id, evaluation_id=request.evaluation_id
-            )
-            reconciled = store.reconcile(registry)
-            status = next(
-                item.status.value
-                for item in reconciled
-                if item.evaluation_id == request.evaluation_id
-            )
-            if status != "valid":
-                raise ValueError("Behavioral artifact cross-reconciliation failed")
-            registry.mark_behavioral_evaluation_reconciled(
-                adapter_id, evaluation_id=request.evaluation_id
-            )
-            return status
-
-        artifact_status = execute_agent_event(
-            runtime,
-            AgentEventType.BEHAVIORAL_EVALUATE,
-            source="api.adapters.behavioral_evaluation_binding",
-            handler=bind_and_finalize,
-            payload={"adapter_id": adapter_id, "evaluation_id": request.evaluation_id},
-        ).value
+    except BehavioralArtifactBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        if reserved:
+            store.fail(request.evaluation_id, "policy_rejected")
+        raise
     except (ValueError, RuntimeError) as exc:
+        if reserved:
+            store.fail(request.evaluation_id, "evaluation_failed")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     manifest = result.manifest
     assert manifest is not None
@@ -172,6 +130,90 @@ def behavioral_evaluate_adapter(
         artifact_status=artifact_status,
         artifact_path=f"behavioral/{request.evaluation_id}.json",
     )
+
+
+def _run_and_bind_behavioral_evaluation(
+    *,
+    settings: Settings,
+    registry: AdapterRegistry,
+    runtime: AgentRuntime,
+    store: BehavioralArtifactStore,
+    adapter_id: str,
+    request: AdapterBehavioralEvaluateRequest,
+    entry_path: Path,
+    adapter_hash: str,
+    base_model_revision: str,
+):
+    policy = settings.adapter_registry.behavioral_activation_policy
+    if policy == BehavioralActivationPolicy.DISABLED:
+        raise HTTPException(
+            status_code=403, detail="Behavioral evaluation is disabled by policy"
+        )
+    runtime_kind = (
+        "real_model_runtime"
+        if policy == BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+        else "deterministic_runtime"
+    )
+    if request.runtime_kind is not None and request.runtime_kind != runtime_kind:
+        raise HTTPException(
+            status_code=(
+                403
+                if settings.project.environment == ProjectEnvironment.PRODUCTION
+                else 409
+            ),
+            detail=f"Behavioral runtime kind is fixed by policy to {runtime_kind}",
+        )
+    evaluation_runner = (
+        run_real_model_runtime_evaluation
+        if runtime_kind == "real_model_runtime"
+        else run_deterministic_runtime_evaluation
+    )
+    result, artifact_status = evaluation_runner(
+        settings,
+        request.evaluation_id,
+        baseline_id=request.baseline_id,
+        candidate_id=adapter_id,
+        candidate_adapter_path=entry_path,
+        candidate_adapter_hash=adapter_hash,
+        base_model_revision=base_model_revision,
+        subject_revision=request.subject_revision,
+    )
+    if artifact_status != "prepared":
+        raise ValueError("Behavioral artifact did not enter prepared state")
+
+    def bind_and_finalize() -> str:
+        registry.prepare_behavioral_evaluation(
+            adapter_id,
+            evaluation_id=request.evaluation_id,
+            prepared_path=store.prepared_path(request.evaluation_id),
+            final_path=store.final_path(request.evaluation_id),
+        )
+        store.finalize(request.evaluation_id)
+        registry.finalize_behavioral_evaluation(
+            adapter_id, evaluation_id=request.evaluation_id
+        )
+        reconciled = store.reconcile(registry)
+        status = next(
+            item.status.value
+            for item in reconciled
+            if item.evaluation_id == request.evaluation_id
+        )
+        if status != "valid":
+            raise ValueError("Behavioral artifact cross-reconciliation failed")
+        registry.mark_behavioral_evaluation_reconciled(
+            adapter_id, evaluation_id=request.evaluation_id
+        )
+        store.mark_reconciled(request.evaluation_id)
+        return status
+
+    artifact_status = execute_agent_event(
+        runtime,
+        AgentEventType.BEHAVIORAL_EVALUATE,
+        source="api.adapters.behavioral_evaluation_binding",
+        handler=bind_and_finalize,
+        payload={"adapter_id": adapter_id, "evaluation_id": request.evaluation_id},
+    ).value
+    return result, artifact_status
 
 
 @router.get("/runtime", response_model=AdapterRuntimeStateResponse)
@@ -222,9 +264,7 @@ def behavioral_evaluation_status(
             "drift": _gate_status(entry.drift_gate_passed),
         },
         deterministic_status=eligibility.deterministic_status,
-        deterministic_coverage=_coverage_status(
-            entry.deterministic_coverage_complete
-        ),
+        deterministic_coverage=_coverage_status(entry.deterministic_coverage_complete),
         deterministic_artifact=_artifact_status(
             entry.behavioral_evaluation_id,
             entry.behavioral_artifact_state,
@@ -490,11 +530,25 @@ def _evaluate_candidate(
     if entry is None:
         raise ValueError(f"Unknown adapter: {adapter_id}")
     baseline = load_model_provider(settings)
-    candidate = load_model_provider(
-        settings,
-        adapter_path=entry.path,
-        allow_candidate_adapter=True,
-    )
+    if settings.model.provider.lower() == "transformers":
+        manifest = build_adapter_artifact_manifest(
+            Path(entry.path),
+            base_model_name=entry.base_model,
+            base_model_revision=entry.base_model_revision,
+        )
+        candidate = load_model_provider(
+            settings,
+            adapter_path=entry.path,
+            allow_candidate_adapter=True,
+            expected_adapter_hash=entry.adapter_hash,
+            expected_adapter_manifest=manifest,
+        )
+    else:
+        candidate = load_model_provider(
+            settings,
+            adapter_path=entry.path,
+            allow_candidate_adapter=True,
+        )
     return AdapterEvaluator(settings, registry).evaluate(
         adapter_id,
         candidate,
@@ -656,9 +710,7 @@ def adapter_response(
         real_model_behavioral_evaluation_id=entry.real_model_behavioral_evaluation_id,
         real_model_behavioral_gate_passed=entry.real_model_behavioral_gate_passed,
         real_model_behavioral_artifact_state=entry.real_model_behavioral_artifact_state,
-        real_model_coverage_status=_coverage_status(
-            entry.real_model_coverage_complete
-        ),
+        real_model_coverage_status=_coverage_status(entry.real_model_coverage_complete),
         real_model_behavioral_artifact_status=real_artifact,
         behavioral_artifact_hash_match=hash_match,
         activation_eligibility_reason=reason,
@@ -680,9 +732,9 @@ def adapter_response(
     )
 
 
-def _coverage_status(value: bool | None) -> Literal[
-    "complete", "incomplete", "not_evaluated"
-]:
+def _coverage_status(
+    value: bool | None,
+) -> Literal["complete", "incomplete", "not_evaluated"]:
     if value is None:
         return "not_evaluated"
     return "complete" if value else "incomplete"

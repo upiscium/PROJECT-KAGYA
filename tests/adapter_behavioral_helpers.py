@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from kagya.artifact_provenance import build_adapter_artifact_manifest
+
 from kagya.learning import (
     AdapterRegistry,
     BehavioralDimension,
@@ -48,6 +50,7 @@ def bind_runtime_behavioral_result(
     *,
     passed: bool = True,
     evaluation_id: str | None = None,
+    manifest_updates: dict[str, object] | None = None,
     runtime_kind: BehavioralRuntimeKind = BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
 ) -> Path:
     result_path = write_runtime_behavioral_result(
@@ -56,6 +59,7 @@ def bind_runtime_behavioral_result(
         adapter_id,
         passed=passed,
         evaluation_id=evaluation_id,
+        manifest_updates=manifest_updates,
         runtime_kind=runtime_kind,
     )
     registry.apply_behavioral_evaluation(
@@ -129,8 +133,17 @@ def write_runtime_behavioral_result(
     runtime_fixture_hashes = {
         item.scenario_id: scenario_fixture_hash(item) for item in runtime_scenarios
     }
+    adapter_manifest = build_adapter_artifact_manifest(
+        Path(entry.path),
+        base_model_name=entry.base_model,
+        base_model_revision=entry.base_model_revision,
+    )
     manifest_payload: dict[str, object] = {
+        "schema_version": 10,
         "source_commit_sha": "a" * 40,
+        "source_revision_status": "verified",
+        "source_tree_hash": "a" * 40,
+        "build_id": None,
         "subject_revision": "test-subject-revision",
         "runtime_schema_version": 1,
         "evaluator_schema_version": result.evaluator_version,
@@ -139,10 +152,18 @@ def write_runtime_behavioral_result(
         "config_hash": "b" * 64,
         "base_model_id": entry.base_model,
         "base_model_revision": entry.base_model_revision or "",
+        "base_model_revision_requested": entry.base_model_revision,
+        "base_model_revision_resolved": None,
+        "processor_revision_requested": entry.base_model_revision,
+        "processor_revision_resolved": None,
         "base_model_artifact_hash": "c" * 64,
         "candidate_adapter_id": adapter_id,
         "candidate_adapter_hash": entry.adapter_hash or "",
         "candidate_adapter_path_hash": entry.adapter_hash or "",
+        "model_artifact_manifest_hash": None,
+        "model_artifact_manifest": None,
+        "adapter_artifact_manifest_hash": adapter_manifest.sha256,
+        "adapter_artifact_manifest": adapter_manifest.model_dump(mode="json"),
         "tool_registry_hash": "d" * 64,
         "policy_revision": "test-policy-v1",
         "state_schema_version": 1,

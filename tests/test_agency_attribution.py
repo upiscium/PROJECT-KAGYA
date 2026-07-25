@@ -144,17 +144,25 @@ def test_failure_retains_own_contribution_without_self_incapacity_inference(
 ) -> None:
     loop, execution = _loop(tmp_path)
     _decision(loop, "decision-failure")
-    intent = execution.create_from_decision(
-        "decision-failure", idempotency_key="agency-failure"
-    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    intent = runtime.execute(
+        AgentEventType.ACTION_INTENT,
+        source="test.agency.failure-intent",
+        handler=lambda: execution.create_from_decision(
+            "decision-failure", idempotency_key="agency-failure"
+        ),
+    ).value
 
     def fail(_: object, __: object) -> object:
         raise ValueError("structured failure")
 
     execution._invoke = fail  # type: ignore[method-assign]
-    execution.execute(intent.intent_id)
-    runtime = AgentRuntime(queue_capacity=4)
-    runtime.start()
+    runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.agency.failure-execute",
+        handler=lambda: execution.execute(intent.intent_id),
+    )
     try:
         attribution = runtime.execute(
             AgentEventType.ATTRIBUTION_APPLY,
@@ -177,13 +185,21 @@ def test_revision_is_runtime_only_deduplicated_and_snapshot_restorable(
 ) -> None:
     loop, execution = _loop(tmp_path)
     _decision(loop, "decision-revision")
-    intent = execution.create_from_decision(
-        "decision-revision", idempotency_key="agency-revision"
-    )
-    execution.execute(intent.intent_id)
     runtime = AgentRuntime(queue_capacity=4)
     runtime.start()
     try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.agency.revision-intent",
+            handler=lambda: execution.create_from_decision(
+                "decision-revision", idempotency_key="agency-revision"
+            ),
+        ).value
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.agency.revision-execute",
+            handler=lambda: execution.execute(intent.intent_id),
+        )
         initial = runtime.execute(
             AgentEventType.ATTRIBUTION_APPLY,
             source="test.agency.initial",

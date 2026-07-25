@@ -146,10 +146,18 @@ def test_no_valid_alternative_does_not_schedule_or_infer(tmp_path: Path) -> None
     runtime = AgentRuntime(queue_capacity=16)
     runtime.start()
     try:
-        intent = execution.create_from_decision(
-            "decision-no-alternative", idempotency_key="no-alternative"
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.counterfactual.no-alternative-intent",
+            handler=lambda: execution.create_from_decision(
+                "decision-no-alternative", idempotency_key="no-alternative"
+            ),
+        ).value
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.counterfactual.no-alternative-execute",
+            handler=lambda: execution.execute(intent.intent_id),
         )
-        execution.execute(intent.intent_id)
         scheduler = SubjectScheduler(
             runtime,
             loop,
@@ -178,10 +186,18 @@ def test_attribution_revision_revises_simulation_once_and_snapshot_restores(
     runtime = AgentRuntime(queue_capacity=16)
     runtime.start()
     try:
-        intent = execution.create_from_decision(
-            "decision-revision", idempotency_key="counterfactual-revision"
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.counterfactual.revision-intent",
+            handler=lambda: execution.create_from_decision(
+                "decision-revision", idempotency_key="counterfactual-revision"
+            ),
+        ).value
+        runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.counterfactual.revision-execute",
+            handler=lambda: execution.execute(intent.intent_id),
         )
-        execution.execute(intent.intent_id)
         attribution = runtime.execute(
             AgentEventType.ATTRIBUTION_APPLY,
             source="test.counterfactual.attribution",

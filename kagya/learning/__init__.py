@@ -60,9 +60,11 @@ from kagya.learning.subject_behavioral_suite import (
     subject_completion_scenarios,
 )
 from kagya.learning.behavioral_artifacts import (
+    BehavioralArtifactBusyError,
     BehavioralArtifactRecord,
     BehavioralArtifactStatus,
     BehavioralArtifactStore,
+    BehavioralEvaluationState,
 )
 from kagya.learning.runtime_behavioral_harness import (
     AuthoritativeTransitionCollector,
@@ -102,9 +104,11 @@ __all__ = [
     "ActivationEligibilityReason",
     "BehavioralEvidenceStatus",
     "BehavioralEvaluationManifest",
+    "BehavioralArtifactBusyError",
     "BehavioralArtifactRecord",
     "BehavioralArtifactStatus",
     "BehavioralArtifactStore",
+    "BehavioralEvaluationState",
     "AdapterEntry",
     "AdapterEvaluationDecision",
     "AdapterEvaluationResult",

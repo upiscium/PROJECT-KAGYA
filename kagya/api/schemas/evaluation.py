@@ -58,6 +58,11 @@ class BehavioralEvaluationSummary(BaseModel):
     deterministic_runtime_gate_passed: bool = False
     real_model_runtime_gate_passed: bool = False
     activation_eligibility: str = "not_applicable"
+    evaluation_state: str = "finalized"
+    failure_code: str | None = None
+    source_integrity: str = "unknown"
+    model_integrity: str = "unknown"
+    artifact_integrity: str = "unknown"
 
 
 class BehavioralEvaluationHistoryResponse(BaseModel):

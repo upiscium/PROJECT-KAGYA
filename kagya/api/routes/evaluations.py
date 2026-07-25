@@ -30,6 +30,7 @@ from kagya.api.schemas.evaluation import (
 )
 from kagya.config import Settings
 from kagya.learning import (
+    BehavioralArtifactBusyError,
     BehavioralArtifactStore,
     AdapterRegistry,
     run_deterministic_subject_evaluation,
@@ -71,6 +72,9 @@ def list_behavioral_evaluations(
                     artifact_status=record.status.value,
                     quarantine_error="Artifact quarantined by integrity reconciliation",
                     created_at=record.updated_at.isoformat(),
+                    evaluation_state=record.state.value,
+                    failure_code=record.failure_code,
+                    artifact_integrity=record.status.value,
                 )
             )
             continue
@@ -87,6 +91,9 @@ def list_behavioral_evaluations(
                     update={
                         "artifact_status": record.status.value,
                         "activation_eligibility": eligibility,
+                        "evaluation_state": record.state.value,
+                        "failure_code": record.failure_code,
+                        "artifact_integrity": record.status.value,
                     }
                 )
             )
@@ -103,6 +110,9 @@ def list_behavioral_evaluations(
                     artifact_status="corrupt",
                     quarantine_error="Artifact could not be safely decoded",
                     created_at=record.updated_at.isoformat(),
+                    evaluation_state=record.state.value,
+                    failure_code=record.failure_code,
+                    artifact_integrity="corrupt",
                 )
             )
     return BehavioralEvaluationHistoryResponse(
@@ -270,23 +280,29 @@ def _rerun_runtime_evaluation(
         if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
         else None
     )
-    try:
-        current = _manifest(
-            settings,
-            candidate_id=entry.adapter_id,
-            candidate_adapter_path=Path(entry.path),
-            candidate_adapter_hash=entry.adapter_hash,
-            base_model_revision=entry.base_model_revision,
-            subject_revision=manifest.subject_revision,
-            fixture_hashes=fixture_hashes,
-            evaluator_source=evaluator_source,
-        )
-    except (OSError, ValueError) as exc:
-        raise HTTPException(
-            status_code=409, detail="Candidate artifact is missing or differs"
-        ) from exc
+    current = None
+    if runtime_kind != BehavioralRuntimeKind.REAL_MODEL_RUNTIME:
+        try:
+            current = _manifest(
+                settings,
+                candidate_id=entry.adapter_id,
+                candidate_adapter_path=Path(entry.path),
+                candidate_adapter_hash=entry.adapter_hash,
+                base_model_revision=entry.base_model_revision,
+                subject_revision=manifest.subject_revision,
+                fixture_hashes=fixture_hashes,
+                evaluator_source=evaluator_source,
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Candidate artifact is missing or differs: candidate_adapter_path_hash",
+            ) from exc
     immutable_fields = (
         "source_commit_sha",
+        "source_revision_status",
+        "source_tree_hash",
+        "build_id",
         "subject_revision",
         "runtime_schema_version",
         "evaluator_schema_version",
@@ -295,49 +311,67 @@ def _rerun_runtime_evaluation(
         "config_hash",
         "base_model_id",
         "base_model_revision",
+        "base_model_revision_requested",
+        "base_model_revision_resolved",
+        "processor_revision_requested",
+        "processor_revision_resolved",
         "base_model_artifact_hash",
+        "model_artifact_manifest_hash",
+        "model_artifact_manifest",
         "candidate_adapter_id",
         "candidate_adapter_hash",
         "candidate_adapter_path_hash",
+        "adapter_artifact_manifest_hash",
+        "adapter_artifact_manifest",
         "tool_registry_hash",
         "policy_revision",
         "state_schema_version",
         "evaluator_implementation_hash",
     )
-    mismatches = [
-        name
-        for name in immutable_fields
-        if getattr(current, name) != getattr(manifest, name)
-    ]
-    if original.fixture_hashes != fixture_hashes:
-        mismatches.append("fixture_hashes")
-    if mismatches:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Immutable rerun manifest differs: {', '.join(sorted(set(mismatches)))}; use a new evaluation ID",
-        )
     runner = (
         run_real_model_runtime_evaluation
         if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME
         else run_deterministic_runtime_evaluation
     )
+    store = BehavioralArtifactStore(settings.adapter_registry.eval_result_dir)
+    reserved = False
     try:
-        result, status = runner(
-            settings,
-            request.rerun_id,
-            baseline_id=original.baseline.subject_id,
-            candidate_id=entry.adapter_id,
-            candidate_adapter_path=Path(entry.path),
-            candidate_adapter_hash=entry.adapter_hash,
-            base_model_revision=entry.base_model_revision,
-            subject_revision=manifest.subject_revision,
-        )
-        if status != "prepared":
-            raise ValueError("Rerun artifact was not prepared")
-        BehavioralArtifactStore(settings.adapter_registry.eval_result_dir).finalize(
-            request.rerun_id
-        )
-    except (ValueError, RuntimeError) as exc:
+        with store.adapter_lock(entry.adapter_id, blocking=False):
+            store.begin(request.rerun_id, adapter_key=entry.adapter_id)
+            reserved = True
+            store.mark_running(request.rerun_id)
+            result, status = runner(
+                settings,
+                request.rerun_id,
+                baseline_id=original.baseline.subject_id,
+                candidate_id=entry.adapter_id,
+                candidate_adapter_path=Path(entry.path),
+                candidate_adapter_hash=entry.adapter_hash,
+                base_model_revision=entry.base_model_revision,
+                subject_revision=manifest.subject_revision,
+            )
+            if status != "prepared" or result.manifest is None:
+                raise ValueError("Rerun artifact was not prepared")
+            if runtime_kind == BehavioralRuntimeKind.REAL_MODEL_RUNTIME:
+                current = result.manifest
+            assert current is not None
+            mismatches = [
+                name
+                for name in immutable_fields
+                if getattr(current, name) != getattr(manifest, name)
+            ]
+            if original.fixture_hashes != fixture_hashes:
+                mismatches.append("fixture_hashes")
+            if mismatches:
+                raise ValueError(
+                    f"Immutable rerun manifest differs: {', '.join(sorted(set(mismatches)))}; use a new evaluation ID"
+                )
+            store.finalize(request.rerun_id)
+    except BehavioralArtifactBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        if reserved:
+            store.fail(request.rerun_id, "evaluation_failed")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return BehavioralRerunResponse(
         source_evaluation_id=original.evaluation_id,
@@ -470,6 +504,14 @@ def _behavioral_summary(path: Path) -> BehavioralEvaluationSummary:
         real_model_runtime_gate_passed=bool(
             payload.get("real_model_runtime_gate_passed", False)
         ),
+        source_integrity=str(manifest.get("source_revision_status", "unknown")),
+        model_integrity=(
+            "verified"
+            if manifest.get("model_artifact_manifest_hash")
+            and manifest.get("base_model_revision_resolved")
+            else "unknown"
+        ),
+        artifact_integrity="valid",
     )
 
 

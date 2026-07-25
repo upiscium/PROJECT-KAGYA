@@ -16,6 +16,11 @@ jobs:
       KAGYA_ADMIN_TOKEN: test-admin-token
     steps:
       - uses: actions/checkout@v4
+      - name: Export immutable build provenance
+        run: |
+          echo "KAGYA_SOURCE_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "KAGYA_SOURCE_TREE_HASH=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          echo "KAGYA_BUILD_ID=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

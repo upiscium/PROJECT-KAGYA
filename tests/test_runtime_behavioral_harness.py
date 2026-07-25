@@ -1,7 +1,9 @@
 from pathlib import Path
+import json
 
 import pytest
 
+from kagya.actions import ACTION_STATE_KEY, ActionState, ActionValidationRecord
 from kagya.config import load_settings
 from kagya.learning import (
     AuthoritativeTransitionCollector,
@@ -13,6 +15,10 @@ from kagya.identity import OriginActor
 from kagya.motivation import CommitmentStatus
 from kagya.runtime import AgentEventType, JournalLifecycle, hash_snapshot
 from kagya.outbox import OutboxMessageKind
+from kagya.learning.runtime_behavioral_runner import (
+    _create_action_decision,
+    _create_runtime_intent,
+)
 from kagya.training import DatasetCandidate, DatasetGovernanceStore, DatasetProvenance
 
 
@@ -89,6 +95,57 @@ def test_restart_builds_fresh_graph_and_restores_filesystem_state(
     commitments = harness.capture_authoritative_state()["domains"]["commitments"]
     assert commitments[0]["commitment_id"] == "restart-commitment"
     assert commitments[0]["status"] == CommitmentStatus.PROPOSED.value
+    harness.shutdown()
+
+
+def test_rejected_action_validation_survives_restart_and_wal_without_raw_args(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path).create().start()
+    private_path = "../private-validation-sentinel"
+    harness.execute(
+        AgentEventType.DECISION_UPDATE,
+        lambda loop: _create_action_decision(
+            loop,
+            "rejected-validation",
+            "document_search",
+            {"query": "secret-query", "relative_path": private_path},
+        ),
+    )
+    outcome = harness.execute(
+        AgentEventType.ACTION_INTENT,
+        lambda _loop: _create_runtime_intent(harness, "rejected-validation"),
+    )
+
+    record = outcome.value
+    assert isinstance(record, ActionValidationRecord)
+    assert record.arguments_valid is False
+    assert record.validated_event_id == outcome.event.event_id
+    assert record.validated_event_sequence == outcome.event.processing_sequence
+    assert harness.graph is not None
+    assert harness.graph.action_execution.list_intents() == ()
+    assert harness.graph.action_execution.list_receipts() == ()
+    assert harness.action_attempts()[0].arguments_valid is False
+    reconstructed = harness.graph.state_wal.reconstruct().snapshot
+    wal_state = ActionState.model_validate(
+        reconstructed.extensions[ACTION_STATE_KEY]
+    )
+    assert wal_state.validation_records == (record,)
+    serialized_action_state = json.dumps(wal_state.model_dump(mode="json"), sort_keys=True)
+    assert private_path not in serialized_action_state
+    assert "secret-query" not in serialized_action_state
+    public_result = json.dumps(harness.capture_authoritative_state(), sort_keys=True)
+    journal = harness.graph.event_journal.path.read_text(encoding="utf-8")
+    assert private_path not in public_result
+    assert "secret-query" not in public_result
+    assert private_path not in journal
+    assert "secret-query" not in journal
+
+    harness.restart()
+
+    assert harness.graph is not None
+    assert harness.graph.action_execution.list_validation_records() == (record,)
+    assert harness.action_attempts()[0].arguments_valid is False
     harness.shutdown()
 
 

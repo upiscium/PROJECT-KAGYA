@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.config import load_settings
 from kagya.learning import (
     AdapterEvaluator,
@@ -199,9 +200,23 @@ def test_canary_failure_automatically_rolls_back_without_real_model(
             provider,
         )
 
+    def load(selected):
+        provider = DummyProvider()
+        if selected is not None:
+            manifest = build_adapter_artifact_manifest(
+                Path(selected.path),
+                base_model_name=selected.base_model,
+                base_model_revision=selected.base_model_revision,
+            )
+            provider.adapter_artifact_manifest = manifest
+            provider.adapter_artifact_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_hash = selected.adapter_hash
+        return provider
+
     manager = AdapterRuntimeManager(
         registry,
-        provider_loader=lambda _entry: DummyProvider(),
+        provider_loader=load,
         runtime_switch=switch,
         runtime_snapshot=lambda: state[0],
         history_path=tmp_path / "activations.json",
