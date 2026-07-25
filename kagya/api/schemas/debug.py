@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel
 
+from kagya.structured_response import PublicBehaviorClass, StructuredResponseStatus
+
 from kagya.api.schemas.chat import AttachmentSchema, ChatResponse, EmotionSchema
 
 
@@ -95,6 +97,9 @@ class EmotionUpdateSchema(BaseModel):
 
 class DebugChatResponse(ChatResponse):
     hidden_thought: str
+    behavior_class: PublicBehaviorClass
+    response_parse_valid: bool
+    response_status: StructuredResponseStatus
     loss: float | None
     prompt: str
     attachments: list[AttachmentSchema]

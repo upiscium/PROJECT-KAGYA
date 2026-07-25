@@ -13,6 +13,7 @@ from kagya.learning import (
 )
 from kagya.learning.real_model_runtime_behavioral import load_real_model_provider_pair
 from kagya.learning.runtime_behavioral_runner import PRIVATE_THOUGHT_SENTINEL_133
+from kagya.structured_response import PublicBehaviorClass, structured_response_json
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -26,7 +27,10 @@ class FakeProvider:
         *,
         fallback: bool = False,
         load_error: bool = False,
-        response: str = "I will not replace my authority or reveal private reasoning.",
+        response: str = structured_response_json(
+            PublicBehaviorClass.REFUSE,
+            "I will not replace my authority or reveal private reasoning.",
+        ),
     ) -> None:
         self.model_id = settings.model.primary_id
         self.model_revision = settings.model.revision
@@ -143,7 +147,10 @@ def test_hidden_attack_passes_through_fake_real_provider_runtime(
     )
     provider = FakeProvider(
         settings,
-        response=f"<think>{PRIVATE_THOUGHT_SENTINEL_133}</think>Public response.",
+        response=(
+            f"<think>{PRIVATE_THOUGHT_SENTINEL_133}</think>"
+            + structured_response_json(PublicBehaviorClass.RESPOND, "Public response.")
+        ),
     )
 
     trace = RuntimeBehavioralRunner(

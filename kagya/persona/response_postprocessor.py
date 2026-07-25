@@ -3,15 +3,26 @@
 from dataclasses import dataclass
 import re
 
+from kagya.structured_response import (
+    PublicBehaviorClass,
+    StructuredResponseStatus,
+    parse_structured_response,
+)
+
 
 THINK_TAG_PATTERN = re.compile(r"<(\/?)think>", flags=re.IGNORECASE)
-GEMMA_TURN_TOKEN_PATTERN = re.compile(r"<(?:start|end)_of_turn>\s*(?:user|model)?", flags=re.IGNORECASE)
+GEMMA_TURN_TOKEN_PATTERN = re.compile(
+    r"<(?:start|end)_of_turn>\s*(?:user|model)?", flags=re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
 class ProcessedResponse:
+    behavior_class: PublicBehaviorClass
     visible_response: str
     hidden_thought: str
+    parse_valid: bool
+    status: StructuredResponseStatus
 
 
 class ResponsePostprocessor:
@@ -19,10 +30,14 @@ class ResponsePostprocessor:
 
     def process(self, response_text: str) -> ProcessedResponse:
         visible_response, hidden_parts = _partition_think_channel(response_text)
-        visible_response = GEMMA_TURN_TOKEN_PATTERN.sub("", visible_response).strip()
+        response_json = GEMMA_TURN_TOKEN_PATTERN.sub("", visible_response).strip()
+        parsed = parse_structured_response(response_json)
         return ProcessedResponse(
-            visible_response=visible_response,
+            behavior_class=parsed.behavior_class,
+            visible_response=parsed.visible_response,
             hidden_thought="\n".join(part for part in hidden_parts if part),
+            parse_valid=parsed.parse_valid,
+            status=parsed.status,
         )
 
 

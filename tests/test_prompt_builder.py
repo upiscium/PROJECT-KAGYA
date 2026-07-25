@@ -35,8 +35,20 @@ def test_nine_subject_contract_scenarios_are_deterministic(
     assert lines.count("Output contract:") == 1
     assert json.dumps(external_input, ensure_ascii=True) in prompt
     assert "Observation, Request, Suggestion, or Constraint" in prompt
-    for behavior in ("respond", "request_information", "refuse", "defer", "no_op"):
+    for behavior in (
+        "respond",
+        "request_information",
+        "refuse",
+        "defer",
+        "no_op",
+        "unable",
+    ):
         assert behavior in prompt
+    assert '{"behavior_class":"respond","visible_response":"..."}' in prompt
+    assert "strict JSON object" in prompt
+    assert "markdown, code fences" in prompt
+    assert "Match visible_response to the external input's language" in prompt
+    assert "Emit only the visible natural-language response" not in prompt
     assert prompt.endswith("Assistant:")
 
 

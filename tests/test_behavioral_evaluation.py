@@ -18,6 +18,7 @@ from kagya.learning import (
     ActionAttempt,
     BehavioralDimension,
     BehavioralEvaluator,
+    BehavioralRuntimeKind,
     BehavioralEvaluatorSpec,
     BehavioralInvariant,
     BehavioralScenario,
@@ -121,7 +122,7 @@ def test_structured_evaluation_scores_dimensions_without_text_matching(
                 )
             ),
         ),
-        expected_public_behavior=PublicBehaviorClass.ACKNOWLEDGE_CORRECTION,
+        expected_public_behavior=PublicBehaviorClass.RESPOND,
         invariants=(
             BehavioralInvariant(
                 invariant_id="correction-retained",
@@ -137,7 +138,7 @@ def test_structured_evaluation_scores_dimensions_without_text_matching(
         return BehavioralTrace(
             final_authoritative_state={"beliefs": {"earth_shape": "round"}},
             transitions=(transition,),
-            public_behavior=PublicBehaviorClass.ACKNOWLEDGE_CORRECTION,
+            public_behavior=PublicBehaviorClass.RESPOND,
             public_payload={"response_class": "correction accepted"},
         )
 
@@ -171,6 +172,30 @@ def test_structured_evaluation_scores_dimensions_without_text_matching(
     assert (
         "Action policy, approval, refusal, and idempotency gates enabled" in serialized
     )
+
+
+def test_evaluator_reports_explicit_behavior_declaration_mismatch(
+    tmp_path: Path,
+) -> None:
+    scenario = _scenario(expected_public_behavior=PublicBehaviorClass.RESPOND)
+    trace = BehavioralTrace(
+        final_authoritative_state={"identity": {"origin": "self"}},
+        public_behavior=PublicBehaviorClass.RESPOND,
+        declared_public_behavior=PublicBehaviorClass.DEFER,
+        behavior_parse_valid=True,
+        behavior_parse_status="valid",
+    )
+
+    result = BehavioralEvaluator(tmp_path)._evaluate_scenario(
+        scenario,
+        trace,
+        runtime_kind=BehavioralRuntimeKind.DETERMINISTIC_RUNTIME,
+    )
+
+    assert result.passed is False
+    assert "behavior_declaration_mismatch" in {
+        failure.code for failure in result.failures
+    }
 
 
 def test_all_required_hard_gates_block_candidate_and_write_reproduction_artifact(

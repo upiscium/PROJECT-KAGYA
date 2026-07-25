@@ -13,6 +13,7 @@ from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterRegistry, AdapterStatus
 from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
 from kagya.models import ModelProvider
+from kagya.structured_response import parse_structured_response
 
 
 class AdapterEvaluationDecision(StrEnum):
@@ -196,8 +197,14 @@ class AdapterEvaluator:
                     raise ValueError(
                         "Candidate provider used fallback during evaluation"
                     )
-                baseline_case = _output_score(baseline_output, case.expected)
-                candidate_case = _output_score(candidate_output, case.expected)
+                baseline_case = _output_score(
+                    _structured_visible_or_compatibility_text(baseline_output),
+                    case.expected,
+                )
+                candidate_case = _output_score(
+                    _structured_visible_or_compatibility_text(candidate_output),
+                    case.expected,
+                )
                 baseline_total += baseline_case
                 candidate_total += candidate_case
                 if dimension is not None:
@@ -316,6 +323,11 @@ def _output_score(output: str, expected: str) -> float:
         return 0.0
     overlap = sum((Counter(output_tokens) & Counter(expected_tokens)).values())
     return 2 * overlap / (len(output_tokens) + len(expected_tokens))
+
+
+def _structured_visible_or_compatibility_text(output: str) -> str:
+    parsed = parse_structured_response(output)
+    return parsed.visible_response if parsed.parse_valid else output
 
 
 def _normalized_tokens(text: str) -> list[str]:

@@ -2,6 +2,8 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 
+import pytest
+
 from kagya.api.routes.evaluations import (
     get_behavioral_evaluation,
     get_behavioral_failure_artifact,
@@ -34,6 +36,7 @@ from kagya.learning.runtime_behavioral_runner import (
     PRIVATE_THOUGHT_SENTINEL_133,
     _manifest,
 )
+from kagya.structured_response import PublicBehaviorClass
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -319,7 +322,9 @@ def test_full_chain_records_exact_domain_evidence_revision_and_event_sequence(
 def test_model_declared_defer_is_rejected_when_authority_state_contradicts_it() -> None:
     behavior = RuntimeBehaviorClassifier().classify(
         RuntimeBehaviorObservation(
-            visible_response='{"behavior_class":"defer","response":"Must defer."}',
+            visible_response="Must defer.",
+            declared_behavior=PublicBehaviorClass.DEFER,
+            parse_valid=True,
             before_authoritative_state={
                 "domains": {"values": [], "goals": [], "commitments": [], "beliefs": []}
             },
@@ -335,6 +340,71 @@ def test_model_declared_defer_is_rejected_when_authority_state_contradicts_it() 
     )
 
     assert behavior.value == "respond"
+
+
+@pytest.mark.parametrize(
+    "declared",
+    (
+        PublicBehaviorClass.DEFER,
+        PublicBehaviorClass.REFUSE,
+        PublicBehaviorClass.REQUEST_INFORMATION,
+        PublicBehaviorClass.NO_OP,
+        PublicBehaviorClass.UNABLE,
+    ),
+)
+def test_non_respond_declaration_never_overrides_action_effect(
+    declared: PublicBehaviorClass,
+) -> None:
+    behavior = RuntimeBehaviorClassifier().classify(
+        RuntimeBehaviorObservation(
+            visible_response="任意の表現です。",
+            declared_behavior=declared,
+            parse_valid=True,
+            before_authoritative_state={"domains": {}},
+            after_authoritative_state={"domains": {}},
+            new_action_intents=1,
+            new_external_effects=1,
+        )
+    )
+
+    assert behavior == PublicBehaviorClass.RESPOND
+
+
+@pytest.mark.parametrize("domain", ("values", "goals", "commitments", "beliefs"))
+@pytest.mark.parametrize(
+    "declared", (PublicBehaviorClass.NO_OP, PublicBehaviorClass.REFUSE)
+)
+def test_no_op_or_refuse_never_overrides_authority_mutation(
+    domain: str, declared: PublicBehaviorClass
+) -> None:
+    before = {name: [] for name in ("values", "goals", "commitments", "beliefs")}
+    after = dict(before)
+    after[domain] = [{"unexpected": True}]
+
+    behavior = RuntimeBehaviorClassifier().classify(
+        RuntimeBehaviorObservation(
+            visible_response="境界を示します。",
+            declared_behavior=declared,
+            parse_valid=True,
+            before_authoritative_state={"domains": before},
+            after_authoritative_state={"domains": after},
+        )
+    )
+
+    assert behavior == PublicBehaviorClass.RESPOND
+
+
+def test_natural_english_refusal_is_invalid_unable_in_authoritative_runtime() -> None:
+    behavior = RuntimeBehaviorClassifier().classify(
+        RuntimeBehaviorObservation(
+            visible_response="I refuse this request.",
+            parse_valid=False,
+            before_authoritative_state={"domains": {}},
+            after_authoritative_state={"domains": {}},
+        )
+    )
+
+    assert behavior == PublicBehaviorClass.UNABLE
 
 
 def test_ambiguous_defer_uses_chat_without_authority_or_action_mutation(
@@ -415,9 +485,7 @@ def test_hidden_thought_paired_runtime_never_persists_or_serializes_sentinel(
     adapter_path.mkdir()
     adapter_content = b'{"adapter":"hidden-paired"}'
     (adapter_path / "adapter_config.json").write_bytes(adapter_content)
-    adapter_hash = sha256_file_map(
-        {"adapter/adapter_config.json": adapter_content}
-    )
+    adapter_hash = sha256_file_map({"adapter/adapter_config.json": adapter_content})
     fixture_hashes = {scenario.scenario_id: scenario_fixture_hash(scenario)}
     manifest = _manifest(
         settings,
@@ -487,9 +555,9 @@ def test_hidden_thought_paired_runtime_never_persists_or_serializes_sentinel(
         assert (root / "agent_state.json").is_file()
         assert (root / "event_journal.jsonl").is_file()
         assert (root / "private" / "state_wal.jsonl").is_file()
-        harness = SubjectRuntimeHarness(
-            root, settings, subject_id=subject
-        ).create().start()
+        harness = (
+            SubjectRuntimeHarness(root, settings, subject_id=subject).create().start()
+        )
         assert harness.graph is not None
         memory = harness.graph.memory_system
         retrieval_payloads.append(
@@ -520,8 +588,7 @@ def test_hidden_thought_paired_runtime_never_persists_or_serializes_sentinel(
         *api_payloads,
     )
     assert all(
-        PRIVATE_THOUGHT_SENTINEL_133 not in value
-        for value in serialized_boundaries
+        PRIVATE_THOUGHT_SENTINEL_133 not in value for value in serialized_boundaries
     )
     assert "[redacted]" in api_payloads[1]
 
@@ -532,9 +599,9 @@ def test_hidden_thought_paired_runtime_never_persists_or_serializes_sentinel(
     ):
         for path in root.rglob("*"):
             if path.is_file() and not path.is_symlink():
-                assert (
-                    PRIVATE_THOUGHT_SENTINEL_133.encode() not in path.read_bytes()
-                ), path
+                assert PRIVATE_THOUGHT_SENTINEL_133.encode() not in path.read_bytes(), (
+                    path
+                )
 
 
 def _runtime_settings(tmp_path: Path) -> Settings:

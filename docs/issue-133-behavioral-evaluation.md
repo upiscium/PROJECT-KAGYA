@@ -6,7 +6,7 @@ Issue #133 has three deliberately separate evidence levels.
 - `deterministic_runtime` uses `SubjectRuntimeHarness` and fresh baseline/candidate runtime graphs. Actual transitions come from runtime events, before/after state diffs, Journal, WAL, Action evidence, Outbox, and revisioned domain stores. Only a finalized, reconciled `valid` artifact with its immutable manifest can bind the adapter registry.
 - `real_model_runtime` uses the same actual PromptBuilder, Working Memory, MainLoop, AgentRuntime, Scheduler, Action policy, and authoritative-state evaluator with two distinct Transformers providers. The baseline is the exact configured model/revision without an adapter; the candidate is that same model/revision with the registered candidate adapter path and hash. Adapter-load errors or any fallback usage fail the evaluation.
 
-Runtime execution reads fixture inputs only. Public behavior is classified after PromptBuilder, ModelProvider, and response postprocessing from the visible response plus observed Action and authority state. A model-declared behavior class is rejected when Action or authoritative Value, Goal, Commitment, or Belief state contradicts it. Expected behavior and transition fields are evaluator-only.
+Runtime execution reads fixture inputs only. The model must emit one exact JSON object with `behavior_class` and `visible_response`; malformed, missing, extra, unknown, or non-JSON output fails closed to a bounded `unable` response. The declaration is an input to evaluation, not authority: observed ActionIntent/tool effects and authoritative Value, Goal, Commitment, and Belief state take precedence and produce an explicit `behavior_declaration_mismatch` when they contradict `refuse`, `request_information`, `defer`, `no_op`, or `unable`. Expected behavior and transition fields remain evaluator-only. Raw model JSON and stripped `<think>` content are never persisted as public output.
 
 ## Coverage
 
@@ -42,7 +42,7 @@ Crash recovery uses `abrupt_stop`, which stops Autonomy and aborts AgentRuntime 
 
 ## Real Model
 
-Real-model validation is explicit and opt-in. It does not ask the model to classify behavior; the evaluator derives behavior from visible output, ActionIntent/effects, authoritative mutation, and policy invariants:
+Real-model validation is explicit and opt-in. It requires the model's structured public declaration, then independently reconciles that declaration with ActionIntent/effects, authoritative mutation, and policy invariants:
 
 ```bash
 KAGYA_RUN_REAL_MODEL_BEHAVIORAL=1 just behavioral-real-model \
@@ -55,6 +55,8 @@ KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml \
 ```
 
 Normal CI runs the synthetic evaluator contract, provider factories with fakes, and deterministic runtime suite. A green CI run never claims `real_model_runtime_gate_passed`; only the real-model runtime can create that evidence. Production activation requires current ordinary gates, a passed/finalized/reconciled deterministic architecture artifact, and a passed/finalized/reconciled real candidate-model artifact. Missing, failed, stale, corrupt, hash-mismatched, and coverage-incomplete real evidence have distinct bounded status and activation codes.
+
+Hardware-backed real-model evidence is pending until an explicitly opted-in run completes on the configured model and adapter artifacts. Deterministic local evidence does not substitute for that hardware result or alter production policy and artifact provenance requirements.
 
 ## Policy And Migration
 

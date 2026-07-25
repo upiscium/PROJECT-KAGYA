@@ -44,6 +44,7 @@ from kagya.runtime import (
 )
 from kagya.runtime.agent_state import AgentStateSnapshot
 from kagya.tools import ToolAuditLog, ToolExecutor, ToolRegistry
+from kagya.structured_response import PublicBehaviorClass
 
 
 T = TypeVar("T")
@@ -205,6 +206,10 @@ class AuthoritativeTransitionCollector:
         self,
         visible_response: str | None = None,
         *,
+        declared_behavior: PublicBehaviorClass | None = None,
+        parse_valid: bool | None = None,
+        parse_status: str | None = None,
+        runtime_state_behavior: PublicBehaviorClass | None = None,
         duplicate_retry: bool = False,
         duplicate_tool_calls: int = 0,
         duplicate_receipts: int = 0,
@@ -260,6 +265,9 @@ class AuthoritativeTransitionCollector:
         behavior = RuntimeBehaviorClassifier().classify(
             RuntimeBehaviorObservation(
                 visible_response=visible_response,
+                declared_behavior=declared_behavior,
+                parse_valid=parse_valid,
+                runtime_state_behavior=runtime_state_behavior,
                 before_authoritative_state=self.before,
                 after_authoritative_state=after,
                 new_action_intents=max(0, len(after_intents) - len(before_intents)),
@@ -281,12 +289,15 @@ class AuthoritativeTransitionCollector:
             final_authoritative_state=after,
             transitions=transitions,
             public_behavior=behavior,
+            declared_public_behavior=declared_behavior,
+            behavior_parse_valid=parse_valid,
+            behavior_parse_status=parse_status,
             public_payload=cast(
                 dict[str, JsonValue],
                 _json_value(
                     payload
                     or {
-                        "response": visible_response or "",
+                        "visible_response": visible_response or "",
                         "classified_behavior": behavior.value,
                     }
                 ),
@@ -524,6 +535,10 @@ class SubjectRuntimeHarness:
         collector: AuthoritativeTransitionCollector,
         visible_response: str | None = None,
         *,
+        declared_behavior: PublicBehaviorClass | None = None,
+        parse_valid: bool | None = None,
+        parse_status: str | None = None,
+        runtime_state_behavior: PublicBehaviorClass | None = None,
         duplicate_retry: bool = False,
         duplicate_tool_calls: int = 0,
         duplicate_receipts: int = 0,
@@ -531,6 +546,10 @@ class SubjectRuntimeHarness:
     ) -> BehavioralTrace:
         return collector.capture(
             visible_response,
+            declared_behavior=declared_behavior,
+            parse_valid=parse_valid,
+            parse_status=parse_status,
+            runtime_state_behavior=runtime_state_behavior,
             duplicate_retry=duplicate_retry,
             duplicate_tool_calls=duplicate_tool_calls,
             duplicate_receipts=duplicate_receipts,
