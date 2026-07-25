@@ -6,6 +6,7 @@ from typing import Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
@@ -529,11 +530,25 @@ def _evaluate_candidate(
     if entry is None:
         raise ValueError(f"Unknown adapter: {adapter_id}")
     baseline = load_model_provider(settings)
-    candidate = load_model_provider(
-        settings,
-        adapter_path=entry.path,
-        allow_candidate_adapter=True,
-    )
+    if settings.model.provider.lower() == "transformers":
+        manifest = build_adapter_artifact_manifest(
+            Path(entry.path),
+            base_model_name=entry.base_model,
+            base_model_revision=entry.base_model_revision,
+        )
+        candidate = load_model_provider(
+            settings,
+            adapter_path=entry.path,
+            allow_candidate_adapter=True,
+            expected_adapter_hash=entry.adapter_hash,
+            expected_adapter_manifest=manifest,
+        )
+    else:
+        candidate = load_model_provider(
+            settings,
+            adapter_path=entry.path,
+            allow_candidate_adapter=True,
+        )
     return AdapterEvaluator(settings, registry).evaluate(
         adapter_id,
         candidate,

@@ -195,6 +195,8 @@ def _manager(registry, state, tmp_path: Path) -> AdapterRuntimeManager:
             )
             provider.adapter_artifact_manifest = manifest
             provider.adapter_artifact_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_hash = entry.adapter_hash
         return provider
 
     return AdapterRuntimeManager(

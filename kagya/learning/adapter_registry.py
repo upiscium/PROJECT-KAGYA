@@ -818,6 +818,7 @@ class AdapterRegistry:
         activation_sequence: int | None = None,
         loaded_adapter_manifest_hash: str | None = None,
         loaded_adapter_manifest: Any | None = None,
+        loaded_adapter_hash: str | None = None,
         runtime_switch: Callable[[AdapterEntry], None] | None = None,
     ) -> AdapterEntry:
         with self._locked(exclusive=True):
@@ -842,6 +843,7 @@ class AdapterRegistry:
                     entry,
                     loaded_adapter_manifest_hash=loaded_adapter_manifest_hash,
                     loaded_adapter_manifest=loaded_adapter_manifest,
+                    loaded_adapter_hash=loaded_adapter_hash,
                 )
                 if mismatch is not None:
                     raise ValueError(mismatch)
@@ -1730,11 +1732,14 @@ def _loaded_activation_mismatch(
     *,
     loaded_adapter_manifest_hash: str | None,
     loaded_adapter_manifest: Any | None,
+    loaded_adapter_hash: str | None,
 ) -> str | None:
     from kagya.artifact_provenance import build_adapter_artifact_manifest
 
     if loaded_adapter_manifest is None or loaded_adapter_manifest_hash is None:
         return "Loaded provider has no cryptographic adapter manifest"
+    if entry.adapter_hash is None or loaded_adapter_hash != entry.adapter_hash:
+        return "Loaded provider adapter hash differs from the registry artifact hash"
     try:
         current = build_adapter_artifact_manifest(
             Path(entry.path),

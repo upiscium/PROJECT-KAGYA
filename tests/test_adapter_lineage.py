@@ -210,6 +210,8 @@ def test_canary_failure_automatically_rolls_back_without_real_model(
             )
             provider.adapter_artifact_manifest = manifest
             provider.adapter_artifact_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_hash = selected.adapter_hash
         return provider
 
     manager = AdapterRuntimeManager(

@@ -1,8 +1,13 @@
 """Hugging Face Transformers-backed model provider."""
 
+import os
+import errno
 from pathlib import Path
+import shutil
 from typing import Any
+import hashlib
 import json
+from uuid import uuid4
 
 import torch
 from peft import PeftModel
@@ -11,6 +16,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndByte
 from kagya.config import Settings
 from kagya.attachments import ProcessedImageAttachment, validate_image_attachments
 from kagya.artifact_provenance import (
+    AdapterArtifactManifest,
     build_adapter_artifact_manifest,
     build_model_artifact_manifest,
     verify_attached_adapter_config,
@@ -33,6 +39,8 @@ class TransformersProvider:
         processor: Any | None = None,
         allow_candidate_adapter: bool = False,
         allow_archived_adapter: bool = False,
+        expected_adapter_hash: str | None = None,
+        expected_adapter_manifest: AdapterArtifactManifest | None = None,
     ) -> None:
         self.settings = settings
         self.model_id = settings.model.primary_id
@@ -56,8 +64,16 @@ class TransformersProvider:
         self.model_artifact_manifest: Any | None = None
         self.adapter_artifact_manifest_hash: str | None = None
         self.adapter_artifact_manifest: Any | None = None
+        self.adapter_snapshot_manifest_hash: str | None = None
+        self.adapter_snapshot_hash: str | None = None
         if model is not None and adapter_path is not None:
-            self.attach_adapter(adapter_path)
+            self.attach_adapter(
+                adapter_path,
+                expected_adapter_hash=expected_adapter_hash,
+                expected_adapter_manifest=expected_adapter_manifest,
+            )
+        self._expected_adapter_hash = expected_adapter_hash
+        self._expected_adapter_manifest = expected_adapter_manifest
 
     def generate(self, prompt: str) -> str:
         self.last_model_id = self.model_id
@@ -190,7 +206,13 @@ class TransformersProvider:
     def get_processor(self) -> Any:
         return self._get_primary_processor()
 
-    def attach_adapter(self, adapter_path: str | Path) -> None:
+    def attach_adapter(
+        self,
+        adapter_path: str | Path,
+        *,
+        expected_adapter_hash: str | None,
+        expected_adapter_manifest: AdapterArtifactManifest | None,
+    ) -> None:
         if not is_registry_approved_adapter(
             self.settings,
             adapter_path,
@@ -198,17 +220,32 @@ class TransformersProvider:
             allow_archived=self.allow_archived_adapter,
         ):
             raise ValueError("Adapter path is not approved by the adapter registry")
-        manifest = build_adapter_artifact_manifest(
+        if expected_adapter_hash is None or expected_adapter_manifest is None:
+            raise ValueError("Adapter load requires registry hash and artifact manifest")
+        snapshot = _verified_adapter_snapshot(
+            self.settings,
             Path(adapter_path),
-            base_model_name=self.model_id,
-            base_model_revision=self.model_revision,
+            expected_adapter_hash=expected_adapter_hash,
+            expected_manifest=expected_adapter_manifest,
+        )
+        _verify_adapter_artifact(
+            snapshot,
+            expected_adapter_hash=expected_adapter_hash,
+            expected_manifest=expected_adapter_manifest,
         )
         if self.model is None:
             self.model = self._load_model(self.model_id)
-        self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
-        verify_attached_adapter_config(self.model, manifest)
-        self.adapter_artifact_manifest_hash = manifest.sha256
-        self.adapter_artifact_manifest = manifest
+        self.model = PeftModel.from_pretrained(self.model, str(snapshot))
+        snapshot_manifest, snapshot_hash = _verify_adapter_artifact(
+            snapshot,
+            expected_adapter_hash=expected_adapter_hash,
+            expected_manifest=expected_adapter_manifest,
+        )
+        verify_attached_adapter_config(self.model, snapshot_manifest)
+        self.adapter_artifact_manifest_hash = snapshot_manifest.sha256
+        self.adapter_artifact_manifest = snapshot_manifest
+        self.adapter_snapshot_manifest_hash = snapshot_manifest.sha256
+        self.adapter_snapshot_hash = snapshot_hash
         self._adapter_attached = True
 
     def _get_primary_processor(self) -> Any:
@@ -225,7 +262,11 @@ class TransformersProvider:
             self.model = self._load_model(self.model_id)
             self._adapter_attached = False
         if self.adapter_path is not None and not self._adapter_attached:
-            self.attach_adapter(self.adapter_path)
+            self.attach_adapter(
+                self.adapter_path,
+                expected_adapter_hash=self._expected_adapter_hash,
+                expected_adapter_manifest=self._expected_adapter_manifest,
+            )
         return self.model
 
     def _get_fallback_processor(self) -> Any:
@@ -306,6 +347,137 @@ class TransformersProvider:
         if device is None:
             return inputs
         return {key: value.to(device) for key, value in inputs.items()}
+
+
+def _verified_adapter_snapshot(
+    settings: Settings,
+    source: Path,
+    *,
+    expected_adapter_hash: str,
+    expected_manifest: AdapterArtifactManifest,
+) -> Path:
+    source = source.expanduser().resolve()
+    source_manifest, source_hash = _verify_adapter_artifact(
+        source,
+        expected_adapter_hash=expected_adapter_hash,
+        expected_manifest=expected_manifest,
+    )
+    source_state = _adapter_file_state(source)
+    runtime_root = settings.adapter_registry.path.parent / ".adapter-runtime"
+    runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(runtime_root, 0o700)
+    target = runtime_root / source_hash
+    if target.exists():
+        _verify_adapter_artifact(
+            target,
+            expected_adapter_hash=expected_adapter_hash,
+            expected_manifest=expected_manifest,
+        )
+        return target
+
+    temporary = runtime_root / f".{source_hash}.{uuid4().hex}.tmp"
+    temporary.mkdir(mode=0o700)
+    try:
+        for item in _adapter_files(source):
+            relative = item.relative_to(source)
+            destination = temporary / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with item.open("rb") as source_file, destination.open("xb") as target_file:
+                shutil.copyfileobj(source_file, target_file)
+        if _adapter_file_state(source) != source_state:
+            raise RuntimeError("Adapter source changed while creating runtime snapshot")
+        _verify_adapter_artifact(
+            temporary,
+            expected_adapter_hash=source_hash,
+            expected_manifest=source_manifest,
+        )
+        _make_snapshot_read_only(temporary)
+        try:
+            temporary.rename(target)
+        except OSError as exc:
+            if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not target.exists():
+                raise
+            _verify_adapter_artifact(
+                target,
+                expected_adapter_hash=expected_adapter_hash,
+                expected_manifest=expected_manifest,
+            )
+        return target
+    finally:
+        if temporary.exists():
+            _make_snapshot_writable(temporary)
+            shutil.rmtree(temporary)
+
+
+def _verify_adapter_artifact(
+    path: Path,
+    *,
+    expected_adapter_hash: str,
+    expected_manifest: AdapterArtifactManifest,
+) -> tuple[AdapterArtifactManifest, str]:
+    manifest = build_adapter_artifact_manifest(
+        path,
+        base_model_name=expected_manifest.base_model_name,
+        base_model_revision=expected_manifest.base_model_revision,
+    )
+    files = {
+        (Path("adapter") / item.relative_to(path)).as_posix(): item.read_bytes()
+        for item in _adapter_files(path)
+    }
+    adapter_hash = _adapter_file_map_hash(files)
+    if manifest != expected_manifest or manifest.sha256 != expected_manifest.sha256:
+        raise RuntimeError("Adapter artifact manifest mismatch")
+    if adapter_hash != expected_adapter_hash:
+        raise RuntimeError("Adapter registry hash mismatch")
+    return manifest, adapter_hash
+
+
+def _adapter_file_map_hash(files: dict[str, bytes]) -> str:
+    canonical = b"".join(
+        relative.encode()
+        + b"\0"
+        + hashlib.sha256(content).hexdigest().encode()
+        + b"\n"
+        for relative, content in sorted(files.items())
+    )
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _adapter_files(path: Path) -> list[Path]:
+    if not path.is_dir():
+        raise ValueError("Adapter artifact is missing")
+    if any(item.is_symlink() for item in path.rglob("*")):
+        raise ValueError("Adapter artifact contains a symbolic link")
+    files = sorted(item for item in path.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError("Adapter artifact is empty")
+    return files
+
+
+def _adapter_file_state(path: Path) -> tuple[tuple[str, int, int, int, int], ...]:
+    return tuple(
+        (
+            item.relative_to(path).as_posix(),
+            item.stat().st_size,
+            item.stat().st_ino,
+            item.stat().st_mtime_ns,
+            item.stat().st_ctime_ns,
+        )
+        for item in _adapter_files(path)
+    )
+
+
+def _make_snapshot_read_only(path: Path) -> None:
+    for item in path.rglob("*"):
+        os.chmod(item, 0o500 if item.is_dir() else 0o400)
+    os.chmod(path, 0o500)
+
+
+def _make_snapshot_writable(path: Path) -> None:
+    os.chmod(path, 0o700)
+    for item in path.rglob("*"):
+        if item.is_dir():
+            os.chmod(item, 0o700)
 
 
 def is_registry_approved_adapter(

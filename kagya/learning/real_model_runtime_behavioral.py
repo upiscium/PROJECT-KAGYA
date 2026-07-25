@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Callable
 
 from kagya.config import ProjectEnvironment, Settings, load_settings
-from kagya.artifact_provenance import require_immutable_revision
+from kagya.artifact_provenance import (
+    AdapterArtifactManifest,
+    build_adapter_artifact_manifest,
+    require_immutable_revision,
+)
 from kagya.learning.behavioral_artifacts import BehavioralArtifactStore
 from kagya.learning.behavioral_evaluation import (
     BehavioralEvaluator,
@@ -64,17 +68,24 @@ def load_real_model_provider_pair(
     settings: Settings,
     candidate_adapter_path: Path,
     *,
+    candidate_adapter_hash: str | None = None,
+    candidate_adapter_manifest: AdapterArtifactManifest | None = None,
     provider_loader: ProviderLoader = load_model_provider,
 ) -> tuple[FallbackRejectingProvider, FallbackRejectingProvider]:
     """Load an exact base and an exact base plus the registered candidate adapter."""
 
     baseline = FallbackRejectingProvider(provider_loader(settings), adapter_path=None)
+    candidate_kwargs: dict[str, object] = {
+        "adapter_path": candidate_adapter_path,
+        "allow_candidate_adapter": True,
+    }
+    if candidate_adapter_hash is not None and candidate_adapter_manifest is not None:
+        candidate_kwargs.update(
+            expected_adapter_hash=candidate_adapter_hash,
+            expected_adapter_manifest=candidate_adapter_manifest,
+        )
     candidate = FallbackRejectingProvider(
-        provider_loader(
-            settings,
-            adapter_path=candidate_adapter_path,
-            allow_candidate_adapter=True,
-        ),
+        provider_loader(settings, **candidate_kwargs),
         adapter_path=candidate_adapter_path.resolve(),
     )
     if baseline.provider is candidate.provider:
@@ -141,8 +152,17 @@ def run_real_model_runtime_evaluation(
         / "runtime"
         / evaluation_id
     )
+    candidate_adapter_manifest = build_adapter_artifact_manifest(
+        candidate_adapter_path,
+        base_model_name=settings.model.primary_id,
+        base_model_revision=base_model_revision,
+    )
     baseline, candidate = load_real_model_provider_pair(
-        settings, candidate_adapter_path, provider_loader=provider_loader
+        settings,
+        candidate_adapter_path,
+        candidate_adapter_hash=candidate_adapter_hash,
+        candidate_adapter_manifest=candidate_adapter_manifest,
+        provider_loader=provider_loader,
     )
     try:
         # Force the exact primary model before runtime generation. Candidate load

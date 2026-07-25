@@ -116,10 +116,13 @@ class AdapterRuntimeManager:
                 adapter_id,
                 activation_sequence=event.processing_sequence,
                 loaded_adapter_manifest_hash=getattr(
-                    staged_provider, "adapter_artifact_manifest_hash", None
+                    staged_provider, "adapter_snapshot_manifest_hash", None
                 ),
                 loaded_adapter_manifest=getattr(
                     staged_provider, "adapter_artifact_manifest", None
+                ),
+                loaded_adapter_hash=getattr(
+                    staged_provider, "adapter_snapshot_hash", None
                 ),
                 runtime_switch=authoritative_switch,
             )
