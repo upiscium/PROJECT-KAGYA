@@ -9,8 +9,9 @@ The public deployment boundary currently exposes explanations only through authe
 ## Source Admission
 
 - Values appear only when the selected candidate has a recorded per-value contribution and the Decision froze that Value revision.
-- Goals, Commitments, Beliefs, and evidence appear only through explicit `goal_refs`, `commitment_refs`, `belief_refs`, and `evidence_refs` on a considered candidate and corresponding Decision revision maps.
-- The builder never scans all active identity or belief state. Missing, stale, unendorsed, private, context-incompatible, or interlocutor-incompatible references produce unavailable/information-gap codes; incompatible projections omit the source list.
+- Goals, Commitments, Beliefs, and evidence appear only through explicit `goal_refs`, `commitment_refs`, `belief_refs`, and `evidence_refs` on a considered candidate and exact corresponding Decision revision maps.
+- The builder never scans all active identity or belief state. Missing, stale, unendorsed, private, context-incompatible, or interlocutor-incompatible references are omitted completely and produce only bounded information-gap codes and counts.
+- A context mismatch, or a missing/nonparticipant interlocutor when the Decision context has participants, strips every causal reference except Decision and explanation identity/revision.
 - Care or appeasement reasons are copied only from the exact linked, digest-matching current `IdentityBoundaryAssessment` revision.
 - Action risk, policy, approval, validation, intent, receipt, Observation, and Verification IDs are projected only from records causally bound to the Decision.
 
@@ -20,13 +21,15 @@ Create, revise, and render operations require `AgentRuntime` events and idempote
 
 A Decision outcome revises every attached context-specific explanation. Prior revisions remain immutable and the new revision records changed fields, outcome status, prediction error, post-assessment reference, event ID, and processing sequence.
 
-Deterministic rendering uses neutral code templates. Optional natural rendering receives only `public_json()` and must return exactly:
+Deterministic rendering uses neutral versioned clause templates. Optional natural rendering receives only `public_json()` and may select or reorder offered immutable clause IDs. It must return exactly:
 
 ```json
-{"explanation_id":"...","explanation_revision":1,"visible_explanation":"..."}
+{"explanation_id":"...","explanation_revision":1,"ordered_clause_ids":["disposition.no_op.v1"]}
 ```
 
-Unknown fields, mismatched identity/revision, new opaque IDs, new reason-code claims, private markers, malformed JSON, and provider failures fail closed. The renderer failure is persisted while the deterministic structured explanation and deterministic visible text remain available. Natural text is non-authoritative.
+Unknown, duplicate, or mismatched clause IDs, unknown fields, mismatched identity/revision, malformed JSON, provider fallback, and provider failures fail closed. Visible text is always rendered locally; the model cannot provide prose or claims. A failed later render clears prior model ordering and restores deterministic ordering and text.
+
+Schema-valid policy/risk-budget denial is persisted as an `ActionPolicyRejectionRecord`; malformed arguments remain validation failures and are explained as unable rather than policy-blocked. Action status and outcomes are projected only from the latest selected-candidate intent and matching receipt, Observation, and Verification chain.
 
 ## Admin API
 

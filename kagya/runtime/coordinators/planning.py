@@ -280,6 +280,12 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             "interlocutor_id": interlocutor_id,
             "explanation_id": explanation_id,
         }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
         explanation = build_explanation(
             self,
             decision,
@@ -292,7 +298,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         return self._append_decision_explanation(
             explanation,
             idempotency_key=idempotency_key,
-            input_digest=explanation_input_digest(payload),
+            input_digest=input_digest,
         )
 
     def revise_decision_explanation(
@@ -307,20 +313,25 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         event = current_agent_event()
         if event is None or event.processing_sequence is None:
             raise RuntimeError("Explanation revision requires AgentRuntime")
+        payload = {
+            "operation": "revise",
+            "explanation_id": explanation_id,
+            "expected_revision": expected_revision,
+            "context_id": context_id,
+            "interlocutor_id": interlocutor_id,
+        }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
         previous = self.decision_explanation_store.get(explanation_id)
         if previous.revision != expected_revision:
             raise ValueError(
                 f"Explanation revision conflict: expected {expected_revision}, current {previous.revision}"
             )
         decision = self.decision_store.get(previous.decision_id)
-        payload = {
-            "operation": "revise",
-            "explanation_id": explanation_id,
-            "expected_revision": expected_revision,
-            "decision_revision": decision.revision,
-            "context_id": context_id,
-            "interlocutor_id": interlocutor_id,
-        }
         explanation = build_explanation(
             self,
             decision,
@@ -338,7 +349,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         return self._append_decision_explanation(
             explanation,
             idempotency_key=idempotency_key,
-            input_digest=explanation_input_digest(payload),
+            input_digest=input_digest,
         )
 
     def render_decision_explanation(
@@ -351,6 +362,17 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         event = current_agent_event()
         if event is None or event.processing_sequence is None:
             raise RuntimeError("Explanation rendering requires AgentRuntime")
+        payload = {
+            "operation": "render",
+            "explanation_id": explanation_id,
+            "expected_revision": expected_revision,
+        }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
         previous = self.decision_explanation_store.get(explanation_id)
         if previous.revision != expected_revision:
             raise ValueError(
@@ -363,26 +385,20 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             }
         )
         if bool(getattr(self.provider, "last_fallback_used", False)):
-            rendered = rendered.model_copy(
+            failed = render_natural(
+                previous,
+                lambda _prompt: (_ for _ in ()).throw(RuntimeError("provider fallback")),
+            )
+            rendered = failed.model_copy(
                 update={
-                    "renderer": rendered.renderer.model_copy(
-                        update={
-                            "state": "failed",
-                            "visible_explanation": previous.renderer.visible_explanation,
-                            "failure_code": "renderer_invalid_or_unavailable",
-                        }
-                    )
+                    "created_event_id": event.event_id,
+                    "created_event_sequence": event.processing_sequence,
                 }
             )
-        payload = {
-            "operation": "render",
-            "explanation_id": explanation_id,
-            "expected_revision": expected_revision,
-        }
         return self._append_decision_explanation(
             rendered,
             idempotency_key=idempotency_key,
-            input_digest=explanation_input_digest(payload),
+            input_digest=input_digest,
         )
 
     def _append_decision_explanation(
@@ -397,15 +413,16 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             idempotency_key=idempotency_key,
             input_digest=input_digest,
         )
-        self.decision_store.link_explanation(
-            stored.decision_id, stored.explanation_id, stored.revision
-        )
-        execution = getattr(self, "_action_execution", None)
-        if execution is not None:
-            execution.link_explanation(
-                stored.decision_id, f"{stored.explanation_id}@{stored.revision}"
+        reference = f"{stored.explanation_id}@{stored.revision}"
+        decision = self.decision_store.get(stored.decision_id)
+        if reference not in decision.explanation_refs:
+            self.decision_store.link_explanation(
+                stored.decision_id, stored.explanation_id, stored.revision
             )
-        self._persist_decision_state()
+            execution = getattr(self, "_action_execution", None)
+            if execution is not None:
+                execution.link_explanation(stored.decision_id, reference)
+            self._persist_decision_state()
         self._persist_decision_explanation_state()
         return stored
 

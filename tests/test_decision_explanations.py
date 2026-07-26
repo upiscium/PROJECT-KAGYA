@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ from kagya.decision import (
     ActionCandidate,
     ActionType,
     DecisionStore,
+    DecisionExplanationStore,
     PublicDecisionExplanation,
     RendererState,
     build_explanation,
@@ -101,15 +103,16 @@ def test_builder_uses_only_selected_explicit_references_and_marks_missing() -> N
         event_id="event-2",
         event_sequence=2,
         context_id="context-1",
+        interlocutor_id="participant-1",
     )
 
     assert [item.source_id for item in explanation.contributions] == [
-        "referenced-value",
-        "missing-belief",
+        "referenced-value"
     ]
     assert explanation.contributions[0].evidence_refs == ("evidence-1",)
-    assert explanation.contributions[1].availability.value == "missing"
     assert "belief_reference_missing" in explanation.information_gap_codes
+    assert explanation.omitted_reference_count == 1
+    assert "missing-belief" not in str(explanation.public_json())
     assert "unrelated-value" not in str(explanation.public_json())
 
 
@@ -152,6 +155,89 @@ def test_cross_context_projection_omits_sources_and_renderer_fails_closed() -> N
         rendered.renderer.visible_explanation
         == explanation.renderer.visible_explanation
     )
+    serialized = str(explanation.public_json())
+    assert "private-context-value" not in serialized
+    assert "event-2" not in serialized
+    assert explanation.created_event_sequence is None
+    assert explanation.selected.candidate_id == "filtered"
+    assert explanation.context_id is None
+
+
+def test_renderer_can_only_reorder_offered_immutable_clauses() -> None:
+    decision = DecisionStore().create(
+        [_candidate("selected", ActionType.NO_OP)],
+        triggering_event_id="event-1",
+        triggering_event_sequence=1,
+        context_id=None,
+        active_goal_ids=(),
+        value_revision_refs={},
+        emotion_snapshot={},
+    )
+    explanation = build_explanation(
+        _main_loop(), decision, event_id="event-2", event_sequence=2
+    )
+    offered = explanation.renderer.offered_clause_ids
+    rendered = render_natural(
+        explanation,
+        lambda _prompt: json.dumps(
+            {
+                "explanation_id": explanation.explanation_id,
+                "explanation_revision": explanation.revision,
+                "ordered_clause_ids": list(reversed(offered)),
+            }
+        ),
+    )
+    assert rendered.renderer.state == RendererState.SUCCEEDED
+    assert rendered.renderer.ordered_clause_ids == tuple(reversed(offered))
+    assert "honesty" not in rendered.renderer.visible_explanation.lower()
+    assert "belief" not in rendered.renderer.visible_explanation.lower()
+
+    invented = render_natural(
+        rendered,
+        lambda _prompt: json.dumps(
+            {
+                "explanation_id": rendered.explanation_id,
+                "explanation_revision": rendered.revision,
+                "ordered_clause_ids": ["belief.honesty.v1"],
+                "visible_explanation": "I acted from honesty.",
+            }
+        ),
+    )
+    assert invented.renderer.state == RendererState.FAILED
+    assert invented.renderer.failure_code == "renderer_failed"
+    assert invented.renderer.ordered_clause_ids == offered
+    assert invented.renderer.visible_explanation == explanation.renderer.visible_explanation
+
+
+def test_store_empty_and_legacy_restore_are_ghost_free() -> None:
+    decision = DecisionStore().create(
+        [_candidate("selected", ActionType.NO_OP)],
+        triggering_event_id="event-1",
+        triggering_event_sequence=1,
+        context_id=None,
+        active_goal_ids=(),
+        value_revision_refs={},
+        emotion_snapshot={},
+    )
+    explanation = build_explanation(
+        _main_loop(), decision, event_id="event-2", event_sequence=2
+    )
+    store = DecisionExplanationStore()
+    store.append(explanation, idempotency_key="create", input_digest="digest")
+    legacy = store.to_json()
+    legacy_renderer = legacy["records"][explanation.explanation_id][0]["renderer"]
+    legacy_renderer.pop("offered_clause_ids")
+    legacy_renderer.pop("ordered_clause_ids")
+    legacy_renderer["visible_explanation"] = "invented legacy prose"
+
+    store.restore(legacy)
+    restored = store.get(explanation.explanation_id)
+    assert restored.renderer.state == RendererState.DETERMINISTIC
+    assert "invented" not in restored.renderer.visible_explanation
+    store.restore(None)
+    assert store.list_latest() == ()
+    store.restore({})
+    assert store.list_latest() == ()
 
 
 def test_schema_recursively_rejects_private_and_unknown_fields() -> None:
@@ -201,7 +287,13 @@ def _main_loop() -> SimpleNamespace:
         goal_manager=SimpleNamespace(goals={}),
         commitment_store=SimpleNamespace(commitments={}),
         belief_store=SimpleNamespace(records={}),
-        context_registry=SimpleNamespace(get=lambda _context_id: None),
+        context_registry=SimpleNamespace(
+            get=lambda context_id: SimpleNamespace(
+                participant_ids=("participant-1",)
+            )
+            if context_id == "context-1"
+            else None
+        ),
         identity_boundary_store=SimpleNamespace(),
         _action_execution=None,
     )

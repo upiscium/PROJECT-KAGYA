@@ -2488,6 +2488,33 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert not any(item["source_id"] == "care" for item in explanation["contributions"])
     assert explanation["outcome"]["status"] == "pending"
     assert explanation["renderer"]["state"] == "deterministic"
+    assert explanation["renderer"]["visible_explanation"] == " ".join(
+        {
+            "disposition.selected_action.v1": "Disposition: selected action.",
+            "decision_status.awaiting_outcome.v1": "Decision status: awaiting outcome.",
+            "information_gaps.none.v1": "No public information gaps were recorded.",
+            "outcome.pending.v1": "Outcome status: pending.",
+        }[item]
+        for item in explanation["renderer"]["ordered_clause_ids"]
+    )
+    state_before_retry = json.dumps(
+        client.app.state.main_loop.persistent_state.extensions,
+        sort_keys=True,
+    )
+    duplicate_create = client.post(
+        "/api/decisions/decision-api-1/explanations",
+        headers=headers,
+        json={
+            "explanation_id": "explanation-api-1",
+            "context_id": context_id,
+            "idempotency_key": "explanation-create-1",
+        },
+    )
+    assert duplicate_create.json() == explanation
+    assert json.dumps(
+        client.app.state.main_loop.persistent_state.extensions,
+        sort_keys=True,
+    ) == state_before_retry
     assert client.get("/api/decisions/explanations").status_code == 401
     filtered = client.post(
         "/api/decisions/decision-api-1/explanations",
@@ -2502,6 +2529,28 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert filtered["compatibility"] == "context_filtered"
     assert filtered["contributions"] == []
     assert filtered["boundary"] is None
+    assert filtered["selected"]["candidate_id"] == "filtered"
+    assert filtered["evidence_refs"] == []
+    assert filtered["tradeoff_refs"] == []
+    assert filtered["risk"]["action_intent_ref"] is None
+    assert filtered["outcome"]["observed_event_ref"] is None
+    assert filtered["context_id"] is None
+    frame = client.app.state.main_loop.context_registry.get(context_id)
+    assert frame is not None
+    client.app.state.main_loop.context_registry._frames[context_id] = replace(
+        frame, participant_ids=("participant-1",)
+    )
+    missing_interlocutor = client.post(
+        "/api/decisions/decision-api-1/explanations",
+        headers=headers,
+        json={
+            "explanation_id": "explanation-missing-interlocutor",
+            "context_id": context_id,
+            "idempotency_key": "explanation-missing-interlocutor-1",
+        },
+    ).json()
+    assert missing_interlocutor["compatibility"] == "interlocutor_filtered"
+    assert missing_interlocutor["contributions"] == []
     assert client.get("/api/metacognition").status_code == 401
     pre_assessment = client.get(
         f"/api/metacognition/assessments/{record['metacognition_pre_assessment_id']}",
@@ -2557,6 +2606,15 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     rendered = renderer_failure.json()
     assert rendered["revision"] == revised_explanation["revision"] + 1
     assert rendered["renderer"]["state"] == "failed"
+    duplicate_render = client.post(
+        "/api/decisions/explanations/explanation-api-1/render",
+        headers=headers,
+        json={
+            "expected_revision": revised_explanation["revision"],
+            "idempotency_key": "explanation-render-1",
+        },
+    )
+    assert duplicate_render.json() == rendered
     assert (
         rendered["renderer"]["visible_explanation"]
         == revised_explanation["renderer"]["visible_explanation"]
@@ -2664,6 +2722,51 @@ def test_decision_explanation_survives_snapshot_wal_and_restart(
         assert restored.status_code == 200
         assert restored.json()["revision"] == 2
         assert restored.json()["renderer"]["state"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("candidate_type", "disposition"),
+    [
+        ("no_op", "no_op"),
+        ("defer", "defer"),
+        ("request_information", "request_information"),
+    ],
+)
+def test_decision_explanation_dispositions_flow_through_runtime_api(
+    tmp_path: Path, candidate_type: str, disposition: str
+) -> None:
+    with _client(tmp_path) as client:
+        decision_id = f"api-{candidate_type}"
+        created = client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={
+                "decision_id": decision_id,
+                "candidates": [
+                    {
+                        "candidate_id": f"candidate-{candidate_type}",
+                        "candidate_type": candidate_type,
+                        "proposed_action": "bounded disposition",
+                        "parameters": {},
+                        "prerequisites": [],
+                        "predicted_outcomes": [],
+                        "uncertainty": 0.1,
+                        "estimated_cost": 0.0,
+                        "estimated_risk": 0.0,
+                        "value_effects": {},
+                        "appraisal_contributions": {},
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 200
+        explanation = client.post(
+            f"/api/decisions/{decision_id}/explanations",
+            headers=admin_headers(),
+            json={"idempotency_key": f"explain-{candidate_type}"},
+        )
+        assert explanation.status_code == 200
+        assert explanation.json()["disposition"] == disposition
 
 
 def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -> None:
@@ -4118,6 +4221,15 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             },
         )
         assert decision.status_code == 200
+        selected_explanation = client.post(
+            "/api/decisions/api-action-decision/explanations",
+            headers=admin_headers(),
+            json={
+                "explanation_id": "api-action-explanation",
+                "idempotency_key": "api-action-explanation-create",
+            },
+        ).json()
+        assert selected_explanation["disposition"] == "selected_action"
         created = client.post(
             "/api/actions/intents",
             headers=admin_headers(),
@@ -4129,6 +4241,21 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert created.status_code == 200
         intent = created.json()
         assert intent["status"] == "awaiting_approval"
+        awaiting_explanation = client.post(
+            "/api/decisions/explanations/api-action-explanation/revisions",
+            headers=admin_headers(),
+            json={
+                "expected_revision": 1,
+                "idempotency_key": "api-action-explanation-awaiting",
+            },
+        ).json()
+        assert awaiting_explanation["disposition"] == "awaiting_approval"
+        premature_outcome = client.post(
+            "/api/decisions/api-action-decision/outcome",
+            headers=admin_headers(),
+            json={"description": "premature", "utility": 1.0, "success": True},
+        )
+        assert premature_outcome.status_code == 409
         blocked = client.post(
             f"/api/actions/intents/{intent['intent_id']}/execute",
             headers=admin_headers(),
@@ -4154,12 +4281,111 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         )
         assert executed.status_code == 200
         assert executed.json()["status"] == "succeeded"
+        completed_explanation = client.get(
+            "/api/decisions/explanations/api-action-explanation",
+            headers=admin_headers(),
+        ).json()
+        assert completed_explanation["disposition"] == "selected_action"
+        assert completed_explanation["outcome"]["status"] == "succeeded"
+        assert completed_explanation["risk"]["receipt_ref"] == executed.json()["receipt_id"]
         payload = client.get("/api/actions/receipts", headers=admin_headers()).json()
         assert len(payload["receipts"]) == len(payload["observations"]) == 1
         assert (
             payload["receipts"][0]["observation_id"]
             == payload["observations"][0]["observation_id"]
         )
+
+        assert client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-blocked-decision",
+                "candidates": [candidate, fallback],
+            },
+        ).status_code == 200
+        blocked_intent = client.post(
+            "/api/actions/intents",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-blocked-decision",
+                "idempotency_key": "api-blocked-intent",
+                "budget": {"max_risk_class": "read_only"},
+            },
+        )
+        assert blocked_intent.status_code == 200, blocked_intent.text
+        assert blocked_intent.json()["policy_code"] == "risk_budget_denied"
+        blocked_explanation = client.post(
+            "/api/decisions/api-blocked-decision/explanations",
+            headers=admin_headers(),
+            json={"idempotency_key": "api-blocked-explanation"},
+        ).json()
+        assert blocked_explanation["disposition"] == "blocked_policy"
+        assert blocked_explanation["risk"]["policy_status"] == "blocked"
+
+        assert client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-failed-decision",
+                "candidates": [candidate, fallback],
+            },
+        ).status_code == 200
+        failed_intent = client.post(
+            "/api/actions/intents",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-failed-decision",
+                "idempotency_key": "api-failed-intent",
+            },
+        ).json()
+        rejected = client.post(
+            f"/api/actions/intents/{failed_intent['intent_id']}/approval",
+            headers=admin_headers(),
+            json={"approved": False, "reason": "operator_rejected"},
+        )
+        assert rejected.status_code == 200
+        failed_explanation = client.post(
+            "/api/decisions/api-failed-decision/explanations",
+            headers=admin_headers(),
+            json={"idempotency_key": "api-failed-explanation"},
+        ).json()
+        assert failed_explanation["disposition"] == "action_failed"
+        assert failed_explanation["outcome"]["status"] == "failed"
+
+        invalid_candidate = {
+            **candidate,
+            "candidate_id": "invalid-action",
+            "parameters": {
+                "action": {
+                    "tool_name": "document_search",
+                    "arguments": {"query": "x", "relative_path": "../outside"},
+                }
+            },
+        }
+        assert client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-invalid-decision",
+                "candidates": [invalid_candidate, fallback],
+            },
+        ).status_code == 200
+        invalid_result = client.post(
+            "/api/actions/intents",
+            headers=admin_headers(),
+            json={
+                "decision_id": "api-invalid-decision",
+                "idempotency_key": "api-invalid-intent",
+            },
+        )
+        assert invalid_result.status_code == 422
+        invalid_explanation = client.post(
+            "/api/decisions/api-invalid-decision/explanations",
+            headers=admin_headers(),
+            json={"idempotency_key": "api-invalid-explanation"},
+        ).json()
+        assert invalid_explanation["disposition"] == "unable"
+        assert invalid_explanation["risk"]["policy_status"] == "invalid"
 
     wal_types = {
         record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
@@ -4172,17 +4398,17 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         receipts = restarted.get(
             "/api/actions/receipts", headers=admin_headers()
         ).json()["receipts"]
-        assert len(intents) == len(receipts) == 1
-        assert intents[0]["status"] == "succeeded"
+        assert len(intents) == len(receipts) == 2
+        assert any(item["status"] == "succeeded" for item in intents)
+        assert any(item["status"] == "rejected" for item in intents)
         outbox_messages = restarted.get(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"]
         assert any(item["kind"] == "action_result" for item in outbox_messages)
-        assert (
-            next(
-                item for item in outbox_messages if item["kind"] == "approval_request"
-            )["acknowledgment_status"]
-            == "approved"
+        assert any(
+            item["kind"] == "approval_request"
+            and item["acknowledgment_status"] == "approved"
+            for item in outbox_messages
         )
 
 

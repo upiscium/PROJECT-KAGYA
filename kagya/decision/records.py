@@ -569,6 +569,11 @@ class DecisionStore:
         reference = f"{explanation_id}@{explanation_revision}"
         _safe_ref(reference)
         record = self.get(decision_id)
+        if (
+            reference in record.explanation_refs
+            and record.current_explanation_ref == reference
+        ):
+            return record
         updated = replace(
             record,
             explanation_refs=tuple(

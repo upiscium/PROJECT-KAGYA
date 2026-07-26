@@ -88,7 +88,7 @@ class SourceContribution(_StrictModel):
     contribution: float | None = Field(default=None, ge=-1.0, le=1.0)
     evidence_refs: tuple[str, ...] = Field(default=(), max_length=MAX_REFS)
     origin_ref: str | None = None
-    availability: ReferenceAvailability
+    availability: Literal[ReferenceAvailability.AVAILABLE] = ReferenceAvailability.AVAILABLE
 
 
 class UncertaintyProjection(_StrictModel):
@@ -137,6 +137,8 @@ class ChangeProjection(_StrictModel):
 class RendererProjection(_StrictModel):
     state: RendererState
     deterministic_template: str
+    offered_clause_ids: tuple[str, ...] = Field(max_length=16)
+    ordered_clause_ids: tuple[str, ...] = Field(max_length=16)
     visible_explanation: str
     failure_code: str | None = None
 
@@ -159,6 +161,7 @@ class PublicDecisionExplanation(_StrictModel):
     evidence_refs: tuple[str, ...] = Field(default=(), max_length=MAX_REFS)
     uncertainty: tuple[UncertaintyProjection, ...] = Field(default=(), max_length=16)
     information_gap_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    omitted_reference_count: int = Field(default=0, ge=0, le=MAX_REFS)
     risk: RiskProjection
     tradeoff_refs: tuple[str, ...] = Field(default=(), max_length=MAX_REFS)
     conflict_codes: tuple[str, ...] = Field(default=(), max_length=16)
@@ -166,8 +169,8 @@ class PublicDecisionExplanation(_StrictModel):
     reason_codes: tuple[str, ...] = Field(default=(), max_length=32)
     outcome: OutcomeProjection
     change: ChangeProjection
-    created_event_id: str
-    created_event_sequence: int = Field(ge=1)
+    created_event_id: str | None
+    created_event_sequence: int | None = Field(ge=1)
     context_id: str | None = None
     interlocutor_id: str | None = None
     compatibility: Compatibility
@@ -188,7 +191,25 @@ class PublicDecisionExplanation(_StrictModel):
 class NaturalExplanationOutput(_StrictModel):
     explanation_id: str
     explanation_revision: int = Field(ge=1)
-    visible_explanation: str = Field(min_length=1, max_length=2000)
+    ordered_clause_ids: tuple[str, ...] = Field(min_length=1, max_length=16)
+
+
+_CLAUSE_TEMPLATES = {
+    **{
+        f"disposition.{item.value}.v1": f"Disposition: {item.value.replace('_', ' ')}."
+        for item in ExplanationDisposition
+    },
+    **{
+        f"decision_status.{item.value}.v1": f"Decision status: {item.value.replace('_', ' ')}."
+        for item in DecisionStatus
+    },
+    "information_gaps.present.v1": "Some public information is unavailable.",
+    "information_gaps.none.v1": "No public information gaps were recorded.",
+    "outcome.pending.v1": "Outcome status: pending.",
+    "outcome.succeeded.v1": "Outcome status: succeeded.",
+    "outcome.failed.v1": "Outcome status: failed.",
+    "outcome.compensated.v1": "Outcome status: compensated.",
+}
 
 
 class DecisionExplanationStore:
@@ -252,7 +273,10 @@ class DecisionExplanationStore:
                     for item in values
                     if decision_id is None or item.decision_id == decision_id
                 ),
-                key=lambda item: (item.created_event_sequence, item.explanation_id),
+                key=lambda item: (
+                    item.created_event_sequence or 0,
+                    item.explanation_id,
+                ),
             )
         )
 
@@ -270,6 +294,8 @@ class DecisionExplanationStore:
 
     def restore(self, payload: object) -> None:
         if payload in (None, {}):
+            self._records = {}
+            self._idempotency = {}
             return
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise ValueError("Unsupported decision explanation state")
@@ -281,7 +307,10 @@ class DecisionExplanationStore:
             if not isinstance(values, list):
                 raise ValueError("Invalid decision explanation history")
             history = [
-                PublicDecisionExplanation.model_validate(item) for item in values
+                PublicDecisionExplanation.model_validate(
+                    _migrate_explanation_payload(item)
+                )
+                for item in values
             ]
             if any(
                 item.explanation_id != explanation_id or item.revision != index
@@ -299,6 +328,17 @@ class DecisionExplanationStore:
             idempotency[str(key)] = (str(value[0]), str(value[1]), int(value[2]))
         self._records = records
         self._idempotency = idempotency
+
+    def get_idempotent(
+        self, idempotency_key: str, input_digest: str
+    ) -> PublicDecisionExplanation | None:
+        existing = self._idempotency.get(idempotency_key)
+        if existing is None:
+            return None
+        digest, explanation_id, revision = existing
+        if digest != input_digest:
+            raise ValueError("Explanation idempotency key has different input")
+        return self.get(explanation_id, revision)
 
 
 def build_explanation(
@@ -346,14 +386,18 @@ def build_explanation(
         and boundary is None
     ):
         unavailable = (*unavailable, "boundary_reference_unavailable")
-    disposition = action_disposition or _disposition(
-        selected_eval.candidate.candidate_type, boundary
+    disposition = (
+        action_disposition or _disposition(selected_eval.candidate.candidate_type, boundary)
+        if compatibility == "compatible"
+        else _disposition(selected_eval.candidate.candidate_type, None)
     )
     uncertainty = [
         UncertaintyProjection(
             code="selected_candidate_uncertainty",
             severity=selected_eval.candidate.uncertainty,
-            refs=(selected_eval.candidate.candidate_id,),
+            refs=(selected_eval.candidate.candidate_id,)
+            if compatibility == "compatible"
+            else (),
         )
     ]
     information_gaps: list[str] = []
@@ -364,7 +408,7 @@ def build_explanation(
         information_gaps.append(code)
     if compatibility != "compatible":
         information_gaps.append(compatibility)
-    outcome = _outcome(decision)
+    outcome = _outcome(decision, compatibility)
     changed_fields = _changed_fields(previous, decision, outcome, contributions)
     reason_codes = tuple(
         dict.fromkeys(
@@ -376,9 +420,17 @@ def build_explanation(
         )
     )[:32]
     template = _deterministic_template(disposition, decision.status, outcome.status)
-    visible = _deterministic_visible(
-        disposition, decision.status.value, selected.action_type, information_gaps
+    clauses = _deterministic_clauses(
+        disposition, decision.status, outcome.status, bool(information_gaps)
     )
+    visible = _render_clauses(clauses)
+    filtered = compatibility != "compatible"
+    if filtered:
+        selected = selected.model_copy(update={"candidate_id": "filtered"})
+        alternatives = ()
+        risk = _empty_risk()
+        boundary = None
+        reason_codes = (f"compatibility_{compatibility}",)
     return PublicDecisionExplanation(
         explanation_id=explanation_id or f"explanation-{uuid4()}",
         revision=1 if previous is None else previous.revision + 1,
@@ -389,12 +441,21 @@ def build_explanation(
         disposition=disposition,
         major_alternatives=alternatives,
         contributions=contributions,
-        evidence_refs=tuple(selected_eval.candidate.evidence_refs[:MAX_REFS]),
+        evidence_refs=()
+        if filtered
+        else tuple(
+            dict.fromkeys(
+                reference
+                for contribution in contributions
+                for reference in contribution.evidence_refs
+            )
+        )[:MAX_REFS],
         uncertainty=tuple(uncertainty[:16]),
         information_gap_codes=tuple(dict.fromkeys(information_gaps))[:16],
+        omitted_reference_count=min(len(unavailable), MAX_REFS),
         risk=risk,
-        tradeoff_refs=tuple(decision.value_tradeoff_refs[:MAX_REFS]),
-        conflict_codes=_conflict_codes(selected_eval),
+        tradeoff_refs=() if filtered else _tradeoff_refs(main_loop, decision),
+        conflict_codes=() if filtered else _conflict_codes(selected_eval),
         boundary=boundary,
         reason_codes=reason_codes,
         outcome=outcome,
@@ -405,14 +466,16 @@ def build_explanation(
             changed_fields=changed_fields,
             reason_codes=() if previous is None else ("decision_projection_revised",),
         ),
-        created_event_id=event_id,
-        created_event_sequence=event_sequence,
-        context_id=context_id or decision.context_id,
-        interlocutor_id=interlocutor_id,
+        created_event_id=None if filtered else event_id,
+        created_event_sequence=None if filtered else event_sequence,
+        context_id=None if filtered else context_id or decision.context_id,
+        interlocutor_id=None if filtered else interlocutor_id,
         compatibility=compatibility,
         renderer=RendererProjection(
             state=RendererState.DETERMINISTIC,
             deterministic_template=template,
+            offered_clause_ids=clauses,
+            ordered_clause_ids=clauses,
             visible_explanation=visible,
         ),
         created_at=datetime.now(UTC).isoformat(),
@@ -423,11 +486,11 @@ def render_natural(
     explanation: PublicDecisionExplanation,
     generate: Callable[[str], str],
 ) -> PublicDecisionExplanation:
+    deterministic_order = explanation.renderer.offered_clause_ids
     public_payload = explanation.public_json()
     prompt = (
-        "Render only the supplied public-safe decision explanation. Return strict JSON "
-        "with exactly explanation_id, explanation_revision, visible_explanation. "
-        "Do not add identifiers, reasons, facts, or private content.\n"
+        "Select and order only offered_clause_ids. Return strict JSON with exactly "
+        "explanation_id, explanation_revision, ordered_clause_ids. Do not write prose.\n"
         + json.dumps(public_payload, ensure_ascii=True, sort_keys=True)
     )
     try:
@@ -439,18 +502,26 @@ def render_natural(
             or output.explanation_revision != explanation.revision
         ):
             raise ValueError("renderer identity mismatch")
-        _validate_visible_output(output.visible_explanation, public_payload)
+        if (
+            len(output.ordered_clause_ids) != len(set(output.ordered_clause_ids))
+            or not set(output.ordered_clause_ids) <= set(deterministic_order)
+        ):
+            raise ValueError("renderer clause selection is invalid")
         renderer = RendererProjection(
             state=RendererState.SUCCEEDED,
             deterministic_template=explanation.renderer.deterministic_template,
-            visible_explanation=output.visible_explanation,
+            offered_clause_ids=deterministic_order,
+            ordered_clause_ids=output.ordered_clause_ids,
+            visible_explanation=_render_clauses(output.ordered_clause_ids),
         )
     except Exception:
         renderer = RendererProjection(
             state=RendererState.FAILED,
             deterministic_template=explanation.renderer.deterministic_template,
-            visible_explanation=explanation.renderer.visible_explanation,
-            failure_code="renderer_invalid_or_unavailable",
+            offered_clause_ids=deterministic_order,
+            ordered_clause_ids=deterministic_order,
+            visible_explanation=_render_clauses(deterministic_order),
+            failure_code="renderer_failed",
         )
     return explanation.model_copy(
         update={
@@ -502,16 +573,27 @@ def _contributions(
     values: list[SourceContribution] = []
     unavailable: list[str] = []
     for value_id, contribution in selected_eval.value_contributions.items():
+        if not _public_ref(value_id):
+            unavailable.append("value_reference_private")
+            continue
         revision = decision.value_revision_refs.get(value_id)
         current = main_loop.value_system.values.get(value_id)
         availability = _availability(current, revision, compatibility)
+        if (
+            availability == ReferenceAvailability.AVAILABLE
+            and getattr(getattr(current, "scope", None), "value", None) == "context"
+            and decision.context_id not in getattr(current, "context_ids", ())
+        ):
+            availability = ReferenceAvailability.INCOMPATIBLE
         if availability != ReferenceAvailability.AVAILABLE:
             unavailable.append(f"value_reference_{availability.value}")
+            continue
+        assert revision is not None
         values.append(
             SourceContribution(
                 source_type="value",
                 source_id=value_id,
-                source_revision=revision or 0,
+                source_revision=revision,
                 contribution=contribution,
                 evidence_refs=tuple(
                     item
@@ -523,10 +605,11 @@ def _contributions(
                         ),
                         *(current.opposing_evidence_ids if current is not None else ()),
                     )
-                    if item in candidate.evidence_refs
+                    if item in candidate.evidence_refs and _public_ref(item)
                 )[:MAX_REFS],
-                origin_ref=decision.identity_origin_refs.get(f"value:{value_id}"),
-                availability=availability,
+                origin_ref=_public_optional_ref(
+                    decision.identity_origin_refs.get(f"value:{value_id}")
+                ),
             )
         )
     source_groups: tuple[
@@ -553,6 +636,9 @@ def _contributions(
     )
     for source_type, refs, decision_refs, store in source_groups:
         for source_id in refs:
+            if not _public_ref(source_id):
+                unavailable.append(f"{source_type}_reference_private")
+                continue
             revision = decision_refs.get(source_id)
             current = store.get(source_id)
             availability = _availability(current, revision, compatibility)
@@ -565,23 +651,26 @@ def _contributions(
                     availability = ReferenceAvailability.INCOMPATIBLE
             if availability != ReferenceAvailability.AVAILABLE:
                 unavailable.append(f"{source_type}_reference_{availability.value}")
+                continue
+            assert revision is not None
             evidence = ()
             if source_type == "belief" and current is not None:
                 known = {item.reference for item in current.evidence}
                 evidence = tuple(
-                    item for item in candidate.evidence_refs if item in known
+                    item
+                    for item in candidate.evidence_refs
+                    if item in known and _public_ref(item)
                 )
             values.append(
                 SourceContribution(
                     source_type=source_type,
                     source_id=source_id,
-                    source_revision=revision or 0,
+                    source_revision=revision,
                     contribution=None,
                     evidence_refs=evidence[:MAX_REFS],
-                    origin_ref=decision.identity_origin_refs.get(
-                        f"{source_type}:{source_id}"
+                    origin_ref=_public_optional_ref(
+                        decision.identity_origin_refs.get(f"{source_type}:{source_id}")
                     ),
-                    availability=availability,
                 )
             )
     return tuple(values[:MAX_CONTRIBUTIONS]), tuple(dict.fromkeys(unavailable))
@@ -602,10 +691,9 @@ def _availability(
     origin = getattr(current, "identity_origin", None) or getattr(
         current, "origin_provenance", None
     )
-    if (
-        origin is not None
-        and getattr(getattr(origin, "endorsement", None), "value", None) != "endorsed"
-    ):
+    if origin is None or getattr(
+        getattr(origin, "endorsement", None), "value", None
+    ) != "endorsed":
         return ReferenceAvailability.PRIVATE
     return ReferenceAvailability.AVAILABLE
 
@@ -620,42 +708,93 @@ def _risk(
             policy_status="not_evaluated",
             approval_status="not_required",
         ), None
-    intent = next(
-        (
-            item
-            for item in execution.list_intents()
-            if item.provenance.decision_id == decision.decision_id
+    intents = [
+        item
+        for item in execution.list_intents()
+        if item.provenance.decision_id == decision.decision_id
+        and item.provenance.candidate_id == decision.selected_candidate_id
+    ]
+    terminal = {"succeeded", "failed", "cancelled", "rejected", "compensated"}
+    intent = max(
+        intents,
+        key=lambda item: (
+            item.status.value in terminal,
+            item.updated_at,
+            item.revision,
         ),
-        None,
+        default=None,
     )
     if intent is None:
-        blocked = next(
+        rejections = getattr(execution, "list_policy_rejections", lambda: ())()
+        blocked = max(
+            (
+                item
+                for item in rejections
+                if item.decision_id == decision.decision_id
+                and item.candidate_id == decision.selected_candidate_id
+            ),
+            key=lambda item: item.event_sequence,
+            default=None,
+        )
+        invalid = max(
             (
                 item
                 for item in execution.list_validation_records()
-                if item.decision_id == decision.decision_id
+                if item.decision_id == decision.decision_id and not item.arguments_valid
             ),
-            None,
+            key=lambda item: item.validated_event_sequence,
+            default=None,
         )
         return (
             RiskProjection(
-                risk_class="unclassified"
-                if blocked is None or blocked.risk_class is None
-                else blocked.risk_class.value,
-                policy_status="blocked"
-                if blocked is not None and not blocked.arguments_valid
-                else "not_evaluated",
+                risk_class="unclassified" if blocked is None else blocked.risk_class.value,
+                policy_status=(
+                    "blocked"
+                    if blocked is not None
+                    else "invalid"
+                    if invalid is not None
+                    else "not_evaluated"
+                ),
                 approval_status="not_required",
+                policy_ref=None
+                if blocked is None
+                else _public_optional_ref(blocked.rejection_id),
+                policy_reason_codes=() if blocked is None else (blocked.reason_code,),
             ),
             ExplanationDisposition.BLOCKED_POLICY
-            if blocked is not None and not blocked.arguments_valid
+            if blocked is not None
+            else ExplanationDisposition.UNABLE
+            if invalid is not None
             else None,
         )
     receipt = next(
         (
             item
             for item in execution.list_receipts()
-            if item.intent_id == intent.intent_id
+            if item.receipt_id == intent.receipt_id and item.intent_id == intent.intent_id
+        ),
+        None,
+    )
+    observation = next(
+        (
+            item
+            for item in execution.list_observations()
+            if receipt is not None
+            and item.observation_id == receipt.observation_id
+            and item.receipt_id == receipt.receipt_id
+            and item.intent_id == intent.intent_id
+        ),
+        None,
+    )
+    verification = next(
+        (
+            item
+            for item in execution.list_verifications()
+            if receipt is not None
+            and observation is not None
+            and item.verification_id == receipt.verification_id
+            and item.observation_id == observation.observation_id
+            and item.intent_id == intent.intent_id
         ),
         None,
     )
@@ -682,13 +821,19 @@ def _risk(
         else "pending"
         if approval is None
         else approval.status,
-        policy_ref=intent.policy.evaluation_id,
-        approval_ref=intent.approval_id,
-        action_intent_ref=intent.intent_id,
-        validation_ref=intent.validation_record_id,
-        receipt_ref=None if receipt is None else receipt.receipt_id,
-        observation_ref=None if receipt is None else receipt.observation_id,
-        verification_ref=None if receipt is None else receipt.verification_id,
+        policy_ref=_public_optional_ref(intent.policy.evaluation_id),
+        approval_ref=_public_optional_ref(intent.approval_id),
+        action_intent_ref=_public_optional_ref(intent.intent_id),
+        validation_ref=_public_optional_ref(intent.validation_record_id),
+        receipt_ref=None
+        if receipt is None
+        else _public_optional_ref(receipt.receipt_id),
+        observation_ref=None
+        if observation is None
+        else _public_optional_ref(observation.observation_id),
+        verification_ref=None
+        if verification is None
+        else _public_optional_ref(verification.verification_id),
         policy_reason_codes=tuple(
             _safe_reason(item) for item in intent.policy.reasons[:16]
         ),
@@ -698,7 +843,11 @@ def _risk(
 def _boundary(
     main_loop: Any, decision: DecisionRecord, compatibility: str
 ) -> BoundaryProjection | None:
-    if decision.boundary_assessment_id is None or compatibility != "compatible":
+    if (
+        decision.boundary_assessment_id is None
+        or compatibility != "compatible"
+        or not _public_ref(decision.boundary_assessment_id)
+    ):
         return None
     try:
         assessment = main_loop.identity_boundary_store.get_assessment(
@@ -725,7 +874,7 @@ def _boundary(
     )
 
 
-def _outcome(decision: DecisionRecord) -> OutcomeProjection:
+def _outcome(decision: DecisionRecord, compatibility: str) -> OutcomeProjection:
     if decision.actual_outcome is None:
         return OutcomeProjection(status="pending")
     status: Literal["succeeded", "failed", "compensated"] = (
@@ -736,14 +885,16 @@ def _outcome(decision: DecisionRecord) -> OutcomeProjection:
         else "failed"
     )
     event_ref = None
-    if decision.actual_outcome.observed_event_id is not None:
+    if compatibility == "compatible" and decision.actual_outcome.observed_event_id is not None:
         event_ref = decision.actual_outcome.observed_event_id
     return OutcomeProjection(
         status=status,
         utility=decision.actual_outcome.utility,
         prediction_error=decision.prediction_error,
         observed_event_ref=event_ref,
-        post_assessment_ref=decision.metacognition_post_assessment_id,
+        post_assessment_ref=decision.metacognition_post_assessment_id
+        if compatibility == "compatible"
+        else None,
     )
 
 
@@ -773,10 +924,14 @@ def _compatibility(
     requested_context = context_id or decision.context_id
     if requested_context != decision.context_id:
         return "context_filtered"
-    if interlocutor_id is None or decision.context_id is None:
+    if decision.context_id is None:
         return "compatible"
     context = main_loop.context_registry.get(decision.context_id)
-    if context is None or interlocutor_id not in context.participant_ids:
+    if context is None:
+        return "interlocutor_filtered"
+    if context.participant_ids and (
+        interlocutor_id is None or interlocutor_id not in context.participant_ids
+    ):
         return "interlocutor_filtered"
     return "compatible"
 
@@ -785,6 +940,30 @@ def _conflict_codes(selected_eval: Any) -> tuple[str, ...]:
     return tuple(
         _safe_reason(item) for item in selected_eval.reasons if "conflict" in item
     )[:16]
+
+
+def _tradeoff_refs(main_loop: Any, decision: DecisionRecord) -> tuple[str, ...]:
+    known = {
+        item.tradeoff_id
+        for item in getattr(main_loop.value_system, "tradeoffs", ())
+        if item.decision_id == decision.decision_id
+        and item.option_id == decision.selected_candidate_id
+        and item.context_id == decision.context_id
+        and item.value_revision_refs == decision.value_revision_refs
+        and _public_ref(item.tradeoff_id)
+    }
+    return tuple(item for item in decision.value_tradeoff_refs if item in known)[:MAX_REFS]
+
+
+def _public_optional_ref(value: str | None) -> str | None:
+    return value if value is not None and _public_ref(value) else None
+
+
+def _public_ref(value: str) -> bool:
+    lowered = value.lower()
+    return bool(_SAFE_ID.fullmatch(value)) and not any(
+        marker in lowered for marker in _PRIVATE_MARKERS
+    )
 
 
 def _changed_fields(
@@ -813,11 +992,64 @@ def _deterministic_template(
     return f"decision_explanation.{disposition.value}.{status.value}.{outcome}.v1"
 
 
-def _deterministic_visible(
-    disposition: ExplanationDisposition, status: str, action_type: str, gaps: list[str]
-) -> str:
-    gap_codes = ",".join(dict.fromkeys(gaps)) if gaps else "none"
-    return f"disposition={disposition.value}; action={action_type}; status={status}; information_gaps={gap_codes}"
+def _migrate_explanation_payload(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    renderer = value.get("renderer")
+    if not isinstance(renderer, dict) or "offered_clause_ids" in renderer:
+        return value
+    try:
+        clauses = _deterministic_clauses(
+            ExplanationDisposition(str(value["disposition"])),
+            DecisionStatus(str(value["decision_status"])),
+            str(value["outcome"]["status"]),
+            bool(value.get("information_gap_codes")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return value
+    migrated = dict(value)
+    migrated["renderer"] = {
+        "state": RendererState.DETERMINISTIC.value,
+        "deterministic_template": renderer.get(
+            "deterministic_template",
+            _deterministic_template(
+                ExplanationDisposition(str(value["disposition"])),
+                DecisionStatus(str(value["decision_status"])),
+                str(value["outcome"]["status"]),
+            ),
+        ),
+        "offered_clause_ids": clauses,
+        "ordered_clause_ids": clauses,
+        "visible_explanation": _render_clauses(clauses),
+        "failure_code": None,
+    }
+    return migrated
+
+
+def _deterministic_clauses(
+    disposition: ExplanationDisposition,
+    status: DecisionStatus,
+    outcome: str,
+    has_gaps: bool,
+) -> tuple[str, ...]:
+    return (
+        f"disposition.{disposition.value}.v1",
+        f"decision_status.{status.value}.v1",
+        f"information_gaps.{'present' if has_gaps else 'none'}.v1",
+        f"outcome.{outcome}.v1",
+    )
+
+
+def _render_clauses(clause_ids: tuple[str, ...]) -> str:
+    return " ".join(_CLAUSE_TEMPLATES[item] for item in clause_ids)
+
+
+def _empty_risk() -> RiskProjection:
+    return RiskProjection(
+        risk_class="filtered",
+        policy_status="filtered",
+        approval_status="filtered",
+    )
 
 
 def _safe_reason(value: str) -> str:
@@ -859,7 +1091,7 @@ def _validate_safe_tree(value: Any, key: str | None = None) -> None:
         if key in {"created_at"}:
             datetime.fromisoformat(value)
             return
-        if key in {"deterministic_template"}:
+        if key in {"deterministic_template", "offered_clause_ids", "ordered_clause_ids"}:
             if not re.fullmatch(r"[a-z0-9_.]+", value):
                 raise ValueError("invalid deterministic template")
             return
@@ -890,24 +1122,3 @@ def _validate_safe_tree(value: Any, key: str | None = None) -> None:
             and not _SAFE_ID.fullmatch(value)
         ):
             raise ValueError("invalid safe explanation reference")
-
-
-def _validate_visible_output(text: str, payload: dict[str, Any]) -> None:
-    lowered = text.lower()
-    if any(marker in lowered for marker in _PRIVATE_MARKERS):
-        raise ValueError("renderer emitted private content")
-    if re.search(r"(?:^|\s)(?:/|[A-Za-z]:\\)[^\s]+", text):
-        raise ValueError("renderer emitted a filesystem path")
-    allowed = set(re.findall(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{2,}", json.dumps(payload)))
-    claimed = set(
-        re.findall(
-            r"(?:decision|value|belief|goal|commitment|candidate|boundary|event|intent|receipt|observation|verification)-[A-Za-z0-9_.:@-]+",
-            text,
-        )
-    )
-    if not claimed <= allowed:
-        raise ValueError("renderer introduced an unknown reference")
-    known_codes = set(re.findall(r'"([a-z][a-z0-9_]{1,63})"', json.dumps(payload)))
-    claimed_codes = set(re.findall(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b", lowered))
-    if not claimed_codes <= known_codes:
-        raise ValueError("renderer introduced an unknown reason code")

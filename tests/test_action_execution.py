@@ -274,6 +274,8 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
 
     assert intent.status == IntentStatus.AWAITING_APPROVAL
     assert len(layer.list_approvals(pending_only=True)) == 1
+    with pytest.raises(ValueError, match="awaiting approval or execution"):
+        layer.validate_decision_outcome("decision-notify", True)
     with pytest.raises(ActionPolicyError, match="not executable"):
         runtime.execute(
             AgentEventType.ACTION_EXECUTE,
@@ -294,6 +296,9 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         handler=lambda: layer.execute(approved.intent_id),
     ).value
     assert completed.status == IntentStatus.SUCCEEDED
+    layer.validate_decision_outcome("decision-notify", True)
+    with pytest.raises(ValueError, match="contradicts action verification"):
+        layer.validate_decision_outcome("decision-notify", False)
     state = ActionState.model_validate(
         loop.persistent_state.extensions[ACTION_STATE_KEY]
     )
@@ -701,22 +706,87 @@ def test_valid_argument_record_is_persisted_before_risk_budget_rejection(
     runtime = AgentRuntime(queue_capacity=4)
     runtime.start()
     try:
-        with pytest.raises(ActionPolicyError, match="risk budget"):
-            runtime.execute(
-                AgentEventType.ACTION_INTENT,
-                source="test.risk-budget",
-                handler=lambda: layer.create_from_decision(
-                    "decision-risk-budget",
-                    idempotency_key="risk-budget",
-                    budget=ActionBudget(max_risk_class="read_only"),
-                ),
-            )
+        rejected = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.risk-budget",
+            handler=lambda: layer.create_from_decision(
+                "decision-risk-budget",
+                idempotency_key="risk-budget",
+                budget=ActionBudget(max_risk_class="read_only"),
+            ),
+        ).value
     finally:
         runtime.shutdown()
 
     assert layer.list_validation_records()[0].arguments_valid is True
+    rejection = layer.list_policy_rejections()[0]
+    assert rejected == rejection
+    assert rejection.decision_id == "decision-risk-budget"
+    assert rejection.policy_code == "risk_budget_denied"
+    assert rejection.reason_code == "risk_class_exceeds_budget"
+    assert "Bounded body" not in rejection.model_dump_json()
     assert layer.list_intents() == ()
     assert "Bounded body" not in layer.list_validation_records()[0].model_dump_json()
+
+
+def test_policy_rejection_retry_and_explanation_link_are_state_idempotent(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-idempotent-policy",
+        "local_notification_enqueue",
+        {"channel": "local", "title": "Review", "body": "Bounded body"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        results = [
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.idempotent-risk-budget",
+                handler=lambda: layer.create_from_decision(
+                    "decision-idempotent-policy",
+                    idempotency_key="same-policy-request",
+                    budget=ActionBudget(max_risk_class="read_only"),
+                ),
+            ).value
+            for _ in range(2)
+        ]
+    finally:
+        runtime.shutdown()
+    assert len(layer.list_validation_records()) == 1
+    assert len(layer.list_policy_rejections()) == 1
+    assert results[0] == results[1]
+
+    _decision(
+        loop,
+        "decision-idempotent-link",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.idempotent-link",
+            handler=lambda: layer.create_from_decision(
+                "decision-idempotent-link", idempotency_key="link-intent"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+    layer.link_explanation("decision-idempotent-link", "explanation-1@1")
+    linked = layer.get_intent(intent.intent_id)
+    layer.link_explanation("decision-idempotent-link", "explanation-1@1")
+    duplicate = layer.get_intent(intent.intent_id)
+    assert duplicate.revision == linked.revision
+    assert duplicate.explanation_refs == ("explanation-1@1",)
 
 
 def test_malformed_action_contract_gets_bounded_validation_evidence(
@@ -818,7 +888,7 @@ def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     migrated = restored.get_intent(intent.intent_id)
     assert migrated.status == IntentStatus.REJECTED
     assert migrated.failure_code == "legacy_unvalidated_intent"
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 2
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 3
     persisted_revision = migrated.revision
 
     restarted = ActionExecutionLayer(

@@ -197,6 +197,8 @@ class ActionCoordinator(RuntimeDomainMixin):
         success: bool,
     ) -> DecisionRecord:
         event = current_agent_event()
+        if self._action_execution is not None:
+            self._action_execution.validate_decision_outcome(decision_id, success)
         record = self.decision_store.record_outcome(
             decision_id,
             description=description,
