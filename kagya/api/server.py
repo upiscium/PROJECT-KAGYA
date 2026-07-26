@@ -496,7 +496,12 @@ def _activate_subject_runtime(app: FastAPI) -> None:
     registry = getattr(app.state, "chat_job_registry", None)
     if registry is None:
         raise RuntimeError("offline chat job registry is unavailable")
-    registry.activate()
+    registry.activate(lambda: _start_background_producers(app))
+
+
+def _start_background_producers(app: FastAPI) -> None:
+    """Start event producers only after durable Chat replay is accepted."""
+
     autonomy = getattr(app.state, "autonomy_loop", None)
     if autonomy is not None:
         autonomy.start()

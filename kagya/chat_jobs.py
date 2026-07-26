@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 import hmac
 import json
 import os
 from pathlib import Path
-from threading import Condition, RLock, Timer
+from threading import Condition, Event, RLock, Thread, Timer
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -60,9 +62,24 @@ class ChatStreamEvent:
     data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ChatRecoveryDisposition:
+    state: str
+    cancel_code: OperationCancelCode | None = None
+
+
 Executor = Callable[[dict[str, Any]], dict[str, Any]]
 CompletionObserver = Callable[[dict[str, Any]], None]
 ResultReconstructor = Callable[[str], dict[str, Any] | None]
+ReplayCompleteCallback = Callable[[], None]
+
+
+class ReplayState(StrEnum):
+    INACTIVE = "inactive"
+    STARTING = "starting"
+    REPLAYING = "replaying"
+    COMPLETE = "complete"
+    FAILED = "failed"
 
 
 class ChatJobRegistry:
@@ -77,7 +94,9 @@ class ChatJobRegistry:
         replay_limit: int = 256,
         timeout_seconds: float = 300.0,
         completion_observer: CompletionObserver | None = None,
-        recovery_dispositions: dict[str, str] | None = None,
+        recovery_dispositions: Mapping[
+            str, str | ChatRecoveryDisposition
+        ] | None = None,
         required_event_ids: set[str] | None = None,
         result_reconstructor: ResultReconstructor | None = None,
     ) -> None:
@@ -88,7 +107,14 @@ class ChatJobRegistry:
         self.timeout_seconds = timeout_seconds
         self.completion_observer = completion_observer
         self._has_recovery_evidence = recovery_dispositions is not None
-        self.recovery_dispositions = recovery_dispositions or {}
+        self.recovery_dispositions = {
+            event_id: (
+                value
+                if isinstance(value, ChatRecoveryDisposition)
+                else ChatRecoveryDisposition(value)
+            )
+            for event_id, value in (recovery_dispositions or {}).items()
+        }
         self.required_event_ids = required_event_ids or set()
         self.result_reconstructor = result_reconstructor
         self._lock = RLock()
@@ -100,9 +126,11 @@ class ChatJobRegistry:
         self._event_sequences: dict[str, int] = {}
         self._errors: dict[str, BaseException] = {}
         self._enqueue_sequence = 0
-        self._activated = False
-        self._replay_complete = False
+        self._replay_state = ReplayState.INACTIVE
         self._queued_for_replay: list[str] = []
+        self._replay_stop = Event()
+        self._replay_thread: Thread | None = None
+        self._replay_complete_callback: ReplayCompleteCallback | None = None
         self._key = self._load_key()
         self._load()
         self._missing_required_event_ids = self.required_event_ids - {
@@ -112,23 +140,34 @@ class ChatJobRegistry:
         with self._lock:
             self._recover_without_submission()
 
-    def activate(self) -> None:
-        """Replay durable queued jobs after the AgentRuntime starts accepting work."""
+    def activate(
+        self, completion_callback: ReplayCompleteCallback | None = None
+    ) -> None:
+        """Start queued replay without blocking API process startup."""
 
+        invoke_callback = False
         with self._lock:
-            if self._replay_complete:
+            if completion_callback is not None:
+                self._replay_complete_callback = completion_callback
+            if self._replay_state == ReplayState.COMPLETE:
+                invoke_callback = completion_callback is not None
+            elif self._replay_state != ReplayState.INACTIVE:
                 return
-            if self._activated:
-                return
-            self._activated = True
-        try:
-            self._replay_queued_jobs()
-        except Exception:
-            with self._lock:
-                self._activated = False
-            raise
-        with self._lock:
-            self._replay_complete = True
+            elif not self._queued_for_replay:
+                self._replay_state = ReplayState.COMPLETE
+                invoke_callback = completion_callback is not None
+            else:
+                self._replay_state = ReplayState.STARTING
+                self._replay_thread = Thread(
+                    target=self._run_replay_feeder,
+                    name="kagya-chat-replay",
+                    daemon=True,
+                )
+                self._replay_thread.start()
+        if invoke_callback:
+            callback = completion_callback or self._replay_complete_callback
+            if callback is not None:
+                callback()
 
     def enqueue(
         self,
@@ -200,13 +239,20 @@ class ChatJobRegistry:
     @property
     def is_ready(self) -> bool:
         return (
-            self._activated
-            and self._replay_complete
+            self._replay_state == ReplayState.COMPLETE
             and not self._missing_required_event_ids
             and not self._recovery_ambiguous
         )
 
     def shutdown(self) -> None:
+        self._replay_stop.set()
+        with self._changed:
+            self._changed.notify_all()
+        replay_thread = self._replay_thread
+        if replay_thread is not None:
+            replay_thread.join(timeout=5.0)
+            if replay_thread.is_alive():
+                raise RuntimeError("chat replay feeder did not stop")
         with self._lock:
             cancellable = [
                 operation_id
@@ -232,24 +278,38 @@ class ChatJobRegistry:
             if record.status.status == OperationState.FINALIZING:
                 return "already_finalizing"
             token = self._tokens.get(operation_id)
-            if token is not None:
-                token.cancel(code.value)
+            previous = record.model_copy(deep=True)
+            previous_event_sequence = self._event_sequences.get(operation_id, 0)
             if record.status.status == OperationState.QUEUED:
-                record.requested_cancel_code = code
-                record.cancel_requested_at = operation_now()
-                self._transition(
-                    operation_id, OperationState.CANCELED, cancel_code=code
-                )
+                try:
+                    record.requested_cancel_code = code
+                    record.cancel_requested_at = operation_now()
+                    self._transition(
+                        operation_id, OperationState.CANCELED, cancel_code=code
+                    )
+                except Exception:
+                    self._records[operation_id] = previous
+                    self._event_sequences[operation_id] = previous_event_sequence
+                    raise
+                if token is not None:
+                    token.cancel(code.value)
                 self._refresh_queue_positions()
                 self._emit(operation_id, "canceled", {"code": code.value})
                 return "canceled"
-            record.requested_cancel_code = code
-            record.cancel_requested_at = operation_now()
-            self._transition(
-                operation_id,
-                record.status.status,
-                cancel_requested=True,
-            )
+            try:
+                record.requested_cancel_code = code
+                record.cancel_requested_at = operation_now()
+                self._transition(
+                    operation_id,
+                    record.status.status,
+                    cancel_requested=True,
+                )
+            except Exception:
+                self._records[operation_id] = previous
+                self._event_sequences[operation_id] = previous_event_sequence
+                raise
+            if token is not None:
+                token.cancel(code.value)
             return "cancel_requested"
 
     def events_after(
@@ -279,7 +339,8 @@ class ChatJobRegistry:
             operation_id = record.status.operation_id
             self._events[operation_id] = deque(maxlen=self.replay_limit)
             self._event_sequences[operation_id] = record.last_stream_sequence
-            disposition = self.recovery_dispositions.get(record.status.event_id)
+            recovery = self.recovery_dispositions.get(record.status.event_id)
+            disposition = None if recovery is None else recovery.state
             reconcile = record.status.status in {
                 OperationState.RUNNING,
                 OperationState.FINALIZING,
@@ -346,9 +407,22 @@ class ChatJobRegistry:
                         disposition == "uncommitted" and record.status.cancel_requested
                     )
                     if canceled:
+                        journal_cancel_code = (
+                            None if recovery is None else recovery.cancel_code
+                        )
+                        registry_cancel_code = (
+                            record.requested_cancel_code or record.status.cancel_code
+                        )
+                        if (
+                            journal_cancel_code is not None
+                            and registry_cancel_code is not None
+                            and journal_cancel_code != registry_cancel_code
+                        ):
+                            self._recovery_ambiguous = True
+                            continue
                         code = (
-                            record.requested_cancel_code
-                            or record.status.cancel_code
+                            journal_cancel_code
+                            or registry_cancel_code
                             or OperationCancelCode.SHUTDOWN
                         )
                         self._transition(
@@ -412,19 +486,33 @@ class ChatJobRegistry:
                     )
         self._refresh_queue_positions()
 
-    def _replay_queued_jobs(self) -> None:
-        while True:
-            with self._changed:
-                if not self._queued_for_replay:
-                    return
-                operation_id = self._queued_for_replay[0]
-                record = self._records[operation_id]
-                try:
-                    self._submit(record)
-                except AgentRuntimeQueueFull:
-                    self._changed.wait(0.01)
-                    continue
-                self._queued_for_replay.pop(0)
+    def _run_replay_feeder(self) -> None:
+        try:
+            with self._lock:
+                self._replay_state = ReplayState.REPLAYING
+            while not self._replay_stop.is_set():
+                with self._changed:
+                    if not self._queued_for_replay:
+                        self._replay_state = ReplayState.COMPLETE
+                        callback = self._replay_complete_callback
+                        break
+                    operation_id = self._queued_for_replay[0]
+                    record = self._records[operation_id]
+                    try:
+                        self._submit(record)
+                    except AgentRuntimeQueueFull:
+                        self._changed.wait()
+                        continue
+                    self._queued_for_replay.pop(0)
+            else:
+                return
+        except Exception:
+            with self._lock:
+                self._replay_state = ReplayState.FAILED
+                self._recovery_ambiguous = True
+            return
+        if callback is not None:
+            callback()
 
     def _submit(self, record: ChatJobRecord) -> None:
         operation_id = record.status.operation_id
@@ -441,15 +529,16 @@ class ChatJobRegistry:
                 0.0, (record.timeout_deadline - operation_now()).total_seconds()
             )
             if remaining == 0:
-                record.requested_cancel_code = OperationCancelCode.TIMEOUT
-                record.cancel_requested_at = operation_now()
-                self._transition(
-                    operation_id,
-                    OperationState.QUEUED,
-                    cancel_requested=True,
-                    queue_position=record.status.queue_position,
-                )
-                token.cancel(OperationCancelCode.TIMEOUT.value)
+                if record.requested_cancel_code is None:
+                    record.requested_cancel_code = OperationCancelCode.TIMEOUT
+                    record.cancel_requested_at = operation_now()
+                    self._transition(
+                        operation_id,
+                        OperationState.QUEUED,
+                        cancel_requested=True,
+                        queue_position=record.status.queue_position,
+                    )
+                token.cancel(record.requested_cancel_code.value)
             else:
                 timer = Timer(
                     remaining,
@@ -467,6 +556,7 @@ class ChatJobRegistry:
                     )
                 self._transition(operation_id, OperationState.RUNNING)
                 self._refresh_queue_positions()
+                self._changed.notify_all()
             token.raise_if_canceled()
             result = self.executor(self._open(record.sealed_request))
             with self._lock:
