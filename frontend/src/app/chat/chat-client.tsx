@@ -11,6 +11,7 @@ import { EmotionMeter } from "@/components/emotion-meter";
 
 type AttachmentType = "image" | "audio" | "video";
 type ChatTurn = { role: "user" | "assistant"; content: string; attachments?: Attachment[]; result?: ChatResponse };
+type CancelUiState = "idle" | "requesting" | "requested" | "canceled" | "failed";
 
 const feedbackOptions: Array<{ value: FeedbackSignal; label: string }> = [
   { value: "good", label: "Good response" },
@@ -69,37 +70,59 @@ export function ChatClient() {
   const [contextId, setContextId] = useState<string | undefined>();
   const [operation, setOperation] = useState<OperationStatus | null>(null);
   const [streamedText, setStreamedText] = useState("");
-  const [canceled, setCanceled] = useState(false);
+  const [cancelState, setCancelState] = useState<CancelUiState>("idle");
   const [cancelMessage, setCancelMessage] = useState<string | null>(null);
   const streamController = useRef<AbortController | null>(null);
+  const operationRef = useRef<OperationStatus | null>(null);
+  const activeRequest = useRef<Parameters<typeof api.chat>[0] | null>(null);
+  const finalizedOperations = useRef(new Set<string>());
+
+  function updateOperation(status: OperationStatus) {
+    operationRef.current = status;
+    setOperation(status);
+  }
+
+  function finalizeResult(operationId: string, result: ChatResponse) {
+    if (finalizedOperations.current.has(operationId)) return;
+    finalizedOperations.current.add(operationId);
+    const request = activeRequest.current;
+    if (request) {
+      setHistory((current) => [
+        ...current,
+        { role: "user", content: request.text, attachments: request.attachments },
+        { role: "assistant", content: result.response, result },
+      ]);
+    }
+    setMessage("");
+    setAttachments([]);
+    setContextId(result.context_id);
+    operationRef.current = null;
+    setOperation(null);
+    setStreamedText("");
+    setCancelState("idle");
+  }
+
   const mutation = useMutation({
     mutationFn: (request: Parameters<typeof api.chat>[0]) => {
       const controller = new AbortController();
       streamController.current = controller;
       return streamChatJob(request, {
-        status: setOperation,
+        status: updateOperation,
         token: (text) => setStreamedText((current) => current + text),
       }, controller.signal);
     },
-    onMutate: () => {
-      setCanceled(false);
+    onMutate: (request) => {
+      activeRequest.current = request;
+      setCancelState("idle");
       setCancelMessage(null);
     },
-    onSuccess: (result, variables) => {
-      setHistory((current) => [
-        ...current,
-        { role: "user", content: variables.text, attachments: variables.attachments },
-        { role: "assistant", content: result.response, result },
-      ]);
-      setMessage("");
-      setAttachments([]);
-      setContextId(result.context_id);
-      setOperation(null);
-      setStreamedText("");
+    onSuccess: (result) => {
+      const operationId = operationRef.current?.operation_id ?? `direct:${result.episode_id}`;
+      finalizeResult(operationId, result);
     },
     onError: (error) => {
       if (error instanceof ChatJobCanceledError) {
-        setCanceled(true);
+        setCancelState("canceled");
         setStreamedText("");
       }
     },
@@ -109,11 +132,31 @@ export function ChatClient() {
   });
   const cancelMutation = useMutation({
     mutationFn: (operationId: string) => api.cancelChatJob(operationId),
-    onSuccess: (response) => {
-      setOperation(response.operation);
-      setCanceled(true);
-      setStreamedText("");
-      streamController.current?.abort();
+    onMutate: () => setCancelState("requesting"),
+    onSuccess: async (response) => {
+      updateOperation(response.operation);
+      switch (response.disposition) {
+        case "canceled":
+          setCancelState("canceled");
+          setStreamedText("");
+          streamController.current?.abort();
+          return;
+        case "cancel_requested":
+          setCancelState("requested");
+          return;
+        case "already_completed": {
+          const completed = await api.chatJobResult(response.operation.operation_id);
+          finalizeResult(response.operation.operation_id, completed.result);
+          streamController.current?.abort();
+          return;
+        }
+        case "failed":
+          setCancelState("failed");
+          streamController.current?.abort();
+          return;
+        default:
+          throw new ApiError("Unknown cancellation disposition");
+      }
     },
     onError: (error) => {
       if (error instanceof ApiError && error.detail === "already_finalizing") {
@@ -124,7 +167,7 @@ export function ChatClient() {
 
   const latest = [...history].reverse().find((turn) => turn.result)?.result;
   const canAddAttachment = attachmentUrl.trim().length > 0;
-  const canCancel = operation?.status === "queued" || operation?.status === "running";
+  const canCancel = cancelState === "idle" && (operation?.status === "queued" || operation?.status === "running");
 
   function addAttachment() {
     if (!canAddAttachment) return;
@@ -175,10 +218,13 @@ export function ChatClient() {
             <strong>KAGYA</strong>
             <p className="generating-indicator"><span className="spinner" aria-hidden="true" />{operation?.status === "queued" ? `Queued${operation.queue_position ? ` (${operation.queue_position})` : ""}` : operation?.status === "finalizing" ? "Finalizing response..." : "Generating response..."}</p>
             {streamedText ? <p>{streamedText}</p> : null}
-            {canCancel && operation ? <Button type="button" disabled={cancelMutation.isPending} onClick={() => cancelMutation.mutate(operation.operation_id)}>Cancel</Button> : null}
+            {canCancel && operation ? <Button type="button" onClick={() => cancelMutation.mutate(operation.operation_id)}>Cancel</Button> : null}
           </div>
         ) : null}
-        {canceled ? <p className="muted" role="status">Canceled</p> : null}
+        {cancelState === "requesting" ? <p className="muted" role="status">Canceling...</p> : null}
+        {cancelState === "requested" ? <p className="muted" role="status">Cancellation requested...</p> : null}
+        {cancelState === "canceled" ? <p className="muted" role="status">Canceled</p> : null}
+        {cancelState === "failed" ? <p className="error" role="status">Cancellation failed</p> : null}
       </Card>
 
       <form
@@ -214,7 +260,7 @@ export function ChatClient() {
 
       {cancelMessage ? <p className="error">{cancelMessage}</p> : null}
       {cancelMutation.error && !cancelMessage ? <p className="error">{errorMessage(cancelMutation.error)}</p> : null}
-      {mutation.error && !canceled ? <p className="error">{errorMessage(mutation.error)}</p> : null}
+      {mutation.error && cancelState !== "canceled" ? <p className="error">{errorMessage(mutation.error)}</p> : null}
     </div>
   );
 }

@@ -1,8 +1,14 @@
 """Chat API schemas."""
 
+from typing import Literal
+
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from kagya.operation_status import OperationStatus
+
+ChatCancelDisposition = Literal[
+    "canceled", "cancel_requested", "already_completed", "failed"
+]
 
 
 class AttachmentSchema(BaseModel):
@@ -66,5 +72,5 @@ class ChatJobResult(BaseModel):
 
 
 class ChatCancelResponse(BaseModel):
-    disposition: str
+    disposition: ChatCancelDisposition
     operation: OperationStatus
