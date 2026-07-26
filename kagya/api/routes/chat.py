@@ -22,7 +22,11 @@ from kagya.api.schemas.chat import (
     EmotionSchema,
     ModelSchema,
 )
-from kagya.chat_jobs import ChatJobRegistry, ChatStreamEvent
+from kagya.chat_jobs import (
+    ChatJobRegistry,
+    ChatRecoveryDisposition,
+    ChatStreamEvent,
+)
 from kagya.operation_status import OperationCancelCode, OperationState
 from kagya.runtime import JournalLifecycle
 from kagya.runtime import (
@@ -254,7 +258,7 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
     chat_event_ids = {
         record.event_id for record in journal_records if record.source == "api.chat.job"
     }
-    latest_chat_records = {}
+    latest_chat_records: dict[str, Any] = {}
     for record in journal_records:
         if record.event_id in chat_event_ids:
             latest_chat_records[record.event_id] = record
@@ -356,22 +360,28 @@ def _request_client(request: Request) -> str:
     return "unknown" if request.client is None else request.client.host
 
 
-def _journal_disposition(record: Any) -> str:
+def _journal_disposition(record: Any) -> ChatRecoveryDisposition:
     if record.lifecycle == JournalLifecycle.COMPLETED:
-        return "committed"
+        return ChatRecoveryDisposition("committed")
     if record.lifecycle == JournalLifecycle.FAILED:
         if (record.failure_category or "").startswith("canceled_"):
-            return "canceled"
-        return "failed"
+            raw_code = (record.failure_category or "").removeprefix("canceled_")
+            try:
+                cancel_code = OperationCancelCode(raw_code)
+            except ValueError:
+                return ChatRecoveryDisposition("ambiguous")
+            return ChatRecoveryDisposition("canceled", cancel_code)
+        return ChatRecoveryDisposition("failed")
     if record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED:
-        return {
+        state = {
             "committed_before_crash": "committed",
             "uncommitted_after_crash": "uncommitted",
             "accepted_not_started": "queued",
         }.get(record.failure_category, "ambiguous")
+        return ChatRecoveryDisposition(state)
     if record.lifecycle == JournalLifecycle.ACCEPTED:
-        return "queued"
-    return "ambiguous"
+        return ChatRecoveryDisposition("queued")
+    return ChatRecoveryDisposition("ambiguous")
 
 
 def _optional_str(value: Any) -> str | None:

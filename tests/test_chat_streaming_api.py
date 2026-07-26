@@ -11,8 +11,9 @@ import pytest
 
 from kagya.chat_jobs import ChatJobRecord
 from kagya.api.server import _activate_subject_runtime
+from kagya.api.routes.chat import _journal_disposition
 from kagya.operation_status import OperationState, OperationStatus, operation_now
-from kagya.runtime import AgentEvent, AgentEventType
+from kagya.runtime import AgentEvent, AgentEventType, JournalLifecycle
 from tests.test_fastapi_backend import ThinkingProvider, _client, _settings
 
 
@@ -30,13 +31,37 @@ class BlockingThinkingProvider(ThinkingProvider):
         yield self.response_text
 
 
+@pytest.mark.parametrize(
+    ("category", "expected"),
+    [
+        ("canceled_client_request", "client_request"),
+        ("canceled_timeout", "timeout"),
+        ("canceled_shutdown", "shutdown"),
+    ],
+)
+def test_journal_cancel_recovery_preserves_reason(
+    category: str, expected: str
+) -> None:
+    disposition = _journal_disposition(
+        SimpleNamespace(
+            lifecycle=JournalLifecycle.FAILED,
+            failure_category=category,
+        )
+    )
+
+    assert disposition.state == "canceled"
+    assert disposition.cancel_code == expected
+
+
 def test_subject_runtime_replays_chat_before_background_producers() -> None:
     order: list[str] = []
     app = SimpleNamespace(
         state=SimpleNamespace(
             agent_runtime=SimpleNamespace(start=lambda: order.append("runtime")),
             chat_job_registry=SimpleNamespace(
-                activate=lambda: order.append("chat-replay")
+                activate=lambda callback: (
+                    order.append("chat-replay"), callback()
+                )
             ),
             autonomy_loop=SimpleNamespace(start=lambda: order.append("autonomy")),
             emotion_timer=SimpleNamespace(start=lambda: order.append("emotion")),

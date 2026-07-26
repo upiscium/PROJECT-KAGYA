@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import shutil
 from threading import Event
@@ -8,7 +9,7 @@ import time
 
 import pytest
 
-from kagya.chat_jobs import ChatJobRegistry
+from kagya.chat_jobs import ChatJobRegistry, ChatRecoveryDisposition
 from kagya.operation_status import OperationCancelCode, OperationState
 from kagya.runtime import (
     AgentEventType,
@@ -33,6 +34,15 @@ def _wait(registry: ChatJobRegistry, operation_id: str, timeout: float = 3.0):
             return record
         time.sleep(0.01)
     raise AssertionError("chat job did not become terminal")
+
+
+def _wait_ready(registry: ChatJobRegistry, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if registry.is_ready:
+            return
+        time.sleep(0.01)
+    raise AssertionError("chat job registry did not become ready")
 
 
 def _result(payload: dict[str, object]) -> dict[str, object]:
@@ -141,6 +151,45 @@ def test_running_cancel_aborts_unsupported_provider_before_commit(
         event.event != "token"
         for event in registry.events_after(job.status.operation_id, 0)
     )
+
+
+def test_cancel_persist_failure_does_not_cancel_provider(tmp_path: Path) -> None:
+    entered = Event()
+    release = Event()
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        entered.set()
+        release.wait(2)
+        cancellation_checkpoint()
+        return _result(payload)
+
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(tmp_path / "jobs.json", runtime, execute)
+    job, _ = registry.enqueue(
+        {"text": "must-complete"},
+        client_id="client",
+        idempotency_key="cancel-persist-failure",
+        correlation_id="context",
+    )
+    assert entered.wait(1)
+    persist = registry._persist
+    registry._persist = lambda: (_ for _ in ()).throw(OSError("registry unavailable"))
+
+    with pytest.raises(OSError, match="registry unavailable"):
+        registry.cancel(job.status.operation_id, OperationCancelCode.CLIENT_REQUEST)
+    current = registry.get(job.status.operation_id)
+    assert current is not None
+    assert current.requested_cancel_code is None
+    assert current.status.cancel_requested is False
+
+    registry._persist = persist
+    release.set()
+    terminal = _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    assert terminal.status.status == OperationState.COMPLETED
+    assert terminal.result == {"response": "must-complete"}
 
 
 def test_cancel_wins_when_paused_before_finalizing(tmp_path: Path) -> None:
@@ -424,6 +473,7 @@ def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> 
     assert restarted.is_ready is False
     restarted_runtime.start()
     restarted.activate()
+    _wait_ready(restarted)
     assert restarted.is_ready is True
     completed = _wait(restarted, job.status.operation_id)
     restarted_runtime.shutdown()
@@ -494,6 +544,144 @@ def test_activate_replays_queued_jobs_once_in_enqueue_order(tmp_path: Path) -> N
     ]
     assert [text for text, _sequence in executions] == ["0", "1", "2"]
     assert [sequence for _text, sequence in executions] == [1, 2, 3]
+
+
+def test_activate_does_not_block_on_capacity_bound_replay(tmp_path: Path) -> None:
+    source_path = tmp_path / "source" / "jobs.json"
+    replay_path = tmp_path / "replay" / "jobs.json"
+    source_runtime = AgentRuntime(queue_capacity=4)
+    source_runtime.start()
+    source_release = Event()
+    source_runtime.submit(
+        AgentEventType.STATE_SNAPSHOT,
+        source="test.source-blocker",
+        handler=lambda: source_release.wait(2),
+    )
+    source_registry = ChatJobRegistry(source_path, source_runtime, _result)
+    jobs = [
+        source_registry.enqueue(
+            {"text": str(index)},
+            client_id="client",
+            idempotency_key=f"async-replay-{index}",
+            correlation_id="context",
+        )[0]
+        for index in range(3)
+    ]
+    replay_path.parent.mkdir(parents=True)
+    shutil.copy2(source_path, replay_path)
+    shutil.copy2(
+        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
+    )
+
+    entered = Event()
+    release = Event()
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        if payload["text"] == "0":
+            entered.set()
+            release.wait(2)
+        return _result(payload)
+
+    replay_runtime = AgentRuntime(queue_capacity=1)
+    replay_registry = ChatJobRegistry(replay_path, replay_runtime, execute)
+    replay_runtime.start()
+    started = time.monotonic()
+    replay_registry.activate()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert entered.wait(1)
+    assert replay_registry.is_ready is False
+    release.set()
+    _wait_ready(replay_registry)
+    completed = [_wait(replay_registry, job.status.operation_id) for job in jobs]
+    replay_registry.shutdown()
+    replay_runtime.shutdown()
+    for job in jobs:
+        source_registry.cancel(job.status.operation_id, OperationCancelCode.SHUTDOWN)
+    source_release.set()
+    source_runtime.shutdown()
+
+    assert [item.result["response"] for item in completed if item.result] == [
+        "0",
+        "1",
+        "2",
+    ]
+
+
+def test_expired_replay_wait_has_bounded_registry_writes(tmp_path: Path) -> None:
+    source_path = tmp_path / "source" / "jobs.json"
+    replay_path = tmp_path / "replay" / "jobs.json"
+    source_runtime = AgentRuntime(queue_capacity=4)
+    source_runtime.start()
+    source_release = Event()
+    source_runtime.submit(
+        AgentEventType.STATE_SNAPSHOT,
+        source="test.source-blocker",
+        handler=lambda: source_release.wait(2),
+    )
+    source_registry = ChatJobRegistry(source_path, source_runtime, _result)
+    jobs = [
+        source_registry.enqueue(
+            {"text": str(index)},
+            client_id="client",
+            idempotency_key=f"bounded-timeout-{index}",
+            correlation_id="context",
+        )[0]
+        for index in range(3)
+    ]
+    replay_path.parent.mkdir(parents=True)
+    shutil.copy2(source_path, replay_path)
+    shutil.copy2(
+        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
+    )
+    values = json.loads(replay_path.read_text())
+    future = datetime.now(UTC) + timedelta(seconds=10)
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    for index, value in enumerate(values):
+        value["timeout_deadline"] = (past if index == 2 else future).isoformat()
+    replay_path.write_text(json.dumps(values))
+
+    entered = Event()
+    release = Event()
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        if payload["text"] == "0":
+            entered.set()
+            release.wait(2)
+        return _result(payload)
+
+    replay_runtime = AgentRuntime(queue_capacity=1)
+    replay_registry = ChatJobRegistry(replay_path, replay_runtime, execute)
+    writes = 0
+    persist = replay_registry._persist
+
+    def count_persist() -> None:
+        nonlocal writes
+        writes += 1
+        persist()
+
+    replay_registry._persist = count_persist
+    replay_runtime.start()
+    replay_registry.activate()
+    assert entered.wait(1)
+    time.sleep(0.2)
+    writes_while_waiting = writes
+    time.sleep(0.2)
+
+    assert writes == writes_while_waiting
+    assert writes_while_waiting <= 5
+    release.set()
+    terminal = _wait(replay_registry, jobs[2].status.operation_id)
+    replay_registry.shutdown()
+    replay_runtime.shutdown()
+    for job in jobs:
+        source_registry.cancel(job.status.operation_id, OperationCancelCode.SHUTDOWN)
+    source_release.set()
+    source_runtime.shutdown()
+
+    assert terminal.status.status == OperationState.CANCELED
+    assert terminal.status.cancel_code == OperationCancelCode.TIMEOUT
 
 
 def test_fresh_registry_promotes_journal_committed_finalizing_result(
@@ -759,6 +947,54 @@ def test_v1_record_migrates_without_inventing_cancel_authority(tmp_path: Path) -
     assert migrated.schema_version == 2
     assert migrated.requested_cancel_code is None
     assert migrated.cancel_requested_at is None
+
+
+def test_registry_and_journal_cancel_reason_mismatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "mismatch"},
+        client_id="client",
+        idempotency_key="cancel-mismatch",
+        correlation_id="context",
+    )
+    completed = _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+    values = json.loads(path.read_text())
+    values[0]["pending_result"] = values[0].pop("result")
+    values[0]["requested_cancel_code"] = "client_request"
+    values[0]["status"].update(
+        status="finalizing",
+        completed_at=None,
+        result_available=False,
+        cancel_requested=True,
+    )
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(
+        path,
+        restarted_runtime,
+        _result,
+        recovery_dispositions={
+            completed.status.event_id: ChatRecoveryDisposition(
+                "canceled", OperationCancelCode.TIMEOUT
+            )
+        },
+    )
+    restarted.activate()
+    recovered = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert restarted.is_ready is False
+    assert recovered is not None
+    assert recovered.status.status == OperationState.FINALIZING
+    assert recovered.requested_cancel_code == OperationCancelCode.CLIENT_REQUEST
 
 
 def test_fresh_registry_fails_closed_on_ambiguous_commit(tmp_path: Path) -> None:
