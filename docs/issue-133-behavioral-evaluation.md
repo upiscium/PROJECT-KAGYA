@@ -56,12 +56,32 @@ KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml \
 
 Normal CI runs the synthetic evaluator contract, provider factories with fakes, and deterministic runtime suite. A green CI run never claims `real_model_runtime_gate_passed`; only the real-model runtime can create that evidence. Production activation requires current ordinary gates, a passed/finalized/reconciled deterministic architecture artifact, and a passed/finalized/reconciled real candidate-model artifact. Missing, failed, stale, corrupt, hash-mismatched, and coverage-incomplete real evidence have distinct bounded status and activation codes.
 
-Hardware-backed real-model evidence is pending until an explicitly opted-in run completes on the configured model and adapter artifacts. Deterministic local evidence does not substitute for that hardware result or alter production policy and artifact provenance requirements.
+### Hardware Evidence
+
+The opt-in Transformers run `issue-133-rtx4080-20260726-v7` completed at `2026-07-26T04:13:44.786540Z` with a `valid` reconciled artifact and `real_model_runtime_gate_passed=true`.
+
+- Source: verified commit `524e638f317a253c36220909177423a4e3e18a76`
+- Base model: `google/gemma-4-12B-it`
+- Requested and resolved model revision: `12ace6d648d72bd41519e140f1185f34d38c7e3d`
+- Requested and resolved processor revision: `12ace6d648d72bd41519e140f1185f34d38c7e3d`
+- Candidate adapter: `adapter-223573b8-f1a2-49ed-a80e-d0acab913a7b`
+- Candidate adapter hash: `bfc2d53b832ebc0f919c5d274604b3c7ea4e7a8d72bde9e350c7d06e72c520aa`
+- Fixture set hash: `6058307147fe1da460a6e2c1ade922a945e81935bc7286605187edba3f174bfa`
+- Coverage manifest hash: `ba43ee25c9d74362c4879a1e8378e1cc5f4038c85f5c1caf2380a4281a6f16c3`
+- Baseline and candidate aggregate scores: `1.0`
+- Candidate dimension scores: all 23 required dimensions `1.0`
+- Coverage: complete, with no missing dimensions or hard gates
+- Hard-gate failures: none
+- Provider generations: 17 baseline and 17 candidate
+- Fallback used: false
+- Hardware: NVIDIA GeForce RTX 4080, 16376 MiB, driver 595.45.04
+
+This result is evidence for the exact immutable source, fixture, model, processor, and adapter artifacts above. It does not authorize artifacts with different provenance.
 
 ## Policy And Migration
 
 `behavioral_activation_policy` defaults to `real_model_required`. Recognized environments are `production`, `development`, `test`, and `ci`; unknown environments fail validation. Production accepts only `real_model_required`. `deterministic_runtime_only` is limited to development, test, and CI and must be explicitly configured. `disabled` is limited to explicit test settings.
 
-The config loader maps the removed `require_real_model_behavioral_gate` key explicitly: `true` becomes `real_model_required`, while `false` becomes `deterministic_runtime_only`. New configuration should use only the policy enum. Adapter registry schema v9 does not migrate pre-v9 coverage fields as activation authority. A legacy active adapter may continue running with a warning, but reactivation and rollback promotion use current policy and coverage gates.
+The config loader maps the removed `require_real_model_behavioral_gate` key explicitly: `true` becomes `real_model_required`, while `false` becomes `deterministic_runtime_only`. New configuration should use only the policy enum. Adapter registry schema v10 does not migrate legacy coverage or provenance fields as activation authority. A legacy active adapter may continue running with a warning, but reactivation and rollback promotion use current policy and coverage gates.
 
 `POST /api/adapters/{adapter_id}/evaluate` accepts an empty, extra-forbidden request body and always loads separate configured baseline and registered candidate providers over server-owned eval sets. Client-provided scores and dimensions are rejected during schema validation. `GET /api/adapters/{adapter_id}/behavioral-evaluation-status` returns bounded ordinary, deterministic, real-model, artifact, policy, and eligibility states without absolute paths, raw hashes, or private configuration.
