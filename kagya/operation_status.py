@@ -21,6 +21,8 @@ class OperationErrorCode(StrEnum):
     INTERRUPTED = "interrupted"
     TIMEOUT = "timeout"
     PROVIDER_ERROR = "provider_error"
+    COMMIT_INDETERMINATE = "commit_indeterminate"
+    COMMITTED_RESULT_UNAVAILABLE = "committed_result_unavailable"
 
 
 class OperationCancelCode(StrEnum):
@@ -63,9 +65,21 @@ class OperationStatus(BaseModel):
                 raise ValueError("operation timestamps must include a timezone")
         if self.status != OperationState.QUEUED and self.queue_position is not None:
             raise ValueError("only queued operations have a queue position")
-        if self.result_available != (self.status == OperationState.COMPLETED):
+        completed_without_result = (
+            self.status == OperationState.COMPLETED
+            and self.error_code == OperationErrorCode.COMMITTED_RESULT_UNAVAILABLE
+        )
+        if self.result_available != (
+            self.status == OperationState.COMPLETED and not completed_without_result
+        ):
             raise ValueError("result availability must match completed status")
-        if self.error_code is not None and self.status != OperationState.FAILED:
+        allowed_error_states = {
+            OperationErrorCode.COMMIT_INDETERMINATE: OperationState.FINALIZING,
+            OperationErrorCode.COMMITTED_RESULT_UNAVAILABLE: OperationState.COMPLETED,
+        }
+        if self.error_code is not None and self.status != allowed_error_states.get(
+            self.error_code, OperationState.FAILED
+        ):
             raise ValueError("error code requires failed status")
         if self.cancel_code is not None and self.status != OperationState.CANCELED:
             raise ValueError("cancel code requires canceled status")

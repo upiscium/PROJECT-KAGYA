@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 from threading import Lock
 import time
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -127,6 +127,7 @@ class EventJournal:
         retained_files: int = 3,
         telemetry: JournalTelemetry | None = None,
         codec: EncryptedCodec | None = None,
+        failure_injector: Callable[[str], None] | None = None,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("journal max_bytes must be positive")
@@ -139,6 +140,7 @@ class EventJournal:
         self.codec = codec or EncryptedCodec(
             enabled=False, purpose="live-state", context="operator-journal"
         )
+        self._failure_injector = failure_injector
         self._lock = Lock()
         self._last_hash: str | None = None
         self._last_sequence = 0
@@ -184,6 +186,8 @@ class EventJournal:
         )
 
     def completed(self, event: JournalEvent, snapshot_hash: str) -> JournalRecord:
+        if self._failure_injector is not None:
+            self._failure_injector("before_journal_completed")
         return self._append_event(
             event,
             JournalLifecycle.COMPLETED,

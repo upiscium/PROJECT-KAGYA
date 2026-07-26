@@ -1,10 +1,13 @@
 from pathlib import Path
+import json
 import re
 from threading import Event
 import time
 
+import pytest
+
 from kagya.operation_status import OperationState
-from tests.test_fastapi_backend import ThinkingProvider, _client
+from tests.test_fastapi_backend import ThinkingProvider, _client, _settings
 
 
 class BlockingThinkingProvider(ThinkingProvider):
@@ -153,3 +156,123 @@ def test_delete_after_external_prepare_boundary_returns_409_and_completes(
         assert rejected.json()["detail"] == "already_finalizing"
         release.set()
         assert _completed(client, operation_id)["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("component", "stage"),
+    [
+        ("state_wal", "after_wal_append"),
+        ("agent_state_store", "snapshot_atomic_replace"),
+        ("event_journal", "before_journal_completed"),
+    ],
+)
+def test_commit_boundary_failure_is_indeterminate_then_restart_commits(
+    tmp_path: Path, component: str, stage: str
+) -> None:
+    settings = _settings(tmp_path)
+    injected = False
+
+    def fail_once(current: str) -> None:
+        nonlocal injected
+        if current == stage and not injected:
+            injected = True
+            raise OSError(stage)
+
+    with _client(tmp_path, settings=settings) as client:
+        target = getattr(client.app.state, component)
+        target._failure_injector = fail_once
+        submitted = client.post(
+            "/api/chat/jobs",
+            json={"text": f"recover {stage}", "attachments": []},
+            headers={"Idempotency-Key": stage},
+        )
+        operation_id = submitted.json()["operation"]["operation_id"]
+        event_id = submitted.json()["operation"]["event_id"]
+        deadline = time.monotonic() + 3
+        operation = None
+        while time.monotonic() < deadline:
+            operation = client.get(f"/api/chat/jobs/{operation_id}").json()["operation"]
+            if operation["error_code"] == "commit_indeterminate":
+                break
+            time.sleep(0.01)
+        assert operation is not None
+        assert operation["status"] == "finalizing"
+        assert operation["event_id"] == event_id
+        assert operation["error_code"] == "commit_indeterminate"
+        assert client.get("/health/ready").status_code == 503
+        events = client.app.state.chat_job_registry.events_after(operation_id, 0)
+        assert all(event.event not in {"token", "final"} for event in events)
+
+    with _client(tmp_path, settings=settings) as restarted:
+        operation = restarted.get(f"/api/chat/jobs/{operation_id}").json()["operation"]
+        assert operation["status"] == "completed"
+        assert operation["event_id"] == event_id
+        result = restarted.get(f"/api/chat/jobs/{operation_id}/result")
+        assert result.status_code == 200
+        assert result.json()["result"]["response"] == "Visible API answer."
+        stream = restarted.get(f"/api/chat/jobs/{operation_id}/events")
+        event_ids = [
+            int(value)
+            for value in re.findall(r"^id: (\d+)$", stream.text, re.MULTILINE)
+        ]
+        assert event_ids == sorted(set(event_ids))
+        assert stream.text.count("event: final") == 1
+        records = restarted.app.state.memory_system.db1.get(
+            where={"source_event_id": event_id}
+        )
+        assert len(records["ids"]) == 1
+
+
+@pytest.mark.parametrize("source_available", [True, False])
+def test_restart_reconstructs_committed_result_or_returns_bounded_409(
+    tmp_path: Path, source_available: bool
+) -> None:
+    settings = _settings(tmp_path)
+    sentinel = "PRIVATE_RECONSTRUCTION_SENTINEL"
+    with _client(tmp_path, settings=settings) as client:
+        submitted = client.post(
+            "/api/chat/jobs",
+            json={"text": sentinel, "attachments": []},
+            headers={"Idempotency-Key": f"reconstruct-{source_available}"},
+        )
+        operation_id = submitted.json()["operation"]["operation_id"]
+        event_id = submitted.json()["operation"]["event_id"]
+        assert _completed(client, operation_id)["status"] == "completed"
+        if not source_available:
+            source = client.app.state.memory_system.db1.get(
+                where={"source_event_id": event_id}
+            )
+            client.app.state.memory_system.db1.delete(ids=source["ids"])
+
+    registry_path = settings.agent_state.path.parent / "chat_jobs.json"
+    values = json.loads(registry_path.read_text())
+    record = next(
+        item for item in values if item["status"]["operation_id"] == operation_id
+    )
+    record["result"] = None
+    record["pending_result"] = None
+    record["status"].update(
+        status="finalizing",
+        completed_at=None,
+        result_available=False,
+        error_code="commit_indeterminate",
+    )
+    registry_path.write_text(json.dumps(values))
+
+    with _client(tmp_path, settings=settings) as restarted:
+        operation = restarted.get(f"/api/chat/jobs/{operation_id}").json()["operation"]
+        assert operation["status"] == "completed"
+        result = restarted.get(f"/api/chat/jobs/{operation_id}/result")
+        if source_available:
+            assert result.status_code == 200
+            assert result.json()["result"]["response"] == "Visible API answer."
+            assert sentinel not in result.text
+            records = restarted.app.state.memory_system.db1.get(
+                where={"source_event_id": event_id}
+            )
+            assert len(records["ids"]) == 1
+        else:
+            assert operation["error_code"] == "committed_result_unavailable"
+            assert operation["result_available"] is False
+            assert result.status_code == 409
+            assert sentinel not in result.text

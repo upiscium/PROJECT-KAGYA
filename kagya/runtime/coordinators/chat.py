@@ -457,6 +457,15 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 model_id=model_id,
                 model_revision=str(getattr(self.provider, "model_revision", "unknown")),
                 adapter_id=None if fallback_used else self.adapter_id,
+                metadata={
+                    "public_result_recovery": {
+                        "optimal_loss": emotion_state.optimal_loss,
+                        "adapter_hash": None if fallback_used else self.adapter_hash,
+                        "activation_sequence": None
+                        if fallback_used
+                        else self.activation_sequence,
+                    }
+                },
                 validation_status=ValidationStatus.UNVERIFIED,
                 stage_external=event is not None,
             )

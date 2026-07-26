@@ -753,6 +753,21 @@ class DualMemorySystem:
         result = self.db1.get(ids=[episode_id], include=["metadatas"])
         return _first_episode_from_get(result)
 
+    def committed_episodic_for_event(
+        self, event_id: str
+    ) -> EpisodicMemoryRecord | None:
+        result = self.db1.get(
+            where={"source_event_id": event_id}, include=["metadatas"]
+        )
+        committed = [
+            record
+            for record in _episodic_records_from_get(result)
+            if record.external_transaction_status == ExternalTransactionStatus.COMMITTED
+        ]
+        if len(committed) > 1:
+            raise ValueError("committed chat source event is ambiguous")
+        return committed[0] if committed else None
+
     def get_semantic(self, memory_id: str) -> SemanticMemoryRecord | None:
         result = self.db2.get(ids=[memory_id], include=["documents", "metadatas"])
         return _first_semantic_from_get(result)

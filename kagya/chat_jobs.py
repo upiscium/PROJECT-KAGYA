@@ -26,6 +26,7 @@ from kagya.runtime import (
     AgentEventOutcome,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeJournalError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     CancellationToken,
@@ -57,6 +58,7 @@ class ChatStreamEvent:
 
 Executor = Callable[[dict[str, Any]], dict[str, Any]]
 CompletionObserver = Callable[[dict[str, Any]], None]
+ResultReconstructor = Callable[[str], dict[str, Any] | None]
 
 
 class ChatJobRegistry:
@@ -71,8 +73,9 @@ class ChatJobRegistry:
         replay_limit: int = 256,
         timeout_seconds: float = 300.0,
         completion_observer: CompletionObserver | None = None,
-        committed_event_ids: set[str] | None = None,
+        recovery_dispositions: dict[str, str] | None = None,
         required_event_ids: set[str] | None = None,
+        result_reconstructor: ResultReconstructor | None = None,
     ) -> None:
         self.path = path
         self.runtime = runtime
@@ -80,8 +83,10 @@ class ChatJobRegistry:
         self.replay_limit = replay_limit
         self.timeout_seconds = timeout_seconds
         self.completion_observer = completion_observer
-        self.committed_event_ids = committed_event_ids or set()
+        self._has_recovery_evidence = recovery_dispositions is not None
+        self.recovery_dispositions = recovery_dispositions or {}
         self.required_event_ids = required_event_ids or set()
+        self.result_reconstructor = result_reconstructor
         self._lock = RLock()
         self._changed = Condition(self._lock)
         self._records: dict[str, ChatJobRecord] = {}
@@ -96,6 +101,7 @@ class ChatJobRegistry:
         self._missing_required_event_ids = self.required_event_ids - {
             record.status.event_id for record in self._records.values()
         }
+        self._recovery_ambiguous = False
         with self._lock:
             self._recover()
 
@@ -168,7 +174,7 @@ class ChatJobRegistry:
 
     @property
     def is_ready(self) -> bool:
-        return not self._missing_required_event_ids
+        return not self._missing_required_event_ids and not self._recovery_ambiguous
 
     def shutdown(self) -> None:
         with self._lock:
@@ -239,19 +245,86 @@ class ChatJobRegistry:
             operation_id = record.status.operation_id
             self._events[operation_id] = deque(maxlen=self.replay_limit)
             self._event_sequences[operation_id] = record.last_stream_sequence
-            if record.status.status == OperationState.QUEUED:
-                self._submit(record)
-            elif record.status.status in {
+            disposition = self.recovery_dispositions.get(record.status.event_id)
+            reconcile = record.status.status in {
                 OperationState.RUNNING,
                 OperationState.FINALIZING,
+            }
+            if disposition == "committed":
+                reconcile = (
+                    reconcile or record.status.status != OperationState.COMPLETED
+                )
+                reconcile = reconcile or record.result is None
+            elif disposition == "canceled":
+                reconcile = reconcile or record.status.status != OperationState.CANCELED
+            elif disposition == "failed":
+                reconcile = reconcile or record.status.status != OperationState.FAILED
+            elif disposition == "uncommitted":
+                expected = (
+                    OperationState.CANCELED
+                    if record.status.cancel_requested
+                    else OperationState.FAILED
+                )
+                reconcile = reconcile or record.status.status != expected
+            elif disposition == "ambiguous":
+                reconcile = True
+
+            if record.status.status == OperationState.QUEUED and disposition in {
+                None,
+                "queued",
             }:
-                if (
-                    record.status.event_id in self.committed_event_ids
-                    and record.pending_result is not None
-                ):
-                    record.result = record.pending_result
+                self._submit(record)
+            elif reconcile:
+                if disposition == "committed":
+                    result = record.pending_result
+                    if result is None and self.result_reconstructor is not None:
+                        try:
+                            result = self.result_reconstructor(record.status.event_id)
+                        except Exception:
+                            self._recovery_ambiguous = True
+                            continue
+                    record.result = result
                     record.pending_result = None
-                    self._complete(operation_id, record.result)
+                    if result is None:
+                        self._transition(
+                            operation_id,
+                            OperationState.COMPLETED,
+                            error_code=OperationErrorCode.COMMITTED_RESULT_UNAVAILABLE,
+                        )
+                        self._emit(
+                            operation_id,
+                            "error",
+                            {
+                                "code": OperationErrorCode.COMMITTED_RESULT_UNAVAILABLE.value
+                            },
+                        )
+                    else:
+                        self._complete(operation_id, result)
+                elif disposition in {"uncommitted", "failed", "canceled"}:
+                    record.pending_result = None
+                    record.result = None
+                    canceled = disposition == "canceled" or (
+                        disposition == "uncommitted" and record.status.cancel_requested
+                    )
+                    if canceled:
+                        code = record.status.cancel_code or OperationCancelCode.SHUTDOWN
+                        self._transition(
+                            operation_id, OperationState.CANCELED, cancel_code=code
+                        )
+                        self._emit(operation_id, "canceled", {"code": code.value})
+                    else:
+                        self._transition(
+                            operation_id,
+                            OperationState.FAILED,
+                            error_code=OperationErrorCode.INTERRUPTED,
+                        )
+                        self._emit(
+                            operation_id,
+                            "error",
+                            {"code": OperationErrorCode.INTERRUPTED.value},
+                        )
+                elif self._has_recovery_evidence:
+                    self._recovery_ambiguous = True
                 else:
                     record.pending_result = None
                     self._transition(
@@ -273,7 +346,7 @@ class ChatJobRegistry:
                 if record.result is not None:
                     self._emit(operation_id, "final", record.result)
                 elif record.status.status == OperationState.FAILED:
-                    code = (
+                    error_value = (
                         record.status.error_code.value
                         if record.status.error_code
                         else OperationErrorCode.INTERNAL_ERROR.value
@@ -281,10 +354,10 @@ class ChatJobRegistry:
                     self._emit(
                         operation_id,
                         "error",
-                        {"code": code},
+                        {"code": error_value},
                     )
                 elif record.status.status == OperationState.CANCELED:
-                    code = (
+                    cancel_value = (
                         record.status.cancel_code.value
                         if record.status.cancel_code
                         else OperationCancelCode.CLIENT_REQUEST.value
@@ -292,7 +365,7 @@ class ChatJobRegistry:
                     self._emit(
                         operation_id,
                         "canceled",
-                        {"code": code},
+                        {"code": cancel_value},
                     )
         self._refresh_queue_positions()
 
@@ -377,6 +450,16 @@ class ChatJobRegistry:
                         cancel_code=cancel_code,
                     )
                     self._emit(operation_id, "canceled", {"code": cancel_code.value})
+        except AgentRuntimeJournalError as exc:
+            self._errors[operation_id] = exc
+            with self._lock:
+                record = self._records[operation_id]
+                if record.status.status == OperationState.FINALIZING:
+                    self._transition(
+                        operation_id,
+                        OperationState.FINALIZING,
+                        error_code=OperationErrorCode.COMMIT_INDETERMINATE,
+                    )
         except Exception as exc:
             self._errors[operation_id] = exc
             error_code = (
@@ -479,7 +562,10 @@ class ChatJobRegistry:
                 if cancel_requested is None
                 else cancel_requested
             ),
-            result_available=state == OperationState.COMPLETED,
+            result_available=(
+                state == OperationState.COMPLETED
+                and error_code != OperationErrorCode.COMMITTED_RESULT_UNAVAILABLE
+            ),
         )
         record.status = status
         self._emit(operation_id, "status", status.model_dump(mode="json"))

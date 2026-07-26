@@ -246,33 +246,54 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
 
     journal = getattr(app.state, "event_journal", None)
     journal_records = [] if journal is None else journal.verify()
-    committed_event_ids = (
-        set()
-        if journal is None
-        else {
-            record.event_id
-            for record in journal_records
-            if record.lifecycle == JournalLifecycle.COMPLETED
-            or (
-                record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
-                and record.failure_category == "committed_before_crash"
-            )
-        }
-    )
-    latest_chat_records = {
-        record.event_id: record
-        for record in journal_records
-        if record.source == "api.chat.job"
+    chat_event_ids = {
+        record.event_id for record in journal_records if record.source == "api.chat.job"
     }
-    required_event_ids = {
-        event_id
+    latest_chat_records = {}
+    for record in journal_records:
+        if record.event_id in chat_event_ids:
+            latest_chat_records[record.event_id] = record
+    recovery_dispositions = {
+        event_id: _journal_disposition(record)
         for event_id, record in latest_chat_records.items()
-        if record.lifecycle == JournalLifecycle.ACCEPTED
-        or (
-            record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
-            and record.failure_category == "accepted_not_started"
-        )
     }
+    required_event_ids = set(recovery_dispositions)
+
+    def reconstruct_result(event_id: str) -> dict[str, Any] | None:
+        episode = app.state.memory_system.committed_episodic_for_event(event_id)
+        if (
+            episode is None
+            or episode.experience_id is None
+            or episode.context_id is None
+        ):
+            return None
+        recovery = episode.metadata.get("public_result_recovery")
+        if not isinstance(recovery, dict) or "optimal_loss" not in recovery:
+            return None
+        fallback_used = episode.generation_health.fallback_used
+        return ChatResponse(
+            context_id=episode.context_id,
+            episode_id=episode.id,
+            experience_id=episode.experience_id,
+            response=episode.response,
+            emotion=EmotionSchema(
+                valence=episode.emotion_valence,
+                arousal=episode.emotion_arousal,
+                optimal_loss=float(recovery["optimal_loss"]),
+            ),
+            model=ModelSchema(
+                model_id=episode.model_id,
+                adapter_id=None if fallback_used else episode.adapter_id,
+                adapter_hash=None
+                if fallback_used
+                else _optional_str(recovery.get("adapter_hash")),
+                activation_sequence=None
+                if fallback_used
+                else _optional_int(recovery.get("activation_sequence")),
+                fallback_used=fallback_used,
+            ),
+        ).model_dump(mode="json")
+
     return ChatJobRegistry(
         registry_path,
         app.state.agent_runtime,
@@ -280,8 +301,9 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
         replay_limit=settings.chat_stream_replay_limit,
         timeout_seconds=settings.chat_timeout_seconds,
         completion_observer=observe_completed,
-        committed_event_ids=committed_event_ids,
+        recovery_dispositions=recovery_dispositions,
         required_event_ids=required_event_ids,
+        result_reconstructor=reconstruct_result,
     )
 
 
@@ -321,6 +343,32 @@ def _wait_for_terminal(registry: ChatJobRegistry, operation_id: str):
 
 def _request_client(request: Request) -> str:
     return "unknown" if request.client is None else request.client.host
+
+
+def _journal_disposition(record: Any) -> str:
+    if record.lifecycle == JournalLifecycle.COMPLETED:
+        return "committed"
+    if record.lifecycle == JournalLifecycle.FAILED:
+        if (record.failure_category or "").startswith("canceled_"):
+            return "canceled"
+        return "failed"
+    if record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED:
+        return {
+            "committed_before_crash": "committed",
+            "uncommitted_after_crash": "uncommitted",
+            "accepted_not_started": "queued",
+        }.get(record.failure_category, "ambiguous")
+    if record.lifecycle == JournalLifecycle.ACCEPTED:
+        return "queued"
+    return "ambiguous"
+
+
+def _optional_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None
 
 
 def _sse(event: ChatStreamEvent) -> str:

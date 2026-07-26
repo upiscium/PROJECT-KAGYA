@@ -382,7 +382,7 @@ def test_fresh_registry_promotes_journal_committed_finalizing_result(
         path,
         restarted_runtime,
         _result,
-        committed_event_ids={completed.status.event_id},
+        recovery_dispositions={completed.status.event_id: "committed"},
     )
     recovered = restarted.get(job.status.operation_id)
     restarted_runtime.shutdown()
@@ -461,3 +461,238 @@ def test_missing_journal_accepted_spool_fails_registry_readiness(
     runtime.shutdown()
 
     assert registry.is_ready is False
+
+
+def test_completion_journal_failure_preserves_indeterminate_pending_result(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.json"
+
+    class JournalProbe:
+        def accepted(self, event) -> None:
+            del event
+
+        def started(self, event) -> None:
+            del event
+
+        def completed(self, event, snapshot_hash: str) -> None:
+            del event, snapshot_hash
+            raise OSError("journal unavailable")
+
+        def failed(self, event, failure_category: str, snapshot_hash) -> None:
+            del event, failure_category, snapshot_hash
+
+    runtime = AgentRuntime(
+        queue_capacity=2,
+        event_journal=JournalProbe(),
+        completion_hook=lambda event: "0" * 64,
+    )
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "public-result"},
+        client_id="client",
+        idempotency_key="journal-failure",
+        correlation_id="context",
+    )
+
+    deadline = time.monotonic() + 3
+    current = None
+    while time.monotonic() < deadline:
+        current = registry.get(job.status.operation_id)
+        if current is not None and current.status.error_code is not None:
+            break
+        time.sleep(0.01)
+
+    assert current is not None
+    assert current.status.status == OperationState.FINALIZING
+    assert current.status.error_code == "commit_indeterminate"
+    assert current.pending_result == {"response": "public-result"}
+    assert current.status.event_id == job.status.event_id
+    assert runtime.is_accepting is False
+    assert all(
+        event.event not in {"token", "final"}
+        for event in registry.events_after(job.status.operation_id, 0)
+    )
+    persisted = json.loads(path.read_text())[0]
+    assert persisted["status"]["error_code"] == "commit_indeterminate"
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("disposition", "cancel_requested", "expected"),
+    [
+        ("uncommitted", False, OperationState.FAILED),
+        ("uncommitted", True, OperationState.CANCELED),
+        ("failed", False, OperationState.FAILED),
+        ("canceled", False, OperationState.CANCELED),
+    ],
+)
+def test_fresh_registry_reconciles_uncommitted_and_terminal_journal_outcomes(
+    tmp_path: Path,
+    disposition: str,
+    cancel_requested: bool,
+    expected: OperationState,
+) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "discard-me"},
+        client_id="client",
+        idempotency_key=f"recover-{disposition}-{cancel_requested}",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+    values = json.loads(path.read_text())
+    values[0]["pending_result"] = values[0].pop("result")
+    values[0]["status"].update(
+        status="finalizing",
+        completed_at=None,
+        result_available=False,
+        error_code="commit_indeterminate",
+        cancel_requested=cancel_requested,
+    )
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(
+        path,
+        restarted_runtime,
+        _result,
+        recovery_dispositions={job.status.event_id: disposition},
+    )
+    recovered = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert recovered is not None
+    assert recovered.status.status == expected
+    assert recovered.pending_result is None
+    assert recovered.result is None
+
+
+def test_fresh_registry_fails_closed_on_ambiguous_commit(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "preserve-me"},
+        client_id="client",
+        idempotency_key="ambiguous",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+    values = json.loads(path.read_text())
+    values[0]["pending_result"] = values[0].pop("result")
+    values[0]["status"].update(
+        status="finalizing",
+        completed_at=None,
+        result_available=False,
+        error_code="commit_indeterminate",
+    )
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(
+        path,
+        restarted_runtime,
+        _result,
+        recovery_dispositions={job.status.event_id: "ambiguous"},
+    )
+    recovered = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert restarted.is_ready is False
+    assert recovered is not None
+    assert recovered.status.status == OperationState.FINALIZING
+    assert recovered.pending_result == {"response": "preserve-me"}
+
+
+def test_uncommitted_journal_overrides_false_completed_registry_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "must-not-survive"},
+        client_id="client",
+        idempotency_key="false-completion",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(
+        path,
+        restarted_runtime,
+        _result,
+        recovery_dispositions={job.status.event_id: "uncommitted"},
+    )
+    recovered = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert recovered is not None
+    assert recovered.status.status == OperationState.FAILED
+    assert recovered.result is None
+
+
+@pytest.mark.parametrize("reconstructed", [{"response": "recovered"}, None])
+def test_committed_recovery_reconstructs_or_bounds_unavailable_result(
+    tmp_path: Path, reconstructed: dict[str, str] | None
+) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "original"},
+        client_id="client",
+        idempotency_key="reconstruct",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+    values = json.loads(path.read_text())
+    values[0]["result"] = None
+    values[0]["pending_result"] = None
+    values[0]["status"].update(
+        status="finalizing",
+        completed_at=None,
+        result_available=False,
+        error_code="commit_indeterminate",
+    )
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(
+        path,
+        restarted_runtime,
+        _result,
+        recovery_dispositions={job.status.event_id: "committed"},
+        result_reconstructor=lambda event_id: (
+            reconstructed if event_id == job.status.event_id else None
+        ),
+    )
+    recovered = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert recovered is not None
+    assert recovered.status.status == OperationState.COMPLETED
+    assert recovered.result == reconstructed
+    if reconstructed is None:
+        assert recovered.status.error_code == "committed_result_unavailable"
+        assert recovered.status.result_available is False
+    else:
+        assert recovered.status.error_code is None
+        assert recovered.status.result_available is True
