@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import math
 
@@ -328,7 +329,12 @@ def test_repeated_experience_can_form_bounded_intrinsic_goal(tmp_path: Path) -> 
     loop.chat("novel subject two", context_id="ctx-motive")
     loop.chat("novel subject three", context_id="ctx-motive")
 
-    episode, goals = loop.reevaluate_motivation()
+    immediate_episode, immediate_goals = loop.reevaluate_motivation()
+    assert immediate_goals == []
+    assert immediate_episode.generated_goal_ids == ()
+    episode, goals = loop.reevaluate_motivation(
+        review_at=datetime.now(UTC) + timedelta(seconds=61)
+    )
 
     assert 0 < len(goals) <= loop.motivation_dynamics.max_goal_proposals_per_cycle
     assert episode.generated_goal_ids == tuple(goal.goal_id for goal in goals)

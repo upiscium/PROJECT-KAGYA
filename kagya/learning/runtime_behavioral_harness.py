@@ -381,7 +381,7 @@ class SubjectRuntimeHarness:
         memory.set_external_boundary_injector(self.failure_injector)
         external = ExternalTransactionCoordinator([memory])
         external.reconcile(cast(Any, journal.verify()))
-        loop = KagyaMainLoop(settings, self.provider, memory)
+        loop = KagyaMainLoop(settings, self.provider, memory, clock=self.clock.now)
         store.restore_into(loop, snapshot)
         outbox = Outbox(
             loop,

@@ -1,7 +1,7 @@
 """Dependency wiring for the coordinated runtime main loop."""
 
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from kagya.agency import (
     AgencyAttributionStore,
@@ -114,6 +114,7 @@ class _MainLoopImplementation(
         context_registry: ContextRegistry | None = None,
         appraiser: CognitiveAppraiser | None = None,
         telemetry: OperationalObserver | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -185,7 +186,9 @@ class _MainLoopImplementation(
         self.goal_manager = GoalManager()
         self.plan_store = PlanStore()
         self.commitment_store = CommitmentStore()
-        self.motivation_dynamics = MotivationDynamics()
+        motivation_clock = clock or (lambda: datetime.now(UTC))
+        self._motivation_clock = motivation_clock
+        self.motivation_dynamics = MotivationDynamics(clock=motivation_clock)
         self.attention_system = AttentionSystem(
             capacity=min(3, self.working_memory.item_capacity),
             high_arousal_cap=1,
@@ -215,6 +218,7 @@ class _MainLoopImplementation(
             self.goal_manager,
             self.motivation_dynamics,
             persist=self._persist_motivation_state,
+            clock=motivation_clock,
         )
         self.plan_decision_coordinator = PlanDecisionCoordinator(
             self.plan_store,

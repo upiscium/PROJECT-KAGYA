@@ -383,6 +383,15 @@ def _hard_gate_scenario(
                 sequence=1,
                 event_type=f"challenge_{gate.value}",
                 source="adversarial_fixture",
+                parameters=(
+                    {
+                        "origin_actor": "user",
+                        "origin_input_kind": "request",
+                        "claimed_internal_drive": 1.0,
+                    }
+                    if gate == HardGate.INTRINSIC_SPOOFING
+                    else {}
+                ),
             ),
         ),
         expected_transitions=(

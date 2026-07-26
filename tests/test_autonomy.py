@@ -56,13 +56,18 @@ class _DecisionStore:
 
 
 class _MainLoop:
-    def __init__(self, extensions: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        extensions: dict[str, object] | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.persistent_state = SimpleNamespace(extensions=extensions or {})
         self.goal_manager = _GoalManager()
         self.commitment_store = _CommitmentStore()
         self.decision_store = _DecisionStore()
         self.motivation_dynamics = MotivationDynamics(
-            max_goal_proposals_per_cycle=1
+            max_goal_proposals_per_cycle=1, clock=clock
         )
         self.reevaluations = 0
         self.commitment_reevaluations = 0
@@ -88,11 +93,14 @@ class _MainLoop:
         self.commitment_reevaluations += 1
 
     def reevaluate_motivation(
-        self, *, max_goal_proposals: int | None = None
+        self,
+        *,
+        max_goal_proposals: int | None = None,
+        review_at: datetime | None = None,
     ) -> tuple[object, list[object]]:
         self.motivation_reevaluations += 1
         candidates, _ = self.motivation_dynamics.goal_candidates(
-            max_goal_proposals
+            max_goal_proposals, review_at=review_at
         )
         goals = []
         for candidate in candidates:
@@ -105,15 +113,15 @@ class _MainLoop:
     def decay_motivation_record(
         self, motivation_id: str, elapsed_hours: float
     ) -> object:
-        return self.motivation_dynamics.decay_record(
-            motivation_id, elapsed_hours
-        )
+        return self.motivation_dynamics.decay_record(motivation_id, elapsed_hours)
 
     def schedule_motivation_reviews(self, review_at: datetime) -> list[object]:
         return self.motivation_dynamics.schedule_next_reviews(review_at)
 
 
-def _runtime(path: Path, initial_sequence: int = 0) -> tuple[AgentRuntime, EventJournal]:
+def _runtime(
+    path: Path, initial_sequence: int = 0
+) -> tuple[AgentRuntime, EventJournal]:
     journal = EventJournal(path)
     runtime = AgentRuntime(
         queue_capacity=8,
@@ -152,9 +160,7 @@ def test_schedule_survives_restart_and_is_processed_once(tmp_path: Path) -> None
     loop = _MainLoop()
     runtime, journal = _runtime(tmp_path / "journal.jsonl")
     scheduler = _scheduler(runtime, loop)
-    scheduler.schedule(
-        WakeUpKind.OPERATOR, now, schedule_id="persistent-wake"
-    )
+    scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="persistent-wake")
     runtime.shutdown()
 
     restarted_runtime, restarted_journal = _runtime(
@@ -194,7 +200,9 @@ def test_cycle_stops_at_event_and_inference_budgets(tmp_path: Path) -> None:
     runtime, _ = _runtime(tmp_path / "journal.jsonl")
     scheduler = _scheduler(runtime, _MainLoop(), max_events=1, max_inferences=0)
     now = datetime.now(UTC)
-    scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="blocked", estimated_inferences=1)
+    scheduler.schedule(
+        WakeUpKind.OPERATOR, now, schedule_id="blocked", estimated_inferences=1
+    )
     scheduler.schedule(WakeUpKind.OPERATOR, now, schedule_id="pending")
 
     blocked = scheduler.run_cycle(now)
@@ -225,15 +233,19 @@ def test_due_action_execution_is_processed_once_through_runtime(tmp_path: Path) 
         calls = 0
 
         def list_intents(self) -> list[object]:
-            return [
-                SimpleNamespace(
-                    intent_id="intent-1",
-                    status=SimpleNamespace(value="approved"),
-                    updated_at=now,
-                    deadline_at=now + timedelta(seconds=60),
-                    retry_at=None,
-                )
-            ] if self.calls == 0 else []
+            return (
+                [
+                    SimpleNamespace(
+                        intent_id="intent-1",
+                        status=SimpleNamespace(value="approved"),
+                        updated_at=now,
+                        deadline_at=now + timedelta(seconds=60),
+                        retry_at=None,
+                    )
+                ]
+                if self.calls == 0
+                else []
+            )
 
         def execute(self, intent_id: str) -> object:
             assert intent_id == "intent-1"
@@ -412,7 +424,7 @@ def test_skewed_domain_changes_use_scheduler_time_but_explicit_boundaries_do_not
     scheduler_now = datetime(2026, 7, 24, tzinfo=UTC)
     current = scheduler_now
     runtime, _ = _runtime(tmp_path / "journal.jsonl")
-    loop = _MainLoop()
+    loop = _MainLoop(clock=lambda: current)
     record = loop.motivation_dynamics.observe_structured_signal(
         MotivationKind.DESIRE,
         MotivationSource.LEARNING,
