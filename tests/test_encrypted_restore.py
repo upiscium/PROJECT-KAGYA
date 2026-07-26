@@ -11,7 +11,11 @@ from kagya.config import Settings, load_settings
 from kagya.runtime import AgentStateStore, EventJournal, StateWAL
 from kagya.runtime.agent_state import default_agent_state_snapshot
 from kagya.security import EncryptedCodec, EncryptionError, build_live_codecs
-from kagya.security.backup import BackupError, BackupManager
+from kagya.security.backup import (
+    BackupError,
+    BackupManager,
+    assert_no_incomplete_restore,
+)
 from kagya.security.crypto import KeyRing
 from kagya.security.migration import reencrypt_live_state
 
@@ -246,6 +250,51 @@ def test_backup_rejects_symlink_wrong_key_tamper_and_bad_incremental_base(
     bundle.write_bytes(data)
     with pytest.raises(BackupError):
         manager.verify(full.backup_id)
+
+
+def test_restore_crash_checkpoints_never_publish_incomplete_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    preview = BackupManager(settings).create()
+    settings.tools.path.write_bytes(b"newer-authoritative-value")
+
+    def fail_before(checkpoint: str) -> None:
+        if checkpoint == "restore_before_swap":
+            raise RuntimeError("simulated crash before swap")
+
+    with pytest.raises(RuntimeError, match="before swap"):
+        BackupManager(settings, failure_injector=fail_before).restore(
+            preview.backup_id, expected_manifest_hash=preview.manifest_hash
+        )
+    assert settings.tools.path.read_bytes() == b"newer-authoritative-value"
+
+    def fail_after(checkpoint: str) -> None:
+        if checkpoint == "restore_after_swap":
+            raise RuntimeError("simulated crash after swap")
+
+    with pytest.raises(RuntimeError, match="after swap"):
+        BackupManager(settings, failure_injector=fail_after).restore(
+            preview.backup_id, expected_manifest_hash=preview.manifest_hash
+        )
+    assert settings.tools.path.read_bytes() == SENTINEL
+    assert not (settings.at_rest.backup.directory / ".restore-in-progress").exists()
+
+
+def test_incomplete_restore_marker_blocks_startup_and_status_redacts_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    manager = BackupManager(settings)
+    manager.create()
+    status = manager.list(1)[0].model_dump(mode="json")
+    assert "path" not in json.dumps(status).lower()
+    marker = settings.at_rest.backup.directory / ".restore-in-progress"
+    marker.write_text("{}", encoding="ascii")
+    with pytest.raises(BackupError, match="incomplete authoritative restore"):
+        assert_no_incomplete_restore(settings)
 
 
 def test_production_requires_encryption_and_memory_attestation() -> None:
