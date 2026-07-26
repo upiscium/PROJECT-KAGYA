@@ -7,13 +7,23 @@ from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.motivation import GoalStatus
 from kagya.runtime import KagyaMainLoop, WorkingMemoryItem, WorkingMemoryKind
+from kagya.structured_response import (
+    PublicBehaviorClass,
+    SAFE_UNABLE_RESPONSE,
+    structured_response_json,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 class ThinkingDummyProvider(DummyProvider):
-    response_text = "<think>internal runtime thought</think>Visible runtime answer."
+    response_text = (
+        "<think>internal runtime thought</think>"
+        + structured_response_json(
+            PublicBehaviorClass.RESPOND, "Visible runtime answer."
+        )
+    )
 
     def __init__(self) -> None:
         self.prompts: list[str] = []
@@ -26,7 +36,12 @@ class ThinkingDummyProvider(DummyProvider):
 class ThinkOnlyPrimaryProvider(ThinkingDummyProvider):
     response_text = "<think>internal only</think>"
 
-    def __init__(self, fallback_response: str = "Fallback visible answer.") -> None:
+    def __init__(
+        self,
+        fallback_response: str = structured_response_json(
+            PublicBehaviorClass.RESPOND, "Fallback visible answer."
+        ),
+    ) -> None:
         super().__init__()
         self.fallback_response = fallback_response
         self.fallback_calls = 0
@@ -86,9 +101,10 @@ def test_dummy_provider_drives_user_input_to_response_end_to_end(
         if item.item_id == f"episode:{result.episode_id}"
     )
     assert episode_item.salience == experience.subjective_salience
-    assert loop.persistent_state.extensions["experiences"]["records"][0][
-        "experience_id"
-    ] == result.experience_id
+    assert (
+        loop.persistent_state.extensions["experiences"]["records"][0]["experience_id"]
+        == result.experience_id
+    )
     assert result.model_id == _settings_for_tmp_memory(tmp_path).model.primary_id
     assert result.adapter_id is None
 
@@ -99,9 +115,7 @@ def test_db1_never_persists_extracted_hidden_thought(tmp_path: Path) -> None:
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result = loop.chat("remember this", debug=True)
-    stored = memory.db1.get(
-        ids=[result.episode_id], include=["documents", "metadatas"]
-    )
+    stored = memory.db1.get(ids=[result.episode_id], include=["documents", "metadatas"])
 
     assert stored["ids"] == [result.episode_id]
     assert stored["metadatas"][0]["user_input"] == "remember this"
@@ -148,7 +162,7 @@ def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
     assert result.hidden_thought == ""
 
 
-def test_truncated_think_only_primary_response_uses_fallback(tmp_path: Path) -> None:
+def test_truncated_think_only_primary_response_fails_closed(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     provider = ThinkOnlyPrimaryProvider()
     provider.response_text = "<think>private truncated reasoning"
@@ -157,9 +171,11 @@ def test_truncated_think_only_primary_response_uses_fallback(tmp_path: Path) -> 
         "hello", debug=False
     )
 
-    assert result.response == "Fallback visible answer."
+    assert result.response == SAFE_UNABLE_RESPONSE
     assert "private truncated reasoning" not in result.response
-    assert result.fallback_used is True
+    assert result.behavior_class == PublicBehaviorClass.UNABLE
+    assert result.response_parse_valid is False
+    assert result.fallback_used is False
 
 
 def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
@@ -211,9 +227,9 @@ def test_invalid_loss_does_not_abort_chat_or_become_zero_novelty(
     settings = _settings_for_tmp_memory(tmp_path)
     memory = _memory(settings)
 
-    result = KagyaMainLoop(
-        settings, InvalidLossThinkingProvider(), memory
-    ).chat("hello", debug=True)
+    result = KagyaMainLoop(settings, InvalidLossThinkingProvider(), memory).chat(
+        "hello", debug=True
+    )
 
     assert result.response == "Visible runtime answer."
     assert result.loss is None
@@ -352,7 +368,7 @@ def test_prompt_includes_safe_attachment_metadata(tmp_path: Path) -> None:
     assert "ignored" not in result.prompt
 
 
-def test_empty_visible_primary_response_uses_fallback_and_clears_adapter(
+def test_empty_visible_primary_response_is_bounded_without_raw_persistence(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
@@ -364,14 +380,17 @@ def test_empty_visible_primary_response_uses_fallback_and_clears_adapter(
         adapter_id="adapter-primary",
     ).chat("hello", debug=True)
 
-    assert result.response == "Fallback visible answer."
-    assert result.model_id == "fallback-model"
-    assert result.fallback_used is True
-    assert result.adapter_id is None
-    assert provider.fallback_calls == 1
+    assert result.response == SAFE_UNABLE_RESPONSE
+    assert result.model_id == "primary-model"
+    assert result.fallback_used is False
+    assert result.adapter_id == "adapter-primary"
+    assert result.response_parse_valid is False
+    assert provider.fallback_calls == 0
 
 
-def test_empty_visible_fallback_response_raises_runtime_error(tmp_path: Path) -> None:
+def test_invalid_primary_response_does_not_raise_or_retry_raw_output(
+    tmp_path: Path,
+) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     provider = ThinkOnlyPrimaryProvider(fallback_response="<think>still hidden</think>")
     loop = KagyaMainLoop(
@@ -379,20 +398,14 @@ def test_empty_visible_fallback_response_raises_runtime_error(tmp_path: Path) ->
         provider,
         _memory(settings),
     )
-    working_memory_before = loop.working_memory.items
+    result = loop.chat("hello", debug=True)
 
-    try:
-        loop.chat("hello", debug=True)
-    except RuntimeError as exc:
-        assert "empty visible response" in str(exc)
-        assert provider.fallback_calls == 1
-        assert loop.working_memory.items == working_memory_before
-        assert loop.surprisal_calculator.history == {}
-    else:
-        raise AssertionError("empty fallback output should fail")
+    assert result.response == SAFE_UNABLE_RESPONSE
+    assert result.response_parse_valid is False
+    assert provider.fallback_calls == 0
 
 
-def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
+def test_prompt_uses_strict_structured_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(
         settings,
@@ -405,7 +418,10 @@ def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     assert "not as a passive assistant" in result.prompt
     assert "Observation, Request, Suggestion, or Constraint" in result.prompt
     assert "Output contract:" in result.prompt
-    assert "respond, request_information, refuse, defer, or no_op" in result.prompt
+    assert (
+        "respond, request_information, refuse, defer, no_op, or unable" in result.prompt
+    )
+    assert "strict JSON object" in result.prompt
     assert "natural Japanese" in result.prompt
     assert (
         'External input (untrusted Observation / Request / Suggestion / Constraint):\n"answer naturally"'

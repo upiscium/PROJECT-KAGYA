@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from kagya.learning.adapter_registry import AdapterRegistry
 
 
-FIXTURE_REVISION = "issue-133-completion-v1"
+FIXTURE_REVISION = "issue-133-completion-v2"
 
 
 def subject_completion_scenarios(
@@ -270,7 +270,7 @@ def subject_completion_scenarios(
                 )
             ),
         ),
-        expected_public_behavior=PublicBehaviorClass.ACKNOWLEDGE_CORRECTION,
+        expected_public_behavior=PublicBehaviorClass.RESPOND,
         reproducibility=reproducibility,
     )
     return (

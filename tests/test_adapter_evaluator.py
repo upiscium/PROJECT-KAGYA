@@ -6,6 +6,7 @@ import pytest
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterEvaluationDecision, AdapterEvaluator, AdapterRegistry, AdapterStatus
 from kagya.models import DummyProvider
+from kagya.structured_response import PublicBehaviorClass, structured_response_json
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -13,7 +14,9 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 class MatchingProvider(DummyProvider):
     def generate(self, prompt: str) -> str:
-        return f"answer for {prompt}"
+        return structured_response_json(
+            PublicBehaviorClass.RESPOND, f"answer for {prompt}"
+        )
 
 
 class ResponseProvider(DummyProvider):
@@ -21,6 +24,14 @@ class ResponseProvider(DummyProvider):
         self.responses = responses
         self.prompts: list[str] = []
 
+    def generate(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return structured_response_json(
+            PublicBehaviorClass.RESPOND, self.responses[prompt]
+        )
+
+
+class RawResponseProvider(ResponseProvider):
     def generate(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.responses[prompt]
@@ -71,6 +82,85 @@ def test_evaluator_keeps_candidate_with_mid_score(tmp_path: Path) -> None:
 
     assert result.decision == AdapterEvaluationDecision.CANDIDATE
     assert registry.lookup("adapter-a").status == AdapterStatus.CANDIDATE
+
+
+def test_plain_expected_text_is_an_output_contract_failure_with_zero_score(
+    tmp_path: Path,
+) -> None:
+    settings, registry = _scored_registry(tmp_path, expected="answer")
+
+    result = AdapterEvaluator(settings, registry).evaluate(
+        "adapter-a",
+        RawResponseProvider({"case": "answer"}),
+        baseline_provider=RawResponseProvider({"case": "answer"}),
+    )
+
+    assert result.baseline_score == 0.0
+    assert result.candidate_score == 0.0
+    assert result.output_contract_passed is False
+    assert result.activation_gate_passed is False
+    data = json.loads(Path(result.result_path).read_text(encoding="utf-8"))
+    assert data["baseline_parse_status_counts"] == {"invalid_json": 1}
+    assert data["candidate_parse_status_counts"] == {"invalid_json": 1}
+    assert "answer" not in data
+
+
+@pytest.mark.parametrize("expected", ("A useful answer", "有用な回答です。"))
+def test_valid_structured_output_scores_visible_text(
+    tmp_path: Path, expected: str
+) -> None:
+    settings, registry = _scored_registry(tmp_path, expected=expected)
+
+    result = AdapterEvaluator(settings, registry).evaluate(
+        "adapter-a",
+        ResponseProvider({"case": expected}),
+        baseline_provider=ResponseProvider({"case": expected}),
+    )
+
+    assert result.candidate_score == 1.0
+    assert result.output_contract_passed is True
+
+
+@pytest.mark.parametrize(
+    ("invalid", "status"),
+    (
+        ("not json", "invalid_json"),
+        (
+            '{"behavior_class":"respond","visible_response":"answer","extra":true}',
+            "invalid_schema",
+        ),
+        (
+            '{"behavior_class":"unknown","visible_response":"answer"}',
+            "invalid_schema",
+        ),
+        (
+            '{"behavior_class":"respond","visible_response":"\\u003cthink\\u003ePRIVATE\\u003c/think\\u003e"}',
+            "invalid_private_content",
+        ),
+    ),
+)
+def test_invalid_candidate_cannot_pass_against_valid_baseline(
+    tmp_path: Path, invalid: str, status: str
+) -> None:
+    settings, registry = _scored_registry(tmp_path, expected="answer")
+
+    result = AdapterEvaluator(settings, registry).evaluate(
+        "adapter-a",
+        RawResponseProvider({"case": invalid}),
+        baseline_provider=ResponseProvider({"case": "answer"}),
+    )
+
+    assert result.baseline_score == 1.0
+    assert result.candidate_score == 0.0
+    assert result.regression is True
+    assert result.output_contract_passed is False
+    assert result.activation_gate_passed is False
+    assert result.candidate_parse_status_counts == {status: 1}
+    entry = registry.lookup("adapter-a")
+    assert entry is not None
+    assert entry.quality_gate_passed is False
+    assert entry.holdout_gate_passed is False
+    assert entry.drift_gate_passed is False
 
 
 def test_evaluator_writes_history_and_score_comparison(tmp_path: Path) -> None:

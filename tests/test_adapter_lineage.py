@@ -13,6 +13,7 @@ from kagya.learning import (
 )
 from kagya.models import DummyProvider
 from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.structured_response import PublicBehaviorClass, structured_response_json
 from tests.adapter_behavioral_helpers import (
     bind_runtime_behavioral_result,
     register_runtime_candidate,
@@ -27,7 +28,7 @@ class _Responses(DummyProvider):
         self.response = response
 
     def generate(self, prompt: str) -> str:
-        return self.response
+        return structured_response_json(PublicBehaviorClass.RESPOND, self.response)
 
 
 def test_lineage_requires_known_compatible_parent_hash_and_revision(

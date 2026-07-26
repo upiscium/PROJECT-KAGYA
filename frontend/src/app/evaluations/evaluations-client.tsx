@@ -54,7 +54,7 @@ export function EvaluationsClient() {
         <div className="page-header">
           <div>
             <h2 id="behavioral-heading">Subject behavioral gates</h2>
-            <p className="muted">Per-dimension history, hard failures, and reproducible fixture reruns.</p>
+            <p className="muted">Structured model declarations are reconciled against authoritative runtime effects; declarations never override observed actions or state.</p>
           </div>
           <Button onClick={() => rerun.mutate()} disabled={!behavioralId || rerun.isPending}>
             {rerun.isPending ? "Rerunning..." : "Rerun fixture"}
@@ -66,6 +66,10 @@ export function EvaluationsClient() {
           <EvidenceSection title="Synthetic evaluator contract" kind="synthetic_evaluator_contract" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
           <EvidenceSection title="Deterministic runtime evaluation" kind="deterministic_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
           <EvidenceSection title="Real-model runtime evaluation" kind="real_model_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <Card>
+            <CardTitle>Hardware evidence</CardTitle>
+            <p className="muted">Pending an explicit real-model run on the configured model and adapter artifacts. Deterministic evidence does not satisfy the production hardware gate.</p>
+          </Card>
           <Card>
             <CardTitle>Dimension deltas</CardTitle>
             {behavioral.data?.results.find((item) => item.evaluation_id === behavioralId) ? (

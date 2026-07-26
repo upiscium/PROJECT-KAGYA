@@ -97,6 +97,9 @@ def debug_chat(
     return DebugChatResponse(
         **base.model_dump(),
         hidden_thought=result.hidden_thought,
+        behavior_class=result.behavior_class,
+        response_parse_valid=result.response_parse_valid,
+        response_status=result.response_status,
         loss=result.loss,
         prompt=result.prompt,
         attachments=request.attachments,

@@ -54,6 +54,8 @@ from tests.adapter_behavioral_helpers import (
     register_runtime_candidate,
     write_runtime_behavioral_result,
 )
+from kagya.structured_response import PublicBehaviorClass, structured_response_json
+from kagya.structured_response import SAFE_UNABLE_RESPONSE
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -61,7 +63,9 @@ ADMIN_TOKEN = "test-admin-token"
 
 
 class ThinkingProvider(DummyProvider):
-    response_text = "<think>debug thought</think>Visible API answer."
+    response_text = "<think>debug thought</think>" + structured_response_json(
+        PublicBehaviorClass.RESPOND, "Visible API answer."
+    )
 
 
 class EmptyFallbackProvider(DummyProvider):
@@ -78,10 +82,15 @@ class EmptyFallbackProvider(DummyProvider):
 
 
 class SuccessfulFallbackProvider(EmptyFallbackProvider):
+    def generate(self, prompt: str) -> str:
+        raise RuntimeError("primary unavailable")
+
     def generate_fallback(self, prompt: str) -> str:
         self.last_model_id = "fallback-model"
         self.last_fallback_used = True
-        return "Fallback visible API answer."
+        return structured_response_json(
+            PublicBehaviorClass.RESPOND, "Fallback visible API answer."
+        )
 
 
 class PreloadProvider(DummyProvider):
@@ -120,6 +129,7 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
     assert data["model"]["fallback_used"] is False
     assert "hidden_thought" not in data
     assert "prompt" not in data
+    assert "behavior_class" not in response.text
     assert "<think>" not in str(data)
 
 
@@ -445,7 +455,7 @@ def test_api_chat_accepts_legacy_message_key(tmp_path: Path) -> None:
     assert response.status_code == 200
 
 
-def test_api_chat_returns_500_when_fallback_has_no_visible_response(
+def test_api_chat_returns_bounded_unable_for_invalid_model_output(
     tmp_path: Path,
 ) -> None:
     client = _client(tmp_path)
@@ -453,11 +463,13 @@ def test_api_chat_returns_500_when_fallback_has_no_visible_response(
 
     response = client.post("/api/chat", json={"text": "hello", "attachments": []})
 
-    assert response.status_code == 500
-    assert "empty visible response" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["response"] == SAFE_UNABLE_RESPONSE
+    assert "primary hidden only" not in response.text
+    assert "behavior_class" not in response.json()
 
 
-def test_debug_chat_returns_500_when_fallback_has_no_visible_response(
+def test_debug_chat_reports_bounded_invalid_structured_status(
     tmp_path: Path,
 ) -> None:
     client = _client(tmp_path)
@@ -469,8 +481,11 @@ def test_debug_chat_returns_500_when_fallback_has_no_visible_response(
         json={"text": "hello", "attachments": [], "debug": True},
     )
 
-    assert response.status_code == 500
-    assert "empty visible response" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["response"] == SAFE_UNABLE_RESPONSE
+    assert response.json()["behavior_class"] == "unable"
+    assert response.json()["response_parse_valid"] is False
+    assert response.json()["response_status"] == "invalid_json"
 
 
 def test_api_chat_debug_includes_hidden_thought_and_loss(tmp_path: Path) -> None:
@@ -699,7 +714,9 @@ def test_adapter_behavioral_evaluate_runs_deterministic_runtime_and_binds_valid_
         client.app.state.main_loop,
         client.app.state.agent_state_store.last_snapshot.last_processed_event_sequence,
     )
-    assert after.last_processed_event_sequence == before.last_processed_event_sequence + 1
+    assert (
+        after.last_processed_event_sequence == before.last_processed_event_sequence + 1
+    )
     assert after.model_dump(exclude={"saved_at", "last_processed_event_sequence"}) == (
         before.model_dump(exclude={"saved_at", "last_processed_event_sequence"})
     )
@@ -3124,32 +3141,38 @@ def test_agency_attribution_admin_api_is_read_and_revise_only(
         listed = client.get("/api/attributions", headers=admin_headers())
         assert listed.status_code == 200
         assert listed.json() == {"attributions": []}
-        assert client.post(
-            "/api/attributions/not-created/revisions",
-            headers=admin_headers(),
-            json={
-                "expected_revision": 1,
-                "contributors": [
-                    {
-                        "kind": "self",
-                        "causal_share": 1.0,
-                        "confidence": 1.0,
-                        "controllability": 1.0,
-                        "foreseeability": 1.0,
-                        "responsibility_share": 1.0,
-                    }
-                ],
-                "intended": True,
-                "uncertainty": 0.0,
-                "evidence_refs": ["observation:later"],
-                "reason_code": "later_evidence",
-            },
-        ).status_code == 409
-        assert client.post(
-            "/api/attributions",
-            headers=admin_headers(),
-            json={},
-        ).status_code == 405
+        assert (
+            client.post(
+                "/api/attributions/not-created/revisions",
+                headers=admin_headers(),
+                json={
+                    "expected_revision": 1,
+                    "contributors": [
+                        {
+                            "kind": "self",
+                            "causal_share": 1.0,
+                            "confidence": 1.0,
+                            "controllability": 1.0,
+                            "foreseeability": 1.0,
+                            "responsibility_share": 1.0,
+                        }
+                    ],
+                    "intended": True,
+                    "uncertainty": 0.0,
+                    "evidence_refs": ["observation:later"],
+                    "reason_code": "later_evidence",
+                },
+            ).status_code
+            == 409
+        )
+        assert (
+            client.post(
+                "/api/attributions",
+                headers=admin_headers(),
+                json={},
+            ).status_code
+            == 405
+        )
 
 
 def test_counterfactual_admin_api_is_read_and_revise_only(tmp_path: Path) -> None:
@@ -3159,16 +3182,23 @@ def test_counterfactual_admin_api_is_read_and_revise_only(tmp_path: Path) -> Non
         listed = client.get("/api/counterfactuals", headers=admin_headers())
         assert listed.status_code == 200
         assert listed.json() == {"counterfactuals": []}
-        assert client.get(
-            "/api/counterfactuals/not-created", headers=admin_headers()
-        ).status_code == 404
-        assert client.post(
-            "/api/counterfactuals",
-            headers=admin_headers(),
-            json={},
-        ).status_code == 405
+        assert (
+            client.get(
+                "/api/counterfactuals/not-created", headers=admin_headers()
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/counterfactuals",
+                headers=admin_headers(),
+                json={},
+            ).status_code
+            == 405
+        )
     assert "counterfactual_read" in {
-        record.event_type for record in EventJournal(settings.agent_journal.path).verify()
+        record.event_type
+        for record in EventJournal(settings.agent_journal.path).verify()
     }
     assert "counterfactual_read" in {
         record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
@@ -3280,9 +3310,15 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
     with _client(tmp_path, settings=settings) as client:
         first = client.post(
             "/api/chat",
-            json={"text": "novel intrinsic topic one", "attachments": []},
+            json={
+                "text": "Bounded project signal observation alpha: build 417 completed successfully.",
+                "attachments": [],
+            },
         ).json()
-        for text in ("novel intrinsic topic two", "novel intrinsic topic three"):
+        for text in (
+            "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+            "Bounded project signal observation gamma: release candidate marker 9 is active.",
+        ):
             assert (
                 client.post(
                     "/api/chat",
@@ -3487,9 +3523,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         ).json()["messages"][0]
         assert approval_message["kind"] == "approval_request"
         assert approval_message["references"]["action_id"] == intent["intent_id"]
-        delivered = client.post(
-            "/api/outbox/deliveries", headers=admin_headers()
-        )
+        delivered = client.post("/api/outbox/deliveries", headers=admin_headers())
         assert delivered.status_code == 200
         approved = client.post(
             f"/api/outbox/messages/{approval_message['message_id']}/responses",
@@ -3503,9 +3537,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         )
         assert executed.status_code == 200
         assert executed.json()["status"] == "succeeded"
-        payload = client.get(
-            "/api/actions/receipts", headers=admin_headers()
-        ).json()
+        payload = client.get("/api/actions/receipts", headers=admin_headers()).json()
         assert len(payload["receipts"]) == len(payload["observations"]) == 1
         assert (
             payload["receipts"][0]["observation_id"]
@@ -3517,9 +3549,9 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
     }
     assert {"action_intent", "outbox_response", "action_execute"}.issubset(wal_types)
     with _client(tmp_path, settings=settings) as restarted:
-        intents = restarted.get(
-            "/api/actions/intents", headers=admin_headers()
-        ).json()["intents"]
+        intents = restarted.get("/api/actions/intents", headers=admin_headers()).json()[
+            "intents"
+        ]
         receipts = restarted.get(
             "/api/actions/receipts", headers=admin_headers()
         ).json()["receipts"]
@@ -3529,9 +3561,12 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"]
         assert any(item["kind"] == "action_result" for item in outbox_messages)
-        assert next(
-            item for item in outbox_messages if item["kind"] == "approval_request"
-        )["acknowledgment_status"] == "approved"
+        assert (
+            next(
+                item for item in outbox_messages if item["kind"] == "approval_request"
+            )["acknowledgment_status"]
+            == "approved"
+        )
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

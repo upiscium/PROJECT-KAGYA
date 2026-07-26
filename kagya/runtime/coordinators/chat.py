@@ -33,6 +33,7 @@ from kagya.runtime.working_memory import (
     working_memory_item,
 )
 from kagya.runtime.context import ContextFrame, InterlocutorModel
+from kagya.structured_response import PublicBehaviorClass, StructuredResponseStatus
 from kagya.runtime.coordinators._shared import (
     RuntimeDomainMixin,
     fallback_used as provider_fallback_used,
@@ -46,6 +47,9 @@ class ChatResult:
     experience_id: str
     response: str
     hidden_thought: str
+    behavior_class: PublicBehaviorClass
+    response_parse_valid: bool
+    response_status: StructuredResponseStatus
     loss: float | None
     valence: float
     arousal: float
@@ -294,17 +298,6 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     raise RuntimeError("Fallback model generation failed") from exc
                 raw_response = generate_fallback(self.provider, prompt)
             processed_response = self.postprocessor.process(raw_response)
-            if not processed_response.visible_response.strip():
-                if provider_fallback_used(self.provider):
-                    raise RuntimeError(
-                        "Fallback model produced an empty visible response"
-                    )
-                raw_response = generate_fallback(self.provider, prompt)
-                processed_response = self.postprocessor.process(raw_response)
-                if not processed_response.visible_response.strip():
-                    raise RuntimeError(
-                        "Fallback model produced an empty visible response"
-                    )
             model_id = str(
                 getattr(self.provider, "last_model_id", self.settings.model.primary_id)
             )
@@ -484,6 +477,9 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
             experience_id=experience.experience_id,
             response=processed_response.visible_response,
             hidden_thought=processed_response.hidden_thought if debug else "",
+            behavior_class=processed_response.behavior_class,
+            response_parse_valid=processed_response.parse_valid,
+            response_status=processed_response.status,
             loss=loss_measurement.raw_loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,

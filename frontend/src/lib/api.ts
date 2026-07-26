@@ -43,6 +43,9 @@ export type RetrievedMemory = {
 
 export type DebugChatResponse = ChatResponse & {
   hidden_thought: string;
+  behavior_class: "respond" | "refuse" | "request_information" | "defer" | "no_op" | "unable";
+  response_parse_valid: boolean;
+  response_status: "valid" | "invalid_json" | "invalid_schema" | "invalid_empty_response" | "invalid_private_content";
   loss: number | null;
   prompt: string;
   attachments: Attachment[];

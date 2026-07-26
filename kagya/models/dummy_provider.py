@@ -2,11 +2,15 @@
 
 from typing import Any
 
+from kagya.structured_response import PublicBehaviorClass, structured_response_json
+
 
 class DummyProvider:
     """Provider that avoids loading real model weights."""
 
-    response_text = "DummyProvider deterministic response."
+    response_text = structured_response_json(
+        PublicBehaviorClass.RESPOND, "DummyProvider deterministic response."
+    )
     loss_value = 0.1234
 
     def generate(self, prompt: str) -> str:

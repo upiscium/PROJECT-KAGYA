@@ -1,121 +1,163 @@
+import json
+
+import pytest
+from pydantic import ValidationError
+
 from kagya.persona import ResponsePostprocessor
+from kagya.structured_response import (
+    PublicBehaviorClass,
+    SAFE_UNABLE_RESPONSE,
+    StructuredSubjectResponse,
+    StructuredResponseStatus,
+)
 
 
-def test_complete_think_blocks_are_extracted() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("<think>internal plan</think>Visible answer")
-
-    assert processed.hidden_thought == "internal plan"
-
-
-def test_visible_response_removes_complete_think_blocks() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("A <think>secret</think> B <think>more</think> C")
-
-    assert processed.visible_response == "A  B  C"
-    assert processed.hidden_thought == "secret\nmore"
-
-
-def test_unclosed_think_block_is_fail_closed() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("Visible <think>unfinished thought")
-
-    assert processed.hidden_thought == "unfinished thought"
-    assert "<think>" not in processed.visible_response
-    assert processed.visible_response == "Visible"
-
-
-def test_orphan_closing_think_tag_does_not_hide_visible_content() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("Visible orphan</think> text")
-
-    assert "</think>" not in processed.visible_response
-    assert processed.visible_response == "Visible orphan text"
-
-
-def test_visible_response_preserves_html() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("<h1>Title</h1><strong>Answer</strong>")
-
-    assert processed.visible_response == "<h1>Title</h1><strong>Answer</strong>"
-
-
-def test_visible_response_removes_gemma_turn_tokens() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("<start_of_turn>model\nA concise answer.<end_of_turn>")
-
-    assert processed.visible_response == "A concise answer."
-
-
-def test_visible_response_preserves_role_labelled_text() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("A concise answer.\nQuestion: repeated prompt\nAnswer: repeated answer")
-
-    assert processed.visible_response == (
-        "A concise answer.\nQuestion: repeated prompt\nAnswer: repeated answer"
+def _response(behavior: str, visible: str) -> str:
+    return json.dumps(
+        {"behavior_class": behavior, "visible_response": visible},
+        ensure_ascii=False,
     )
 
 
-def test_visible_response_preserves_leading_answer_label() -> None:
-    postprocessor = ResponsePostprocessor()
+@pytest.mark.parametrize(
+    ("behavior", "visible"),
+    (
+        ("refuse", "その依頼は受けられません。"),
+        ("defer", "今は判断を保留します。"),
+        ("request_information", "対象を教えてください。"),
+        ("refuse", "I will not do that."),
+        ("respond", "I refuse to infer behavior from these English words."),
+    ),
+)
+def test_strict_structured_response_preserves_declared_class(
+    behavior: str, visible: str
+) -> None:
+    processed = ResponsePostprocessor().process(_response(behavior, visible))
 
-    processed = postprocessor.process("Answer: A concise answer.")
-
-    assert processed.visible_response == "Answer: A concise answer."
-
-
-def test_visible_response_preserves_assistant_labelled_text() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("A concise answer.\nAssistant is a repeated label.")
-
-    assert processed.visible_response == "A concise answer.\nAssistant is a repeated label."
-
-
-def test_visible_response_does_not_rewrite_project_names() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("PROJECT-KAGAYA helps locally.")
-
-    assert processed.visible_response == "PROJECT-KAGAYA helps locally."
+    assert processed.behavior_class.value == behavior
+    assert processed.visible_response == visible
+    assert processed.parse_valid is True
+    assert processed.status.value == "valid"
 
 
-def test_visible_response_preserves_repeated_words() -> None:
-    postprocessor = ResponsePostprocessor()
+def test_empty_no_op_is_valid() -> None:
+    processed = ResponsePostprocessor().process(_response("no_op", ""))
 
-    processed = postprocessor.process("It writes guide, guide, guide, guide,")
-
-    assert processed.visible_response == "It writes guide, guide, guide, guide,"
-
-
-def test_visible_response_preserves_sample_response_preface() -> None:
-    postprocessor = ResponsePostprocessor()
-
-    processed = postprocessor.process("Sure, here are the corresponding responses:\n\nこんにちは")
-
-    assert processed.visible_response == (
-        "Sure, here are the corresponding responses:\n\nこんにちは"
-    )
-
-
-def test_multiple_and_nested_think_blocks_stay_internal() -> None:
-    processed = ResponsePostprocessor().process(
-        "A<think>one<think>nested</think>end</think>B<think>two</think>C"
-    )
-
-    assert processed.visible_response == "ABC"
-    assert processed.hidden_thought == "onenestedend\ntwo"
-
-
-def test_think_only_truncated_response_has_no_visible_content() -> None:
-    processed = ResponsePostprocessor().process("<think>private truncated reasoning")
-
+    assert processed.behavior_class == PublicBehaviorClass.NO_OP
     assert processed.visible_response == ""
-    assert processed.hidden_thought == "private truncated reasoning"
+    assert processed.parse_valid is True
+
+
+def test_structured_subject_response_is_frozen_and_extra_forbidden() -> None:
+    response = StructuredSubjectResponse(
+        behavior_class=PublicBehaviorClass.RESPOND,
+        visible_response="Visible",
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        response.visible_response = "changed"
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        StructuredSubjectResponse.model_validate_json(
+            '{"behavior_class":"respond","visible_response":"Visible","extra":true}'
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "natural English refusal: I refuse",
+        "{not json",
+        _response("unknown", "text"),
+        json.dumps({"behavior_class": "respond"}),
+        json.dumps({"visible_response": "text"}),
+        '{"behavior_class":"respond","behavior_class":"refuse","visible_response":"text"}',
+        json.dumps(
+            {
+                "behavior_class": "respond",
+                "visible_response": "text",
+                "extra": "private raw output",
+            }
+        ),
+        _response("respond", ""),
+    ),
+)
+def test_invalid_output_fails_closed_without_exposing_raw_output(raw: str) -> None:
+    processed = ResponsePostprocessor().process(raw)
+
+    assert processed.behavior_class == PublicBehaviorClass.UNABLE
+    assert processed.visible_response == SAFE_UNABLE_RESPONSE
+    assert processed.parse_valid is False
+    assert raw not in processed.visible_response
+
+
+def test_think_channel_around_json_is_debug_only() -> None:
+    processed = ResponsePostprocessor().process(
+        "<think>PRIVATE_SENTINEL</think>" + _response("respond", "公開できる回答です。")
+    )
+
+    assert processed.visible_response == "公開できる回答です。"
+    assert processed.hidden_thought == "PRIVATE_SENTINEL"
+    assert processed.parse_valid is True
+
+
+def test_nested_think_blocks_are_removed_before_json_parsing() -> None:
+    processed = ResponsePostprocessor().process(
+        "<think>one<think>nested</think>end</think>" + _response("respond", "Visible")
+    )
+
+    assert processed.visible_response == "Visible"
+    assert processed.hidden_thought == "onenestedend"
+
+
+def test_gemma_turn_tokens_are_removed_before_json_parsing() -> None:
+    processed = ResponsePostprocessor().process(
+        "<start_of_turn>model\n" + _response("respond", "Visible") + "<end_of_turn>"
+    )
+
+    assert processed.visible_response == "Visible"
+    assert processed.parse_valid is True
+
+
+@pytest.mark.parametrize(
+    "visible",
+    (
+        "<think>PRIVATE</think>public",
+        "<ThInK>PRIVATE</tHiNk>",
+        "safe <think>nested <think>PRIVATE</think></think>",
+        "<private_reasoning>PRIVATE</private_reasoning>",
+        "PRIVATE_THOUGHT_SENTINEL_133",
+        "<start_of_turn>model safe<end_of_turn>",
+    ),
+)
+def test_decoded_private_content_fails_closed_without_debug_leak(visible: str) -> None:
+    raw = _response("respond", visible)
+
+    processed = ResponsePostprocessor().process(raw)
+
+    assert processed.behavior_class == PublicBehaviorClass.UNABLE
+    assert processed.visible_response == SAFE_UNABLE_RESPONSE
+    assert processed.hidden_thought == ""
+    assert processed.parse_valid is False
+    assert processed.status == StructuredResponseStatus.INVALID_PRIVATE_CONTENT
+    assert "PRIVATE" not in processed.visible_response
+
+
+def test_unicode_escaped_think_tag_is_rejected_after_json_decoding() -> None:
+    raw = (
+        '{"behavior_class":"respond","visible_response":'
+        '"\\u003cthink\\u003ePRIVATE\\u003c/think\\u003e"}'
+    )
+
+    processed = ResponsePostprocessor().process(raw)
+
+    assert processed.visible_response == SAFE_UNABLE_RESPONSE
+    assert processed.hidden_thought == ""
+    assert processed.status == StructuredResponseStatus.INVALID_PRIVATE_CONTENT
+
+
+def test_structured_model_rejects_private_visible_content_directly() -> None:
+    with pytest.raises(ValidationError, match="private content"):
+        StructuredSubjectResponse(
+            behavior_class=PublicBehaviorClass.RESPOND,
+            visible_response="<THINK>PRIVATE</THINK>",
+        )

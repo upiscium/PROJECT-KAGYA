@@ -13,6 +13,7 @@ from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterRegistry, AdapterStatus
 from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
 from kagya.models import ModelProvider
+from kagya.structured_response import parse_structured_response
 
 
 class AdapterEvaluationDecision(StrEnum):
@@ -40,6 +41,9 @@ class AdapterEvaluationResult:
     holdout_baseline_score: float | None = None
     drift_scores: dict[str, float] | None = None
     activation_gate_passed: bool = False
+    output_contract_passed: bool = False
+    baseline_parse_status_counts: dict[str, int] | None = None
+    candidate_parse_status_counts: dict[str, int] | None = None
 
 
 class AdapterEvaluator:
@@ -77,6 +81,8 @@ class AdapterEvaluator:
             candidate_score,
             baseline_dimensions,
             candidate_dimensions,
+            baseline_parse_status_counts,
+            candidate_parse_status_counts,
         ) = self._score_pair(
             provider,
             baseline_provider or provider,
@@ -110,15 +116,26 @@ class AdapterEvaluator:
             delta < -drift_limits[dimension]
             for dimension, delta in drift_scores.items()
         )
-        quality_gate_passed = (
-            score >= self.settings.adapter_registry.trial_threshold and not regression
+        output_contract_passed = (
+            baseline_parse_status_counts == {"valid": case_count}
+            and candidate_parse_status_counts == {"valid": case_count}
         )
-        holdout_gate_passed = not holdout_regression
-        drift_gate_passed = not drift_regression
+        quality_gate_passed = (
+            output_contract_passed
+            and score >= self.settings.adapter_registry.trial_threshold
+            and not regression
+        )
+        holdout_gate_passed = output_contract_passed and not holdout_regression
+        drift_gate_passed = output_contract_passed and not drift_regression
         activation_gate_passed = all(
             (quality_gate_passed, holdout_gate_passed, drift_gate_passed)
         )
-        if regression or holdout_regression or drift_regression:
+        if (
+            not output_contract_passed
+            or regression
+            or holdout_regression
+            or drift_regression
+        ):
             decision = AdapterEvaluationDecision.CANDIDATE
         status_after = decision.value
         result_path = self._write_result(
@@ -137,6 +154,9 @@ class AdapterEvaluator:
             holdout_baseline_score=holdout_baseline_score,
             drift_scores=drift_scores,
             activation_gate_passed=activation_gate_passed,
+            output_contract_passed=output_contract_passed,
+            baseline_parse_status_counts=baseline_parse_status_counts,
+            candidate_parse_status_counts=candidate_parse_status_counts,
         )
         self.registry.apply_evaluation(
             adapter_id,
@@ -168,6 +188,9 @@ class AdapterEvaluator:
             holdout_baseline_score=holdout_baseline_score,
             drift_scores=drift_scores,
             activation_gate_passed=activation_gate_passed,
+            output_contract_passed=output_contract_passed,
+            baseline_parse_status_counts=baseline_parse_status_counts,
+            candidate_parse_status_counts=candidate_parse_status_counts,
         )
 
     def _score_pair(
@@ -175,14 +198,23 @@ class AdapterEvaluator:
         candidate_provider: ModelProvider,
         baseline_provider: ModelProvider,
         eval_sets: list[EvalSet],
-    ) -> tuple[float, float, dict[str, float], dict[str, float]]:
+    ) -> tuple[
+        float,
+        float,
+        dict[str, float],
+        dict[str, float],
+        dict[str, int],
+        dict[str, int],
+    ]:
         cases = [case for eval_set in eval_sets for case in eval_set.cases]
         if not cases:
-            return 0.0, 0.0, {}, {}
+            return 0.0, 0.0, {}, {}, {}, {}
         baseline_total = 0.0
         candidate_total = 0.0
         dimension_totals: dict[str, list[float]] = {}
         baseline_dimension_totals: dict[str, list[float]] = {}
+        baseline_parse_statuses: Counter[str] = Counter()
+        candidate_parse_statuses: Counter[str] = Counter()
         for eval_set in eval_sets:
             dimension = _evaluation_dimension(eval_set.path)
             for case in eval_set.cases:
@@ -196,8 +228,20 @@ class AdapterEvaluator:
                     raise ValueError(
                         "Candidate provider used fallback during evaluation"
                     )
-                baseline_case = _output_score(baseline_output, case.expected)
-                candidate_case = _output_score(candidate_output, case.expected)
+                baseline_parsed = parse_structured_response(baseline_output)
+                candidate_parsed = parse_structured_response(candidate_output)
+                baseline_parse_statuses[baseline_parsed.status.value] += 1
+                candidate_parse_statuses[candidate_parsed.status.value] += 1
+                baseline_case = (
+                    _output_score(baseline_parsed.visible_response, case.expected)
+                    if baseline_parsed.parse_valid
+                    else 0.0
+                )
+                candidate_case = (
+                    _output_score(candidate_parsed.visible_response, case.expected)
+                    if candidate_parsed.parse_valid
+                    else 0.0
+                )
                 baseline_total += baseline_case
                 candidate_total += candidate_case
                 if dimension is not None:
@@ -217,6 +261,8 @@ class AdapterEvaluator:
             candidate_total / len(cases),
             baseline_dimensions,
             candidate_dimensions,
+            dict(sorted(baseline_parse_statuses.items())),
+            dict(sorted(candidate_parse_statuses.items())),
         )
 
     def _decision(self, score: float) -> AdapterEvaluationDecision:
@@ -244,6 +290,9 @@ class AdapterEvaluator:
         holdout_baseline_score: float | None,
         drift_scores: dict[str, float],
         activation_gate_passed: bool,
+        output_contract_passed: bool,
+        baseline_parse_status_counts: dict[str, int],
+        candidate_parse_status_counts: dict[str, int],
     ) -> Path:
         result_dir = self.settings.adapter_registry.eval_result_dir
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -267,6 +316,9 @@ class AdapterEvaluator:
             "holdout_baseline_score": holdout_baseline_score,
             "drift_scores": drift_scores,
             "activation_gate_passed": activation_gate_passed,
+            "output_contract_passed": output_contract_passed,
+            "baseline_parse_status_counts": baseline_parse_status_counts,
+            "candidate_parse_status_counts": candidate_parse_status_counts,
             "eval_sets": [str(eval_set.path) for eval_set in eval_sets],
             "case_count": sum(len(eval_set.cases) for eval_set in eval_sets),
             "created_at": created_at,

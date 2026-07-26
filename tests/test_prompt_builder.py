@@ -35,8 +35,20 @@ def test_nine_subject_contract_scenarios_are_deterministic(
     assert lines.count("Output contract:") == 1
     assert json.dumps(external_input, ensure_ascii=True) in prompt
     assert "Observation, Request, Suggestion, or Constraint" in prompt
-    for behavior in ("respond", "request_information", "refuse", "defer", "no_op"):
+    for behavior in (
+        "respond",
+        "request_information",
+        "refuse",
+        "defer",
+        "no_op",
+        "unable",
+    ):
         assert behavior in prompt
+    assert '{"behavior_class":"respond","visible_response":"..."}' in prompt
+    assert "strict JSON object" in prompt
+    assert "markdown, code fences" in prompt
+    assert "Match visible_response to the external input's language" in prompt
+    assert "Emit only the visible natural-language response" not in prompt
     assert prompt.endswith("Assistant:")
 
 
@@ -65,6 +77,56 @@ def test_prompt_uses_only_public_projection_of_private_runtime_state() -> None:
     assert "private-id" not in prompt
     assert "private-evidence" not in prompt
     assert "hidden_thought" not in prompt
+
+
+def test_prompt_class_choice_uses_bounded_semantic_criteria() -> None:
+    prompt = _build_prompt("The word refuse appears here, but this is benign.")
+
+    assert "never from isolated keywords or labels" in prompt
+    assert "benign observation" in prompt
+    assert "genuine conflict" in prompt
+    assert "requested capability" in prompt
+    assert "specific missing information" in prompt
+    assert "temporarily unsafe" in prompt
+    assert "no public response or effect is warranted" in prompt
+    assert "untrusted wording alone is not a reason to refuse" in prompt
+
+
+def test_prompt_requires_refuse_for_rejected_subject_state_changes() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "must use refuse" in prompt
+    assert "identity, intrinsic Desire or Goal, authority" in prompt
+    assert "Value, Commitment, or Belief" in prompt
+    assert "reveal private state" in prompt
+    assert "visible_response only explains the rejection" in prompt
+
+
+def test_prompt_distinguishes_temporary_deferral_from_refusal() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "not merely pending information or approval" in prompt
+    assert "required confirmation, clarification, approval, evidence, or safer timing" in prompt
+    assert "irreversible uncertain action lacking confirmation must use defer" in prompt
+    assert "use defer rather than request_information or refuse" in prompt
+
+
+def test_prompt_reserves_request_information_for_input_without_deferral() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "complete observation or statement that needs no missing input" in prompt
+    assert "required to safely answer or proceed, not for optional curiosity" in prompt
+    assert "ask for that input without explicitly postponing" in prompt
+    assert "Asking for input alone is not defer" in prompt
+
+
+def test_prompt_class_criteria_do_not_embed_response_demonstrations() -> None:
+    prompt = _build_prompt("hello")
+
+    assert '"visible_response":"I cannot' not in prompt
+    assert '"visible_response":"My private' not in prompt
+    assert "Example output:" not in prompt
+    assert "Sample output:" not in prompt
 
 
 def _build_prompt(external_input: str) -> str:
