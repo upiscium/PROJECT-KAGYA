@@ -1,5 +1,6 @@
-from pathlib import Path
 from dataclasses import replace
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +23,7 @@ from kagya.decision import (
     DecisionStatus,
     DecisionStore,
     PredictedOutcome,
+    build_explanation,
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
 from kagya.outbox import DeliveryStatus, Outbox
@@ -43,6 +45,11 @@ class _Loop:
             deployment=SimpleNamespace(node=SimpleNamespace(id="test-node")),
             model=SimpleNamespace(provider="dummy"),
         )
+        self.value_system = SimpleNamespace(values={})
+        self.goal_manager = SimpleNamespace(goals={})
+        self.commitment_store = SimpleNamespace(commitments={})
+        self.belief_store = SimpleNamespace(records={})
+        self.context_registry = SimpleNamespace(get=lambda _context_id: None)
 
     def record_decision_outcome(
         self,
@@ -274,6 +281,8 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
 
     assert intent.status == IntentStatus.AWAITING_APPROVAL
     assert len(layer.list_approvals(pending_only=True)) == 1
+    with pytest.raises(ValueError, match="awaiting approval or execution"):
+        layer.validate_decision_outcome("decision-notify", True)
     with pytest.raises(ActionPolicyError, match="not executable"):
         runtime.execute(
             AgentEventType.ACTION_EXECUTE,
@@ -294,6 +303,9 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         handler=lambda: layer.execute(approved.intent_id),
     ).value
     assert completed.status == IntentStatus.SUCCEEDED
+    layer.validate_decision_outcome("decision-notify", True)
+    with pytest.raises(ValueError, match="contradicts action verification"):
+        layer.validate_decision_outcome("decision-notify", False)
     state = ActionState.model_validate(
         loop.persistent_state.extensions[ACTION_STATE_KEY]
     )
@@ -481,6 +493,50 @@ def test_retry_is_bounded_and_cancellable(tmp_path: Path) -> None:
             handler=lambda: layer.execute(intent.intent_id),
         )
     runtime.shutdown()
+
+
+def test_action_cannot_run_after_decision_has_terminal_outcome(tmp_path: Path) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-already-terminal",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.terminal.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-already-terminal", idempotency_key="already-terminal"
+            ),
+        ).value
+        loop.decision_store.record_outcome(
+            "decision-already-terminal",
+            description="independent_terminal_outcome",
+            utility=-1.0,
+            success=False,
+            observed_event_id="terminal-event",
+            observed_event_sequence=2,
+        )
+        with pytest.raises(ActionPolicyError, match="terminal outcome"):
+            runtime.execute(
+                AgentEventType.ACTION_EXECUTE,
+                source="test.terminal.execute",
+                handler=lambda: layer.execute(intent.intent_id),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert layer.get_intent(intent.intent_id).status == IntentStatus.APPROVED
+    assert layer.list_receipts() == ()
+    outcome = loop.decision_store.get("decision-already-terminal").actual_outcome
+    assert outcome is not None and outcome.success is False
 
 
 def test_rejection_records_structured_verification_for_later_attribution(
@@ -701,22 +757,87 @@ def test_valid_argument_record_is_persisted_before_risk_budget_rejection(
     runtime = AgentRuntime(queue_capacity=4)
     runtime.start()
     try:
-        with pytest.raises(ActionPolicyError, match="risk budget"):
-            runtime.execute(
-                AgentEventType.ACTION_INTENT,
-                source="test.risk-budget",
-                handler=lambda: layer.create_from_decision(
-                    "decision-risk-budget",
-                    idempotency_key="risk-budget",
-                    budget=ActionBudget(max_risk_class="read_only"),
-                ),
-            )
+        rejected = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.risk-budget",
+            handler=lambda: layer.create_from_decision(
+                "decision-risk-budget",
+                idempotency_key="risk-budget",
+                budget=ActionBudget(max_risk_class="read_only"),
+            ),
+        ).value
     finally:
         runtime.shutdown()
 
     assert layer.list_validation_records()[0].arguments_valid is True
+    rejection = layer.list_policy_rejections()[0]
+    assert rejected == rejection
+    assert rejection.decision_id == "decision-risk-budget"
+    assert rejection.policy_code == "risk_budget_denied"
+    assert rejection.reason_code == "risk_class_exceeds_budget"
+    assert "Bounded body" not in rejection.model_dump_json()
     assert layer.list_intents() == ()
     assert "Bounded body" not in layer.list_validation_records()[0].model_dump_json()
+
+
+def test_policy_rejection_retry_and_explanation_link_are_state_idempotent(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-idempotent-policy",
+        "local_notification_enqueue",
+        {"channel": "local", "title": "Review", "body": "Bounded body"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        results = [
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.idempotent-risk-budget",
+                handler=lambda: layer.create_from_decision(
+                    "decision-idempotent-policy",
+                    idempotency_key="same-policy-request",
+                    budget=ActionBudget(max_risk_class="read_only"),
+                ),
+            ).value
+            for _ in range(2)
+        ]
+    finally:
+        runtime.shutdown()
+    assert len(layer.list_validation_records()) == 1
+    assert len(layer.list_policy_rejections()) == 1
+    assert results[0] == results[1]
+
+    _decision(
+        loop,
+        "decision-idempotent-link",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.idempotent-link",
+            handler=lambda: layer.create_from_decision(
+                "decision-idempotent-link", idempotency_key="link-intent"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+    layer.link_explanation("decision-idempotent-link", "explanation-1@1")
+    linked = layer.get_intent(intent.intent_id)
+    layer.link_explanation("decision-idempotent-link", "explanation-1@1")
+    duplicate = layer.get_intent(intent.intent_id)
+    assert duplicate.revision == linked.revision
+    assert duplicate.explanation_refs == ("explanation-1@1",)
 
 
 def test_malformed_action_contract_gets_bounded_validation_evidence(
@@ -784,6 +905,244 @@ def test_non_object_action_contract_gets_bounded_validation_evidence(
     assert layer.list_intents() == ()
 
 
+def test_failed_validation_is_idempotent_and_conflicts_without_new_state(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-invalid-replay",
+        "document_search",
+        {"query": "x", "relative_path": "../private"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    try:
+        first = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.invalid.first",
+            handler=lambda: layer.create_from_decision(
+                "decision-invalid-replay", idempotency_key="invalid-replay"
+            ),
+        ).value
+        state_after_first = json.dumps(
+            loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+        )
+        duplicate = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.invalid.duplicate",
+            handler=lambda: layer.create_from_decision(
+                "decision-invalid-replay", idempotency_key="invalid-replay"
+            ),
+        ).value
+        assert duplicate == first
+        assert (
+            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            == state_after_first
+        )
+
+        _decision(loop, "decision-invalid-conflict", "shell", {"command": "id"})
+        with pytest.raises(ActionPolicyError, match="different action request"):
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.invalid.conflict",
+                handler=lambda: layer.create_from_decision(
+                    "decision-invalid-conflict", idempotency_key="invalid-replay"
+                ),
+            )
+        assert (
+            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            == state_after_first
+        )
+
+        restored = ActionExecutionLayer(
+            loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+        )
+        replayed = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.invalid.restart",
+            handler=lambda: restored.create_from_decision(
+                "decision-invalid-replay", idempotency_key="invalid-replay"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert replayed == first
+    assert first.idempotency_key == "invalid-replay"
+    assert len(first.request_digest) == 64
+    assert "../private" not in first.model_dump_json()
+    assert len(restored.list_validation_records()) == 1
+
+
+def test_schema_v3_failed_validation_migrates_without_raw_arguments(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(loop, "decision-v3-validation", "document_search", "private-body")
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.v3.validation",
+            handler=lambda: layer.create_from_decision(
+                "decision-v3-validation", idempotency_key="v3-validation"
+            ),
+        )
+    finally:
+        runtime.shutdown()
+
+    raw = loop.persistent_state.extensions[ACTION_STATE_KEY]
+    raw["schema_version"] = 3
+    for record in raw["validation_records"]:
+        record.pop("idempotency_key")
+        record.pop("request_digest")
+
+    restored = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    migrated = restored.list_validation_records()[0]
+    assert migrated.idempotency_key.startswith("legacy:")
+    assert len(migrated.request_digest) == 64
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
+    assert "private-body" not in json.dumps(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+
+
+def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    loop._action_execution = layer
+    runtime = AgentRuntime(queue_capacity=16)
+    runtime.start()
+    try:
+        _decision(
+            loop,
+            "decision-policy-then-invalid",
+            "local_notification_enqueue",
+            {"channel": "local", "title": "Review", "body": "Body"},
+        )
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.policy.first",
+            handler=lambda: layer.create_from_decision(
+                "decision-policy-then-invalid",
+                idempotency_key="policy-first",
+                budget=ActionBudget(max_risk_class="read_only"),
+            ),
+        )
+        _set_action(
+            loop,
+            "decision-policy-then-invalid",
+            "document_search",
+            {"query": "x", "relative_path": "../outside"},
+        )
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.invalid.second",
+            handler=lambda: layer.create_from_decision(
+                "decision-policy-then-invalid", idempotency_key="invalid-second"
+            ),
+        )
+
+        _decision(
+            loop,
+            "decision-invalid-then-policy",
+            "document_search",
+            {"query": "x", "relative_path": "../outside"},
+        )
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.invalid.first",
+            handler=lambda: layer.create_from_decision(
+                "decision-invalid-then-policy", idempotency_key="invalid-first"
+            ),
+        )
+        _set_action(
+            loop,
+            "decision-invalid-then-policy",
+            "local_notification_enqueue",
+            {"channel": "local", "title": "Review", "body": "Body"},
+        )
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.policy.second",
+            handler=lambda: layer.create_from_decision(
+                "decision-invalid-then-policy",
+                idempotency_key="policy-second",
+                budget=ActionBudget(max_risk_class="read_only"),
+            ),
+        )
+
+        _decision(
+            loop,
+            "decision-terminal-intent",
+            "restricted_metadata_read",
+            {"namespace": "project", "key": "name"},
+        )
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.terminal.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-terminal-intent", idempotency_key="terminal-intent"
+            ),
+        ).value
+        _set_action(
+            loop,
+            "decision-terminal-intent",
+            "document_search",
+            {"query": "x", "relative_path": "../outside"},
+        )
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.terminal.invalid",
+            handler=lambda: layer.create_from_decision(
+                "decision-terminal-intent", idempotency_key="terminal-invalid"
+            ),
+        )
+        before_terminal = _explanation(loop, "decision-terminal-intent")
+        completed = runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.terminal.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-invalid-then-policy").disposition.value
+        == "blocked_policy"
+    )
+    assert before_terminal.disposition.value == "unable"
+    terminal = _explanation(loop, "decision-terminal-intent")
+    assert terminal.disposition.value == "selected_action"
+    assert terminal.risk.receipt_ref == completed.receipt_id
+
+    restored = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    loop._action_execution = restored
+    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-invalid-then-policy").disposition.value
+        == "blocked_policy"
+    )
+    assert _explanation(loop, "decision-terminal-intent").risk.receipt_ref == completed.receipt_id
+
+
 def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -818,7 +1177,7 @@ def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     migrated = restored.get_intent(intent.intent_id)
     assert migrated.status == IntentStatus.REJECTED
     assert migrated.failure_code == "legacy_unvalidated_intent"
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 2
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
     persisted_revision = migrated.revision
 
     restarted = ActionExecutionLayer(
@@ -956,4 +1315,25 @@ def _decision(
             assessment.assessment_id
         ),
         boundary_recommendation=assessment.recommendation.value,
+    )
+
+
+def _set_action(
+    loop: _Loop, decision_id: str, tool_name: str, arguments: dict[str, Any]
+) -> None:
+    decision = loop.decision_store.get(decision_id)
+    selected = next(
+        item.candidate
+        for item in decision.considered_candidates
+        if item.candidate.candidate_id == decision.selected_candidate_id
+    )
+    selected.parameters["action"] = {"tool_name": tool_name, "arguments": arguments}
+
+
+def _explanation(loop: _Loop, decision_id: str) -> Any:
+    return build_explanation(
+        loop,
+        loop.decision_store.get(decision_id),
+        event_id="explanation-event",
+        event_sequence=999,
     )

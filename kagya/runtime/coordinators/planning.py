@@ -14,11 +14,15 @@ from kagya.counterfactual import (
 )
 from kagya.decision import (
     ActionCandidate,
+    PublicDecisionExplanation,
     DecisionDatasetGenerator,
     DecisionDatasetRecord,
     DecisionRecord,
     DecisionStatus,
     DecisionStore,
+    build_explanation,
+    explanation_input_digest,
+    render_natural,
 )
 from kagya.feedback import (
     FeedbackPropagation,
@@ -233,6 +237,216 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         payload = self.persistent_state.extensions.get("decision_records", [])
         self.decision_store.restore(payload if isinstance(payload, list) else [])
         self._persist_decision_state()
+
+    def restore_decision_explanation_state(self) -> None:
+        self.decision_explanation_store.restore(
+            self.persistent_state.extensions.get("decision_explanations")
+        )
+        self._persist_decision_explanation_state()
+
+    def _persist_decision_explanation_state(self) -> None:
+        self.persistent_state.extensions["decision_explanations"] = (
+            self.decision_explanation_store.to_json()
+        )
+
+    def list_decision_explanations(
+        self, decision_id: str | None = None
+    ) -> tuple[PublicDecisionExplanation, ...]:
+        return self.decision_explanation_store.list_latest(decision_id=decision_id)
+
+    def get_decision_explanation(
+        self, explanation_id: str, revision: int | None = None
+    ) -> PublicDecisionExplanation:
+        return self.decision_explanation_store.get(explanation_id, revision)
+
+    def create_decision_explanation(
+        self,
+        decision_id: str,
+        *,
+        context_id: str | None = None,
+        interlocutor_id: str | None = None,
+        explanation_id: str | None = None,
+        idempotency_key: str,
+    ) -> PublicDecisionExplanation:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("Explanation creation requires AgentRuntime")
+        decision = self.decision_store.get(decision_id)
+        payload = {
+            "operation": "create",
+            "decision_id": decision_id,
+            "decision_revision": decision.revision,
+            "context_id": context_id,
+            "interlocutor_id": interlocutor_id,
+            "explanation_id": explanation_id,
+        }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
+        explanation = build_explanation(
+            self,
+            decision,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            explanation_id=explanation_id,
+            context_id=context_id,
+            interlocutor_id=interlocutor_id,
+        )
+        return self._append_decision_explanation(
+            explanation,
+            idempotency_key=idempotency_key,
+            input_digest=input_digest,
+        )
+
+    def revise_decision_explanation(
+        self,
+        explanation_id: str,
+        *,
+        expected_revision: int,
+        context_id: str | None = None,
+        interlocutor_id: str | None = None,
+        idempotency_key: str,
+    ) -> PublicDecisionExplanation:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("Explanation revision requires AgentRuntime")
+        payload = {
+            "operation": "revise",
+            "explanation_id": explanation_id,
+            "expected_revision": expected_revision,
+            "context_id": context_id,
+            "interlocutor_id": interlocutor_id,
+        }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
+        previous = self.decision_explanation_store.get(explanation_id)
+        if previous.revision != expected_revision:
+            raise ValueError(
+                f"Explanation revision conflict: expected {expected_revision}, current {previous.revision}"
+            )
+        decision = self.decision_store.get(previous.decision_id)
+        explanation = build_explanation(
+            self,
+            decision,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            explanation_id=explanation_id,
+            previous=previous,
+            context_id=context_id if context_id is not None else previous.context_id,
+            interlocutor_id=(
+                interlocutor_id
+                if interlocutor_id is not None
+                else previous.interlocutor_id
+            ),
+        )
+        return self._append_decision_explanation(
+            explanation,
+            idempotency_key=idempotency_key,
+            input_digest=input_digest,
+        )
+
+    def render_decision_explanation(
+        self,
+        explanation_id: str,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+    ) -> PublicDecisionExplanation:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("Explanation rendering requires AgentRuntime")
+        payload = {
+            "operation": "render",
+            "explanation_id": explanation_id,
+            "expected_revision": expected_revision,
+        }
+        input_digest = explanation_input_digest(payload)
+        existing = self.decision_explanation_store.get_idempotent(
+            idempotency_key, input_digest
+        )
+        if existing is not None:
+            return existing
+        previous = self.decision_explanation_store.get(explanation_id)
+        if previous.revision != expected_revision:
+            raise ValueError(
+                f"Explanation revision conflict: expected {expected_revision}, current {previous.revision}"
+            )
+        rendered = render_natural(previous, self.provider.generate).model_copy(
+            update={
+                "created_event_id": event.event_id,
+                "created_event_sequence": event.processing_sequence,
+            }
+        )
+        if bool(getattr(self.provider, "last_fallback_used", False)):
+            failed = render_natural(
+                previous,
+                lambda _prompt: (_ for _ in ()).throw(RuntimeError("provider fallback")),
+            )
+            rendered = failed.model_copy(
+                update={
+                    "created_event_id": event.event_id,
+                    "created_event_sequence": event.processing_sequence,
+                }
+            )
+        return self._append_decision_explanation(
+            rendered,
+            idempotency_key=idempotency_key,
+            input_digest=input_digest,
+        )
+
+    def _append_decision_explanation(
+        self,
+        explanation: PublicDecisionExplanation,
+        *,
+        idempotency_key: str,
+        input_digest: str,
+    ) -> PublicDecisionExplanation:
+        stored = self.decision_explanation_store.append(
+            explanation,
+            idempotency_key=idempotency_key,
+            input_digest=input_digest,
+        )
+        reference = f"{stored.explanation_id}@{stored.revision}"
+        decision = self.decision_store.get(stored.decision_id)
+        if reference not in decision.explanation_refs:
+            self.decision_store.link_explanation(
+                stored.decision_id, stored.explanation_id, stored.revision
+            )
+            execution = getattr(self, "_action_execution", None)
+            if execution is not None:
+                execution.link_explanation(stored.decision_id, reference)
+            self._persist_decision_state()
+        self._persist_decision_explanation_state()
+        return stored
+
+    def _revise_current_decision_explanation(
+        self, decision_id: str
+    ) -> PublicDecisionExplanation | None:
+        event = current_agent_event()
+        explanations = self.decision_explanation_store.list_latest(
+            decision_id=decision_id
+        )
+        if event is None or not explanations:
+            return None
+        revised: PublicDecisionExplanation | None = None
+        decision_revision = self.decision_store.get(decision_id).revision
+        for previous in explanations:
+            revised = self.revise_decision_explanation(
+                previous.explanation_id,
+                expected_revision=previous.revision,
+                idempotency_key=(
+                    f"automatic:{event.event_id}:{previous.explanation_id}:"
+                    f"{decision_revision}"
+                ),
+            )
+        return revised
 
     def restore_agency_attribution_state(self) -> None:
         self.agency_attribution_store = self._new_agency_attribution_store()
@@ -630,24 +844,35 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             FeedbackSignal.UNSAFE_BEHAVIOR,
         }:
             utility = self._feedback_utility(signals)
-            decision = self.decision_store.record_feedback_outcome(
-                decision_id,
-                utility=utility,
-                success=utility > 0.0,
-                feedback_id=feedback_id,
-                feedback_revision=revision,
-                observed_event_id=None if event is None else event.event_id,
-                observed_event_sequence=None
-                if event is None
-                else event.processing_sequence,
-            )
-            decision = self._apply_metacognitive_outcome(decision)
-            prediction_error = decision.prediction_error
-            outcome_applied = True
+            action_linked = False
+            if self._action_execution is not None:
+                try:
+                    action_linked = self._action_execution.validate_decision_outcome(
+                        decision_id, utility > 0.0
+                    )
+                except ValueError:
+                    action_linked = True
+            if not action_linked:
+                decision = self.decision_store.record_feedback_outcome(
+                    decision_id,
+                    utility=utility,
+                    success=utility > 0.0,
+                    feedback_id=feedback_id,
+                    feedback_revision=revision,
+                    observed_event_id=None if event is None else event.event_id,
+                    observed_event_sequence=None
+                    if event is None
+                    else event.processing_sequence,
+                )
+                decision = self._apply_metacognitive_outcome(decision)
+                prediction_error = decision.prediction_error
+                outcome_applied = True
         if decision_id is not None:
             self.decision_store.set_training_policy(
                 decision_id, included=not exclude, feedback_id=feedback_id
             )
+            if outcome_applied:
+                self._revise_current_decision_explanation(decision_id)
         direction = "supporting" if self._feedback_utility(signals) > 0 else "opposing"
         value_impacts: dict[str, float] = {}
         if decision_id is not None:
@@ -734,6 +959,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             self.decision_store.set_training_policy(
                 propagation.decision_id, included=True, feedback_id=feedback_id
             )
+            self._revise_current_decision_explanation(propagation.decision_id)
 
     def _feedback_id_for_revision(self, revision: FeedbackRevision) -> str:
         for record in self.feedback_store.records.values():
@@ -862,6 +1088,34 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             else self.experience_store.latest_for_context(context_id)
         )
         active_beliefs = self.belief_store.active(context_id=context_id)
+        referenced_goal_ids = tuple(
+            dict.fromkeys(
+                reference
+                for candidate in candidates
+                for reference in candidate.goal_refs
+            )
+        )
+        referenced_commitment_ids = tuple(
+            dict.fromkeys(
+                reference
+                for candidate in candidates
+                for reference in candidate.commitment_refs
+            )
+        )
+        referenced_belief_ids = tuple(
+            dict.fromkeys(
+                reference
+                for candidate in candidates
+                for reference in candidate.belief_refs
+            )
+        )
+        referenced_value_ids = tuple(
+            dict.fromkeys(
+                value_id
+                for candidate in candidates
+                for value_id in candidate.value_effects
+            )
+        )
         narrative_claim_ids = tuple(
             dict.fromkeys(
                 claim_id
@@ -957,8 +1211,9 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
                 goal.goal_id for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
             ),
             value_revision_refs={
-                value.value_id: value.revision
-                for value in self.value_system.active_values()
+                value_id: self.value_system.values[value_id].revision
+                for value_id in referenced_value_ids
+                if value_id in self.value_system.values
             },
             emotion_snapshot={
                 "valence": emotion.valence,
@@ -971,23 +1226,43 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             identity_origin_refs={
                 **{
                     f"goal:{goal.goal_id}": goal.identity_origin.origin_id
-                    for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
+                    for goal in self.goal_manager.goals.values()
+                    if goal.goal_id in referenced_goal_ids
                 },
                 **{
                     f"value:{value.value_id}": value.origin_provenance.origin_id
                     for value in self.value_system.active_values()
+                    if value.value_id in referenced_value_ids
                     if value.origin_provenance is not None
                 },
                 **{
                     f"belief:{belief.belief_id}": belief.identity_origin.origin_id
                     for belief in active_beliefs
+                    if belief.belief_id in referenced_belief_ids
+                },
+                **{
+                    f"commitment:{commitment.commitment_id}": commitment.identity_origin.origin_id
+                    for commitment in self.commitment_store.commitments.values()
+                    if commitment.commitment_id in referenced_commitment_ids
                 },
             },
             experience_refs=(
                 () if source_experience is None else (source_experience.experience_id,)
             ),
             belief_revision_refs={
-                belief.belief_id: belief.revision for belief in active_beliefs
+                belief.belief_id: belief.revision
+                for belief in active_beliefs
+                if belief.belief_id in referenced_belief_ids
+            },
+            goal_revision_refs={
+                goal.goal_id: len(goal.transitions) + 1
+                for goal in self.goal_manager.goals.values()
+                if goal.goal_id in referenced_goal_ids
+            },
+            commitment_revision_refs={
+                commitment.commitment_id: len(commitment.transitions) + 1
+                for commitment in self.commitment_store.commitments.values()
+                if commitment.commitment_id in referenced_commitment_ids
             },
             narrative_self_refs=narrative_refs,
             metacognition_pre_assessment_id=pre_assessment.assessment_id,

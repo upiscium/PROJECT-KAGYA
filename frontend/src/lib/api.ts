@@ -62,6 +62,31 @@ export type DebugChatResponse = ChatResponse & {
   emotion_update: { valence_contributions: Record<string, number>; arousal_contributions: Record<string, number>; reasons: string[] };
 };
 
+export type DecisionExplanation = {
+  schema_version: 1;
+  explanation_id: string;
+  revision: number;
+  decision_id: string;
+  decision_revision: number;
+  decision_status: string;
+  disposition: string;
+  selected: { candidate_id: string; action_type: string; eligible: boolean; score: number | null; uncertainty: number; risk: number; disposition_code: string; reason_codes: string[] };
+  major_alternatives: Array<{ candidate_id: string; action_type: string; eligible: boolean; score: number | null; uncertainty: number; risk: number; disposition_code: string; reason_codes: string[] }>;
+  contributions: Array<{ source_type: string; source_id: string; source_revision: number; contribution: number | null; evidence_refs: string[]; origin_ref: string | null; availability: "available" }>;
+  evidence_refs: string[];
+  uncertainty: Array<{ code: string; severity: number; refs: string[] }>;
+  information_gap_codes: string[];
+  omitted_reference_count: number;
+  risk: { risk_class: string; policy_status: string; approval_status: string; policy_ref: string | null; approval_ref: string | null; action_intent_ref: string | null; validation_ref: string | null; receipt_ref: string | null; observation_ref: string | null; verification_ref: string | null; policy_reason_codes: string[] };
+  tradeoff_refs: string[];
+  conflict_codes: string[];
+  boundary: { assessment_id: string; assessment_revision: number; classification: string; recommendation: string; disposition: string; reason_codes: string[] } | null;
+  reason_codes: string[];
+  outcome: { status: string; utility: number | null; prediction_error: number | null; observed_event_ref: string | null; post_assessment_ref: string | null };
+  change: { previous_explanation_revision: number | null; changed_fields: string[]; reason_codes: string[] };
+  renderer: { state: string; deterministic_template: string; offered_clause_ids: string[]; ordered_clause_ids: string[]; visible_explanation: string; failure_code: string | null };
+};
+
 export type EpisodeMemory = {
   id: string;
   user_input: string;
@@ -563,6 +588,24 @@ function formatHttpError(status: number, statusText: string, detail: string): st
   return detail ? `${status} ${statusText}: ${detail}` : `${status} ${statusText}`;
 }
 
+function parseDecisionExplanationResponse(value: unknown): { explanations: DecisionExplanation[] } {
+  if (!isRecord(value) || !Array.isArray(value.explanations)) throw new ApiError("Backend returned an invalid decision explanation response.");
+  for (const item of value.explanations) {
+    if (!isRecord(item) || typeof item.explanation_id !== "string" || typeof item.decision_id !== "string" || typeof item.revision !== "number" || typeof item.decision_revision !== "number") throw new ApiError("Backend returned an invalid decision explanation response.");
+    if (!isRecord(item.renderer) || !Array.isArray(item.renderer.offered_clause_ids) || !Array.isArray(item.renderer.ordered_clause_ids) || typeof item.renderer.visible_explanation !== "string") throw new ApiError("Backend returned an invalid decision explanation renderer.");
+    if (!isRecord(item.risk) || !isRecord(item.outcome) || !isRecord(item.change) || !isRecord(item.selected)) throw new ApiError("Backend returned an invalid decision explanation projection.");
+    for (const key of ["major_alternatives", "contributions", "evidence_refs", "uncertainty", "information_gap_codes", "tradeoff_refs", "conflict_codes", "reason_codes"] as const) {
+      if (!Array.isArray(item[key])) throw new ApiError("Backend returned an invalid decision explanation projection.");
+    }
+    if (typeof item.omitted_reference_count !== "number") throw new ApiError("Backend returned an invalid decision explanation projection.");
+  }
+  return value as { explanations: DecisionExplanation[] };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
   feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
@@ -611,6 +654,7 @@ export const api = {
   experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
   experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
   beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
+  decisionExplanations: async () => parseDecisionExplanationResponse(await adminRequest<unknown>("/decisions/explanations")),
   motivation: () => adminRequest<MotivationState>("/motivation"),
   outboxMessages: () => adminRequest<OutboxMessageListResponse>("/outbox/messages"),
   deliverOutbox: () => adminRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),

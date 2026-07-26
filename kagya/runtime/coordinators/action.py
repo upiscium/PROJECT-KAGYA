@@ -197,6 +197,8 @@ class ActionCoordinator(RuntimeDomainMixin):
         success: bool,
     ) -> DecisionRecord:
         event = current_agent_event()
+        if self._action_execution is not None:
+            self._action_execution.validate_decision_outcome(decision_id, success)
         record = self.decision_store.record_outcome(
             decision_id,
             description=description,
@@ -240,7 +242,8 @@ class ActionCoordinator(RuntimeDomainMixin):
             self._persist_self_model_state()
             self._persist_metacognition_state()
         self._persist_decision_state()
-        return record
+        self._revise_current_decision_explanation(decision_id)
+        return self.decision_store.get(decision_id)
 
     def record_verified_action_experience(self, intent_id: str) -> ExperienceRecord:
         if current_agent_event() is None:
@@ -1029,6 +1032,7 @@ class ActionCoordinator(RuntimeDomainMixin):
             else event.processing_sequence,
         )
         self._persist_decision_state()
+        self._revise_current_decision_explanation(decision_id)
         return record
 
     def _metacognitive_candidate_scores(

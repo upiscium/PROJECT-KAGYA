@@ -41,6 +41,10 @@ class ActionCandidateRequest(_RequestModel):
     plan_id: str | None = None
     plan_revision: int | None = Field(default=None, ge=1)
     step_id: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list, max_length=32)
+    goal_refs: list[str] = Field(default_factory=list, max_length=32)
+    commitment_refs: list[str] = Field(default_factory=list, max_length=32)
+    belief_refs: list[str] = Field(default_factory=list, max_length=32)
 
     def to_domain(self) -> ActionCandidate:
         return ActionCandidate(
@@ -61,6 +65,10 @@ class ActionCandidateRequest(_RequestModel):
             plan_id=self.plan_id,
             plan_revision=self.plan_revision,
             step_id=self.step_id,
+            evidence_refs=tuple(self.evidence_refs),
+            goal_refs=tuple(self.goal_refs),
+            commitment_refs=tuple(self.commitment_refs),
+            belief_refs=tuple(self.belief_refs),
         )
 
 
@@ -80,6 +88,25 @@ class DecisionOutcomeRequest(_RequestModel):
     description: str = Field(min_length=1)
     utility: float = Field(ge=-1.0, le=1.0)
     success: bool
+
+
+class ExplanationCreateRequest(_RequestModel):
+    explanation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    context_id: str | None = Field(default=None, min_length=1, max_length=128)
+    interlocutor_id: str | None = Field(default=None, min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class ExplanationReviseRequest(_RequestModel):
+    expected_revision: int = Field(ge=1)
+    context_id: str | None = Field(default=None, min_length=1, max_length=128)
+    interlocutor_id: str | None = Field(default=None, min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class ExplanationRenderRequest(_RequestModel):
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=128)
 
 
 router = APIRouter(
@@ -178,6 +205,126 @@ def record_outcome(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return asdict(record)
+
+
+@router.get("/explanations")
+def list_explanations(
+    request: Request,
+    decision_id: str | None = None,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    records = execute_agent_event(
+        runtime,
+        AgentEventType.DECISION_EXPLANATION_READ,
+        source="api.decisions.explanations.list",
+        handler=lambda: main_loop.list_decision_explanations(decision_id),
+    ).value
+    return {"explanations": [item.public_json() for item in records]}
+
+
+@router.get("/explanations/{explanation_id}")
+def get_explanation(
+    explanation_id: str,
+    request: Request,
+    revision: int | None = None,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.DECISION_EXPLANATION_READ,
+            source="api.decisions.explanations.get",
+            handler=lambda: main_loop.get_decision_explanation(
+                explanation_id, revision
+            ),
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return record.public_json()
+
+
+@router.post("/{decision_id}/explanations")
+def create_explanation(
+    decision_id: str,
+    body: ExplanationCreateRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.DECISION_EXPLANATION_CREATE,
+            source="api.decisions.explanations.create",
+            handler=lambda: main_loop.create_decision_explanation(
+                decision_id,
+                context_id=body.context_id,
+                interlocutor_id=body.interlocutor_id,
+                explanation_id=body.explanation_id,
+                idempotency_key=body.idempotency_key,
+            ),
+            payload={"decision_id": decision_id},
+            correlation_id=decision_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return record.public_json()
+
+
+@router.post("/explanations/{explanation_id}/revisions")
+def revise_explanation(
+    explanation_id: str,
+    body: ExplanationReviseRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.DECISION_EXPLANATION_REVISE,
+            source="api.decisions.explanations.revise",
+            handler=lambda: main_loop.revise_decision_explanation(
+                explanation_id,
+                expected_revision=body.expected_revision,
+                context_id=body.context_id,
+                interlocutor_id=body.interlocutor_id,
+                idempotency_key=body.idempotency_key,
+            ),
+            payload={"explanation_id": explanation_id},
+            correlation_id=explanation_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return record.public_json()
+
+
+@router.post("/explanations/{explanation_id}/render")
+def render_explanation(
+    explanation_id: str,
+    body: ExplanationRenderRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    main_loop = get_main_loop(request)
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.DECISION_EXPLANATION_RENDER,
+            source="api.decisions.explanations.render",
+            handler=lambda: main_loop.render_decision_explanation(
+                explanation_id,
+                expected_revision=body.expected_revision,
+                idempotency_key=body.idempotency_key,
+            ),
+            payload={"explanation_id": explanation_id},
+            correlation_id=explanation_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return record.public_json()
 
 
 @router.get("/dataset")

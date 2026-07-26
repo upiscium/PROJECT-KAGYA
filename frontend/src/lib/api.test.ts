@@ -80,6 +80,24 @@ describe("api client", () => {
     ]);
   });
 
+  it("validates the backend decision explanation schema before UI use", async () => {
+    const explanation = {
+      explanation_id: "explanation-1", revision: 1, decision_id: "decision-1", decision_revision: 1,
+      selected: {}, major_alternatives: [], contributions: [], evidence_refs: [], uncertainty: [], information_gap_codes: [], omitted_reference_count: 0,
+      risk: {}, tradeoff_refs: [], conflict_codes: [], boundary: null, reason_codes: [], outcome: {}, change: {},
+      renderer: { offered_clause_ids: ["disposition.no_op.v1"], ordered_clause_ids: ["disposition.no_op.v1"], visible_explanation: "Disposition: no op." },
+    };
+    fetchMock.mockReturnValue(jsonResponse({ explanations: [explanation] }));
+
+    const response = await api.decisionExplanations();
+
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/decisions/explanations", expect.anything());
+    expect(response.explanations[0].renderer.ordered_clause_ids).toEqual(["disposition.no_op.v1"]);
+
+    fetchMock.mockReturnValue(jsonResponse({ explanations: [{ ...explanation, renderer: { visible_explanation: "invented prose" } }] }));
+    await expect(api.decisionExplanations()).rejects.toThrow("invalid decision explanation renderer");
+  });
+
   it("formats backend JSON error details", async () => {
     fetchMock.mockReturnValue(errorResponse(500, "Internal Server Error", { detail: "Fallback model produced an empty visible response" }));
 
