@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,12 +25,19 @@ from kagya.decision import (
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
 from kagya.outbox import DeliveryStatus, Outbox
+from kagya.identity import (
+    BoundaryAssessmentInput,
+    IdentityBoundaryStore,
+    SocialPressureMetadata,
+    SocialPressureSignalType,
+)
 
 
 class _Loop:
     def __init__(self) -> None:
         self.persistent_state = PersistentAgentState()
         self.decision_store = DecisionStore()
+        self.identity_boundary_store = IdentityBoundaryStore()
         self.settings = SimpleNamespace(
             project=SimpleNamespace(name="PROJECT-KAGYA", environment="test"),
             deployment=SimpleNamespace(node=SimpleNamespace(id="test-node")),
@@ -53,7 +61,9 @@ class _Loop:
             utility=utility,
             success=success,
             observed_event_id=None if event is None else event.event_id,
-            observed_event_sequence=None if event is None else event.processing_sequence,
+            observed_event_sequence=None
+            if event is None
+            else event.processing_sequence,
         )
 
     def record_decision_compensation(
@@ -125,6 +135,118 @@ def test_read_action_flows_through_runtime_to_observation_and_decision(
     assert decision.actual_outcome.observed_event_id == receipt.event_id
 
 
+def test_refusal_assessment_blocks_linked_action_intent(tmp_path: Path) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-boundary",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    signal = loop.identity_boundary_store.add_pressure(
+        SocialPressureMetadata(
+            signal_type=SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT,
+            protected_state_ref="value:protected@1",
+        ),
+        context_id="context:one",
+        event_id="event-boundary",
+        event_sequence=1,
+    )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref="decision:decision-boundary",
+            origin_refs=("origin:user",),
+            pressure_signal_ids=(signal.signal_id,),
+            protected_state_conflict_refs=("value:protected@1",),
+        ),
+        event_id="event-boundary",
+        event_sequence=1,
+        value_revision_refs={"protected": 1},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+    )
+    decision = loop.decision_store.get("decision-boundary")
+    loop.decision_store.records[decision.decision_id] = replace(
+        decision,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        with pytest.raises(ActionPolicyError, match="blocks action"):
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.boundary",
+                handler=lambda: layer.create_from_decision(
+                    "decision-boundary", idempotency_key="boundary"
+                ),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert layer.list_intents() == ()
+
+
+def test_care_assessment_allows_normal_action_policy(tmp_path: Path) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-care",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref="decision:decision-care",
+            origin_refs=("origin:self",),
+            self_endorsed_value_refs=("care",),
+            other_welfare_evidence_refs=("experience:welfare",),
+        ),
+        event_id="event-care",
+        event_sequence=1,
+        value_revision_refs={"care": 1},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+    )
+    decision = loop.decision_store.get("decision-care")
+    loop.decision_store.records[decision.decision_id] = replace(
+        decision,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.care",
+            handler=lambda: layer.create_from_decision(
+                "decision-care", idempotency_key="care"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert intent.status == IntentStatus.APPROVED
+
+
 def test_notification_requires_approval_is_idempotent_and_compensates(
     tmp_path: Path,
 ) -> None:
@@ -172,13 +294,20 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         handler=lambda: layer.execute(approved.intent_id),
     ).value
     assert completed.status == IntentStatus.SUCCEEDED
-    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
     assert len(state.notifications) == 1
     assert state.notifications[0]["status"] == "queued"
     assert len(loop.outbox.list_messages()) == 2
-    assert next(
-        item for item in loop.outbox.list_messages() if item.kind.value == "approval_request"
-    ).acknowledgment_status.value == "approved"
+    assert (
+        next(
+            item
+            for item in loop.outbox.list_messages()
+            if item.kind.value == "approval_request"
+        ).acknowledgment_status.value
+        == "approved"
+    )
 
     restored = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -191,17 +320,27 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         ).value.receipt_id
         == completed.receipt_id
     )
-    assert len(ActionState.model_validate(
-        loop.persistent_state.extensions[ACTION_STATE_KEY]
-    ).notifications) == 1
+    assert (
+        len(
+            ActionState.model_validate(
+                loop.persistent_state.extensions[ACTION_STATE_KEY]
+            ).notifications
+        )
+        == 1
+    )
 
     compensated = restored.compensate(completed.intent_id)
-    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
     assert compensated.status == IntentStatus.COMPENSATED
     assert state.notifications[0]["status"] == "cancelled"
-    assert next(
-        item for item in loop.outbox.list_messages() if item.title == "Review"
-    ).delivery_status == DeliveryStatus.CANCELLED
+    assert (
+        next(
+            item for item in loop.outbox.list_messages() if item.title == "Review"
+        ).delivery_status
+        == DeliveryStatus.CANCELLED
+    )
     assert state.receipts[-1].status == ReceiptStatus.COMPENSATED
     assert state.receipts[-1].compensation_of == completed.receipt_id
     outcome = loop.decision_store.get("decision-notify").actual_outcome
@@ -418,7 +557,9 @@ def test_action_validation_requires_event_and_missing_record_rejects_before_call
     assert not isinstance(intent, ActionValidationRecord)
     with pytest.raises(ActionPolicyError, match="authoritative event"):
         layer.execute(intent.intent_id)
-    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
     missing = intent.model_copy(update={"validation_record_id": None})
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
         update={"intents": (missing,)}
@@ -465,7 +606,9 @@ def test_action_validation_rejects_argument_mutation_and_schema_change(
         ),
     ).value
     assert not isinstance(intent, ActionValidationRecord)
-    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
     tampered = intent.model_copy(
         update={"arguments": {"namespace": "project", "key": "environment"}}
     )
@@ -480,9 +623,7 @@ def test_action_validation_rejects_argument_mutation_and_schema_change(
         )
     assert layer.list_receipts() == ()
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
-    revision = action_execution._VALIDATION_SCHEMA_REVISIONS[
-        "restricted_metadata_read"
-    ]
+    revision = action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"]
     action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] += 1
     try:
         with pytest.raises(ActionPolicyError, match="schema revision is stale"):
@@ -492,9 +633,9 @@ def test_action_validation_rejects_argument_mutation_and_schema_change(
                 handler=lambda: layer.execute(intent.intent_id),
             )
     finally:
-        action_execution._VALIDATION_SCHEMA_REVISIONS[
-            "restricted_metadata_read"
-        ] = revision
+        action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] = (
+            revision
+        )
         runtime.shutdown()
     assert layer.list_receipts() == ()
 
@@ -526,9 +667,7 @@ def test_successful_execution_is_idempotent_after_validation_schema_change(
         source="test.idempotent.execute",
         handler=lambda: layer.execute(intent.intent_id),
     ).value
-    revision = action_execution._VALIDATION_SCHEMA_REVISIONS[
-        "restricted_metadata_read"
-    ]
+    revision = action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"]
     action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] += 1
     try:
         duplicate = runtime.execute(
@@ -537,9 +676,9 @@ def test_successful_execution_is_idempotent_after_validation_schema_change(
             handler=lambda: layer.execute(intent.intent_id),
         ).value
     finally:
-        action_execution._VALIDATION_SCHEMA_REVISIONS[
-            "restricted_metadata_read"
-        ] = revision
+        action_execution._VALIDATION_SCHEMA_REVISIONS["restricted_metadata_read"] = (
+            revision
+        )
         runtime.shutdown()
 
     assert duplicate.receipt_id == completed.receipt_id
@@ -687,6 +826,7 @@ def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     )
     assert restarted.get_intent(intent.intent_id).revision == persisted_revision
 
+
 def test_action_validation_rejects_record_binding_and_event_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -710,7 +850,9 @@ def test_action_validation_rejects_record_binding_and_event_mismatch(
         ),
     ).value
     assert not isinstance(intent, ActionValidationRecord)
-    state = ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
     record = state.validation_records[0]
 
     mismatched = record.model_copy(update={"intent_id": "another-intent"})
@@ -755,7 +897,10 @@ def _decision(
         prerequisites=(),
         predicted_outcomes=(
             PredictedOutcome(
-                outcome_id="success", description="Action succeeds", probability=1.0, utility=1.0
+                outcome_id="success",
+                description="Action succeeds",
+                probability=1.0,
+                utility=1.0,
             ),
         ),
         uncertainty=0.0,
@@ -772,7 +917,10 @@ def _decision(
         prerequisites=(),
         predicted_outcomes=(
             PredictedOutcome(
-                outcome_id="idle", description="No action", probability=1.0, utility=-1.0
+                outcome_id="idle",
+                description="No action",
+                probability=1.0,
+                utility=-1.0,
             ),
         ),
         uncertainty=0.0,
@@ -780,6 +928,18 @@ def _decision(
         estimated_risk=0.0,
         value_effects={},
         appraisal_contributions={},
+    )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref=f"decision:{decision_id}",
+            origin_refs=("event:event-source",),
+        ),
+        event_id="event-source",
+        event_sequence=7,
+        value_revision_refs={},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
     )
     loop.decision_store.create(
         [action, fallback],
@@ -790,4 +950,10 @@ def _decision(
         value_revision_refs={},
         emotion_snapshot={},
         decision_id=decision_id,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
     )

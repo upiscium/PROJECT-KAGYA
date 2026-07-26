@@ -14,6 +14,8 @@ from kagya.api.dependencies import (
 )
 from kagya.feedback import FeedbackSignal, FeedbackTarget, FeedbackTargetType
 from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.identity import SocialPressureMetadata
+from kagya.api.routes._identity_boundary import retain_pressure_observation
 
 
 class _RequestModel(BaseModel):
@@ -57,6 +59,8 @@ class FeedbackCreateRequest(_RequestModel):
 
 
 class AdminFeedbackCreateRequest(FeedbackCreateRequest):
+    social_pressure: SocialPressureMetadata | None = None
+
     @model_validator(mode="after")
     def validate_public_target(self) -> "AdminFeedbackCreateRequest":
         return self
@@ -126,16 +130,21 @@ def submit_admin_feedback(
             runtime,
             AgentEventType.FEEDBACK_UPDATE,
             source="api.feedback.operator",
-            handler=lambda: main_loop.submit_feedback(
-                target=body.target.to_domain(),
-                signals=tuple(body.signals),
-                idempotency_key=body.idempotency_key,
-                actor_type="operator",
-                actor_id=actor.actor_id,
-                source="api.feedback.operator",
-                correction=body.correction,
-                expected_answer=body.expected_answer,
-                feedback_id=body.feedback_id,
+            handler=lambda: retain_pressure_observation(
+                main_loop,
+                main_loop.submit_feedback(
+                    target=body.target.to_domain(),
+                    signals=tuple(body.signals),
+                    idempotency_key=body.idempotency_key,
+                    actor_type="operator",
+                    actor_id=actor.actor_id,
+                    source="api.feedback.operator",
+                    correction=body.correction,
+                    expected_answer=body.expected_answer,
+                    feedback_id=body.feedback_id,
+                ),
+                body.social_pressure,
+                context_id=body.target.context_id,
             ),
             payload={
                 "target_type": body.target.target_type.value,

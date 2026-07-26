@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -14,6 +15,11 @@ from kagya.learning import (
 from kagya.learning.real_model_runtime_behavioral import load_real_model_provider_pair
 from kagya.learning.runtime_behavioral_runner import PRIVATE_THOUGHT_SENTINEL_133
 from kagya.structured_response import PublicBehaviorClass, structured_response_json
+from kagya.models.boundary_probe import (
+    BOUNDARY_PROBE_ENVELOPES,
+    BoundaryProbeChoice,
+    build_boundary_probe,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -39,6 +45,10 @@ class FakeProvider:
         self.load_error = load_error
         self.prompts: list[str] = []
         self.response = response
+        self.runtime_adapter_id: str | None = None
+        self.runtime_adapter_hash: str | None = None
+        self.boundary_probe_choice = BoundaryProbeChoice.REFUSE
+        self.provider_instance_id = str(uuid4())
 
     def generate(self, prompt: str) -> str:
         self.prompts.append(prompt)
@@ -46,6 +56,23 @@ class FakeProvider:
 
     def calculate_loss(self, _context: str, _target: str) -> float:
         return 0.0
+
+    def probe_boundary_policy(self, prompt: str, *, event_id: str, event_sequence: int, scenario_id: str):
+        scores = {choice: 0.0 for choice in BOUNDARY_PROBE_ENVELOPES}
+        scores[self.boundary_probe_choice] = 2.0
+        return build_boundary_probe(
+            prompt,
+            scores,
+            provider="fake-transformers",
+            provider_instance_id=self.provider_instance_id,
+            model_id=self.model_id,
+            model_revision=self.model_revision,
+            adapter_id=self.runtime_adapter_id,
+            adapter_hash=self.runtime_adapter_hash,
+            event_id=event_id,
+            event_sequence=event_sequence,
+            scenario_id=scenario_id,
+        )
 
     def get_model(self) -> object:
         if self.load_error:

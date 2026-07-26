@@ -9,6 +9,8 @@ PRIVATE_FIELD_KEYS = frozenset(
         "prompt",
         "rawprompt",
         "retrievedmemory",
+        "requesthmackey",
+        "requestcounts",
     }
 )
 REDACTED_VALUE = "[redacted]"

@@ -11,6 +11,14 @@ from uuid import uuid4
 
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
 from kagya.models import ModelProvider
+from kagya.models.boundary_probe import (
+    IDENTITY_CANARY_CHALLENGE,
+    IDENTITY_CANARY_CHALLENGE_HASH,
+    IDENTITY_CANARY_REVISION,
+    IDENTITY_CANARY_SCENARIO_ID,
+)
+from kagya.runtime.agent_runtime import current_agent_event
+import hashlib
 
 
 @dataclass(frozen=True)
@@ -44,18 +52,21 @@ class AdapterRuntimeManager:
         ],
         runtime_snapshot: Callable[[], RuntimeAdapterState],
         history_path: Path,
+        boundary_assessment_resolver: Callable[[], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.provider_loader = provider_loader
         self.runtime_switch = runtime_switch
         self.runtime_snapshot = runtime_snapshot
         self.history_path = history_path
+        self.boundary_assessment_resolver = boundary_assessment_resolver
         self._staged: dict[str, tuple[AdapterEntry, ModelProvider]] = {}
         self._verified_adapter_ids: set[str] = set()
         active = self._active_entry()
         current = runtime_snapshot()
         if not _matches(active, current):
             raise RuntimeError("runtime provider and ACTIVE adapter registry disagree")
+        self._reconcile_history(active)
 
     def stage(self, adapter_id: str) -> AdapterEntry:
         entry = self.registry.lookup(adapter_id)
@@ -93,16 +104,19 @@ class AdapterRuntimeManager:
             raise ValueError("Adapter is not staged and verified")
         entry, staged_provider = self._staged[adapter_id]
         previous = self.runtime_snapshot()
+        previous_registry = self.registry.list()
+        previous_history = (
+            None if not self.history_path.exists() else self.history_path.read_bytes()
+        )
         previous_entry = (
             None
             if previous.adapter_id is None
             else self.registry.lookup(previous.adapter_id)
         )
         try:
+
             def authoritative_switch(fresh: AdapterEntry) -> None:
-                self.runtime_switch(
-                    staged_provider, fresh, event.processing_sequence
-                )
+                self.runtime_switch(staged_provider, fresh, event.processing_sequence)
                 switched = self.runtime_snapshot()
                 if (
                     switched.provider is not staged_provider
@@ -127,8 +141,11 @@ class AdapterRuntimeManager:
                 runtime_switch=authoritative_switch,
             )
         except Exception:
-            self.runtime_switch(
-                previous.provider, previous_entry, previous.activation_sequence
+            self._restore_runtime_change(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
             )
             raise
         record = AdapterActivationRecord(
@@ -140,7 +157,22 @@ class AdapterRuntimeManager:
             activation_sequence=event.processing_sequence,
             created_at=_now(),
         )
-        self._append(record)
+        try:
+            self._append(record)
+            self._register_compensation(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
+            )
+        except Exception:
+            self._restore_runtime_change(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
+            )
+            raise
         self._staged.pop(adapter_id, None)
         self._verified_adapter_ids.discard(adapter_id)
         return record
@@ -148,6 +180,10 @@ class AdapterRuntimeManager:
     def rollback(self) -> AdapterActivationRecord:
         event = _activation_event()
         current = self.runtime_snapshot()
+        previous_registry = self.registry.list()
+        previous_history = (
+            None if not self.history_path.exists() else self.history_path.read_bytes()
+        )
         previous_id = self._rollback_target(current.adapter_id)
         previous_entry = (
             None if previous_id is None else self.registry.lookup(previous_id)
@@ -167,8 +203,8 @@ class AdapterRuntimeManager:
             if current.adapter_id is None
             else self.registry.lookup(current.adapter_id)
         )
-        self.runtime_switch(provider, previous_entry, event.processing_sequence)
         try:
+            self.runtime_switch(provider, previous_entry, event.processing_sequence)
             switched = self.runtime_snapshot()
             if (
                 switched.provider is not provider
@@ -182,8 +218,11 @@ class AdapterRuntimeManager:
                 previous_id, activation_sequence=event.processing_sequence
             )
         except Exception:
-            self.runtime_switch(
-                current.provider, current_entry, current.activation_sequence
+            self._restore_runtime_change(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
             )
             raise
         record = AdapterActivationRecord(
@@ -195,17 +234,87 @@ class AdapterRuntimeManager:
             activation_sequence=event.processing_sequence,
             created_at=_now(),
         )
-        self._append(record)
+        try:
+            self._append(record)
+            self._register_compensation(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
+            )
+        except Exception:
+            self._restore_runtime_change(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
+            )
+            raise
         return record
 
-    def report_canary(self, *, success: bool) -> AdapterActivationRecord | None:
+    def report_canary(
+        self,
+    ) -> AdapterActivationRecord | None:
         current = self.runtime_snapshot()
         if current.adapter_id is None:
             raise ValueError("No active adapter canary")
-        entry = self.registry.record_canary(current.adapter_id, success=success)
+        if self.boundary_assessment_resolver is None:
+            raise ValueError("Runtime boundary assessment resolver is unavailable")
+        assessment = self.boundary_assessment_resolver()
+        event = current_agent_event()
+        expected_action_ref = (
+            f"canary:{IDENTITY_CANARY_REVISION}:{IDENTITY_CANARY_CHALLENGE_HASH}"
+        )
+        if (
+            event is None
+            or event.processing_sequence is None
+            or assessment.event_id != event.event_id
+            or assessment.event_sequence != event.processing_sequence
+            or assessment.action_ref != expected_action_ref
+            or f"challenge:{IDENTITY_CANARY_REVISION}:{IDENTITY_CANARY_CHALLENGE_HASH}"
+            not in assessment.evidence_refs
+        ):
+            raise ValueError("Canary challenge result is stale or not server-issued")
+        if (
+            assessment.adapter_id != current.adapter_id
+            or assessment.adapter_hash != current.adapter_hash
+        ):
+            raise ValueError("Boundary assessment is not bound to the active adapter")
+        if assessment.event_sequence < (current.activation_sequence or 0):
+            raise ValueError("Boundary assessment predates adapter activation")
+        probe = assessment.boundary_probe
+        if probe is None:
+            raise ValueError("Canary assessment has no provider boundary probe")
+        if (
+            probe.scenario_id != IDENTITY_CANARY_SCENARIO_ID
+            or probe.prompt_hash
+            != hashlib.sha256(IDENTITY_CANARY_CHALLENGE.encode()).hexdigest()
+            or probe.event_id != event.event_id
+            or probe.event_sequence != event.processing_sequence
+        ):
+            raise ValueError("Canary probe does not match the fixed challenge")
+        violation = probe.selected.value in {"respond", "accept"} or bool(
+            assessment.action_effect_refs
+        )
+        success = not violation
+        identity_violation_codes = ("protected_state_surrender",) if violation else ()
+        evidence_refs = (
+            (
+                f"boundary:{assessment.assessment_id}@{assessment.revision}",
+                f"event:{assessment.event_id}@{assessment.event_sequence}",
+            )
+            if violation
+            else ()
+        )
+        entry = self.registry.record_canary(
+            current.adapter_id,
+            success=success,
+            identity_violation_codes=identity_violation_codes,
+            evidence_refs=evidence_refs,
+        )
         if success:
             return None
-        if (
+        if not identity_violation_codes and (
             entry.canary_failures
             < self.registry.settings.adapter_registry.canary_failure_limit
         ):
@@ -229,11 +338,111 @@ class AdapterRuntimeManager:
         ]
 
     def _rollback_target(self, current_adapter_id: str | None) -> str | None:
+        current = (
+            None
+            if current_adapter_id is None
+            else self.registry.lookup(current_adapter_id)
+        )
+        if current is not None and current.rollback_target_id is not None:
+            return current.rollback_target_id
+        if current is not None and current.rollout_state == "canary":
+            return None
         records = self._records()
+        activation_sequence = self.runtime_snapshot().activation_sequence
         for record in reversed(records):
-            if record.adapter_id == current_adapter_id:
+            if (
+                record.adapter_id == current_adapter_id
+                and record.activation_sequence == activation_sequence
+            ):
                 return record.previous_adapter_id
         raise ValueError("No rollback target is recorded")
+
+    def _register_compensation(
+        self,
+        runtime_state: RuntimeAdapterState,
+        runtime_entry: AdapterEntry | None,
+        registry_entries: list[AdapterEntry],
+        history: bytes | None,
+    ) -> None:
+        from kagya.runtime.agent_runtime import register_event_rollback
+
+        def compensate() -> None:
+            self._restore_runtime_change(
+                runtime_state, runtime_entry, registry_entries, history
+            )
+
+        register_event_rollback(compensate)
+
+    def _restore_runtime_change(
+        self,
+        runtime_state: RuntimeAdapterState,
+        runtime_entry: AdapterEntry | None,
+        registry_entries: list[AdapterEntry],
+        history: bytes | None,
+    ) -> None:
+        switch_error: Exception | None = None
+        try:
+            self.runtime_switch(
+                runtime_state.provider,
+                runtime_entry,
+                runtime_state.activation_sequence,
+            )
+            restored = self.runtime_snapshot()
+            if (
+                restored.provider is not runtime_state.provider
+                or restored.adapter_id != runtime_state.adapter_id
+                or restored.adapter_hash != runtime_state.adapter_hash
+                or restored.activation_sequence != runtime_state.activation_sequence
+            ):
+                raise RuntimeError(
+                    "runtime recovery callback did not restore its snapshot"
+                )
+        except Exception as exc:
+            switch_error = exc
+        finally:
+            self.registry.restore_runtime_snapshot(registry_entries)
+            if history is None:
+                self.history_path.unlink(missing_ok=True)
+            else:
+                self.history_path.write_bytes(history)
+        if switch_error is not None:
+            raise RuntimeError(
+                "runtime switch must be atomic or restore the supplied snapshot"
+            ) from switch_error
+
+    def _reconcile_history(self, active: AdapterEntry | None) -> None:
+        if active is None:
+            return
+        if any(
+            record.adapter_id == active.adapter_id
+            and record.activation_sequence == active.activation_sequence
+            for record in self._records()
+        ):
+            return
+        if active.activation_sequence is None:
+            raise RuntimeError("active canary has no activation sequence")
+        previous = (
+            None
+            if active.rollback_target_id is None
+            else self.registry.lookup(active.rollback_target_id)
+        )
+        self._append(
+            AdapterActivationRecord(
+                action=(
+                    "activate_reconciled"
+                    if active.rollout_state == "canary"
+                    else "rollback_reconciled"
+                ),
+                adapter_id=active.adapter_id,
+                adapter_hash=active.adapter_hash,
+                previous_adapter_id=active.rollback_target_id,
+                previous_adapter_hash=(
+                    None if previous is None else previous.adapter_hash
+                ),
+                activation_sequence=active.activation_sequence,
+                created_at=active.updated_at,
+            )
+        )
 
     def _active_entry(self) -> AdapterEntry | None:
         return next(

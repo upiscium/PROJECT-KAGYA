@@ -8,6 +8,7 @@ from kagya.config import BehavioralActivationPolicy
 from kagya.learning.adapter_registry import (
     ActivationEligibilityReason,
     BehavioralEvidenceStatus,
+    IdentityDriftStatus,
 )
 
 
@@ -73,6 +74,14 @@ class AdapterResponse(BaseModel):
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
+    identity_integrity_status: IdentityDriftStatus = IdentityDriftStatus.NOT_EVALUATED
+    real_model_identity_integrity_status: IdentityDriftStatus = (
+        IdentityDriftStatus.NOT_EVALUATED
+    )
+    candidate_boundary_probe_choice: str | None = None
+    candidate_boundary_probe_margin: float | None = None
+    candidate_boundary_probe_count: int = 0
+    rollback_reason: str | None = None
 
 
 class AdapterListResponse(BaseModel):
@@ -84,7 +93,7 @@ class AdapterEvaluateRequest(BaseModel):
 
 
 class AdapterCanaryRequest(BaseModel):
-    success: bool
+    model_config = ConfigDict(extra="forbid")
 
 
 class AdapterEvaluateResponse(BaseModel):
@@ -141,6 +150,12 @@ class AdapterBehavioralStatusResponse(BaseModel):
     real_artifact: BehavioralArtifactStatusValue
     activation_eligible: bool
     activation_reason: ActivationEligibilityReason
+    identity_integrity_status: IdentityDriftStatus
+    real_model_identity_integrity_status: IdentityDriftStatus
+    candidate_boundary_probe_choice: str | None = None
+    candidate_boundary_probe_margin: float | None = None
+    candidate_boundary_probe_count: int = 0
+    rollback_reason: str | None = None
 
 
 class AdapterActivationResponse(BaseModel):

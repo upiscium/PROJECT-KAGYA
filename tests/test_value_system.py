@@ -81,19 +81,10 @@ def test_different_value_states_change_option_ranking() -> None:
     care_first.restore({"care": 0.9, "honesty": 0.1})
     honesty_first = _system()
     honesty_first.restore({"care": 0.1, "honesty": 0.9})
-    options = {
-        "careful": {"care": 1.0},
-        "candid": {"honesty": 1.0},
-    }
-
-    assert (
-        care_first.evaluate(options)[0].total_score
-        > care_first.evaluate(options)[1].total_score
-    )
-    assert (
-        honesty_first.evaluate(options)[0].total_score
-        < honesty_first.evaluate(options)[1].total_score
-    )
+    assert care_first.get("care").weight == 0.6
+    assert honesty_first.get("honesty").weight == 0.6
+    assert not care_first.evaluate({"legacy": {"legacy:care": 1.0}})[0].contributions
+    assert not honesty_first.evaluate({"legacy": {"legacy:honesty": 1.0}})[0].contributions
 
 
 def test_legacy_flat_values_migrate_and_round_trip() -> None:
@@ -104,8 +95,10 @@ def test_legacy_flat_values_migrate_and_round_trip() -> None:
     restored = _system()
     restored.restore(payload)
 
-    assert restored.get("care").weight == 0.9
-    assert restored.get("curiosity").weight == 0.7
+    assert restored.get("care").weight == 0.6
+    assert restored.get("legacy:care").weight == 0.9
+    assert restored.get("legacy:curiosity").weight == 0.7
+    assert restored.get("legacy:care") not in restored.active_values()
     assert restored.to_json() == payload
 
 
@@ -326,6 +319,9 @@ def _system() -> ValueSystem:
                 origin="test",
                 last_updated_at="2026-01-01T00:00:00+00:00",
                 allowed_update_rate=0.05,
+                origin_provenance=new_identity_origin(
+                    OriginActor.SELF, OriginInputKind.INTERNAL_STATE
+                ),
             ),
             ValueState(
                 value_id="honesty",
@@ -337,6 +333,9 @@ def _system() -> ValueSystem:
                 origin="test",
                 last_updated_at="2026-01-01T00:00:00+00:00",
                 allowed_update_rate=0.05,
+                origin_provenance=new_identity_origin(
+                    OriginActor.SELF, OriginInputKind.INTERNAL_STATE
+                ),
             ),
         ],
         conflicts=[ValueConflictDefinition("care", "honesty", "compassionate-honesty")],

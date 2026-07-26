@@ -29,6 +29,7 @@ from kagya.decision import (
 )
 from kagya.identity import (
     EndorsementStatus,
+    IdentityBoundaryStore,
     NarrativeSelf,
     OriginActor,
     OriginInputKind,
@@ -163,11 +164,11 @@ class _MainLoopImplementation(
                     last_updated_at=datetime.now(UTC).isoformat(),
                     allowed_update_rate=seed.allowed_update_rate,
                     origin_provenance=new_identity_origin(
-                        OriginActor.INHERITED,
+                        OriginActor.SYSTEM,
                         OriginInputKind.CONFIG_SEED,
                         source_ref=f"config:{seed.value_id}",
                         confidence=seed.confidence,
-                        endorsement=EndorsementStatus.UNCERTAIN,
+                        endorsement=EndorsementStatus.ENDORSED,
                     ),
                 )
                 for seed in settings.values.seeds
@@ -195,6 +196,7 @@ class _MainLoopImplementation(
         )
         self.decision_store = DecisionStore()
         self.self_model = SelfModel()
+        self.identity_boundary_store = IdentityBoundaryStore()
         self.experience_store = ExperienceStore()
         self.relationship_store = RelationshipStore()
         self.narrative_self = NarrativeSelf()
@@ -243,6 +245,7 @@ class _MainLoopImplementation(
         self.restore_agency_attribution_state()
         self.restore_counterfactual_state()
         self.restore_self_model_state()
+        self.restore_identity_boundary_state()
         self.restore_experience_state()
         self.restore_narrative_self_state()
         self.restore_belief_state()

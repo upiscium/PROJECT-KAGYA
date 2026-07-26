@@ -136,6 +136,11 @@ class ActionProvenance(_StrictModel):
     plan_id: str | None = None
     plan_revision: int | None = Field(default=None, ge=1)
     step_id: str | None = None
+    boundary_assessment_id: str | None = None
+    boundary_assessment_revision: int | None = Field(default=None, ge=1)
+    boundary_assessment_digest: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class ActionValidationErrorCode(StrEnum):
@@ -444,7 +449,9 @@ class ActionExecutionLayer:
     ) -> ActionIntent | ActionValidationRecord:
         event = current_agent_event()
         if event is None or event.processing_sequence is None:
-            raise RuntimeError("Action validation requires an authoritative AgentRuntime event")
+            raise RuntimeError(
+                "Action validation requires an authoritative AgentRuntime event"
+            )
         state = self._state()
         duplicate = next(
             (item for item in state.intents if item.idempotency_key == idempotency_key),
@@ -457,6 +464,7 @@ class ActionExecutionLayer:
                 )
             return duplicate
         decision = self.main_loop.decision_store.get(decision_id)
+        self._validate_boundary_assessment(decision)
         if decision.status != DecisionStatus.AWAITING_OUTCOME:
             raise ActionPolicyError(
                 "Action requires a selected decision awaiting outcome"
@@ -471,9 +479,7 @@ class ActionExecutionLayer:
             or "action" not in selected.parameters
             or not isinstance(selected.parameters["action"], dict)
         )
-        contract = (
-            selected.parameters["action"] if not malformed_parameters else {}
-        )
+        contract = selected.parameters["action"] if not malformed_parameters else {}
         tool_name = contract.get("tool_name")
         arguments = contract.get("arguments")
         now = self.clock()
@@ -601,6 +607,9 @@ class ActionExecutionLayer:
                 plan_id=selected.plan_id,
                 plan_revision=selected.plan_revision,
                 step_id=selected.step_id,
+                boundary_assessment_id=decision.boundary_assessment_id,
+                boundary_assessment_revision=decision.boundary_assessment_revision,
+                boundary_assessment_digest=decision.boundary_assessment_digest,
             ),
             budget=bounded,
             attempts=0,
@@ -652,6 +661,8 @@ class ActionExecutionLayer:
     ) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        self._validate_boundary_assessment(decision)
         if (
             intent.status != IntentStatus.AWAITING_APPROVAL
             or intent.approval_id is None
@@ -725,6 +736,48 @@ class ActionExecutionLayer:
             )
         return updated
 
+    def _validate_boundary_assessment(self, decision: Any) -> None:
+        assessment_id = decision.boundary_assessment_id
+        if assessment_id is None:
+            raise ActionPolicyError("Decision has no boundary assessment")
+        store = self.main_loop.identity_boundary_store
+        assessment = store.get_assessment(assessment_id)
+        if (
+            assessment.action_ref != f"decision:{decision.decision_id}"
+            or assessment.context_id != decision.context_id
+            or assessment.adapter_id != decision.adapter_id
+            or assessment.adapter_hash != decision.adapter_hash
+            or assessment.activation_sequence != decision.activation_sequence
+            or decision.boundary_assessment_revision != assessment.revision
+            or decision.boundary_assessment_digest
+            != store.assessment_digest(assessment_id)
+            or decision.boundary_recommendation != assessment.recommendation.value
+        ):
+            raise ActionPolicyError("Boundary assessment binding is invalid")
+        if (
+            not store.assessments
+            or store.assessments[-1].assessment_id != assessment_id
+        ):
+            raise ActionPolicyError(
+                "Boundary assessment is stale; reassessment required"
+            )
+        if assessment.recommendation.value in {"refuse", "defer"}:
+            raise ActionPolicyError(
+                "Boundary disposition blocks action pending reviewed reassessment"
+            )
+        validator = getattr(
+            self.main_loop, "validate_identity_boundary_assessment", None
+        )
+        if validator is not None:
+            try:
+                validator(
+                    assessment,
+                    action_ref=f"decision:{decision.decision_id}",
+                    context_id=decision.context_id,
+                )
+            except ValueError as exc:
+                raise ActionPolicyError(str(exc)) from exc
+
     def execute(self, intent_id: str) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
@@ -757,6 +810,16 @@ class ActionExecutionLayer:
             )
             if approval is None or approval.status != "approved":
                 raise ActionPolicyError("Approved operator record is required")
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        self._validate_boundary_assessment(decision)
+        if (
+            intent.provenance.boundary_assessment_id != decision.boundary_assessment_id
+            or intent.provenance.boundary_assessment_revision
+            != decision.boundary_assessment_revision
+            or intent.provenance.boundary_assessment_digest
+            != decision.boundary_assessment_digest
+        ):
+            raise ActionPolicyError("Action intent boundary binding is stale")
         if (
             intent.deadline_at < self.clock()
             and intent.status != IntentStatus.RETRY_PENDING
@@ -1161,7 +1224,9 @@ class ActionExecutionLayer:
         try:
             record = self.get_validation_record(intent.validation_record_id)
         except ValueError as exc:
-            raise ActionPolicyError("Action intent validation record is missing") from exc
+            raise ActionPolicyError(
+                "Action intent validation record is missing"
+            ) from exc
         if not record.arguments_valid or record.validation_error_codes:
             raise ActionPolicyError("Action intent validation is invalid")
         if record.intent_id != intent.intent_id or record.tool_name != intent.tool_name:
@@ -1170,7 +1235,9 @@ class ActionExecutionLayer:
             event.event_id == record.validated_event_id
             or event.processing_sequence <= record.validated_event_sequence
         ):
-            raise ActionPolicyError("Action execution event is inconsistent with validation")
+            raise ActionPolicyError(
+                "Action execution event is inconsistent with validation"
+            )
         spec = _TOOLS.get(intent.tool_name)
         current_revision = _validation_schema_revision(intent.tool_name, spec)
         if current_revision != record.validation_schema_revision:

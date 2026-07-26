@@ -34,6 +34,7 @@ from kagya.feedback import (
     feedback_fingerprint,
     normalize_signals,
 )
+from kagya.identity import BoundaryAssessmentInput
 from kagya.memory import MemoryLifecycleStatus
 from kagya.memory import ValidationStatus
 from kagya.motivation import (
@@ -831,8 +832,13 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         context_id: str | None = None,
         satisfied_prerequisites: set[str] | None = None,
         decision_id: str | None = None,
+        boundary_assessment_id: str | None = None,
     ) -> DecisionRecord:
         event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError(
+                "Decision creation requires an authoritative AgentRuntime event"
+            )
         for candidate in candidates:
             self.plan_store.validate_candidate(candidate)
         if context_id is not None and self.context_registry.get(context_id) is None:
@@ -894,6 +900,29 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             for candidate in candidates
         ]
         identifier = decision_id or str(uuid4())
+        if boundary_assessment_id is None:
+            boundary_assessment = self.assess_identity_boundary(
+                BoundaryAssessmentInput(
+                    action_ref=f"decision:{identifier}",
+                    origin_refs=(f"event:{event.event_id}",),
+                    context_id=context_id,
+                )
+            )
+            boundary_assessment_id = boundary_assessment.assessment_id
+        else:
+            boundary_assessment = self.identity_boundary_store.get_assessment(
+                boundary_assessment_id
+            )
+            if (
+                self.identity_boundary_store.assessments[-1].assessment_id
+                != boundary_assessment_id
+            ):
+                raise ValueError("Decision boundary assessment is stale")
+        self.validate_identity_boundary_assessment(
+            boundary_assessment,
+            action_ref=f"decision:{identifier}",
+            context_id=context_id,
+        )
         narrative_refs = tuple(
             f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
             for claim_id in narrative_claim_ids
@@ -921,17 +950,15 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         )
         record = self.decision_store.create(
             relationship_candidates,
-            triggering_event_id=None if event is None else event.event_id,
-            triggering_event_sequence=None
-            if event is None
-            else event.processing_sequence,
+            triggering_event_id=event.event_id,
+            triggering_event_sequence=event.processing_sequence,
             context_id=context_id,
             active_goal_ids=tuple(
                 goal.goal_id for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)
             ),
             value_revision_refs={
                 value.value_id: value.revision
-                for value in self.value_system.list_values()
+                for value in self.value_system.active_values()
             },
             emotion_snapshot={
                 "valence": emotion.valence,
@@ -948,7 +975,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
                 },
                 **{
                     f"value:{value.value_id}": value.origin_provenance.origin_id
-                    for value in self.value_system.list_values()
+                    for value in self.value_system.active_values()
                     if value.origin_provenance is not None
                 },
                 **{
@@ -964,6 +991,22 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             },
             narrative_self_refs=narrative_refs,
             metacognition_pre_assessment_id=pre_assessment.assessment_id,
+            boundary_assessment_id=boundary_assessment_id,
+            boundary_assessment_revision=(
+                None if boundary_assessment is None else boundary_assessment.revision
+            ),
+            boundary_assessment_digest=(
+                None
+                if boundary_assessment is None
+                else self.identity_boundary_store.assessment_digest(
+                    boundary_assessment.assessment_id
+                )
+            ),
+            boundary_recommendation=(
+                None
+                if boundary_assessment is None
+                else boundary_assessment.recommendation.value
+            ),
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"

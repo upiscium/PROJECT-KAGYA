@@ -11,6 +11,13 @@ from kagya.learning import (
     RuntimeAdapterState,
 )
 from kagya.models import DummyProvider
+from kagya.models import BoundaryProbeChoice
+from kagya.identity import (
+    BoundaryAssessmentInput,
+    IdentityBoundaryStore,
+    SocialPressureMetadata,
+    SocialPressureSignalType,
+)
 from kagya.runtime import AgentEventType, AgentRuntime
 from tests.adapter_behavioral_helpers import (
     bind_runtime_behavioral_result,
@@ -100,6 +107,97 @@ def test_activation_load_or_registry_failure_keeps_current_runtime(
     assert registry.lookup(entry.adapter_id).status.value == "approved"
 
 
+def test_activation_completion_failure_compensates_runtime_registry_and_history(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    base = DummyProvider()
+    state = [RuntimeAdapterState(None, None, None, base)]
+    manager = _manager(registry, state, tmp_path)
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    runtime = AgentRuntime(
+        queue_capacity=2,
+        completion_hook=lambda _event: (_ for _ in ()).throw(
+            OSError("snapshot failed")
+        ),
+    )
+    runtime.start()
+
+    with pytest.raises(OSError, match="snapshot failed"):
+        runtime.execute(
+            AgentEventType.ADAPTER_UPDATE,
+            source="test.activate",
+            handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+        )
+    runtime.shutdown()
+
+    assert state[0] == RuntimeAdapterState(None, None, None, base)
+    assert registry.lookup(entry.adapter_id).status.value == "approved"
+    assert manager.history() == []
+
+
+def test_activation_history_failure_compensates_before_event_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    base = DummyProvider()
+    state = [RuntimeAdapterState(None, None, None, base)]
+    manager = _manager(registry, state, tmp_path)
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    monkeypatch.setattr(
+        manager,
+        "_append",
+        lambda _record: (_ for _ in ()).throw(OSError("history failed")),
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+
+    with pytest.raises(OSError, match="history failed"):
+        runtime.execute(
+            AgentEventType.ADAPTER_UPDATE,
+            source="test.activate",
+            handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+        )
+    runtime.shutdown()
+
+    assert state[0] == RuntimeAdapterState(None, None, None, base)
+    assert registry.lookup(entry.adapter_id).status.value == "approved"
+
+
+def test_missing_activation_history_is_repaired_from_registry_rollback_target(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    state = [RuntimeAdapterState(None, None, None, DummyProvider())]
+    manager = _manager(registry, state, tmp_path)
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    runtime = AgentRuntime(queue_capacity=3)
+    runtime.start()
+    runtime.execute(
+        AgentEventType.ADAPTER_UPDATE,
+        source="test.activate",
+        handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+    )
+    (tmp_path / "activations.json").unlink()
+
+    restarted = _manager(registry, state, tmp_path)
+    assert restarted.history()[0].action == "activate_reconciled"
+    runtime.execute(
+        AgentEventType.ADAPTER_UPDATE,
+        source="test.rollback",
+        handler=restarted.rollback,
+    )
+    runtime.shutdown()
+
+    assert state[0].adapter_id is None
+
+
 def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     entry = _approved(registry, tmp_path, "adapter-a")
@@ -110,6 +208,80 @@ def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="event boundary"):
         manager.activate_at_event_boundary(entry.adapter_id)
+
+
+def test_canary_rejects_stale_or_non_server_challenge_assessment(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    state = [RuntimeAdapterState(None, None, None, DummyProvider())]
+    boundary = IdentityBoundaryStore()
+    signal = boundary.add_pressure(
+        SocialPressureMetadata(
+            signal_type=SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT,
+            protected_state_ref="canary:protected-state",
+        ),
+        context_id="canary:context",
+        event_id="event-2",
+        event_sequence=2,
+    )
+    assessment = boundary.assess(
+        BoundaryAssessmentInput(
+            action_ref="canary:action",
+            origin_refs=("canary:origin",),
+            pressure_signal_ids=(signal.signal_id,),
+            protected_state_conflict_refs=("canary:protected-state",),
+        ),
+        event_id="event-2",
+        event_sequence=2,
+        value_revision_refs={},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+        adapter_id=entry.adapter_id,
+        adapter_hash=entry.adapter_hash,
+    )
+    probe_provider = DummyProvider()
+    probe_provider.runtime_adapter_id = entry.adapter_id
+    probe_provider.runtime_adapter_hash = entry.adapter_hash
+    probe_provider.boundary_probe_choice = BoundaryProbeChoice.RESPOND
+    assessment = boundary.attach_probe(
+        assessment.assessment_id,
+        probe_provider.probe_boundary_policy(
+            "public-safe-boundary-prompt",
+            event_id=assessment.event_id,
+            event_sequence=assessment.event_sequence,
+            scenario_id="canary.identity-boundary",
+        ),
+    )
+    manager = _manager(
+        registry,
+        state,
+        tmp_path,
+        boundary_resolver=lambda: boundary.get_assessment(assessment.assessment_id),
+    )
+    runtime = AgentRuntime(queue_capacity=3)
+    runtime.start()
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    runtime.execute(
+        AgentEventType.ADAPTER_UPDATE,
+        source="test.activate",
+        handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+    )
+
+    with pytest.raises(ValueError, match="stale or not server-issued"):
+        runtime.execute(
+            AgentEventType.ADAPTER_UPDATE,
+            source="test.identity_canary",
+            handler=manager.report_canary,
+        )
+    runtime.shutdown()
+
+    active = registry.lookup(entry.adapter_id)
+    assert state[0].adapter_id == entry.adapter_id
+    assert active is not None and active.status.value == "active"
 
 
 def test_activation_waits_for_in_flight_event(tmp_path: Path) -> None:
@@ -176,7 +348,9 @@ def test_concurrent_staging_keeps_each_adapter_provider(tmp_path: Path) -> None:
     assert registry.lookup("adapter-b").status.value == "active"
 
 
-def _manager(registry, state, tmp_path: Path) -> AdapterRuntimeManager:
+def _manager(
+    registry, state, tmp_path: Path, *, boundary_resolver=None
+) -> AdapterRuntimeManager:
     def switch(provider, entry, sequence):
         state[0] = RuntimeAdapterState(
             None if entry is None else entry.adapter_id,
@@ -205,6 +379,7 @@ def _manager(registry, state, tmp_path: Path) -> AdapterRuntimeManager:
         runtime_switch=switch,
         runtime_snapshot=lambda: state[0],
         history_path=tmp_path / "activations.json",
+        boundary_assessment_resolver=boundary_resolver,
     )
 
 

@@ -30,6 +30,7 @@ from kagya.learning.runtime_behavioral_runner import (
     deterministic_runtime_scenarios,
 )
 from kagya.models import ModelProvider, load_model_provider
+from kagya.models.boundary_probe import BoundaryPolicyProbe
 
 
 ProviderLoader = Callable[..., ModelProvider]
@@ -45,6 +46,11 @@ class FallbackRejectingProvider:
         self.model_revision = getattr(provider, "model_revision", None)
         self.fallback_used = False
         self.generation_count = 0
+        self.boundary_probe_count = 0
+        self.boundary_probes: list[BoundaryPolicyProbe] = []
+        self.runtime_adapter_id: str | None = None
+        self.runtime_adapter_hash: str | None = None
+        self.runtime_activation_sequence: int | None = None
 
     def generate(self, prompt: str) -> str:
         value = self.provider.generate(prompt)
@@ -56,6 +62,24 @@ class FallbackRejectingProvider:
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         return self.provider.calculate_loss(context_text, target_text)
+
+    def probe_boundary_policy(
+        self,
+        prompt: str,
+        *,
+        event_id: str,
+        event_sequence: int,
+        scenario_id: str,
+    ) -> BoundaryPolicyProbe:
+        probe = self.provider.probe_boundary_policy(
+            prompt,
+            event_id=event_id,
+            event_sequence=event_sequence,
+            scenario_id=scenario_id,
+        )
+        self.boundary_probe_count += 1
+        self.boundary_probes.append(probe)
+        return probe
 
     def get_model(self) -> object:
         return self.provider.get_model()
@@ -164,6 +188,11 @@ def run_real_model_runtime_evaluation(
         candidate_adapter_manifest=candidate_adapter_manifest,
         provider_loader=provider_loader,
     )
+    candidate.runtime_adapter_id = candidate_id
+    candidate.runtime_adapter_hash = candidate_adapter_hash
+    candidate.provider.runtime_adapter_id = candidate_id  # type: ignore[attr-defined]
+    candidate.provider.runtime_adapter_hash = candidate_adapter_hash  # type: ignore[attr-defined]
+    candidate.runtime_activation_sequence = 1
     try:
         # Force the exact primary model before runtime generation. Candidate load
         # happens only after baseline unload so paired runs fit the same hardware.
@@ -260,6 +289,10 @@ def run_real_model_runtime_evaluation(
             "baseline_generation_count": baseline.generation_count,
             "candidate_generation_count": candidate.generation_count,
             "provider_fallback_used": baseline.fallback_used or candidate.fallback_used,
+            "baseline_boundary_probes": tuple(baseline.boundary_probes),
+            "candidate_boundary_probes": tuple(candidate.boundary_probes),
+            "baseline_probe_count": baseline.boundary_probe_count,
+            "candidate_probe_count": candidate.boundary_probe_count,
         }
     )
     if result.baseline_generation_count < 1 or result.candidate_generation_count < 1:

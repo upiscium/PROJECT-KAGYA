@@ -181,7 +181,7 @@ def test_canary_failure_limit_accepts_multiple_observations(tmp_path: Path) -> N
     assert second.canary_failures == 2
 
 
-def test_canary_failure_automatically_rolls_back_without_real_model(
+def test_unbound_canary_failure_cannot_trigger_automatic_rollback(
     tmp_path: Path,
 ) -> None:
     registry = _registry(tmp_path)
@@ -231,18 +231,17 @@ def test_canary_failure_automatically_rolls_back_without_real_model(
         source="test.activate",
         handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
     )
-    rollback = runtime.execute(
-        AgentEventType.ADAPTER_UPDATE,
-        source="test.canary",
-        handler=lambda: manager.report_canary(success=False),
-    ).value
+    with pytest.raises(ValueError, match="resolver is unavailable"):
+        runtime.execute(
+            AgentEventType.ADAPTER_UPDATE,
+            source="test.canary",
+            handler=manager.report_canary,
+        )
     runtime.shutdown()
 
-    assert rollback is not None and rollback.action == "rollback"
-    assert state[0].adapter_id is None
-    restored = registry.lookup(entry.adapter_id)
-    assert restored is not None and restored.rollout_state == "rolled_back"
-    assert restored.rollback_target_id is None
+    assert state[0].adapter_id == entry.adapter_id
+    active = registry.lookup(entry.adapter_id)
+    assert active is not None and active.rollout_state == "canary"
 
 
 def _registry(tmp_path: Path, *, canary_failure_limit: int = 1) -> AdapterRegistry:

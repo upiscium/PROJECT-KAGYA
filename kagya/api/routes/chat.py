@@ -43,7 +43,6 @@ def chat(
                 origin_actor=OriginActor.USER,
             ),
             payload={
-                "text": request.text,
                 "attachments": attachment_metadata(request),
             },
             correlation_id=context_id,

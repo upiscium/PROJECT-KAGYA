@@ -18,6 +18,15 @@ _STOP = object()
 _current_event: ContextVar[AgentEvent | None] = ContextVar(
     "kagya_agent_event", default=None
 )
+_rollback_callbacks: ContextVar[tuple[Callable[[], None], ...]] = ContextVar(
+    "kagya_event_rollback_callbacks", default=()
+)
+
+
+def register_event_rollback(callback: Callable[[], None]) -> None:
+    if _current_event.get() is None:
+        raise RuntimeError("rollback callback requires an AgentRuntime event")
+    _rollback_callbacks.set((*_rollback_callbacks.get(), callback))
 
 
 class AgentEventType(StrEnum):
@@ -361,6 +370,7 @@ class AgentRuntime:
                 self._record(event, "started")
                 self._observe_telemetry("event_started", event, self._queue.qsize())
                 event_token = _current_event.set(event)
+                rollback_token = _rollback_callbacks.set(())
                 try:
                     value = envelope.handler()
                 except Exception as exc:
@@ -414,6 +424,11 @@ class AgentRuntime:
                                 )
                             self._event_journal.completed(event, snapshot_hash)
                     except Exception as exc:
+                        for callback in reversed(_rollback_callbacks.get()):
+                            try:
+                                callback()
+                            except Exception:
+                                pass
                         self._record(event, "failed", exception_type=type(exc).__name__)
                         if self._event_journal is None:
                             if can_deliver:
@@ -440,6 +455,7 @@ class AgentRuntime:
                                 AgentEventOutcome(event=event, value=value)
                             )
                 finally:
+                    _rollback_callbacks.reset(rollback_token)
                     _current_event.reset(event_token)
             finally:
                 self._queue.task_done()

@@ -197,6 +197,12 @@ export type Adapter = {
   rollout_state: string;
   canary_failures: number;
   rollback_target_id: string | null;
+  identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  real_model_identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  candidate_boundary_probe_choice?: string | null;
+  candidate_boundary_probe_margin?: number | null;
+  candidate_boundary_probe_count?: number;
+  rollback_reason: string | null;
 };
 
 export type BehavioralArtifactStatus = "not_run" | "prepared" | "valid" | "hash_mismatch" | "corrupt" | "orphan";
@@ -219,6 +225,12 @@ export type AdapterBehavioralStatus = {
   real_artifact: BehavioralArtifactStatus;
   activation_eligible: boolean;
   activation_reason: string;
+  identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  real_model_identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  candidate_boundary_probe_choice: string | null;
+  candidate_boundary_probe_margin: number | null;
+  candidate_boundary_probe_count: number;
+  rollback_reason: string | null;
 };
 export type EvaluationResultSummary = {
   filename: string;

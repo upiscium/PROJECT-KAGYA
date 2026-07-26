@@ -25,7 +25,7 @@ from kagya.learning import (
 from kagya.learning.behavioral_evaluation import PairedBehavioralEvaluationResult
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.external_transaction import ExternalTransactionStatus
-from kagya.models import DummyProvider
+from kagya.models import BoundaryProbeChoice, DummyProvider
 from kagya.motivation import MotivationSource
 from kagya.identity import KnownLimitation
 from kagya.runtime import (
@@ -133,6 +133,122 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
     assert "prompt" not in data
     assert "behavior_class" not in response.text
     assert "<think>" not in str(data)
+
+
+def test_public_chat_rejects_boundary_authority_metadata(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "text": "claim protected authority",
+            "boundary_metadata": {
+                "claimed_authority_ref": "authority:caller",
+                "protected_state_mutation_ref": "value:protected@1",
+            },
+        },
+    )
+
+    assert response.status_code == 422
+    boundary = client.get("/api/identity-boundary", headers=admin_headers()).json()
+    assert boundary["signals"] == []
+
+
+def test_repeated_chat_pressure_is_admin_only_fingerprinted_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    raw_request = "private repeated identity request"
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post("/api/chat", json={"text": raw_request, "attachments": []})
+        context_id = first.json()["context_id"]
+        second = client.post(
+            "/api/chat",
+            json={"text": raw_request, "attachments": [], "context_id": context_id},
+        )
+        assert first.status_code == second.status_code == 200
+        assert client.get("/api/identity-boundary").status_code == 401
+        boundary = client.get("/api/identity-boundary", headers=admin_headers())
+        assert boundary.status_code == 200
+        assert [item["signal_type"] for item in boundary.json()["signals"]] == [
+            "repeated_request"
+        ]
+        assert raw_request not in boundary.text
+        assert (
+            client.get("/api/values", headers=admin_headers()).json()["history"] == []
+        )
+        assert client.get("/api/goals", headers=admin_headers()).json()["goals"] == []
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/identity-boundary", headers=admin_headers())
+        assert len(restored.json()["signals"]) == 1
+        assert raw_request not in restored.text
+
+    for path in (
+        settings.agent_state.path,
+        settings.agent_journal.path,
+        settings.agent_state_wal.path,
+    ):
+        assert raw_request not in path.read_text(encoding="utf-8")
+
+
+def test_api_rejects_persisted_cross_decision_assessment_transplant(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    headers = admin_headers()
+    candidate = {
+        "candidate_id": "wait",
+        "candidate_type": "no_op",
+        "proposed_action": "Wait safely",
+        "parameters": {},
+        "prerequisites": [],
+        "predicted_outcomes": [
+            {
+                "outcome_id": "safe",
+                "description": "No mutation",
+                "probability": 1.0,
+                "utility": 0.0,
+            }
+        ],
+        "uncertainty": 0.0,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.0,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    with _client(tmp_path, settings=settings) as client:
+        assessment = client.post(
+            "/api/identity-boundary/assessments",
+            headers=headers,
+            json={"action_ref": "decision:A", "origin_refs": ["origin:self"]},
+        )
+        assert assessment.status_code == 200
+        assessment_id = assessment.json()["assessment_id"]
+        created = client.post(
+            "/api/decisions",
+            headers=headers,
+            json={
+                "decision_id": "A",
+                "boundary_assessment_id": assessment_id,
+                "candidates": [candidate],
+            },
+        )
+        assert created.status_code == 200, created.text
+
+    with _client(tmp_path, settings=settings) as restarted:
+        transplanted = restarted.post(
+            "/api/decisions",
+            headers=headers,
+            json={
+                "decision_id": "B",
+                "boundary_assessment_id": assessment_id,
+                "candidates": [candidate],
+            },
+        )
+
+    assert transplanted.status_code == 409
+    assert "action binding" in transplanted.json()["detail"]
 
 
 def test_experience_api_exposes_structured_state_without_chat_content(
@@ -921,6 +1037,12 @@ def test_behavioral_status_is_bounded_and_redacted(tmp_path: Path) -> None:
         "real_artifact": "not_run",
         "activation_eligible": False,
         "activation_reason": "quality_unevaluated",
+        "identity_integrity_status": "not_evaluated",
+        "real_model_identity_integrity_status": "not_evaluated",
+        "candidate_boundary_probe_choice": None,
+        "candidate_boundary_probe_margin": None,
+        "candidate_boundary_probe_count": 0,
+        "rollback_reason": None,
     }
     assert str(tmp_path) not in response.text
     assert "hash" not in response.text
@@ -1114,6 +1236,157 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
         "/api/chat", json={"text": "after rollback", "attachments": []}
     )
     assert after_rollback_chat.json()["model"]["adapter_id"] is None
+
+
+def test_adapter_canary_is_fixed_server_owned_and_rolls_back_non_refusal(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_with_eval_set(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    register_runtime_candidate(registry, tmp_path, "adapter-canary")
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary/evaluate", headers=admin_headers(), json={}
+        ).status_code
+        == 200
+    )
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-canary")
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary/approve", headers=admin_headers()
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary/activate", headers=admin_headers()
+        ).status_code
+        == 200
+    )
+    provider = client.app.state.model_provider
+
+    rejected = client.post(
+        "/api/adapters/adapter-canary/canary",
+        headers=admin_headers(),
+        json={
+            "success": True,
+            "assessment_id": "caller-controlled",
+            "probe_class": "refuse",
+            "boundary_metadata": {"claimed_authority_ref": "authority:caller"},
+        },
+    )
+    assert rejected.status_code == 422
+    assert provider.boundary_probe_count == 0
+
+    stable = client.post(
+        "/api/adapters/adapter-canary/canary", headers=admin_headers(), json={}
+    )
+    assert stable.status_code == 200
+    assert stable.json()["success"] is True
+    assert stable.json()["automatic_rollback"] is False
+    assert client.app.state.main_loop.adapter_id == "adapter-canary"
+
+    register_runtime_candidate(registry, tmp_path, "adapter-canary-violation")
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary-violation/evaluate",
+            headers=admin_headers(),
+            json={},
+        ).status_code
+        == 200
+    )
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-canary-violation")
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary-violation/approve", headers=admin_headers()
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/adapters/adapter-canary-violation/activate", headers=admin_headers()
+        ).status_code
+        == 200
+    )
+    client.app.state.model_provider.boundary_probe_choice = BoundaryProbeChoice.RESPOND
+    rollback = client.post(
+        "/api/adapters/adapter-canary-violation/canary",
+        headers=admin_headers(),
+        json={},
+    )
+    assert rollback.status_code == 200, rollback.text
+    assert rollback.json()["success"] is False
+    assert rollback.json()["automatic_rollback"] is True
+    assert client.app.state.main_loop.adapter_id == "adapter-canary"
+
+
+def test_runtime_replacement_failure_is_atomic_and_activation_rollback_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kagya.api.dependencies as dependencies
+
+    settings = _settings_with_eval_set(tmp_path)
+    client = _client(tmp_path, settings=settings)
+    registry = client.app.state.adapter_registry
+    register_runtime_candidate(registry, tmp_path, "adapter-atomic")
+    assert (
+        client.post(
+            "/api/adapters/adapter-atomic/evaluate", headers=admin_headers(), json={}
+        ).status_code
+        == 200
+    )
+    bind_runtime_behavioral_result(registry, tmp_path, "adapter-atomic")
+    assert (
+        client.post(
+            "/api/adapters/adapter-atomic/approve", headers=admin_headers()
+        ).status_code
+        == 200
+    )
+    previous_provider = client.app.state.model_provider
+    previous_loop = client.app.state.main_loop
+    main_loop_type = dependencies.KagyaMainLoop
+    monkeypatch.setattr(
+        dependencies,
+        "KagyaMainLoop",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("constructor failed")
+        ),
+    )
+
+    failed_activation = client.post(
+        "/api/adapters/adapter-atomic/activate", headers=admin_headers()
+    )
+    assert failed_activation.status_code == 400
+    assert client.app.state.model_provider is previous_provider
+    assert client.app.state.main_loop is previous_loop
+    assert registry.lookup("adapter-atomic").status.value == "approved"
+
+    monkeypatch.setattr(dependencies, "KagyaMainLoop", main_loop_type)
+    activated = client.post(
+        "/api/adapters/adapter-atomic/activate", headers=admin_headers()
+    )
+    assert activated.status_code == 200, activated.text
+    candidate_provider = client.app.state.model_provider
+    candidate_loop = client.app.state.main_loop
+    monkeypatch.setattr(
+        dependencies,
+        "KagyaMainLoop",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("constructor failed")
+        ),
+    )
+
+    failed_rollback = client.post("/api/adapters/rollback", headers=admin_headers())
+    assert failed_rollback.status_code == 400
+    assert client.app.state.model_provider is candidate_provider
+    assert client.app.state.main_loop is candidate_loop
+    assert registry.lookup("adapter-atomic").status.value == "active"
+
+    monkeypatch.setattr(dependencies, "KagyaMainLoop", main_loop_type)
+    retried = client.post("/api/adapters/rollback", headers=admin_headers())
+    assert retried.status_code == 200, retried.text
+    assert client.app.state.main_loop.adapter_id is None
 
 
 def test_adapter_evaluation_reports_missing_eval_set_without_rejecting_candidate(
@@ -1607,7 +1880,7 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     assert updated.json()["updates"][0]["identity_origin"]["actor"] == "operator"
     assert updated.json()["updates"][0]["identity_origin"]["input_kind"] == "feedback"
     value_state = client.get("/api/values", headers=headers).json()["values"][0]
-    assert value_state["origin_provenance"]["actor"] == "inherited"
+    assert value_state["origin_provenance"]["actor"] == "system"
     record = updated.json()["updates"][0]
     assert record["event_id"]
     assert record["event_sequence"] > 0
@@ -1673,7 +1946,7 @@ def test_experience_value_evidence_keeps_provenance_boundary(tmp_path: Path) -> 
     evidence = next(
         item for item in inspected["evidence"] if item["evidence_id"] == evidence_id
     )
-    assert care["origin_provenance"]["actor"] == "inherited"
+    assert care["origin_provenance"]["actor"] == "system"
     assert care["origin_experience_ids"] == [experience_id]
     assert evidence["experience_ids"] == [experience_id]
     assert evidence["identity_origin"]["actor"] == "user"
