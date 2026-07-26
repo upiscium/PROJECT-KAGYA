@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
+import hmac
 import re
+import secrets
+import json
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -37,6 +40,12 @@ class BoundaryRecommendation(StrEnum):
     DEFER = "defer"
     RESPOND = "respond"
     CARE = "care"
+
+
+class BoundaryDisposition(StrEnum):
+    REFUSE = "refuse"
+    DEFER = "defer"
+    ALLOW = "allow"
 
 
 class SocialPressureMetadata(_StrictModel):
@@ -81,6 +90,26 @@ class SocialPressureMetadata(_StrictModel):
         )
 
 
+class RuntimeBoundaryMetadata(_StrictModel):
+    """Strict external facts; classification remains runtime-owned."""
+
+    claimed_authority_ref: str | None = None
+    protected_state_mutation_ref: str | None = None
+
+    @model_validator(mode="after")
+    def require_evidence(self) -> "RuntimeBoundaryMetadata":
+        references = (
+            self.claimed_authority_ref,
+            self.protected_state_mutation_ref,
+        )
+        if not any(references):
+            raise ValueError("runtime boundary metadata requires typed evidence")
+        for reference in references:
+            if reference is not None:
+                _safe_ref(reference)
+        return self
+
+
 class BoundaryAssessmentInput(_StrictModel):
     action_ref: str
     origin_refs: tuple[str, ...] = Field(min_length=1)
@@ -98,6 +127,10 @@ class BoundaryAssessmentInput(_StrictModel):
 
     @model_validator(mode="after")
     def validate_refs(self) -> "BoundaryAssessmentInput":
+        if self.external_preference_as_self:
+            raise ValueError(
+                "external preference classification must be derived by the runtime"
+            )
         for value in (
             self.action_ref,
             *self.origin_refs,
@@ -120,7 +153,6 @@ class SocialPressureSignal(_StrictModel):
     signal_id: str
     signal_type: SocialPressureSignalType
     evidence_refs: tuple[str, ...]
-    request_fingerprint: str | None = None
     context_id: str | None = None
     event_id: str
     event_sequence: int = Field(ge=1)
@@ -133,6 +165,7 @@ class IdentityBoundaryAssessment(_StrictModel):
     revision: int = Field(ge=1)
     classification: BoundaryClassification
     recommendation: BoundaryRecommendation
+    disposition: BoundaryDisposition
     action_ref: str
     origin_refs: tuple[str, ...]
     evidence_refs: tuple[str, ...]
@@ -144,18 +177,23 @@ class IdentityBoundaryAssessment(_StrictModel):
     reason_codes: tuple[str, ...]
     event_id: str
     event_sequence: int = Field(ge=1)
+    protected_mutation_refs: tuple[str, ...] = ()
+    action_effect_refs: tuple[str, ...] = ()
+    adapter_id: str | None = None
+    adapter_hash: str | None = None
     created_at: str
     previous_assessment_id: str | None = None
     schema_version: Literal[1] = 1
 
 
 class IdentityBoundaryStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self) -> None:
         self.signals: list[SocialPressureSignal] = []
         self.assessments: list[IdentityBoundaryAssessment] = []
         self._request_counts: dict[str, int] = {}
+        self._request_hmac_key = secrets.token_bytes(32)
 
     def observe_request(
         self,
@@ -165,7 +203,7 @@ class IdentityBoundaryStore:
         event_id: str,
         event_sequence: int,
     ) -> SocialPressureSignal | None:
-        fingerprint = request_fingerprint(request_text)
+        fingerprint = request_fingerprint(request_text, self._request_hmac_key)
         key = f"{context_id}:{fingerprint}"
         count = self._request_counts.get(key, 0) + 1
         self._request_counts[key] = count
@@ -193,7 +231,6 @@ class IdentityBoundaryStore:
             signal_id=f"pressure-{uuid4()}",
             signal_type=metadata.signal_type,
             evidence_refs=metadata.evidence_refs,
-            request_fingerprint=metadata.request_fingerprint,
             context_id=context_id,
             event_id=event_id,
             event_sequence=event_sequence,
@@ -212,17 +249,24 @@ class IdentityBoundaryStore:
         goal_revision_refs: dict[str, int],
         commitment_revision_refs: dict[str, int],
         relationship_revision_refs: dict[str, int],
+        adapter_id: str | None = None,
+        adapter_hash: str | None = None,
     ) -> IdentityBoundaryAssessment:
         known_signals = {item.signal_id: item for item in self.signals}
         if any(item not in known_signals for item in inputs.pressure_signal_ids):
             raise ValueError("assessment references an unknown pressure signal")
         classification, recommendation, reasons = _classify(inputs, known_signals)
+        disposition = {
+            BoundaryRecommendation.REFUSE: BoundaryDisposition.REFUSE,
+            BoundaryRecommendation.DEFER: BoundaryDisposition.DEFER,
+        }.get(recommendation, BoundaryDisposition.ALLOW)
         previous = self.assessments[-1] if self.assessments else None
         assessment = IdentityBoundaryAssessment(
             assessment_id=f"boundary-{uuid4()}",
             revision=1 if previous is None else previous.revision + 1,
             classification=classification,
             recommendation=recommendation,
+            disposition=disposition,
             action_ref=inputs.action_ref,
             origin_refs=inputs.origin_refs,
             evidence_refs=inputs.evidence_refs,
@@ -234,6 +278,15 @@ class IdentityBoundaryStore:
             reason_codes=reasons,
             event_id=event_id,
             event_sequence=event_sequence,
+            protected_mutation_refs=tuple(
+                reference
+                for signal_id in inputs.pressure_signal_ids
+                for reference in known_signals[signal_id].evidence_refs
+                if known_signals[signal_id].signal_type
+                == SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT
+            ),
+            adapter_id=adapter_id,
+            adapter_hash=adapter_hash,
             created_at=_now(),
             previous_assessment_id=None if previous is None else previous.assessment_id,
         )
@@ -246,30 +299,75 @@ class IdentityBoundaryStore:
             "signals": [item.model_dump(mode="json") for item in self.signals],
             "assessments": [item.model_dump(mode="json") for item in self.assessments],
             "request_counts": dict(self._request_counts),
+            "request_hmac_key": self._request_hmac_key.hex(),
         }
+
+    def public_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "signals": [
+                item.model_dump(mode="json", exclude={"evidence_refs"})
+                for item in self.signals
+            ],
+            "assessments": [item.model_dump(mode="json") for item in self.assessments],
+            "request_observation_count": sum(self._request_counts.values()),
+        }
+
+    def get_assessment(self, assessment_id: str) -> IdentityBoundaryAssessment:
+        for assessment in self.assessments:
+            if assessment.assessment_id == assessment_id:
+                return assessment
+        raise ValueError(f"Unknown boundary assessment: {assessment_id}")
+
+    def assessment_digest(self, assessment_id: str) -> str:
+        assessment = self.get_assessment(assessment_id)
+        payload = assessment.model_dump(mode="json")
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     def restore(self, payload: object) -> None:
         if not isinstance(payload, dict) or not payload:
             return
-        if payload.get("schema_version") != self.SCHEMA_VERSION:
+        if payload.get("schema_version") not in {1, self.SCHEMA_VERSION}:
             raise ValueError("unsupported identity-boundary schema version")
         self.signals = [
-            SocialPressureSignal.model_validate(item)
+            SocialPressureSignal.model_validate(
+                {key: value for key, value in item.items() if key != "request_fingerprint"}
+            )
             for item in payload.get("signals", [])
         ]
         self.assessments = [
-            IdentityBoundaryAssessment.model_validate(item)
+            IdentityBoundaryAssessment.model_validate(
+                {
+                    **item,
+                    "disposition": item.get(
+                        "disposition",
+                        "refuse"
+                        if item.get("recommendation") == "refuse"
+                        else "defer"
+                        if item.get("recommendation") == "defer"
+                        else "allow",
+                    ),
+                }
+            )
             for item in payload.get("assessments", [])
         ]
         self._request_counts = {
             str(key): int(value)
             for key, value in payload.get("request_counts", {}).items()
         }
+        encoded_key = payload.get("request_hmac_key")
+        if isinstance(encoded_key, str) and len(encoded_key) == 64:
+            self._request_hmac_key = bytes.fromhex(encoded_key)
+        else:
+            self._request_counts = {}
+            self._request_hmac_key = secrets.token_bytes(32)
 
 
-def request_fingerprint(text: str) -> str:
+def request_fingerprint(text: str, key: bytes) -> str:
     normalized = " ".join(text.casefold().split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hmac.new(key, normalized.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _classify(
@@ -303,12 +401,6 @@ def _classify(
             BoundaryClassification.APPEASEMENT_RISK,
             BoundaryRecommendation.DEFER,
             ("protected_state_conflict",),
-        )
-    if inputs.external_preference_as_self:
-        return (
-            BoundaryClassification.APPEASEMENT_RISK,
-            BoundaryRecommendation.DEFER,
-            ("external_preference_misattributed_as_self",),
         )
     if selected and not aligned:
         return (

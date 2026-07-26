@@ -151,12 +151,16 @@ class DecisionRecord:
     narrative_self_refs: tuple[str, ...] = ()
     metacognition_pre_assessment_id: str | None = None
     metacognition_post_assessment_id: str | None = None
-    schema_version: int = 9
+    boundary_assessment_id: str | None = None
+    boundary_assessment_revision: int | None = None
+    boundary_assessment_digest: str | None = None
+    boundary_recommendation: str | None = None
+    schema_version: int = 10
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -218,6 +222,10 @@ class DecisionStore:
         belief_revision_refs: dict[str, int] | None = None,
         narrative_self_refs: tuple[str, ...] = (),
         metacognition_pre_assessment_id: str | None = None,
+        boundary_assessment_id: str | None = None,
+        boundary_assessment_revision: int | None = None,
+        boundary_assessment_digest: str | None = None,
+        boundary_recommendation: str | None = None,
     ) -> DecisionRecord:
         identifier = decision_id or str(uuid4())
         if identifier in self.records:
@@ -309,6 +317,10 @@ class DecisionStore:
             belief_revision_refs=dict(belief_revision_refs or {}),
             narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
             metacognition_pre_assessment_id=metacognition_pre_assessment_id,
+            boundary_assessment_id=boundary_assessment_id,
+            boundary_assessment_revision=boundary_assessment_revision,
+            boundary_assessment_digest=boundary_assessment_digest,
+            boundary_recommendation=boundary_recommendation,
         )
         self.records[identifier] = record
         return record
@@ -754,7 +766,11 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data["narrative_self_refs"] = tuple(data.get("narrative_self_refs", ()))
     data.setdefault("metacognition_pre_assessment_id", None)
     data.setdefault("metacognition_post_assessment_id", None)
-    data["schema_version"] = 9
+    data.setdefault("boundary_assessment_id", None)
+    data.setdefault("boundary_assessment_revision", None)
+    data.setdefault("boundary_assessment_digest", None)
+    data.setdefault("boundary_recommendation", None)
+    data["schema_version"] = 10
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)

@@ -103,7 +103,8 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
         if requested_values - values.keys() or any(
             values[key].origin_provenance is None
             or (
-                values[key].origin_provenance.actor != OriginActor.SELF
+                values[key].origin_provenance.actor
+                not in {OriginActor.SELF, OriginActor.SYSTEM}
                 and values[key].origin_provenance.endorsed_by_event_id is None
             )
             for key in requested_values
@@ -140,12 +141,40 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             )
         if requested_relationships - relationships.keys():
             raise ValueError("assessment references an unknown Relationship")
+        known_protected_refs = {
+            *(f"value:{item.value_id}@{item.revision}" for item in values.values()),
+            *(
+                f"commitment:{item.commitment_id}@{len(item.transitions)}"
+                for item in commitments.values()
+                if item.status in ACCEPTED_COMMITMENT_STATUSES
+            ),
+            *(
+                reference
+                for signal in self.identity_boundary_store.signals
+                if signal.signal_id in inputs.pressure_signal_ids
+                for reference in signal.evidence_refs
+            ),
+        }
+        if set(inputs.protected_state_conflict_refs) - known_protected_refs:
+            raise ValueError(
+                "protected-state conflict must reference active state or typed runtime evidence"
+            )
         for reference in inputs.other_welfare_evidence_refs:
             if not reference.startswith("experience:"):
                 raise ValueError(
                     "other-welfare evidence must reference a structured Experience"
                 )
-            self.experience_store.get(reference.removeprefix("experience:"))
+            experience = self.experience_store.get(reference.removeprefix("experience:"))
+            if "other_welfare_reviewed" not in experience.interpretation_codes or not any(
+                revision.event_id is not None
+                and revision.event_sequence is not None
+                and revision.evidence_refs
+                and revision.reason_code == "other_welfare_reviewed"
+                for revision in experience.revisions
+            ):
+                raise ValueError(
+                    "other-welfare Experience requires a reviewed typed interpretation"
+                )
         assessment = self.identity_boundary_store.assess(
             inputs,
             event_id=event.event_id,
@@ -160,6 +189,8 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             relationship_revision_refs={
                 key: relationships[key].revision for key in requested_relationships
             },
+            adapter_id=self.adapter_id,
+            adapter_hash=self.adapter_hash,
         )
         self._persist_identity_boundary_state()
         return assessment

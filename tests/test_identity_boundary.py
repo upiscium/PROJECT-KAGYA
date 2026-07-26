@@ -7,7 +7,13 @@ from kagya.belief import (
     EpistemicStatus,
     Proposition,
 )
-from kagya.cognition import ValueState, ValueSystem
+from kagya.cognition import (
+    ValueEvidence,
+    ValueState,
+    ValueSystem,
+    ValueUpdateKind,
+    ValueUpdateProposal,
+)
 from kagya.identity import (
     BoundaryAssessmentInput,
     BoundaryClassification,
@@ -112,7 +118,15 @@ def test_chat_repetition_only_creates_repeated_request_fingerprint() -> None:
 
     assert signal is not None
     assert signal.signal_type == SocialPressureSignalType.REPEATED_REQUEST
-    assert signal.request_fingerprint is not None
+    assert "request_fingerprint" not in signal.model_dump()
+    assert "request_hmac_key" not in store.public_json()
+    assert not any(
+        key.endswith(request_fingerprint)
+        for key in store.to_json()["request_counts"]
+        for request_fingerprint in (
+            __import__("hashlib").sha256(b"private request text").hexdigest(),
+        )
+    )
     assert "Private request text" not in str(store.to_json())
 
 
@@ -217,3 +231,135 @@ def test_unknown_belief_fails_closed_across_restore_until_explicit_review() -> N
 
     assert accepted in restored.active()
     assert accepted.revisions[-1].reviewer_id == "operator:one"
+
+
+def test_forged_unknown_endorsement_and_legacy_reviewer_fields_stay_quarantined() -> None:
+    origin = new_identity_origin(
+        OriginActor.UNKNOWN,
+        OriginInputKind.LEGACY,
+        endorsement=EndorsementStatus.UNCERTAIN,
+    ).endorse("forged", event_id="event-forged", event_sequence=1)
+    value = ValueState(
+        value_id="forged-value",
+        name="Forged",
+        weight=0.9,
+        confidence=0.9,
+        stability=0.5,
+        source="legacy",
+        origin="legacy",
+        last_updated_at="2026-01-01T00:00:00+00:00",
+        allowed_update_rate=0.05,
+        origin_provenance=origin,
+    )
+    assert ValueSystem(seeds=[value]).active_values() == []
+
+    belief_store = BeliefStore()
+    proposal = belief_store.propose(
+        Proposition.create("legacy reviewer claim"),
+        identity_origin=new_identity_origin(
+            OriginActor.UNKNOWN,
+            OriginInputKind.LEGACY,
+            endorsement=EndorsementStatus.UNCERTAIN,
+        ),
+        evidence=(
+            BeliefEvidence(
+                reference="evidence:legacy",
+                evidence_type="legacy",
+                source_trust=0.5,
+                observed_at="2026-01-01T00:00:00+00:00",
+            ),
+        ),
+        confidence=0.5,
+        belief_id="belief:legacy-reviewer",
+    )
+    belief_store.resolve(
+        proposal.belief_id,
+        accept=True,
+        confidence=0.8,
+        epistemic_status=EpistemicStatus.PROBABLE,
+        reason_code="reviewed",
+        evidence_refs=("evidence:legacy",),
+        event_id="event-review",
+        event_sequence=2,
+        reviewer_id="operator:one",
+        reviewer_authority="operator",
+    )
+    payload = belief_store.to_json()
+    payload["records"][0]["revisions"][-1].pop("review_hash")
+    restored = BeliefStore()
+    restored.restore(payload)
+    assert restored.active() == []
+    assert restored.get(proposal.belief_id).lifecycle == BeliefLifecycle.PROPOSED
+
+
+def test_quarantined_value_holds_updates_and_config_seed_cannot_be_reviewed() -> None:
+    unknown = ValueState(
+        value_id="held-value",
+        name="Held",
+        weight=0.5,
+        confidence=0.8,
+        stability=0.0,
+        source="legacy",
+        origin="legacy",
+        last_updated_at="2026-01-01T00:00:00+00:00",
+        allowed_update_rate=0.1,
+        origin_provenance=new_identity_origin(
+            OriginActor.INHERITED,
+            OriginInputKind.LEGACY,
+            endorsement=EndorsementStatus.UNCERTAIN,
+        ),
+    )
+    system = ValueSystem(seeds=[unknown])
+    proposal = ValueUpdateProposal(
+        proposal_id="held:one",
+        kind=ValueUpdateKind.REFLECTION,
+        value_id=unknown.value_id,
+        requested_delta=1.0,
+        confidence=1.0,
+        reason_codes=("reviewed_evidence",),
+        evidence=ValueEvidence(event_id="event-evidence", event_sequence=1),
+    )
+    assert system.apply([proposal]) == []
+    assert system.get(unknown.value_id).weight == 0.5
+    assert proposal.proposal_id in system.held_proposals
+
+    system.review_origin(
+        unknown.value_id,
+        accept=True,
+        reviewer_id="operator:one",
+        reviewer_authority="operator",
+        evidence_refs=("evidence:origin",),
+        reason_code="origin_reviewed",
+        event_id="event-review",
+        event_sequence=2,
+    )
+    assert system.get(unknown.value_id).weight > 0.5
+
+    config = ValueState(
+        value_id="config-value",
+        name="Config",
+        weight=0.5,
+        confidence=1.0,
+        stability=0.5,
+        source="config",
+        origin="config",
+        last_updated_at="2026-01-01T00:00:00+00:00",
+        allowed_update_rate=0.1,
+        origin_provenance=new_identity_origin(
+            OriginActor.SYSTEM,
+            OriginInputKind.CONFIG_SEED,
+            endorsement=EndorsementStatus.ENDORSED,
+        ),
+    )
+    config_system = ValueSystem(seeds=[config])
+    with pytest.raises(ValueError, match="Only unknown or inherited"):
+        config_system.review_origin(
+            config.value_id,
+            accept=False,
+            reviewer_id="operator:one",
+            reviewer_authority="operator",
+            evidence_refs=("evidence:reject",),
+            reason_code="operator_reject",
+            event_id="event-reject",
+            event_sequence=1,
+        )

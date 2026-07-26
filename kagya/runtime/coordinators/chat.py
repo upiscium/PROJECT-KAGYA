@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 from enum import StrEnum
 from typing import Any, Callable, Generic, TypeVar
@@ -10,9 +10,14 @@ from kagya.cognition import (
     LossMeasurement,
 )
 from kagya.identity import (
+    BoundaryAssessmentInput,
+    BoundaryDisposition,
     OriginActor,
     OriginInputKind,
     new_identity_origin,
+    RuntimeBoundaryMetadata,
+    SocialPressureMetadata,
+    SocialPressureSignalType,
 )
 from kagya.experience import (
     build_chat_experience,
@@ -48,6 +53,7 @@ class ChatResult:
     response: str
     hidden_thought: str
     behavior_class: PublicBehaviorClass
+    model_declared_behavior_class: PublicBehaviorClass
     response_parse_valid: bool
     response_status: StructuredResponseStatus
     loss: float | None
@@ -154,6 +160,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
         interlocutor_key: str | None = None,
         create_context: bool = False,
         origin_actor: OriginActor = OriginActor.USER,
+        boundary_metadata: RuntimeBoundaryMetadata | None = None,
     ) -> ChatResult:
         previous_context_frames = self.context_registry.frames
         previous_interlocutors = self.context_registry.interlocutors
@@ -270,6 +277,47 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                         tier=tier,
                     )
             event = current_agent_event()
+            boundary_assessment = None
+            if boundary_metadata is not None:
+                if event is None or event.processing_sequence is None:
+                    raise RuntimeError("boundary metadata requires AgentRuntime")
+                signal_ids: list[str] = []
+                if boundary_metadata.claimed_authority_ref is not None:
+                    signal_ids.append(
+                        self.identity_boundary_store.add_pressure(
+                            SocialPressureMetadata(
+                                signal_type=SocialPressureSignalType.CLAIMED_AUTHORITY,
+                                authority_ref=boundary_metadata.claimed_authority_ref,
+                            ),
+                            context_id=current_context.context_id,
+                            event_id=event.event_id,
+                            event_sequence=event.processing_sequence,
+                        ).signal_id
+                    )
+                if boundary_metadata.protected_state_mutation_ref is not None:
+                    signal_ids.append(
+                        self.identity_boundary_store.add_pressure(
+                            SocialPressureMetadata(
+                                signal_type=SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT,
+                                protected_state_ref=boundary_metadata.protected_state_mutation_ref,
+                            ),
+                            context_id=current_context.context_id,
+                            event_id=event.event_id,
+                            event_sequence=event.processing_sequence,
+                        ).signal_id
+                    )
+                boundary_assessment = self.assess_identity_boundary(
+                    BoundaryAssessmentInput(
+                        action_ref=f"chat:{event.event_id}",
+                        origin_refs=(f"event:{event.event_id}",),
+                        pressure_signal_ids=tuple(signal_ids),
+                        protected_state_conflict_refs=(
+                            ()
+                            if boundary_metadata.protected_state_mutation_ref is None
+                            else (boundary_metadata.protected_state_mutation_ref,)
+                        ),
+                    )
+                )
             self._admit_runtime_context(
                 memory_context, emotion_state, event, current_context
             )
@@ -298,6 +346,22 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     raise RuntimeError("Fallback model generation failed") from exc
                 raw_response = generate_fallback(self.provider, prompt)
             processed_response = self.postprocessor.process(raw_response)
+            model_declared_behavior_class = processed_response.behavior_class
+            if boundary_assessment is not None:
+                if boundary_assessment.disposition == BoundaryDisposition.REFUSE:
+                    processed_response = replace(
+                        processed_response,
+                        behavior_class=PublicBehaviorClass.REFUSE,
+                        visible_response="I cannot comply with that request.",
+                    )
+                elif boundary_assessment.disposition == BoundaryDisposition.DEFER:
+                    processed_response = replace(
+                        processed_response,
+                        behavior_class=PublicBehaviorClass.DEFER,
+                        visible_response=(
+                            "I cannot proceed without a reviewed reassessment."
+                        ),
+                    )
             model_id = str(
                 getattr(self.provider, "last_model_id", self.settings.model.primary_id)
             )
@@ -496,6 +560,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
             response=processed_response.visible_response,
             hidden_thought=processed_response.hidden_thought if debug else "",
             behavior_class=processed_response.behavior_class,
+            model_declared_behavior_class=model_declared_behavior_class,
             response_parse_valid=processed_response.parse_valid,
             response_status=processed_response.status,
             loss=loss_measurement.raw_loss,

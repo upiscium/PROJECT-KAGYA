@@ -831,8 +831,14 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
         context_id: str | None = None,
         satisfied_prerequisites: set[str] | None = None,
         decision_id: str | None = None,
+        boundary_assessment_id: str | None = None,
     ) -> DecisionRecord:
         event = current_agent_event()
+        boundary_assessment = (
+            None
+            if boundary_assessment_id is None
+            else self.identity_boundary_store.get_assessment(boundary_assessment_id)
+        )
         for candidate in candidates:
             self.plan_store.validate_candidate(candidate)
         if context_id is not None and self.context_registry.get(context_id) is None:
@@ -964,6 +970,22 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             },
             narrative_self_refs=narrative_refs,
             metacognition_pre_assessment_id=pre_assessment.assessment_id,
+            boundary_assessment_id=boundary_assessment_id,
+            boundary_assessment_revision=(
+                None if boundary_assessment is None else boundary_assessment.revision
+            ),
+            boundary_assessment_digest=(
+                None
+                if boundary_assessment is None
+                else self.identity_boundary_store.assessment_digest(
+                    boundary_assessment.assessment_id
+                )
+            ),
+            boundary_recommendation=(
+                None
+                if boundary_assessment is None
+                else boundary_assessment.recommendation.value
+            ),
             satisfied_prerequisites=completed_goals
             | {
                 f"capability:{capability.capability_id}"

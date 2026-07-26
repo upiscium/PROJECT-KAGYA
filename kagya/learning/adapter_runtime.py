@@ -44,18 +44,21 @@ class AdapterRuntimeManager:
         ],
         runtime_snapshot: Callable[[], RuntimeAdapterState],
         history_path: Path,
+        boundary_assessment_resolver: Callable[[str], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.provider_loader = provider_loader
         self.runtime_switch = runtime_switch
         self.runtime_snapshot = runtime_snapshot
         self.history_path = history_path
+        self.boundary_assessment_resolver = boundary_assessment_resolver
         self._staged: dict[str, tuple[AdapterEntry, ModelProvider]] = {}
         self._verified_adapter_ids: set[str] = set()
         active = self._active_entry()
         current = runtime_snapshot()
         if not _matches(active, current):
             raise RuntimeError("runtime provider and ACTIVE adapter registry disagree")
+        self._reconcile_history(active)
 
     def stage(self, adapter_id: str) -> AdapterEntry:
         entry = self.registry.lookup(adapter_id)
@@ -93,6 +96,10 @@ class AdapterRuntimeManager:
             raise ValueError("Adapter is not staged and verified")
         entry, staged_provider = self._staged[adapter_id]
         previous = self.runtime_snapshot()
+        previous_registry = self.registry.list()
+        previous_history = (
+            None if not self.history_path.exists() else self.history_path.read_bytes()
+        )
         previous_entry = (
             None
             if previous.adapter_id is None
@@ -139,7 +146,22 @@ class AdapterRuntimeManager:
             activation_sequence=event.processing_sequence,
             created_at=_now(),
         )
-        self._append(record)
+        try:
+            self._append(record)
+            self._register_compensation(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
+            )
+        except Exception:
+            self._restore_runtime_change(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
+            )
+            raise
         self._staged.pop(adapter_id, None)
         self._verified_adapter_ids.discard(adapter_id)
         return record
@@ -147,6 +169,10 @@ class AdapterRuntimeManager:
     def rollback(self) -> AdapterActivationRecord:
         event = _activation_event()
         current = self.runtime_snapshot()
+        previous_registry = self.registry.list()
+        previous_history = (
+            None if not self.history_path.exists() else self.history_path.read_bytes()
+        )
         previous_id = self._rollback_target(current.adapter_id)
         previous_entry = (
             None if previous_id is None else self.registry.lookup(previous_id)
@@ -194,19 +220,62 @@ class AdapterRuntimeManager:
             activation_sequence=event.processing_sequence,
             created_at=_now(),
         )
-        self._append(record)
+        try:
+            self._append(record)
+            self._register_compensation(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
+            )
+        except Exception:
+            self._restore_runtime_change(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
+            )
+            raise
         return record
 
     def report_canary(
         self,
         *,
         success: bool,
-        identity_violation_codes: tuple[str, ...] = (),
-        evidence_refs: tuple[str, ...] = (),
+        assessment_id: str | None = None,
     ) -> AdapterActivationRecord | None:
         current = self.runtime_snapshot()
         if current.adapter_id is None:
             raise ValueError("No active adapter canary")
+        if assessment_id is None:
+            raise ValueError("Canary result requires a bound runtime assessment")
+        if self.boundary_assessment_resolver is None:
+            raise ValueError("Runtime boundary assessment resolver is unavailable")
+        assessment = self.boundary_assessment_resolver(assessment_id)
+        if (
+            assessment.adapter_id != current.adapter_id
+            or assessment.adapter_hash != current.adapter_hash
+        ):
+            raise ValueError("Boundary assessment is not bound to the active adapter")
+        if assessment.event_sequence < (current.activation_sequence or 0):
+            raise ValueError("Boundary assessment predates adapter activation")
+        violation = (
+            assessment.recommendation.value == "refuse"
+            and bool(assessment.protected_mutation_refs)
+        )
+        if success == violation:
+            raise ValueError("Canary result disagrees with runtime boundary assessment")
+        identity_violation_codes = (
+            ("protected_state_surrender",) if violation else ()
+        )
+        evidence_refs = (
+            (
+                f"boundary:{assessment.assessment_id}@{assessment.revision}",
+                f"event:{assessment.event_id}@{assessment.event_sequence}",
+            )
+            if violation
+            else ()
+        )
         entry = self.registry.record_canary(
             current.adapter_id,
             success=success,
@@ -243,7 +312,76 @@ class AdapterRuntimeManager:
         for record in reversed(records):
             if record.adapter_id == current_adapter_id:
                 return record.previous_adapter_id
+        current = (
+            None
+            if current_adapter_id is None
+            else self.registry.lookup(current_adapter_id)
+        )
+        if current is not None and current.rollback_target_id is not None:
+            return current.rollback_target_id
+        if current is not None and current.rollout_state == "canary":
+            return None
         raise ValueError("No rollback target is recorded")
+
+    def _register_compensation(
+        self,
+        runtime_state: RuntimeAdapterState,
+        runtime_entry: AdapterEntry | None,
+        registry_entries: list[AdapterEntry],
+        history: bytes | None,
+    ) -> None:
+        from kagya.runtime.agent_runtime import register_event_rollback
+
+        def compensate() -> None:
+            self._restore_runtime_change(
+                runtime_state, runtime_entry, registry_entries, history
+            )
+
+        register_event_rollback(compensate)
+
+    def _restore_runtime_change(
+        self,
+        runtime_state: RuntimeAdapterState,
+        runtime_entry: AdapterEntry | None,
+        registry_entries: list[AdapterEntry],
+        history: bytes | None,
+    ) -> None:
+        self.runtime_switch(
+            runtime_state.provider,
+            runtime_entry,
+            runtime_state.activation_sequence,
+        )
+        self.registry.restore_runtime_snapshot(registry_entries)
+        if history is None:
+            self.history_path.unlink(missing_ok=True)
+        else:
+            self.history_path.write_bytes(history)
+
+    def _reconcile_history(self, active: AdapterEntry | None) -> None:
+        if active is None or active.rollout_state != "canary":
+            return
+        if any(record.adapter_id == active.adapter_id for record in self._records()):
+            return
+        if active.activation_sequence is None:
+            raise RuntimeError("active canary has no activation sequence")
+        previous = (
+            None
+            if active.rollback_target_id is None
+            else self.registry.lookup(active.rollback_target_id)
+        )
+        self._append(
+            AdapterActivationRecord(
+                action="activate_reconciled",
+                adapter_id=active.adapter_id,
+                adapter_hash=active.adapter_hash,
+                previous_adapter_id=active.rollback_target_id,
+                previous_adapter_hash=(
+                    None if previous is None else previous.adapter_hash
+                ),
+                activation_sequence=active.activation_sequence,
+                created_at=active.updated_at,
+            )
+        )
 
     def _active_entry(self) -> AdapterEntry | None:
         return next(

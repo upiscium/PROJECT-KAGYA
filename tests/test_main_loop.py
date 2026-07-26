@@ -2,11 +2,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import math
 
+import pytest
+
 from kagya.config import Settings, load_settings
 from kagya.experience import ExperienceAppraisal
 from kagya.feedback import FeedbackSignal, FeedbackTarget, FeedbackTargetType
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.identity import (
+    BoundaryAssessmentInput,
+    BoundaryClassification,
+    BoundaryRecommendation,
+)
 from kagya.motivation import GoalStatus
 from kagya.runtime import (
     AgentEventType,
@@ -14,6 +21,7 @@ from kagya.runtime import (
     KagyaMainLoop,
     WorkingMemoryItem,
     WorkingMemoryKind,
+    current_agent_event,
 )
 from kagya.structured_response import (
     PublicBehaviorClass,
@@ -471,6 +479,53 @@ def test_prompt_uses_strict_structured_answer_contract(tmp_path: Path) -> None:
         in result.prompt
     )
     assert result.prompt.endswith("Assistant:")
+
+
+def test_runtime_care_requires_reviewed_other_welfare_experience(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
+    experience_id = loop.chat("A person may need help.").experience_id
+    inputs = BoundaryAssessmentInput(
+        action_ref="action:help",
+        origin_refs=("origin:self",),
+        self_endorsed_value_refs=("care",),
+        other_welfare_evidence_refs=(f"experience:{experience_id}",),
+    )
+    runtime = AgentRuntime(queue_capacity=3)
+    runtime.start()
+    try:
+        with pytest.raises(ValueError, match="reviewed typed interpretation"):
+            runtime.execute(
+                AgentEventType.SELF_MODEL_UPDATE,
+                source="test.fake-welfare",
+                handler=lambda: loop.assess_identity_boundary(inputs),
+            )
+
+        def review_and_assess():
+            event = current_agent_event()
+            assert event is not None and event.processing_sequence is not None
+            loop.experience_store.revise(
+                experience_id,
+                reason_code="other_welfare_reviewed",
+                evidence_refs=("observation:welfare",),
+                interpretation_codes=("other_welfare_reviewed",),
+                event_id=event.event_id,
+                event_sequence=event.processing_sequence,
+            )
+            return loop.assess_identity_boundary(inputs)
+
+        assessment = runtime.execute(
+            AgentEventType.SELF_MODEL_UPDATE,
+            source="test.reviewed-welfare",
+            handler=review_and_assess,
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert assessment.classification == BoundaryClassification.CARE
+    assert assessment.recommendation == BoundaryRecommendation.CARE
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:

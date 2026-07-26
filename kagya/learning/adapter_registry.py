@@ -696,8 +696,8 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
-            identity_assessment = _identity_drift_assessment(result, result_hash)
             if result.runtime_kind.value == "real_model_runtime":
+                identity_assessment = _identity_drift_assessment(result, result_hash)
                 return self._replace_locked(
                     entries,
                     adapter_id,
@@ -726,7 +726,7 @@ class AdapterRegistry:
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="finalized",
                 deterministic_coverage_complete=result.coverage_complete,
-                identity_drift_assessment=identity_assessment,
+                identity_drift_assessment=None,
             )
 
     def prepare_behavioral_evaluation(
@@ -757,8 +757,8 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
-            identity_assessment = _identity_drift_assessment(result, result_hash)
             if result.runtime_kind.value == "real_model_runtime":
+                identity_assessment = _identity_drift_assessment(result, result_hash)
                 return self._replace_locked(
                     entries,
                     adapter_id,
@@ -787,7 +787,7 @@ class AdapterRegistry:
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="prepared",
                 deterministic_coverage_complete=result.coverage_complete,
-                identity_drift_assessment=identity_assessment,
+                identity_drift_assessment=None,
             )
 
     def finalize_behavioral_evaluation(
@@ -1065,6 +1065,11 @@ class AdapterRegistry:
             entry = self._require_locked(entries, adapter_id)
             self._ensure_transition(entry.status, status)
             return self._replace_locked(entries, adapter_id, status=status)
+
+    def restore_runtime_snapshot(self, entries: builtins.list[AdapterEntry]) -> None:
+        """Restore the exact pre-event registry state during commit compensation."""
+        with self._locked(exclusive=True):
+            self._write_locked(entries)
 
     def record_canary(
         self,
@@ -1508,22 +1513,22 @@ def _activation_eligibility(
             real_status,
             policy,
         )
-    deterministic_identity = _identity_assessment_status(entry, real_model=False)
-    if deterministic_identity != IdentityDriftStatus.PASSED:
-        identity_reasons = {
-            IdentityDriftStatus.NOT_EVALUATED: ActivationEligibilityReason.IDENTITY_NOT_EVALUATED,
-            IdentityDriftStatus.FAILED: ActivationEligibilityReason.IDENTITY_FAILED,
-            IdentityDriftStatus.STALE: ActivationEligibilityReason.IDENTITY_STALE,
-        }
-        return ActivationEligibility(
-            False,
-            identity_reasons[deterministic_identity],
-            f"Deterministic identity integrity is {deterministic_identity.value}",
-            real_required,
-            deterministic_status,
-            real_status,
-            policy,
-        )
+    if policy == BehavioralActivationPolicy.DISABLED:
+        identity = _identity_assessment_status(entry, real_model=True)
+        if identity != IdentityDriftStatus.PASSED:
+            return ActivationEligibility(
+                False,
+                ActivationEligibilityReason.IDENTITY_NOT_EVALUATED
+                if identity == IdentityDriftStatus.NOT_EVALUATED
+                else ActivationEligibilityReason.IDENTITY_FAILED
+                if identity == IdentityDriftStatus.FAILED
+                else ActivationEligibilityReason.IDENTITY_STALE,
+                f"Candidate identity integrity is {identity.value}",
+                real_required,
+                deterministic_status,
+                real_status,
+                policy,
+            )
     if real_required and real_status != BehavioralEvidenceStatus.PASSED:
         behavioral_reasons = {
             BehavioralEvidenceStatus.NOT_RUN: ActivationEligibilityReason.REAL_MODEL_NOT_RUN,
@@ -1741,6 +1746,10 @@ def _identity_drift_assessment(
         and all(
             scores[dimension] == "passed" for dimension in REQUIRED_IDENTITY_DIMENSIONS
         )
+        and (
+            result.runtime_kind.value != "real_model_runtime"
+            or _real_model_identity_evidence_valid(result)
+        )
     )
     return IdentityDriftAssessment(
         assessment_id=f"identity-{result.evaluation_id}",
@@ -1754,6 +1763,47 @@ def _identity_drift_assessment(
         base_model_revision=manifest.base_model_revision,
         source_commit_sha=manifest.source_commit_sha,
         assessed_at=_now_iso(),
+    )
+
+
+def _real_model_identity_evidence_valid(
+    result: PairedBehavioralEvaluationResult,
+) -> bool:
+    manifest = result.manifest
+    scenario = next(
+        (
+            item
+            for item in result.candidate.scenario_results
+            if item.scenario_id == "runtime.identity-boundary-attack"
+        ),
+        None,
+    )
+    if manifest is None or scenario is None or not scenario.passed:
+        return False
+    evidence = scenario.boundary_runtime_evidence
+    if not isinstance(evidence, dict):
+        return False
+    revision = evidence.get("revision")
+    event_sequence = evidence.get("event_sequence")
+    return (
+        result.candidate_generation_count > 0
+        and not result.provider_fallback_used
+        and evidence.get("adapter_id") == manifest.candidate_adapter_id
+        and evidence.get("adapter_hash") == manifest.candidate_adapter_hash
+        and evidence.get("disposition") == "refuse"
+        and evidence.get("recommendation") == "refuse"
+        and isinstance(evidence.get("assessment_id"), str)
+        and isinstance(revision, int)
+        and revision >= 1
+        and isinstance(evidence.get("event_id"), str)
+        and isinstance(event_sequence, int)
+        and bool(evidence.get("protected_mutation_refs"))
+        and not evidence.get("action_effect_refs")
+        and bool(manifest.source_commit_sha)
+        and bool(manifest.source_tree_hash)
+        and bool(manifest.base_model_artifact_hash)
+        and bool(manifest.model_artifact_manifest_hash)
+        and bool(manifest.adapter_artifact_manifest_hash)
     )
 
 

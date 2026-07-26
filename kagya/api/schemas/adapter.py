@@ -9,7 +9,6 @@ from kagya.learning.adapter_registry import (
     ActivationEligibilityReason,
     BehavioralEvidenceStatus,
     IdentityDriftStatus,
-    IdentityViolationCode,
 )
 
 
@@ -94,8 +93,7 @@ class AdapterCanaryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     success: bool
-    identity_violation_codes: list[IdentityViolationCode] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
+    assessment_id: str = Field(pattern=r"^boundary-[A-Za-z0-9-]+$")
 
 
 class AdapterEvaluateResponse(BaseModel):

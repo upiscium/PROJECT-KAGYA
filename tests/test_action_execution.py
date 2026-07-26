@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,12 +25,19 @@ from kagya.decision import (
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
 from kagya.outbox import DeliveryStatus, Outbox
+from kagya.identity import (
+    BoundaryAssessmentInput,
+    IdentityBoundaryStore,
+    SocialPressureMetadata,
+    SocialPressureSignalType,
+)
 
 
 class _Loop:
     def __init__(self) -> None:
         self.persistent_state = PersistentAgentState()
         self.decision_store = DecisionStore()
+        self.identity_boundary_store = IdentityBoundaryStore()
         self.settings = SimpleNamespace(
             project=SimpleNamespace(name="PROJECT-KAGYA", environment="test"),
             deployment=SimpleNamespace(node=SimpleNamespace(id="test-node")),
@@ -123,6 +131,118 @@ def test_read_action_flows_through_runtime_to_observation_and_decision(
     assert decision.status == DecisionStatus.RESOLVED
     assert decision.actual_outcome is not None and decision.actual_outcome.success
     assert decision.actual_outcome.observed_event_id == receipt.event_id
+
+
+def test_refusal_assessment_blocks_linked_action_intent(tmp_path: Path) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-boundary",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    signal = loop.identity_boundary_store.add_pressure(
+        SocialPressureMetadata(
+            signal_type=SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT,
+            protected_state_ref="value:protected@1",
+        ),
+        context_id="context:one",
+        event_id="event-boundary",
+        event_sequence=1,
+    )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref="action:blocked",
+            origin_refs=("origin:user",),
+            pressure_signal_ids=(signal.signal_id,),
+            protected_state_conflict_refs=("value:protected@1",),
+        ),
+        event_id="event-boundary",
+        event_sequence=1,
+        value_revision_refs={"protected": 1},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+    )
+    decision = loop.decision_store.get("decision-boundary")
+    loop.decision_store.records[decision.decision_id] = replace(
+        decision,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        with pytest.raises(ActionPolicyError, match="blocks action"):
+            runtime.execute(
+                AgentEventType.ACTION_INTENT,
+                source="test.boundary",
+                handler=lambda: layer.create_from_decision(
+                    "decision-boundary", idempotency_key="boundary"
+                ),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert layer.list_intents() == ()
+
+
+def test_care_assessment_allows_normal_action_policy(tmp_path: Path) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-care",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref="action:care",
+            origin_refs=("origin:self",),
+            self_endorsed_value_refs=("care",),
+            other_welfare_evidence_refs=("experience:welfare",),
+        ),
+        event_id="event-care",
+        event_sequence=1,
+        value_revision_refs={"care": 1},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+    )
+    decision = loop.decision_store.get("decision-care")
+    loop.decision_store.records[decision.decision_id] = replace(
+        decision,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.care",
+            handler=lambda: layer.create_from_decision(
+                "decision-care", idempotency_key="care"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert intent.status == IntentStatus.APPROVED
 
 
 def test_notification_requires_approval_is_idempotent_and_compensates(

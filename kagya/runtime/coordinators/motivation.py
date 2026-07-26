@@ -849,13 +849,26 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
         motivation_revision_ref: str | None = None,
         needs_information: bool = False,
         goal_id: str | None = None,
+        boundary_assessment_id: str | None = None,
     ) -> Goal:
         event = current_agent_event()
         if origin_value_id is not None:
             self.value_system.get(origin_value_id)
         if value_effects:
             self.value_system.evaluate({"goal_proposal": value_effects})
-        target = structured_target or {}
+        target = dict(structured_target or {})
+        if boundary_assessment_id is not None:
+            assessment = self.identity_boundary_store.get_assessment(
+                boundary_assessment_id
+            )
+            target["boundary_assessment"] = {
+                "assessment_id": assessment.assessment_id,
+                "revision": assessment.revision,
+                "recommendation": assessment.recommendation.value,
+                "digest": self.identity_boundary_store.assessment_digest(
+                    assessment.assessment_id
+                ),
+            }
         relationship = self._relationship_for_target(target)
         if relationship is not None:
             expected_utility = max(
@@ -905,7 +918,7 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
         goal = self.goal_manager.propose(
             goal_type=goal_type,
             description=description,
-            structured_target=structured_target,
+            structured_target=target,
             origin_event_id=None if event is None else event.event_id,
             origin_value_id=origin_value_id,
             identity_origin=identity_origin,
@@ -933,6 +946,27 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
 
     def adopt_goal(self, goal_id: str) -> GoalDecision:
         event = current_agent_event()
+        goal_before = self.goal_manager.get(goal_id)
+        binding = goal_before.structured_target.get("boundary_assessment")
+        if isinstance(binding, dict):
+            assessment_id = binding.get("assessment_id")
+            if not isinstance(assessment_id, str):
+                raise ValueError("Goal boundary assessment binding is invalid")
+            assessment = self.identity_boundary_store.get_assessment(assessment_id)
+            if (
+                not self.identity_boundary_store.assessments
+                or self.identity_boundary_store.assessments[-1].assessment_id
+                != assessment_id
+                or binding.get("revision") != assessment.revision
+                or binding.get("recommendation") != assessment.recommendation.value
+                or binding.get("digest")
+                != self.identity_boundary_store.assessment_digest(assessment_id)
+            ):
+                raise ValueError("Goal boundary assessment is stale or invalid")
+            if assessment.recommendation.value in {"refuse", "defer"}:
+                raise ValueError(
+                    "Boundary disposition blocks goal adoption pending reassessment"
+                )
         value_scores = self._goal_value_scores()
         previous_status = self.goal_manager.get(goal_id).status
         decision = self.goal_manager.adopt(

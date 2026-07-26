@@ -381,7 +381,17 @@ class SubjectRuntimeHarness:
         memory.set_external_boundary_injector(self.failure_injector)
         external = ExternalTransactionCoordinator([memory])
         external.reconcile(cast(Any, journal.verify()))
-        loop = KagyaMainLoop(settings, self.provider, memory, clock=self.clock.now)
+        loop = KagyaMainLoop(
+            settings,
+            self.provider,
+            memory,
+            adapter_id=getattr(self.provider, "runtime_adapter_id", None),
+            adapter_hash=getattr(self.provider, "runtime_adapter_hash", None),
+            activation_sequence=getattr(
+                self.provider, "runtime_activation_sequence", None
+            ),
+            clock=self.clock.now,
+        )
         store.restore_into(loop, snapshot)
         outbox = Outbox(
             loop,
@@ -571,6 +581,13 @@ class SubjectRuntimeHarness:
             else 0,
         )
         state = snapshot.model_dump(mode="json")
+        identity = state.get("identity")
+        if isinstance(identity, dict):
+            extensions = identity.get("extensions")
+            if isinstance(extensions, dict) and "identity_boundary" in extensions:
+                extensions["identity_boundary"] = (
+                    graph.main_loop.identity_boundary_store.public_json()
+                )
         state["domains"] = {
             "attention": _json_value(graph.main_loop.attention_system.to_json()),
             "experiences": _model_values(graph.main_loop.experience_store),

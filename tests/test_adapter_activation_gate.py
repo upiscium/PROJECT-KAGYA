@@ -86,7 +86,7 @@ def test_valid_runtime_bound_behavioral_result_activates(tmp_path: Path) -> None
     assert registry.activate("candidate").status == AdapterStatus.ACTIVE
 
 
-def test_identity_assessment_missing_failed_and_stale_fail_closed(
+def test_deterministic_identity_evidence_is_architecture_only(
     tmp_path: Path,
 ) -> None:
     registry = _ordinary_evaluated(tmp_path)
@@ -96,29 +96,22 @@ def test_identity_assessment_missing_failed_and_stale_fail_closed(
 
     payload["adapters"][0]["identity_drift_assessment"] = None
     registry.path.write_text(json.dumps(payload), encoding="utf-8")
-    assert (
-        registry.activation_eligibility("candidate").reason
-        == ActivationEligibilityReason.IDENTITY_NOT_EVALUATED
-    )
+    assert registry.identity_assessment_status("candidate")[0] == "not_evaluated"
+    assert registry.activation_eligibility("candidate").eligible is True
 
     failed_root = tmp_path / "failed"
     failed_root.mkdir()
     failed = _ordinary_evaluated(failed_root)
     bind_runtime_behavioral_result(failed, failed_root, "candidate", passed=False)
     failed.approve("candidate")
-    assert failed.identity_assessment_status("candidate")[0] == "failed"
+    assert failed.identity_assessment_status("candidate")[0] == "not_evaluated"
     assert failed.activation_eligibility("candidate").eligible is False
 
     stale_root = tmp_path / "stale"
     stale_root.mkdir()
     stale = _ready(stale_root)
-    stale_payload = json.loads(stale.path.read_text(encoding="utf-8"))
-    stale_payload["adapters"][0]["identity_drift_assessment"]["adapter_hash"] = "0" * 64
-    stale.path.write_text(json.dumps(stale_payload), encoding="utf-8")
-    assert (
-        stale.activation_eligibility("candidate").reason
-        == ActivationEligibilityReason.IDENTITY_STALE
-    )
+    assert stale.identity_assessment_status("candidate")[0] == "not_evaluated"
+    assert stale.activation_eligibility("candidate").eligible is True
 
 
 def test_production_policy_rejects_missing_real_model_evidence(tmp_path: Path) -> None:
@@ -132,7 +125,7 @@ def test_production_policy_rejects_missing_real_model_evidence(tmp_path: Path) -
         required.activate("candidate")
 
 
-def test_current_real_model_pass_allows_activation(tmp_path: Path) -> None:
+def test_fixture_declared_real_model_pass_cannot_establish_identity(tmp_path: Path) -> None:
     registry = _ordinary_evaluated(tmp_path)
     bind_runtime_behavioral_result(registry, tmp_path, "candidate")
     bind_runtime_behavioral_result(
@@ -145,8 +138,12 @@ def test_current_real_model_pass_allows_activation(tmp_path: Path) -> None:
     registry.approve("candidate")
     required = _with_real_model_policy(registry)
 
-    assert required.activation_eligibility("candidate").eligible is True
-    assert required.activate("candidate").status == AdapterStatus.ACTIVE
+    assert (
+        required.activation_eligibility("candidate").reason
+        == ActivationEligibilityReason.REAL_MODEL_IDENTITY_FAILED
+    )
+    with pytest.raises(ValueError, match="real_model_identity_failed"):
+        required.activate("candidate")
 
 
 def test_development_deterministic_policy_is_explicit_and_real_policy_is_distinct(
@@ -242,7 +239,10 @@ def test_real_model_activation_revalidates_current_files(
         }
     )
     required_registry = AdapterRegistry(required_settings)
-    assert required_registry.activation_eligibility("candidate").eligible is True
+    assert (
+        required_registry.activation_eligibility("candidate").reason
+        == ActivationEligibilityReason.REAL_MODEL_IDENTITY_FAILED
+    )
 
     entry = registry.lookup("candidate")
     assert entry is not None
@@ -881,7 +881,8 @@ def test_production_full_eligibility_requires_coherent_deterministic_and_real_pr
 
     eligibility = registry.activation_eligibility("candidate")
 
-    assert eligibility.eligible is True
+    assert eligibility.eligible is False
+    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_IDENTITY_FAILED
 
     entry = registry.lookup("candidate")
     assert entry is not None and entry.behavioral_evaluation_path is not None

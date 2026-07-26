@@ -518,6 +518,13 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
             provider=loop.provider,
         )
 
+    def resolve_boundary_assessment(assessment_id: str):
+        store = get_main_loop(request).identity_boundary_store
+        assessment = store.get_assessment(assessment_id)
+        if not store.assessments or store.assessments[-1].assessment_id != assessment_id:
+            raise ValueError("Boundary assessment is stale")
+        return assessment
+
     manager = AdapterRuntimeManager(
         registry,
         provider_loader=load,
@@ -526,6 +533,7 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
         history_path=settings.adapter_registry.path.with_name(
             f"{settings.adapter_registry.path.stem}_activations.json"
         ),
+        boundary_assessment_resolver=resolve_boundary_assessment,
     )
     request.app.state.adapter_runtime_manager = manager
     return manager

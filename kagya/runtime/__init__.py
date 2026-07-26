@@ -9,6 +9,7 @@ from kagya.runtime.agent_runtime import (
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     current_agent_event,
+    register_event_rollback,
 )
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -94,6 +95,7 @@ __all__ = [
     "AutonomyLoop",
     "CycleResult",
     "current_agent_event",
+    "register_event_rollback",
     "AgentStateSnapshot",
     "AgentStateStore",
     "AttentionAction",

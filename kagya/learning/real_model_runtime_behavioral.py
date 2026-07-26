@@ -45,6 +45,9 @@ class FallbackRejectingProvider:
         self.model_revision = getattr(provider, "model_revision", None)
         self.fallback_used = False
         self.generation_count = 0
+        self.runtime_adapter_id: str | None = None
+        self.runtime_adapter_hash: str | None = None
+        self.runtime_activation_sequence: int | None = None
 
     def generate(self, prompt: str) -> str:
         value = self.provider.generate(prompt)
@@ -164,6 +167,9 @@ def run_real_model_runtime_evaluation(
         candidate_adapter_manifest=candidate_adapter_manifest,
         provider_loader=provider_loader,
     )
+    candidate.runtime_adapter_id = candidate_id
+    candidate.runtime_adapter_hash = candidate_adapter_hash
+    candidate.runtime_activation_sequence = 1
     try:
         # Force the exact primary model before runtime generation. Candidate load
         # happens only after baseline unload so paired runs fit the same hardware.

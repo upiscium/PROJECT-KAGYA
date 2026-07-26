@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import math
 import re
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any, Iterable
 from uuid import uuid4
 
@@ -40,6 +42,36 @@ class ValueUpdateKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class OriginReviewRecord:
+    reviewer_id: str
+    reviewer_authority: str
+    decision: str
+    evidence_refs: tuple[str, ...]
+    reason_code: str
+    event_id: str
+    event_sequence: int
+    record_hash: str
+
+    def __post_init__(self) -> None:
+        if self.reviewer_authority not in {"subject", "operator"}:
+            raise ValueError("Origin review requires allowed reviewer authority")
+        if self.decision not in {"accept", "reject"}:
+            raise ValueError("Origin review decision is invalid")
+        if not self.event_id or self.event_sequence < 1:
+            raise ValueError("Origin review requires an AgentRuntime event")
+        if self.record_hash != _origin_review_hash(
+            self.reviewer_id,
+            self.reviewer_authority,
+            self.decision,
+            self.evidence_refs,
+            self.reason_code,
+            self.event_id,
+            self.event_sequence,
+        ):
+            raise ValueError("Origin review record hash mismatch")
+
+
+@dataclass(frozen=True)
 class ValueState:
     value_id: str
     name: str
@@ -69,6 +101,7 @@ class ValueState:
     last_challenged_at: str | None = None
     last_reviewed_at: str | None = None
     change_reason: str | None = None
+    origin_review: OriginReviewRecord | None = None
     schema_version: int = 3
 
     def __post_init__(self) -> None:
@@ -182,7 +215,7 @@ class ActionScore:
 
 
 class ValueSystem:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -209,6 +242,7 @@ class ValueSystem:
         self.evidence: dict[str, ValueEvidenceRecord] = {}
         self.tradeoffs: list[ValueTradeoffRecord] = []
         self.reassessments: list[ValueReassessmentRecord] = []
+        self.held_proposals: dict[str, ValueUpdateProposal] = {}
         self.applied_proposals: set[str] = set()
         self.max_update_per_event = max_update_per_event
         self.max_total_update_per_event = max_total_update_per_event
@@ -340,6 +374,9 @@ class ValueSystem:
             if proposal.proposal_id in self.applied_proposals:
                 continue
             self._require(proposal.value_id)
+            if not self._is_active(self._require(proposal.value_id)):
+                self.held_proposals[proposal.proposal_id] = proposal
+                continue
             grouped.setdefault(proposal.value_id, []).append(proposal)
         records: list[ValueUpdateRecord] = []
         remaining_budget = self.max_total_update_per_event
@@ -683,6 +720,7 @@ class ValueSystem:
             "evidence": [asdict(item) for item in self.evidence.values()],
             "tradeoffs": [asdict(item) for item in self.tradeoffs],
             "reassessments": [asdict(item) for item in self.reassessments],
+            "held_proposals": [asdict(item) for item in self.held_proposals.values()],
         }
 
     def get(self, value_id: str) -> ValueState:
@@ -707,15 +745,25 @@ class ValueSystem:
         event_sequence: int,
     ) -> ValueState:
         current = self._require(value_id)
-        if (
-            current.origin_provenance is None
-            or current.origin_provenance.actor == OriginActor.SELF
-            or current.origin_provenance.endorsed_by_event_id is not None
-        ):
-            raise ValueError("Value origin is already self-endorsed")
+        if current.origin_provenance is None or current.origin_provenance.actor not in {
+            OriginActor.UNKNOWN,
+            OriginActor.INHERITED,
+        }:
+            raise ValueError("Only unknown or inherited Value origins can be reviewed")
+        if current.origin_provenance.endorsement not in {
+            EndorsementStatus.PENDING,
+            EndorsementStatus.UNCERTAIN,
+        }:
+            raise ValueError("Value origin is not awaiting review")
         if reviewer_authority not in {"subject", "operator"}:
             raise ValueError("Value review requires subject or operator authority")
-        if not reviewer_id or not evidence_refs or not reason_code:
+        if (
+            not reviewer_id
+            or not evidence_refs
+            or not reason_code
+            or not event_id
+            or event_sequence < 1
+        ):
             raise ValueError("Value review requires reviewer, evidence, and reason")
         if any(
             re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", reference) is None
@@ -735,9 +783,28 @@ class ValueSystem:
                 event_sequence=event_sequence,
             )
         )
+        review = OriginReviewRecord(
+            reviewer_id=reviewer_id,
+            reviewer_authority=reviewer_authority,
+            decision="accept" if accept else "reject",
+            evidence_refs=evidence_refs,
+            reason_code=reason_code,
+            event_id=event_id,
+            event_sequence=event_sequence,
+            record_hash=_origin_review_hash(
+                reviewer_id,
+                reviewer_authority,
+                "accept" if accept else "reject",
+                evidence_refs,
+                reason_code,
+                event_id,
+                event_sequence,
+            ),
+        )
         updated = replace(
             current,
             origin_provenance=origin,
+            origin_review=review,
             revision=current.revision + 1,
             last_reviewed_at=_now(),
             change_reason=reason_code,
@@ -781,6 +848,16 @@ class ValueSystem:
                 reviewer_authority=reviewer_authority,
             )
         )
+        if accept:
+            held = [
+                item
+                for item in self.held_proposals.values()
+                if item.value_id == value_id
+            ]
+            for item in held:
+                self.held_proposals.pop(item.proposal_id, None)
+            if held:
+                self.apply(held)
         return updated
 
     def restore(self, payload: object) -> None:
@@ -791,21 +868,18 @@ class ValueSystem:
             self.evidence = {}
             self.tradeoffs = []
             self.reassessments = []
+            self.held_proposals = {}
             return
-        if payload.get("schema_version") not in {1, 2}:
+        if payload.get("schema_version") not in {1, 2, 3}:
             if (
                 isinstance(payload, dict)
                 and payload
                 and all(isinstance(value, (int, float)) for value in payload.values())
             ):
                 for key, weight in payload.items():
-                    if key in self.values:
-                        self.values[key] = replace(
-                            self.values[key], weight=float(weight)
-                        )
-                    else:
-                        self.values[key] = ValueState(
-                            value_id=key,
+                    legacy_id = f"legacy:{key}"
+                    self.values[legacy_id] = ValueState(
+                            value_id=legacy_id,
                             name=key.replace("_", " ").title(),
                             weight=float(weight),
                             confidence=0.5,
@@ -814,6 +888,12 @@ class ValueSystem:
                             origin="legacy_snapshot",
                             last_updated_at=_now(),
                             allowed_update_rate=self.max_update_per_event,
+                            origin_provenance=new_identity_origin(
+                                OriginActor.INHERITED,
+                                OriginInputKind.LEGACY,
+                                endorsement=EndorsementStatus.UNCERTAIN,
+                                source_ref=f"legacy:{key}",
+                            ),
                         )
             return
         values = payload.get("values")
@@ -845,6 +925,12 @@ class ValueSystem:
             for item in payload.get("reassessments", [])
             if isinstance(item, dict)
         ]
+        self.held_proposals = {
+            proposal.proposal_id: proposal
+            for raw in payload.get("held_proposals", [])
+            if isinstance(raw, dict)
+            for proposal in [_value_update_proposal_from_json(raw)]
+        }
 
     def revisions(self, value_id: str) -> list[ValueUpdateRecord]:
         self._require(value_id)
@@ -959,7 +1045,16 @@ class ValueSystem:
     @staticmethod
     def _is_active(state: ValueState) -> bool:
         origin = state.origin_provenance
-        return origin is not None and origin.endorsement == EndorsementStatus.ENDORSED
+        if origin is None or origin.endorsement != EndorsementStatus.ENDORSED:
+            return False
+        if origin.actor in {OriginActor.SELF, OriginActor.SYSTEM}:
+            return True
+        review = state.origin_review
+        return (
+            origin.actor in {OriginActor.UNKNOWN, OriginActor.INHERITED}
+            and review is not None
+            and review.decision == "accept"
+        )
 
     def _require(self, value_id: str) -> ValueState:
         state = self.values.get(value_id)
@@ -1016,6 +1111,10 @@ def _value_state_from_json(payload: dict[str, Any]) -> ValueState:
         fallback_source=str(data.get("origin", "legacy_value")),
     )
     data["scope"] = ValueScope(data.get("scope", ValueScope.SUBJECT))
+    if isinstance(data.get("origin_review"), dict):
+        review = dict(data["origin_review"])
+        review["evidence_refs"] = tuple(review.get("evidence_refs", ()))
+        data["origin_review"] = OriginReviewRecord(**review)
     for name in (
         "context_ids",
         "origin_experience_ids",
@@ -1028,6 +1127,29 @@ def _value_state_from_json(payload: dict[str, Any]) -> ValueState:
         data[name] = tuple(data.get(name, ()))
     data["schema_version"] = 3
     return ValueState(**data)
+
+
+def _origin_review_hash(
+    reviewer_id: str,
+    reviewer_authority: str,
+    decision: str,
+    evidence_refs: tuple[str, ...],
+    reason_code: str,
+    event_id: str,
+    event_sequence: int,
+) -> str:
+    payload = {
+        "reviewer_id": reviewer_id,
+        "reviewer_authority": reviewer_authority,
+        "decision": decision,
+        "evidence_refs": evidence_refs,
+        "reason_code": reason_code,
+        "event_id": event_id,
+        "event_sequence": event_sequence,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _value_update_record_from_json(payload: dict[str, Any]) -> ValueUpdateRecord:
@@ -1058,6 +1180,20 @@ def _value_evidence_record_from_json(payload: dict[str, Any]) -> ValueEvidenceRe
         data.get("identity_origin"), fallback_source="legacy_value_evidence"
     )
     return ValueEvidenceRecord(**data)
+
+
+def _value_update_proposal_from_json(payload: dict[str, Any]) -> ValueUpdateProposal:
+    data = dict(payload)
+    data["kind"] = ValueUpdateKind(data["kind"])
+    data["reason_codes"] = tuple(data.get("reason_codes", ()))
+    evidence = dict(data["evidence"])
+    for name in ("memory_ids", "experience_ids"):
+        evidence[name] = tuple(evidence.get(name, ()))
+    evidence["identity_origin"] = identity_origin_from_json(
+        evidence.get("identity_origin"), fallback_source="held_value_proposal"
+    )
+    data["evidence"] = ValueEvidence(**evidence)
+    return ValueUpdateProposal(**data)
 
 
 def _value_tradeoff_from_json(payload: dict[str, Any]) -> ValueTradeoffRecord:

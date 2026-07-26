@@ -26,11 +26,11 @@ def inspect_identity_boundary(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     store = get_main_loop(request).identity_boundary_store
+    public = store.public_json()
     payload: dict[str, object] = {
-        "signals": [item.model_dump(mode="json") for item in store.signals[-limit:]],
-        "assessments": [
-            item.model_dump(mode="json") for item in store.assessments[-limit:]
-        ],
+        **public,
+        "signals": list(public["signals"])[-limit:],
+        "assessments": list(public["assessments"])[-limit:],
     }
     return execute_agent_event(
         runtime,
@@ -55,7 +55,7 @@ def submit_pressure_signal(
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return signal.model_dump(mode="json")
+    return signal.model_dump(mode="json", exclude={"evidence_refs"})
 
 
 @router.post("/assessments")

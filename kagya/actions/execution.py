@@ -136,6 +136,11 @@ class ActionProvenance(_StrictModel):
     plan_id: str | None = None
     plan_revision: int | None = Field(default=None, ge=1)
     step_id: str | None = None
+    boundary_assessment_id: str | None = None
+    boundary_assessment_revision: int | None = Field(default=None, ge=1)
+    boundary_assessment_digest: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class ActionValidationErrorCode(StrEnum):
@@ -457,6 +462,7 @@ class ActionExecutionLayer:
                 )
             return duplicate
         decision = self.main_loop.decision_store.get(decision_id)
+        self._validate_boundary_assessment(decision)
         if decision.status != DecisionStatus.AWAITING_OUTCOME:
             raise ActionPolicyError(
                 "Action requires a selected decision awaiting outcome"
@@ -601,6 +607,9 @@ class ActionExecutionLayer:
                 plan_id=selected.plan_id,
                 plan_revision=selected.plan_revision,
                 step_id=selected.step_id,
+                boundary_assessment_id=decision.boundary_assessment_id,
+                boundary_assessment_revision=decision.boundary_assessment_revision,
+                boundary_assessment_digest=decision.boundary_assessment_digest,
             ),
             budget=bounded,
             attempts=0,
@@ -652,6 +661,8 @@ class ActionExecutionLayer:
     ) -> ActionIntent:
         state = self._state()
         intent = self.get_intent(intent_id)
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        self._validate_boundary_assessment(decision)
         if (
             intent.status != IntentStatus.AWAITING_APPROVAL
             or intent.approval_id is None
@@ -724,6 +735,26 @@ class ActionExecutionLayer:
                 event_sequence=None if event is None else event.processing_sequence,
             )
         return updated
+
+    def _validate_boundary_assessment(self, decision: Any) -> None:
+        assessment_id = decision.boundary_assessment_id
+        if assessment_id is None:
+            return
+        store = self.main_loop.identity_boundary_store
+        assessment = store.get_assessment(assessment_id)
+        if (
+            decision.boundary_assessment_revision != assessment.revision
+            or decision.boundary_assessment_digest
+            != store.assessment_digest(assessment_id)
+            or decision.boundary_recommendation != assessment.recommendation.value
+        ):
+            raise ActionPolicyError("Boundary assessment binding is invalid")
+        if not store.assessments or store.assessments[-1].assessment_id != assessment_id:
+            raise ActionPolicyError("Boundary assessment is stale; reassessment required")
+        if assessment.recommendation.value in {"refuse", "defer"}:
+            raise ActionPolicyError(
+                "Boundary disposition blocks action pending reviewed reassessment"
+            )
 
     def execute(self, intent_id: str) -> ActionIntent:
         state = self._state()

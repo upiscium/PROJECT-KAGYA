@@ -489,10 +489,7 @@ def report_adapter_canary(
             source="api.adapters.canary",
             handler=lambda: manager.report_canary(
                 success=request.success,
-                identity_violation_codes=tuple(
-                    item.value for item in request.identity_violation_codes
-                ),
-                evidence_refs=tuple(request.evidence_refs),
+                assessment_id=request.assessment_id,
             ),
             payload={"adapter_id": adapter_id, "success": request.success},
         ).value
@@ -501,9 +498,7 @@ def report_adapter_canary(
     return {
         "adapter_id": adapter_id,
         "success": request.success,
-        "identity_violation_codes": [
-            item.value for item in request.identity_violation_codes
-        ],
+        "assessment_id": request.assessment_id,
         "automatic_rollback": rollback is not None,
         "rollback": None if rollback is None else asdict(rollback),
     }

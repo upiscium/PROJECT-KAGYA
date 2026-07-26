@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 import math
 import re
+import hashlib
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -100,6 +102,7 @@ class BeliefRevision:
     created_at: str
     reviewer_id: str | None = None
     reviewer_authority: str | None = None
+    review_hash: str | None = None
 
     def __post_init__(self) -> None:
         _safe_ref(self.revision_id, "belief revision ID")
@@ -111,6 +114,24 @@ class BeliefRevision:
             raise ValueError("belief revisions must be sequential")
         if datetime.fromisoformat(self.created_at).tzinfo is None:
             raise ValueError("belief revision timestamp must include a timezone")
+        if self.review_hash is not None:
+            if (
+                self.reviewer_id is None
+                or self.reviewer_authority not in {"subject", "operator"}
+                or self.event_id is None
+                or self.event_sequence is None
+            ):
+                raise ValueError("belief review hash requires complete reviewer provenance")
+            if self.review_hash != _belief_review_hash(
+                self.reviewer_id,
+                self.reviewer_authority,
+                self.operation,
+                self.reason_code,
+                self.evidence_refs,
+                self.event_id,
+                self.event_sequence,
+            ):
+                raise ValueError("belief review hash mismatch")
 
 
 @dataclass(frozen=True)
@@ -169,7 +190,7 @@ class BeliefRecord:
 
 
 class BeliefStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self) -> None:
         self.records: dict[str, BeliefRecord] = {}
@@ -283,6 +304,10 @@ class BeliefStore:
                     "unknown-origin belief requires an authorized reviewer"
                 )
             _safe_ref(reviewer_id, "belief reviewer ID")
+            if event_id is None or event_sequence is None or event_sequence < 1:
+                raise ValueError(
+                    "unknown-origin belief review requires an AgentRuntime event"
+                )
         origin = (
             current.identity_origin.endorse(
                 "belief_review", event_id=event_id, event_sequence=event_sequence
@@ -313,6 +338,24 @@ class BeliefStore:
             event_sequence=event_sequence,
             reviewer_id=reviewer_id,
             reviewer_authority=reviewer_authority,
+            review_hash=(
+                _belief_review_hash(
+                    reviewer_id,
+                    reviewer_authority,
+                    "accept" if accept else "reject",
+                    reason_code,
+                    evidence_refs,
+                    event_id,
+                    event_sequence,
+                )
+                if current.identity_origin.actor
+                in {OriginActor.UNKNOWN, OriginActor.INHERITED}
+                and reviewer_id is not None
+                and reviewer_authority is not None
+                and event_id is not None
+                and event_sequence is not None
+                else None
+            ),
         )
         self.records[belief_id] = resolved
         if not accept:
@@ -455,7 +498,7 @@ class BeliefStore:
             and not (
                 record.identity_origin.actor
                 in {OriginActor.UNKNOWN, OriginActor.INHERITED}
-                and not any(revision.reviewer_id for revision in record.revisions)
+                and not any(_valid_origin_review(revision) for revision in record.revisions)
             )
             and _temporally_valid(record, current_time)
             and (
@@ -484,7 +527,7 @@ class BeliefStore:
         if not isinstance(payload, dict) or not payload:
             self.records = {}
             return
-        if payload.get("schema_version") != self.SCHEMA_VERSION:
+        if payload.get("schema_version") not in {1, self.SCHEMA_VERSION}:
             raise ValueError(
                 f"Unsupported belief store schema version: {payload.get('schema_version')}"
             )
@@ -509,6 +552,7 @@ class BeliefStore:
         event_sequence: int | None,
         reviewer_id: str | None = None,
         reviewer_authority: str | None = None,
+        review_hash: str | None = None,
     ) -> BeliefRecord:
         revision = BeliefRevision(
             revision_id=f"belief-revision-{uuid4()}",
@@ -524,6 +568,7 @@ class BeliefStore:
             created_at=_now(),
             reviewer_id=reviewer_id,
             reviewer_authority=reviewer_authority,
+            review_hash=review_hash,
         )
         return replace(
             after,
@@ -637,7 +682,7 @@ def _belief_from_json(payload: dict[str, Any]) -> BeliefRecord:
         data["lifecycle"] == BeliefLifecycle.ACTIVE
         and data["identity_origin"].actor
         in {OriginActor.UNKNOWN, OriginActor.INHERITED}
-        and not any(revision.reviewer_id for revision in data["revisions"])
+        and not any(_valid_origin_review(revision) for revision in data["revisions"])
     ):
         data["lifecycle"] = BeliefLifecycle.PROPOSED
         data["identity_origin"] = replace(
@@ -666,6 +711,39 @@ def _parse_time(value: str | None) -> datetime | None:
 def _safe_ref(value: str, name: str) -> None:
     if re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", value) is None:
         raise ValueError(f"{name} must be an opaque safe reference")
+
+
+def _valid_origin_review(revision: BeliefRevision) -> bool:
+    return (
+        revision.operation == "accept"
+        and revision.reviewer_authority in {"subject", "operator"}
+        and revision.event_id is not None
+        and revision.event_sequence is not None
+        and revision.review_hash is not None
+    )
+
+
+def _belief_review_hash(
+    reviewer_id: str,
+    reviewer_authority: str,
+    operation: str,
+    reason_code: str,
+    evidence_refs: tuple[str, ...],
+    event_id: str,
+    event_sequence: int,
+) -> str:
+    payload = {
+        "reviewer_id": reviewer_id,
+        "reviewer_authority": reviewer_authority,
+        "operation": operation,
+        "reason_code": reason_code,
+        "evidence_refs": evidence_refs,
+        "event_id": event_id,
+        "event_sequence": event_sequence,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _unit(value: float, name: str) -> None:

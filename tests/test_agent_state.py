@@ -67,8 +67,13 @@ def test_snapshot_round_trip_restores_internal_state(tmp_path: Path) -> None:
     assert restored_loop.commitment_store.get("promise-1").status.value == "active"
     assert restored_loop.persistent_state.active_goals[0]["schema_version"] == 4
     assert restored_loop.persistent_state.commitments[0]["schema_version"] == 3
-    assert restored_loop.persistent_state.values["schema_version"] == 2
-    assert restored_loop.value_system.get("care").weight == 0.9
+    assert restored_loop.persistent_state.values["schema_version"] == 3
+    assert restored_loop.value_system.get("care").weight == 0.8
+    assert restored_loop.value_system.get("legacy:care").weight == 0.9
+    assert (
+        restored_loop.value_system.get("legacy:care")
+        not in restored_loop.value_system.active_values()
+    )
     assert restored_loop.self_model.state.traits == {"certainty": 0.5}
     assert restored_loop.persistent_state.self_model["schema_version"] == 2
     assert restored_loop.working_memory.items[0].reference == "episode:one"
