@@ -18,6 +18,10 @@ from kagya.security.backup import (
 )
 from kagya.security.crypto import KeyRing
 from kagya.security.migration import reencrypt_live_state
+from kagya.security.generation import (
+    initialize_encrypted_state,
+    require_encrypted_generation,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -84,9 +88,7 @@ def test_live_files_are_encrypted_and_mixed_plaintext_fails(
     assert store.load(1.0) == snapshot
     settings.agent_state.path.write_bytes(snapshot.model_dump_json().encode())
     with pytest.raises(EncryptionError, match="plaintext"):
-        AgentStateStore(
-            settings.agent_state.path, codec=codecs.snapshot
-        ).load(1.0)
+        AgentStateStore(settings.agent_state.path, codec=codecs.snapshot).load(1.0)
 
 
 def test_live_rotation_rewrites_old_generation_and_old_key_can_be_removed(
@@ -139,13 +141,14 @@ def test_live_rotation_rewrites_old_generation_and_old_key_can_be_removed(
         }
     )
     current_codecs = build_live_codecs(denied_old)
-    assert AgentStateStore(
-        denied_old.agent_state.path, codec=current_codecs.snapshot
-    ).load(1.0) == snapshot
+    assert (
+        AgentStateStore(
+            denied_old.agent_state.path, codec=current_codecs.snapshot
+        ).load(1.0)
+        == snapshot
+    )
     StateWAL(denied_old.agent_state_wal.path, codec=current_codecs.wal).verify()
-    EventJournal(
-        denied_old.agent_journal.path, codec=current_codecs.journal
-    ).verify()
+    EventJournal(denied_old.agent_journal.path, codec=current_codecs.journal).verify()
 
 
 def test_encrypted_backup_round_trip_incremental_and_public_sidecar(
@@ -237,8 +240,9 @@ def test_backup_rejects_symlink_wrong_key_tamper_and_bad_incremental_base(
     header = json.loads(lines[0])
     header["key_ids"] = ["forged", "forged"]
     lines[0] = (
-        json.dumps(header, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        .encode("ascii")
+        json.dumps(
+            header, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
         + b"\n"
     )
     bundle.write_bytes(b"".join(lines))
@@ -278,7 +282,7 @@ def test_restore_crash_checkpoints_never_publish_incomplete_state(
         BackupManager(settings, failure_injector=fail_after).restore(
             preview.backup_id, expected_manifest_hash=preview.manifest_hash
         )
-    assert settings.tools.path.read_bytes() == SENTINEL
+    assert settings.tools.path.read_bytes() == b"newer-authoritative-value"
     assert not (settings.at_rest.backup.directory / ".restore-in-progress").exists()
 
 
@@ -297,6 +301,173 @@ def test_incomplete_restore_marker_blocks_startup_and_status_redacts_paths(
         assert_no_incomplete_restore(settings)
 
 
+def test_failed_rollback_preserves_marker_and_offline_retry_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    preview = BackupManager(settings).create()
+    settings.tools.path.write_bytes(b"prior-generation")
+
+    def fail(checkpoint: str) -> None:
+        if checkpoint in {"restore_after_swap", "restore_rollback_replace"}:
+            raise RuntimeError(checkpoint)
+
+    with pytest.raises(BackupError, match="rollback failed"):
+        BackupManager(settings, failure_injector=fail).restore(
+            preview.backup_id, expected_manifest_hash=preview.manifest_hash
+        )
+    manager = BackupManager(settings)
+    status = manager.recovery_status()
+    assert status["phase"] == "rollback_failed"
+    assert "pending_generation" not in status
+    with pytest.raises(BackupError, match="incomplete authoritative restore"):
+        assert_no_incomplete_restore(settings)
+
+    assert manager.recover()["status"] == "rolled_back"
+    assert settings.tools.path.read_bytes() == b"prior-generation"
+    assert manager.recovery_status() == {"status": "clean"}
+
+
+@pytest.mark.parametrize(
+    "checkpoint", ["backup_after_inventory", "backup_stream_chunk"]
+)
+def test_backup_aborts_when_source_mutates_during_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint: str
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    mutated = False
+
+    def mutate(current: str) -> None:
+        nonlocal mutated
+        if current == checkpoint and not mutated:
+            mutated = True
+            settings.tools.path.write_bytes(b"concurrently-mutated")
+
+    with pytest.raises(BackupError, match="changed while streaming"):
+        BackupManager(settings, failure_injector=mutate).create()
+    assert BackupManager(settings).list() == []
+    assert list(settings.at_rest.backup.directory.glob("*.kgb")) == []
+
+
+def test_retention_keeps_complete_transitive_chains_and_prunes_by_full_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    settings = settings.model_copy(
+        update={
+            "at_rest": settings.at_rest.model_copy(
+                update={
+                    "backup": settings.at_rest.backup.model_copy(
+                        update={"retention_count": 1}
+                    )
+                }
+            )
+        }
+    )
+    _authoritative_graph(settings, SENTINEL)
+    manager = BackupManager(settings)
+    full = manager.create()
+    settings.tools.path.write_bytes(b"incremental-one")
+    first = manager.create(base_backup_id=full.backup_id)
+    settings.tools.path.write_bytes(b"incremental-two")
+    second = manager.create(base_backup_id=first.backup_id)
+    assert {item.backup_id for item in manager.list()} == {
+        full.backup_id,
+        first.backup_id,
+        second.backup_id,
+    }
+
+    newer_full = manager.create()
+    assert [item.backup_id for item in manager.list()] == [newer_full.backup_id]
+    for expired in (full, first, second):
+        assert not (
+            settings.at_rest.backup.directory / f"{expired.backup_id}.kgb"
+        ).exists()
+
+
+def test_missing_incremental_base_is_never_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    manager = BackupManager(settings)
+    full = manager.create()
+    settings.tools.path.write_bytes(b"incremental")
+    incremental = manager.create(base_backup_id=full.backup_id)
+    (settings.at_rest.backup.directory / f"{full.backup_id}.kgb").unlink()
+
+    assert incremental.backup_id not in {item.backup_id for item in manager.list()}
+
+
+def test_encrypted_production_requires_explicit_init_and_detects_file_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch, live=True)
+    settings = settings.model_copy(
+        update={
+            "project": settings.project.model_copy(
+                update={"environment": "production"}
+            ),
+            "at_rest": settings.at_rest.model_copy(
+                update={
+                    "live": settings.at_rest.live.model_copy(
+                        update={
+                            "generation_marker": tmp_path / "sealed-generation.json"
+                        }
+                    ),
+                    "memory_encrypted_filesystem_attested": True,
+                    "backup": settings.at_rest.backup.model_copy(
+                        update={"encrypted_filesystem_attested": True}
+                    ),
+                }
+            ),
+        }
+    )
+    with pytest.raises(EncryptionError, match="not initialized"):
+        require_encrypted_generation(settings)
+
+    initialize_encrypted_state(settings)
+    require_encrypted_generation(settings)
+    settings.agent_state_wal.path.unlink()
+    with pytest.raises(EncryptionError, match="incomplete"):
+        require_encrypted_generation(settings)
+
+
+def test_restore_staging_is_dedicated_private_cleaned_and_attested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    manager = BackupManager(settings)
+    preview = manager.create()
+    staging = settings.at_rest.backup.restore_staging_directory
+    assert (
+        staging.parent == Path(".kagya") or staging != settings.at_rest.backup.directory
+    )
+    assert manager.verify(preview.backup_id) == preview
+    assert staging.stat().st_mode & 0o777 == 0o700
+    assert list(staging.iterdir()) == []
+
+    production = settings.model_copy(
+        update={
+            "project": settings.project.model_copy(
+                update={"environment": "production"}
+            ),
+            "at_rest": settings.at_rest.model_copy(
+                update={
+                    "backup": settings.at_rest.backup.model_copy(
+                        update={"encrypted_filesystem_attested": False}
+                    )
+                }
+            ),
+        }
+    )
+    with pytest.raises(BackupError, match="not attested"):
+        BackupManager(production).verify(preview.backup_id)
+
+
 def test_production_requires_encryption_and_memory_attestation() -> None:
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     raw["project"]["environment"] = "production"
@@ -305,6 +476,9 @@ def test_production_requires_encryption_and_memory_attestation() -> None:
         Settings.model_validate(deepcopy(raw))
     raw["at_rest"]["live"]["enabled"] = True
     with pytest.raises(ValidationError, match="encrypted filesystem attestation"):
+        Settings.model_validate(raw)
+    raw["at_rest"]["memory_encrypted_filesystem_attested"] = True
+    with pytest.raises(ValidationError, match="restore staging"):
         Settings.model_validate(raw)
 
 
@@ -343,6 +517,7 @@ def _settings(
             "backup": settings.at_rest.backup.model_copy(
                 update={
                     "directory": tmp_path / "backups",
+                    "restore_staging_directory": tmp_path / "restore-staging",
                     "keys": settings.at_rest.backup.keys.model_copy(
                         update={"current_key_env": "TEST_BACKUP_KEY"}
                     ),

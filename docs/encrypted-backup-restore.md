@@ -13,11 +13,12 @@ Root keys are strict base64 environment values whose names are configured under
 or tickets. A ring has one write key ID and only explicitly configured old read key
 IDs. Removing an old ID makes that generation unreadable by design.
 
-Chroma does not provide transparent application-level encryption through this
-integration. Production therefore requires `memory_encrypted_filesystem_attested:
-true`, meaning the operator has placed `memory.persist_directory` on an encrypted
-filesystem or volume and verified its boot/unlock/access controls. This is an
-attestation, not application encryption.
+Chroma and plaintext restore staging do not provide transparent application-level
+encryption through this integration. Production therefore requires separate
+`memory_encrypted_filesystem_attested: true` and
+`backup.encrypted_filesystem_attested: true` attestations. Place both
+`memory.persist_directory` and `backup.restore_staging_directory` on encrypted
+filesystems or volumes and verify their boot/unlock/access controls.
 
 ## Configure
 
@@ -30,8 +31,16 @@ export KAGYA_ADAPTER_ARTIFACT_KEY="$(openssl rand -base64 32)"
 ```
 
 For production, set `project.environment: production`, `at_rest.live.enabled:
-true`, and the Chroma filesystem attestation. Development may explicitly retain
-`at_rest.live.enabled: false`.
+true`, and both filesystem attestations. Production first boot is intentionally
+sealed: missing snapshot, WAL, Journal, or generation marker is data loss, not an
+empty state. Initialize a new empty deployment exactly once while the API is down:
+
+```bash
+uv run kagya-backup --config /path/to/config.yaml state-encryption-init
+```
+
+Development may explicitly retain `at_rest.live.enabled: false` and keeps its
+existing first-boot behavior.
 
 If plaintext development state already exists, stop the API and run the explicit
 one-shot migration. Startup never silently migrates encrypted production state:
@@ -64,6 +73,11 @@ intervals, and enforces `retention_count`:
 just backup-scheduled /path/to/config.yaml
 ```
 
+Retention counts full generations/chains. Every retained incremental keeps its
+transitive bases. A superseded full backup and all dependent incrementals are
+deleted together only after a newer verified full chain exists; orphaned
+incrementals are never listed as restorable.
+
 Deletion is best effort. Unlinking expired bundles does not guarantee physical
 erasure on SSDs, flash translation layers, snapshots, journaled filesystems, RAID,
 or copy-on-write storage. Use encrypted-volume key destruction and storage-provider
@@ -87,8 +101,10 @@ admin and recent re-authentication boundary, an expected backup ID, and expected
 manifest hash. It drains the single `AgentRuntime`, swaps only after isolated
 validation, and rebuilds a fresh runtime graph before serving restored state.
 
-Restore decrypts into a mode-`0700` directory beneath the configured backup
-directory, with files mode `0600`. It validates AEAD, manifest and chunk checksums,
+Restore decrypts into a mode-`0700` child of the dedicated
+`backup.restore_staging_directory`, with files mode `0600`. This directory must not
+default beneath backup storage and requires its own production encrypted-filesystem
+attestation. Restore validates AEAD, manifest and chunk checksums,
 incremental base hashes, snapshot/WAL/Journal continuity, and source/model/adapter
 revisions before swap. The prior generation remains in `previous-generation` for
 rollback. Failed pre-swap verification changes nothing; an interrupted swap rolls
@@ -97,9 +113,20 @@ back completed replacements.
 The isolated directory contains plaintext while restore is running. It is deleted
 on success and ordinary failure, but plaintext may survive process/power loss,
 filesystem snapshots, swap, forensic recovery, or privileged host compromise.
-Place `at_rest.backup.directory` on an encrypted filesystem, restrict host/root
-access, disable unencrypted swap, and clean abandoned `kagya-restore-*` directories
-after a crash. The design does not claim secure deletion on CoW filesystems or SSDs.
+Restrict host/root access, disable unencrypted swap, and inspect abandoned
+`kagya-restore-*` directories after a crash. Ordinary success and failure clean the
+staging child. The design does not claim secure deletion on CoW filesystems or SSDs.
+
+The durable `.restore-in-progress` marker is removed only after the restored graph
+is rebuilt and verified, or after rollback and prior-generation verification both
+succeed. Any rollback replace, fsync, or rebuild failure preserves bounded phase
+metadata and blocks API startup. Do not delete the marker manually. With the API
+stopped, inspect and retry recovery:
+
+```bash
+uv run kagya-backup --config /path/to/config.yaml recovery-status
+uv run kagya-backup --config /path/to/config.yaml recovery-retry
+```
 
 ## Rotate
 

@@ -73,6 +73,7 @@ from kagya.runtime import (
 )
 from kagya.security import build_live_codecs
 from kagya.security.backup import assert_no_incomplete_restore
+from kagya.security.generation import require_encrypted_generation
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -199,28 +200,74 @@ def _lifespan(settings: Settings):
         try:
             yield
         finally:
-            autonomy_loop = getattr(app.state, "autonomy_loop", None)
-            if autonomy_loop is not None:
-                autonomy_loop.shutdown()
-                app.state.autonomy_loop = None
-            coordinator = getattr(app.state, "sleep_coordinator", None)
-            if coordinator is not None:
-                coordinator.shutdown()
-                app.state.sleep_coordinator = None
-            timer = getattr(app.state, "emotion_timer", None)
-            if timer is not None:
-                timer.stop()
-                app.state.emotion_timer = None
-            runtime = getattr(app.state, "agent_runtime", None)
-            if runtime is not None:
-                runtime.shutdown()
-                app.state.agent_runtime = None
+            teardown_subject_runtime(app)
 
     return lifespan
 
 
+def teardown_subject_runtime(app: FastAPI) -> None:
+    """Stop every subject writer/resource and invalidate the dependency graph."""
+
+    failures: list[Exception] = []
+    for name, shutdown_method in (
+        ("autonomy_loop", "shutdown"),
+        ("sleep_coordinator", "shutdown"),
+        ("emotion_timer", "stop"),
+        ("agent_runtime", "shutdown"),
+    ):
+        component = getattr(app.state, name, None)
+        if component is not None:
+            try:
+                getattr(component, shutdown_method)()
+            except Exception as exc:
+                failures.append(exc)
+        setattr(app.state, name, None)
+    for name in ("model_provider", "memory_system", "training_dispatcher"):
+        component = getattr(app.state, name, None)
+        if component is not None:
+            for method_name in ("close", "shutdown", "unload"):
+                closer = getattr(component, method_name, None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception as exc:
+                        failures.append(exc)
+                    break
+    for name in (
+        "agent_state_store",
+        "event_journal",
+        "state_wal",
+        "main_loop",
+        "memory_system",
+        "external_transaction_coordinator",
+        "external_reconciliation",
+        "adapter_registry",
+        "adapter_runtime_manager",
+        "model_provider",
+        "model_provider_adapter_id",
+        "outbox",
+        "action_execution",
+        "subject_scheduler",
+        "live_codecs",
+        "sleep_coordinator",
+        "dataset_governance",
+        "training_dispatcher",
+        "tool_registry",
+        "tool_executor",
+        "behavioral_artifact_reconciliation",
+        "runtime_event_log",
+        "operational_telemetry",
+    ):
+        setattr(app.state, name, None)
+    if failures:
+        raise RuntimeError(
+            "one or more subject runtime resources failed to stop"
+        ) from failures[0]
+
+
 def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     assert_no_incomplete_restore(settings)
+    require_encrypted_generation(settings)
     live_codecs = getattr(app.state, "live_codecs", None)
     if live_codecs is None:
         live_codecs = build_live_codecs(settings)

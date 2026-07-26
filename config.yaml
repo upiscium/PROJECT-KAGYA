@@ -155,12 +155,17 @@ agent_state_wal:
 at_rest:
   live:
     enabled: false
+    generation_marker: .kagya/private/state-encryption-generation.json
     keys:
       current_key_id: live-v1
       current_key_env: KAGYA_LIVE_STATE_KEY
       allowed_old_key_envs: {}
   backup:
     directory: .kagya/backups
+    restore_staging_directory: .kagya/restore-staging
+    # Restore verification material is plaintext and needs a separately attested
+    # encrypted filesystem in production.
+    encrypted_filesystem_attested: false
     keys:
       current_key_id: backup-v1
       current_key_env: KAGYA_BACKUP_KEY

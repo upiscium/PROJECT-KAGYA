@@ -37,6 +37,7 @@ from kagya.runtime import (
     StateWAL,
     hash_snapshot,
 )
+from kagya.security.generation import initialize_encrypted_state
 from kagya.tools import (
     ToolAuditEvent,
     ToolDefinition,
@@ -966,12 +967,21 @@ def test_production_behavioral_route_forces_real_model_runtime(
             ),
             "at_rest": base.at_rest.model_copy(
                 update={
-                    "live": base.at_rest.live.model_copy(update={"enabled": True}),
+                    "live": base.at_rest.live.model_copy(
+                        update={
+                            "enabled": True,
+                            "generation_marker": tmp_path / "sealed-generation.json",
+                        }
+                    ),
+                    "backup": base.at_rest.backup.model_copy(
+                        update={"encrypted_filesystem_attested": True}
+                    ),
                     "memory_encrypted_filesystem_attested": True,
                 }
             ),
         }
     )
+    initialize_encrypted_state(settings)
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
     register_runtime_candidate(registry, tmp_path, "production-candidate")
@@ -1178,7 +1188,7 @@ def test_startup_preloads_transformers_provider(tmp_path: Path, monkeypatch) -> 
 
     assert provider.processor_loaded is True
     assert provider.model_loaded is True
-    assert app.state.model_provider is provider
+    assert app.state.model_provider is None
 
 
 def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None:

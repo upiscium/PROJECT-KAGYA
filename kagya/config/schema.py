@@ -324,11 +324,14 @@ class KeyRingSettings(StrictBaseModel):
 
 class LiveEncryptionSettings(StrictBaseModel):
     enabled: bool = False
+    generation_marker: Path = Path(".kagya/private/state-encryption-generation.json")
     keys: KeyRingSettings = Field(default_factory=KeyRingSettings)
 
 
 class BackupEncryptionSettings(StrictBaseModel):
     directory: Path = Path(".kagya/backups")
+    restore_staging_directory: Path = Path(".kagya/restore-staging")
+    encrypted_filesystem_attested: bool = False
     keys: KeyRingSettings = Field(
         default_factory=lambda: KeyRingSettings(
             current_key_env="KAGYA_BACKUP_KEY"
@@ -487,6 +490,13 @@ class Settings(StrictBaseModel):
         ):
             raise ValueError(
                 "production memory requires encrypted filesystem attestation"
+            )
+        if (
+            environment == ProjectEnvironment.PRODUCTION
+            and not self.at_rest.backup.encrypted_filesystem_attested
+        ):
+            raise ValueError(
+                "production restore staging requires encrypted filesystem attestation"
             )
         if (
             policy == BehavioralActivationPolicy.DETERMINISTIC_RUNTIME_ONLY

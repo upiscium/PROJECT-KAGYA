@@ -77,6 +77,9 @@ live-encryption-migrate config="config.yaml":
 live-encryption-rotate config="config.yaml":
     uv run kagya-backup --config {{config}} rotate-live
 
+live-encryption-init config="config.yaml":
+    uv run kagya-backup --config {{config}} state-encryption-init
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."

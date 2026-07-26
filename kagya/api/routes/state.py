@@ -9,8 +9,13 @@ from kagya.api.dependencies import (
     get_agent_state_store,
     get_api_settings,
     get_external_transaction_coordinator,
+    get_adapter_runtime_manager,
+    get_dataset_governance,
     get_main_loop,
+    get_sleep_coordinator,
     get_state_wal,
+    get_tool_executor,
+    get_tool_registry,
     require_admin,
 )
 from kagya.config import Settings
@@ -303,6 +308,17 @@ def commit_encrypted_restore(
     if body.expected_backup_id != backup_id:
         raise HTTPException(status_code=409, detail="expected backup ID does not match")
     manager = BackupManager(settings)
+    initialized_caches = {
+        name
+        for name in (
+            "sleep_coordinator",
+            "dataset_governance",
+            "adapter_runtime_manager",
+            "tool_registry",
+            "tool_executor",
+        )
+        if getattr(request.app.state, name, None) is not None
+    }
     # Serialize all accepted work before the offline-style authoritative swap.
     execute_agent_event(
         runtime,
@@ -310,49 +326,57 @@ def commit_encrypted_restore(
         source="api.state.backup.restore.prepare",
         handler=lambda: manager.verify(backup_id),
     )
-    autonomy_loop = getattr(request.app.state, "autonomy_loop", None)
-    if autonomy_loop is not None:
-        autonomy_loop.shutdown()
-    timer = getattr(request.app.state, "emotion_timer", None)
-    if timer is not None:
-        timer.stop()
-    runtime.shutdown()
     try:
         restored = manager.restore(
-            backup_id, expected_manifest_hash=body.expected_manifest_hash
+            backup_id,
+            expected_manifest_hash=body.expected_manifest_hash,
+            prepare=lambda _root: _teardown_subject_runtime(request),
+            after_publish=lambda: _rebuild_subject_runtime(
+                request, settings, initialized_caches
+            ),
+            after_rollback=lambda: _reset_and_rebuild_subject_runtime(
+                request, settings, initialized_caches
+            ),
         )
-        _rebuild_subject_runtime(request, settings)
         return restored
     except Exception as exc:
-        _rebuild_subject_runtime(request, settings)
+        if getattr(request.app.state, "agent_runtime", None) is None:
+            _reset_and_rebuild_subject_runtime(request, settings, initialized_caches)
         if isinstance(exc, (BackupError, EncryptionError)):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
 
-def _rebuild_subject_runtime(request: Request, settings: Settings) -> None:
-    for name in (
-        "agent_runtime",
-        "agent_state_store",
-        "event_journal",
-        "state_wal",
-        "main_loop",
-        "memory_system",
-        "external_transaction_coordinator",
-        "adapter_registry",
-        "model_provider",
-        "model_provider_adapter_id",
-        "outbox",
-        "action_execution",
-        "subject_scheduler",
-        "autonomy_loop",
-        "emotion_timer",
-        "live_codecs",
-    ):
-        setattr(request.app.state, name, None)
+def _rebuild_subject_runtime(
+    request: Request, settings: Settings, initialized_caches: set[str] | None = None
+) -> None:
     from kagya.api.server import _preload_subject_runtime
 
     _preload_subject_runtime(request.app, settings)
+    initialized = initialized_caches or set()
+    if "dataset_governance" in initialized:
+        get_dataset_governance(request)
+    if "sleep_coordinator" in initialized:
+        get_sleep_coordinator(request)
+    if "adapter_runtime_manager" in initialized:
+        get_adapter_runtime_manager(request)
+    if "tool_registry" in initialized:
+        get_tool_registry(request)
+    if "tool_executor" in initialized:
+        get_tool_executor(request)
+
+
+def _teardown_subject_runtime(request: Request) -> None:
+    from kagya.api.server import teardown_subject_runtime
+
+    teardown_subject_runtime(request.app)
+
+
+def _reset_and_rebuild_subject_runtime(
+    request: Request, settings: Settings, initialized_caches: set[str]
+) -> None:
+    _teardown_subject_runtime(request)
+    _rebuild_subject_runtime(request, settings, initialized_caches)
 
 
 def _current_snapshot(store: AgentStateStore) -> AgentStateSnapshot:

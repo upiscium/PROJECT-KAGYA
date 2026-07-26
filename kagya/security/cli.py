@@ -13,6 +13,7 @@ from kagya.config import load_settings
 from kagya.security.backup import BackupError, BackupManager
 from kagya.security.crypto import EncryptionError
 from kagya.security.migration import migrate_live_state, reencrypt_live_state
+from kagya.security.generation import initialize_encrypted_state
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,15 +44,19 @@ def main(argv: list[str] | None = None) -> int:
             ).total_seconds() < settings.at_rest.backup.schedule_interval_seconds:
                 result = {"status": "not_due"}
             else:
-                full_every = settings.at_rest.backup.incremental_full_every
-                base = None
-                if statuses and len(statuses) % full_every:
-                    base = statuses[0].backup_id
-                result = manager.create(base_backup_id=base)
+                result = manager.create(
+                    base_backup_id=manager.scheduled_base_backup_id()
+                )
         elif args.command == "migrate-live":
             result = {"migrated_files": migrate_live_state(settings)}
         elif args.command == "rotate-live":
             result = {"reencrypted_files": reencrypt_live_state(settings)}
+        elif args.command == "state-encryption-init":
+            result = {"generation_id": initialize_encrypted_state(settings)}
+        elif args.command == "recovery-status":
+            result = manager.recovery_status()
+        elif args.command == "recovery-retry":
+            result = manager.recover()
         else:
             parser.error("unsupported command")
             return 2
@@ -85,6 +90,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("scheduled")
     commands.add_parser("migrate-live")
     commands.add_parser("rotate-live")
+    commands.add_parser("state-encryption-init")
+    commands.add_parser("recovery-status")
+    commands.add_parser("recovery-retry")
     return parser
 
 

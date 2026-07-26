@@ -19,11 +19,16 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.artifact_provenance import build_adapter_artifact_manifest
-from kagya.config.schema import Settings
+from kagya.config.schema import ProjectEnvironment, Settings
 from kagya.runtime.agent_state import AgentStateStore
 from kagya.runtime.event_journal import EventJournal, hash_snapshot
 from kagya.runtime.state_wal import StateWAL
-from kagya.security.crypto import EncryptedCodec, EncryptionError, KeyRing, load_key_ring
+from kagya.security.crypto import (
+    EncryptedCodec,
+    EncryptionError,
+    KeyRing,
+    load_key_ring,
+)
 from kagya.security.live import build_live_codecs
 
 
@@ -118,6 +123,7 @@ class BackupManager:
             if base_manifest.backup_id != base_backup_id:
                 raise BackupError("incremental base backup ID does not match")
         files = self._inventory(base_manifest)
+        self._inject("backup_after_inventory")
         manifest = BackupManifest(
             backup_id=backup_id,
             created_at=created_at,
@@ -128,7 +134,9 @@ class BackupManager:
             adapter_revision=self._active_adapter_revision(),
             base_backup_id=None if base_manifest is None else base_manifest.backup_id,
             base_manifest_hash=None if base_manifest is None else base_manifest.sha256,
-            roots={source.label: _source_exists(source) for source in self._source_list()},
+            roots={
+                source.label: _source_exists(source) for source in self._source_list()
+            },
             files=files,
         )
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -150,6 +158,7 @@ class BackupManager:
             context="backup-chunk",
             key_ring=adapter_ring,
         )
+        published = False
         try:
             with os.fdopen(descriptor, "wb") as output:
                 os.fchmod(output.fileno(), 0o600)
@@ -174,8 +183,12 @@ class BackupManager:
                     path = _source_file(source, entry.relative_path)
                     wrote = False
                     with _open_regular_nofollow(path) as stream:
+                        initial_stat = os.fstat(stream.fileno())
                         offset = 0
+                        streamed_hash = hashlib.sha256()
                         while chunk := stream.read(_CHUNK_SIZE):
+                            self._inject("backup_stream_chunk")
+                            streamed_hash.update(chunk)
                             payload_data = chunk
                             if entry.adapter_artifact:
                                 payload_data = adapter_codec.encode(
@@ -204,6 +217,13 @@ class BackupManager:
                             offset += len(chunk)
                             record_index += 1
                             wrote = True
+                        final_stat = os.fstat(stream.fileno())
+                    if (
+                        offset != entry.size
+                        or streamed_hash.hexdigest() != entry.sha256
+                        or _changed_while_open(initial_stat, final_stat)
+                    ):
+                        raise BackupError("backup source changed while streaming")
                     if not wrote:
                         payload = {
                             "type": "file_chunk",
@@ -232,18 +252,20 @@ class BackupManager:
                 )
                 output.flush()
                 os.fsync(output.fileno())
-            if self._failure_injector is not None:
-                self._failure_injector("backup_before_replace")
+            self._verify_created_bundle(temporary, manifest)
+            self._inject("backup_before_replace")
             os.replace(temporary, final_path)
             _fsync_directory(self.directory)
             status = _bundle_status(final_path, header, created_at)
             _atomic_json(self._sidecar_path(backup_id), status.model_dump(mode="json"))
+            published = True
             self.enforce_retention()
             return _preview(manifest)
         except Exception:
             temporary.unlink(missing_ok=True)
-            final_path.unlink(missing_ok=True)
-            self._sidecar_path(backup_id).unlink(missing_ok=True)
+            if not published:
+                final_path.unlink(missing_ok=True)
+                self._sidecar_path(backup_id).unlink(missing_ok=True)
             raise
 
     def list(self, limit: int = 50) -> builtins.list[BackupStatus]:
@@ -252,9 +274,12 @@ class BackupManager:
         statuses: builtins.list[BackupStatus] = []
         if not self.directory.exists():
             return statuses
+        valid_ids = set(self._restorable_manifests())
         for path in self.directory.glob("*.status.json"):
             try:
-                statuses.append(BackupStatus.model_validate_json(path.read_bytes()))
+                status = BackupStatus.model_validate_json(path.read_bytes())
+                if status.backup_id in valid_ids:
+                    statuses.append(status)
             except (OSError, ValueError):
                 continue
         statuses.sort(key=lambda item: item.created_at, reverse=True)
@@ -264,9 +289,25 @@ class BackupManager:
         manifest, _header = self._read_manifest(self._bundle_path(backup_id))
         return _preview(manifest)
 
+    def scheduled_base_backup_id(self) -> str | None:
+        manifests = self._restorable_manifests()
+        if not manifests:
+            return None
+        latest = max(manifests.values(), key=lambda item: item.created_at)
+        chain_length = 1
+        current = latest
+        while current.base_backup_id is not None:
+            chain_length += 1
+            current = manifests[current.base_backup_id]
+        if chain_length >= self.settings.at_rest.backup.incremental_full_every:
+            return None
+        return latest.backup_id
+
     def verify(self, backup_id: str) -> RestorePreview:
+        self._require_staging_attestation()
+        staging = self._staging_directory()
         with tempfile.TemporaryDirectory(
-            prefix="kagya-restore-verify-", dir=self.directory
+            prefix="kagya-restore-verify-", dir=staging
         ) as temporary:
             root = Path(temporary)
             os.chmod(root, 0o700)
@@ -279,11 +320,13 @@ class BackupManager:
         backup_id: str,
         *,
         expected_manifest_hash: str,
+        prepare: Callable[[Path], None] | None = None,
+        after_publish: Callable[[], None] | None = None,
+        after_rollback: Callable[[], None] | None = None,
     ) -> RestorePreview:
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = Path(
-            tempfile.mkdtemp(prefix="kagya-restore-", dir=self.directory)
-        )
+        self._require_staging_attestation()
+        staging = self._staging_directory()
+        temporary = Path(tempfile.mkdtemp(prefix="kagya-restore-", dir=staging))
         os.chmod(temporary, 0o700)
         try:
             manifest = self._extract_chain(backup_id, temporary)
@@ -292,11 +335,15 @@ class BackupManager:
             if manifest.sha256 != expected_manifest_hash:
                 raise BackupError("restore manifest hash does not match expectation")
             self._verify_staged(temporary, manifest)
-            if self._failure_injector is not None:
-                self._failure_injector("restore_before_swap")
-            self._commit_staged(temporary, manifest)
-            if self._failure_injector is not None:
-                self._failure_injector("restore_after_swap")
+            if prepare is not None:
+                prepare(temporary)
+            self._inject("restore_before_swap")
+            self._commit_staged(
+                temporary,
+                manifest,
+                after_publish=after_publish,
+                after_rollback=after_rollback,
+            )
             return _preview(manifest)
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -304,8 +351,10 @@ class BackupManager:
     def rotate(self, backup_id: str) -> RestorePreview:
         """Re-encrypt an allowed old generation as a new full current generation."""
 
+        self._require_staging_attestation()
+        staging = self._staging_directory()
         with tempfile.TemporaryDirectory(
-            prefix="kagya-rotate-", dir=self.directory
+            prefix="kagya-rotate-", dir=staging
         ) as temporary:
             root = Path(temporary)
             os.chmod(root, 0o700)
@@ -316,15 +365,82 @@ class BackupManager:
     def enforce_retention(self) -> None:
         if not self.directory.exists():
             return
-        paths = sorted(
-            self.directory.glob("*.kgb"), key=lambda item: item.stat().st_mtime,
-            reverse=True,
+        manifests = self._restorable_manifests()
+        chains: dict[str, set[str]] = {}
+        newest: dict[str, datetime] = {}
+        for backup_id, manifest in manifests.items():
+            root_id = self._chain_root(backup_id, manifests)
+            chains.setdefault(root_id, set()).add(backup_id)
+            newest[root_id] = max(
+                newest.get(root_id, manifest.created_at), manifest.created_at
+            )
+        ordered_roots = sorted(chains, key=lambda item: newest[item], reverse=True)
+        retained_roots = set(
+            ordered_roots[: self.settings.at_rest.backup.retention_count]
         )
-        for path in paths[self.settings.at_rest.backup.retention_count :]:
-            sidecar = path.with_suffix(".status.json")
-            path.unlink(missing_ok=True)
-            sidecar.unlink(missing_ok=True)
+        # A chain is removed as one unit, and only when a newer verified full chain exists.
+        for root_id in ordered_roots:
+            if root_id in retained_roots or not any(
+                newest[other] > newest[root_id] for other in retained_roots
+            ):
+                continue
+            for backup_id in chains[root_id]:
+                self._bundle_path(backup_id).unlink(missing_ok=True)
+                self._sidecar_path(backup_id).unlink(missing_ok=True)
+        # Orphaned incrementals are never advertised and can only be removed by
+        # retention once at least one independently restorable full chain exists.
+        if retained_roots:
+            known = set(manifests)
+            for path in self.directory.glob("*.kgb"):
+                if path.stem not in known:
+                    path.unlink(missing_ok=True)
+                    path.with_suffix(".status.json").unlink(missing_ok=True)
         _fsync_directory(self.directory)
+
+    def _restorable_manifests(self) -> dict[str, BackupManifest]:
+        candidates: dict[str, BackupManifest] = {}
+        if not self.directory.exists():
+            return candidates
+        for path in self.directory.glob("*.kgb"):
+            try:
+                manifest, _header = self._read_manifest(path)
+                if path == self._bundle_path(manifest.backup_id):
+                    candidates[manifest.backup_id] = manifest
+            except (BackupError, EncryptionError, OSError, ValueError):
+                continue
+        valid: dict[str, BackupManifest] = {}
+        visiting: set[str] = set()
+
+        def accept(backup_id: str) -> bool:
+            if backup_id in valid:
+                return True
+            manifest = candidates.get(backup_id)
+            if manifest is None or backup_id in visiting:
+                return False
+            if manifest.base_backup_id is None:
+                valid[backup_id] = manifest
+                return True
+            visiting.add(backup_id)
+            base = candidates.get(manifest.base_backup_id)
+            accepted = (
+                base is not None
+                and accept(base.backup_id)
+                and base.sha256 == manifest.base_manifest_hash
+            )
+            visiting.discard(backup_id)
+            if accepted:
+                valid[backup_id] = manifest
+            return accepted
+
+        for backup_id in candidates:
+            accept(backup_id)
+        return valid
+
+    def _chain_root(self, backup_id: str, manifests: dict[str, BackupManifest]) -> str:
+        current = manifests[backup_id]
+        while current.base_backup_id is not None:
+            current = manifests[current.base_backup_id]
+        return current.backup_id
 
     def _inventory(self, base: BackupManifest | None) -> builtins.list[BackupFile]:
         self._validate_inventory_sources()
@@ -419,7 +535,11 @@ class BackupManager:
                         },
                     )
                     payload = json.loads(plaintext)
-                except (EncryptionError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                except (
+                    EncryptionError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ) as exc:
                     raise BackupError("backup record authentication failed") from exc
                 if not isinstance(payload, dict):
                     raise BackupError("backup record payload is invalid")
@@ -435,6 +555,10 @@ class BackupManager:
             if base.sha256 != manifest.base_manifest_hash:
                 raise BackupError("incremental base manifest hash is invalid")
         self._extract_one(self._bundle_path(backup_id), root, manifest)
+        self._shape_staged(root, manifest)
+        return manifest
+
+    def _shape_staged(self, root: Path, manifest: BackupManifest) -> None:
         known_roots = {source.label for source in _sources(self.settings)}
         if set(manifest.roots) != known_roots:
             raise BackupError("backup authoritative root set is invalid")
@@ -449,18 +573,38 @@ class BackupManager:
             if not label_root.is_dir():
                 raise BackupError("isolated restore root contains an invalid entry")
             for path in sorted(label_root.rglob("*"), reverse=True):
-                if path.is_file() and (label_root.name, path.relative_to(label_root).as_posix()) not in expected:
+                if (
+                    path.is_file()
+                    and (label_root.name, path.relative_to(label_root).as_posix())
+                    not in expected
+                ):
                     path.unlink()
                 elif path.is_dir():
                     try:
                         path.rmdir()
                     except OSError:
                         pass
-        return manifest
 
-    def _extract_one(
-        self, path: Path, root: Path, manifest: BackupManifest
-    ) -> None:
+    def _verify_created_bundle(self, path: Path, manifest: BackupManifest) -> None:
+        self._require_staging_attestation()
+        staging = self._staging_directory()
+        with tempfile.TemporaryDirectory(
+            prefix="kagya-backup-self-verify-", dir=staging
+        ) as temporary:
+            root = Path(temporary)
+            os.chmod(root, 0o700)
+            if manifest.base_backup_id is not None:
+                base = self._extract_chain(manifest.base_backup_id, root)
+                if base.sha256 != manifest.base_manifest_hash:
+                    raise BackupError("incremental base manifest hash is invalid")
+            candidate, _header = self._read_manifest(path)
+            if candidate != manifest:
+                raise BackupError("temporary backup manifest changed")
+            self._extract_one(path, root, manifest)
+            self._shape_staged(root, manifest)
+            self._verify_staged(root, manifest)
+
+    def _extract_one(self, path: Path, root: Path, manifest: BackupManifest) -> None:
         _backup_ring, adapter_ring = self._rings()
         adapter_codec = EncryptedCodec(
             enabled=True,
@@ -474,14 +618,18 @@ class BackupManager:
             for index, (payload, _header) in enumerate(self._read_records(path)):
                 if payload.get("type") == "manifest":
                     continue
-                if set(payload) != {
-                    "type",
-                    "root",
-                    "relative_path",
-                    "offset",
-                    "adapter_artifact",
-                    "data",
-                } or payload.get("type") != "file_chunk":
+                if (
+                    set(payload)
+                    != {
+                        "type",
+                        "root",
+                        "relative_path",
+                        "offset",
+                        "adapter_artifact",
+                        "data",
+                    }
+                    or payload.get("type") != "file_chunk"
+                ):
                     raise BackupError("backup file record schema is invalid")
                 key = (str(payload["root"]), str(payload["relative_path"]))
                 entry = expected.get(key)
@@ -512,7 +660,9 @@ class BackupManager:
                             },
                         )
                     except EncryptionError as exc:
-                        raise BackupError("adapter artifact authentication failed") from exc
+                        raise BackupError(
+                            "adapter artifact authentication failed"
+                        ) from exc
                 handle.write(data)
         finally:
             for handle in handles.values():
@@ -593,7 +743,14 @@ class BackupManager:
                 raise BackupError("backup adapter registry revision is invalid")
             _validate_staged_adapter_hashes(root, registry_path, self.settings)
 
-    def _commit_staged(self, root: Path, manifest: BackupManifest) -> None:
+    def _commit_staged(
+        self,
+        root: Path,
+        manifest: BackupManifest,
+        *,
+        after_publish: Callable[[], None] | None,
+        after_rollback: Callable[[], None] | None,
+    ) -> None:
         assert_no_incomplete_restore(self.settings)
         sources = {source.label: source for source in _sources(self.settings)}
         labels = set(manifest.roots)
@@ -601,21 +758,15 @@ class BackupManager:
         pending_rollback = self.directory / f".previous-{uuid4()}"
         pending_rollback.mkdir(mode=0o700)
         marker = self.directory / _RESTORE_MARKER
-        marker_descriptor = os.open(
-            marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        with os.fdopen(marker_descriptor, "wb") as marker_file:
-            marker_file.write(
-                _canonical(
-                    {
-                        "backup_id": manifest.backup_id,
-                        "pending_generation": pending_rollback.name,
-                    }
-                )
-            )
-            marker_file.flush()
-            os.fsync(marker_file.fileno())
-        _fsync_directory(self.directory)
+        metadata: dict[str, Any] = {
+            "schema_version": 1,
+            "backup_id": manifest.backup_id,
+            "pending_generation": pending_rollback.name,
+            "phase": "forward",
+            "completed_operations": 0,
+            "previous_operations": [],
+        }
+        _atomic_json(marker, metadata)
         swapped: builtins.list[tuple[Path, Path | None]] = []
         try:
             for label in sorted(labels):
@@ -644,43 +795,179 @@ class BackupManager:
                         for name in sorted(source.allowed_names or ())
                     ]
                 else:
-                    operations = [
-                        (staged_root / source.path.name, source.path, label)
-                    ]
+                    operations = [(staged_root / source.path.name, source.path, label)]
                 for staged, destination, rollback_name in operations:
                     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     previous: Path | None = None
                     if destination.exists():
                         previous = pending_rollback / rollback_name
                         previous.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        os.replace(destination, previous)
-                    if staged is not None:
-                        try:
-                            os.replace(staged, destination)
-                        except Exception:
-                            if previous is not None:
-                                os.replace(previous, destination)
-                            raise
+                        self._restore_replace(destination, previous, "forward")
                     swapped.append((destination, previous))
-                    _fsync_directory(destination.parent)
+                    metadata["completed_operations"] = len(swapped)
+                    metadata["previous_operations"].append(previous is not None)
+                    _atomic_json(marker, metadata)
+                    if staged is not None:
+                        self._restore_replace(staged, destination, "forward")
+                    self._restore_fsync(destination.parent, "forward")
+            self._inject("restore_after_swap")
+            if after_publish is not None:
+                after_publish()
+            self._verify_live_generation()
             if rollback.exists():
                 shutil.rmtree(rollback)
-            os.replace(pending_rollback, rollback)
-            _fsync_directory(self.directory)
-        except Exception:
-            for destination, previous in reversed(swapped):
-                if destination.exists():
-                    failed = pending_rollback / f"failed-{destination.name}"
-                    os.replace(destination, failed)
-                if previous is not None and previous.exists():
-                    os.replace(previous, destination)
-                    _fsync_directory(destination.parent)
-            raise
-        finally:
-            if pending_rollback.exists():
-                shutil.rmtree(pending_rollback, ignore_errors=True)
+            self._restore_replace(pending_rollback, rollback, "forward")
+            self._restore_fsync(self.directory, "forward")
             marker.unlink(missing_ok=True)
             _fsync_directory(self.directory)
+        except Exception as forward_error:
+            metadata["phase"] = "rollback"
+            _atomic_json(marker, metadata)
+            try:
+                for index, (destination, previous) in enumerate(reversed(swapped)):
+                    if destination.exists():
+                        failed = pending_rollback / f"failed-{index}"
+                        self._restore_replace(destination, failed, "rollback")
+                    if previous is not None and previous.exists():
+                        self._restore_replace(previous, destination, "rollback")
+                    self._restore_fsync(destination.parent, "rollback")
+                self._verify_live_generation()
+                if after_rollback is not None:
+                    after_rollback()
+                shutil.rmtree(pending_rollback)
+                marker.unlink()
+                _fsync_directory(self.directory)
+            except Exception as rollback_error:
+                metadata["phase"] = "rollback_failed"
+                _atomic_json(marker, metadata)
+                raise BackupError(
+                    "restore rollback failed; recovery marker was preserved"
+                ) from rollback_error
+            raise forward_error
+
+    def _restore_replace(self, source: Path, destination: Path, phase: str) -> None:
+        self._inject(f"restore_{phase}_replace")
+        os.replace(source, destination)
+
+    def _restore_fsync(self, path: Path, phase: str) -> None:
+        self._inject(f"restore_{phase}_fsync")
+        _fsync_directory(path)
+
+    def _verify_live_generation(self) -> None:
+        codecs = build_live_codecs(self.settings)
+        snapshot = AgentStateStore(
+            self.settings.agent_state.path, codec=codecs.snapshot
+        ).load(self.settings.emotion.baseline_surprisal)
+        wal = StateWAL(
+            self.settings.agent_state_wal.path, codec=codecs.wal
+        ).reconstruct()
+        if wal.sequence != snapshot.last_processed_event_sequence or (
+            wal.snapshot_hash != hash_snapshot(snapshot)
+        ):
+            raise BackupError("live snapshot and WAL are inconsistent after restore")
+        EventJournal(
+            self.settings.agent_journal.path,
+            retained_files=self.settings.agent_journal.retained_files,
+            codec=codecs.journal,
+        ).verify()
+
+    def recovery_status(self) -> dict[str, Any]:
+        marker = self.directory / _RESTORE_MARKER
+        if not marker.exists():
+            return {"status": "clean"}
+        try:
+            payload = json.loads(marker.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BackupError("restore recovery marker is invalid") from exc
+        allowed = {
+            "schema_version",
+            "backup_id",
+            "pending_generation",
+            "phase",
+            "completed_operations",
+            "previous_operations",
+        }
+        if not isinstance(payload, dict) or set(payload) != allowed:
+            raise BackupError("restore recovery marker schema is invalid")
+        return {
+            "status": "recovery_required",
+            "backup_id": payload["backup_id"],
+            "phase": payload["phase"],
+            "completed_operations": payload["completed_operations"],
+        }
+
+    def recover(self) -> dict[str, Any]:
+        marker = self.directory / _RESTORE_MARKER
+        if not marker.exists():
+            return {"status": "clean"}
+        try:
+            payload = json.loads(marker.read_bytes())
+            backup_id = str(payload["backup_id"])
+            pending_name = str(payload["pending_generation"])
+            completed = int(payload["completed_operations"])
+            previous_flags = payload["previous_operations"]
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise BackupError("restore recovery marker is invalid") from exc
+        if (
+            not pending_name.startswith(".previous-")
+            or Path(pending_name).name != pending_name
+            or not isinstance(previous_flags, list)
+            or len(previous_flags) != completed
+            or not all(isinstance(item, bool) for item in previous_flags)
+        ):
+            raise BackupError("restore recovery marker schema is invalid")
+        manifest, _header = self._read_manifest(self._bundle_path(backup_id))
+        operations = self._manifest_operation_destinations(manifest)
+        if completed < 0 or completed > len(operations):
+            raise BackupError("restore recovery operation count is invalid")
+        pending = self.directory / pending_name
+        if not pending.is_dir():
+            raise BackupError("restore recovery generation is unavailable")
+        payload["phase"] = "rollback"
+        _atomic_json(marker, payload)
+        try:
+            for index in range(completed - 1, -1, -1):
+                destination, rollback_name = operations[index]
+                previous = pending / rollback_name
+                if previous.exists():
+                    if destination.exists():
+                        self._restore_replace(
+                            destination,
+                            pending / f"recovery-failed-{index}",
+                            "rollback",
+                        )
+                    self._restore_replace(previous, destination, "rollback")
+                elif not previous_flags[index] and destination.exists():
+                    failed = pending / f"recovery-failed-{index}"
+                    self._restore_replace(destination, failed, "rollback")
+                self._restore_fsync(destination.parent, "rollback")
+            self._verify_live_generation()
+            shutil.rmtree(pending)
+            marker.unlink()
+            _fsync_directory(self.directory)
+            return {"status": "rolled_back", "backup_id": backup_id}
+        except Exception as exc:
+            payload["phase"] = "rollback_failed"
+            _atomic_json(marker, payload)
+            raise BackupError(
+                "restore recovery retry failed; recovery marker was preserved"
+            ) from exc
+
+    def _manifest_operation_destinations(
+        self, manifest: BackupManifest
+    ) -> builtins.list[tuple[Path, str]]:
+        sources = {source.label: source for source in _sources(self.settings)}
+        operations: builtins.list[tuple[Path, str]] = []
+        for label in sorted(manifest.roots):
+            source = sources[label]
+            if source.directory and source.allowed_names:
+                operations.extend(
+                    (source.path / name, f"{label}-{name}")
+                    for name in sorted(source.allowed_names)
+                )
+            else:
+                operations.append((source.path, label))
+        return operations
 
     def _create_from_staged(self, root: Path) -> RestorePreview:
         # Rotation is deliberately implemented through a temporary settings graph,
@@ -697,6 +984,25 @@ class BackupManager:
 
     def _source_list(self) -> builtins.list[_Source]:
         return _sources(self.settings)
+
+    def _inject(self, checkpoint: str) -> None:
+        if self._failure_injector is not None:
+            self._failure_injector(checkpoint)
+
+    def _require_staging_attestation(self) -> None:
+        if (
+            self.settings.project.environment == ProjectEnvironment.PRODUCTION
+            and not self.settings.at_rest.backup.encrypted_filesystem_attested
+        ):
+            raise BackupError(
+                "production restore staging encrypted filesystem is not attested"
+            )
+
+    def _staging_directory(self) -> Path:
+        path = self.settings.at_rest.backup.restore_staging_directory
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path, 0o700)
+        return path
 
     def _validate_inventory_sources(self) -> None:
         _validate_adapter_registry_paths(self.settings)
@@ -735,7 +1041,10 @@ class _StagedBackupManager(BackupManager):
         ]
 
     def _active_adapter_revision(self) -> str | None:
-        registry = self._overrides["adapter_registry"] / self.settings.adapter_registry.path.name
+        registry = (
+            self._overrides["adapter_registry"]
+            / self.settings.adapter_registry.path.name
+        )
         if not registry.exists():
             return None
         digest, _size = _hash_file(registry)
@@ -855,7 +1164,10 @@ def _walk_source(source: _Source) -> Iterator[tuple[Path, str]]:
             raise BackupError("configured backup directory is not a directory")
         for path in sorted(source.path.rglob("*")):
             relative = path.relative_to(source.path)
-            if source.allowed_names is not None and relative.as_posix() not in source.allowed_names:
+            if (
+                source.allowed_names is not None
+                and relative.as_posix() not in source.allowed_names
+            ):
                 continue
             item_stat = path.lstat()
             if stat.S_ISLNK(item_stat.st_mode):
@@ -880,7 +1192,10 @@ def _source_exists(source: _Source) -> bool:
 def _source_file(source: _Source, relative: str) -> Path:
     relative = _safe_relative(relative)
     candidate = source.path / relative if source.directory else source.path
-    if source.directory and candidate.resolve().is_relative_to(source.path.resolve()) is False:
+    if (
+        source.directory
+        and candidate.resolve().is_relative_to(source.path.resolve()) is False
+    ):
         raise BackupError("backup source path escapes its configured root")
     if candidate.is_symlink() or not candidate.is_file():
         raise BackupError("backup source changed to an unsafe file")
@@ -899,7 +1214,12 @@ def _staged_file(root: Path, label: str, relative: str) -> Path:
 
 def _safe_relative(value: str) -> str:
     path = Path(value)
-    if not value or path.is_absolute() or ".." in path.parts or path.as_posix() != value:
+    if (
+        not value
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.as_posix() != value
+    ):
         raise BackupError("backup relative path is unsafe")
     return value
 
@@ -989,6 +1309,22 @@ def _open_regular_nofollow(path: Path) -> BinaryIO:
     except Exception:
         os.close(descriptor)
         raise
+
+
+def _changed_while_open(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
 
 
 def _canonical(value: Any) -> bytes:

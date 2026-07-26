@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from kagya.config.schema import Settings
@@ -14,6 +14,7 @@ from kagya.runtime.event_journal import EventJournal, JournalRecord
 from kagya.runtime.state_wal import StateWAL, StateWalRecord
 from kagya.security.crypto import EncryptedCodec, EncryptionError
 from kagya.security.live import build_live_codecs
+from kagya.security.generation import seal_encrypted_generation
 
 
 def migrate_live_state(settings: Settings) -> int:
@@ -49,7 +50,21 @@ def migrate_live_state(settings: Settings) -> int:
     ] + [settings.agent_journal.path]
     for path in journal_paths:
         targets.extend(_migrate_lines(path, codecs.journal, JournalRecord))
-    return _replace_targets(targets)
+    if (
+        len(
+            {path for path, _encoded in targets}
+            & {
+                settings.agent_state.path,
+                settings.agent_state_wal.path,
+                settings.agent_journal.path,
+            }
+        )
+        != 3
+    ):
+        raise EncryptionError("plaintext authoritative generation is incomplete")
+    return _replace_targets(
+        targets, finalize=lambda: seal_encrypted_generation(settings)
+    )
 
 
 def reencrypt_live_state(settings: Settings) -> int:
@@ -91,10 +106,14 @@ def reencrypt_live_state(settings: Settings) -> int:
     ] + [settings.agent_journal.path]
     for path in journal_paths:
         targets.extend(_reencrypt_lines(path, codecs.journal, JournalRecord))
-    return _replace_targets(targets)
+    return _replace_targets(
+        targets, finalize=lambda: seal_encrypted_generation(settings)
+    )
 
 
-def _replace_targets(targets: list[tuple[Path, bytes]]) -> int:
+def _replace_targets(
+    targets: list[tuple[Path, bytes]], *, finalize: Callable[[], object] | None = None
+) -> int:
     if not targets:
         return 0
     staged: list[tuple[Path, Path]] = []
@@ -123,6 +142,8 @@ def _replace_targets(targets: list[tuple[Path, bytes]]) -> int:
                 raise
             _fsync_directory(path.parent)
             replaced.append((path, previous))
+        if finalize is not None:
+            finalize()
         return len(replaced)
     except Exception:
         for path, previous in reversed(replaced):
