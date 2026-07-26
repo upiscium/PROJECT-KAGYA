@@ -18,6 +18,12 @@ from kagya.runtime.event_journal import (
     JournalRecord,
     hash_snapshot,
 )
+from kagya.runtime.cancellation import (
+    CancellationToken,
+    OperationCanceled,
+    cancellation_checkpoint,
+    current_cancellation_token,
+)
 from kagya.runtime.agent_state import (
     AgentStateSnapshot,
     AgentStateStore,
@@ -94,6 +100,10 @@ __all__ = [
     "AgentRuntimeStopped",
     "AutonomyLoop",
     "CycleResult",
+    "CancellationToken",
+    "OperationCanceled",
+    "cancellation_checkpoint",
+    "current_cancellation_token",
     "current_agent_event",
     "register_event_rollback",
     "AgentStateSnapshot",

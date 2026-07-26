@@ -2,7 +2,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, errorMessage, type Attachment, type ChatResponse, type FeedbackSignal } from "@/lib/api";
+import { api, errorMessage, streamChatJob, type Attachment, type ChatResponse, type FeedbackSignal, type OperationStatus } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Input, Textarea } from "@/components/ui/input";
@@ -67,8 +67,13 @@ export function ChatClient() {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [history, setHistory] = useState<ChatTurn[]>([]);
   const [contextId, setContextId] = useState<string | undefined>();
+  const [operation, setOperation] = useState<OperationStatus | null>(null);
+  const [streamedText, setStreamedText] = useState("");
   const mutation = useMutation({
-    mutationFn: api.chat,
+    mutationFn: (request: Parameters<typeof api.chat>[0]) => streamChatJob(request, {
+      status: setOperation,
+      token: (text) => setStreamedText((current) => current + text),
+    }),
     onSuccess: (result, variables) => {
       setHistory((current) => [
         ...current,
@@ -78,6 +83,8 @@ export function ChatClient() {
       setMessage("");
       setAttachments([]);
       setContextId(result.context_id);
+      setOperation(null);
+      setStreamedText("");
     },
   });
 
@@ -131,7 +138,9 @@ export function ChatClient() {
         {mutation.isPending ? (
           <div className="chat-bubble assistant" aria-live="polite" aria-label="KAGYA is generating a response">
             <strong>KAGYA</strong>
-            <p className="generating-indicator"><span className="spinner" aria-hidden="true" />Generating response...</p>
+            <p className="generating-indicator"><span className="spinner" aria-hidden="true" />{operation?.status === "queued" ? `Queued${operation.queue_position ? ` (${operation.queue_position})` : ""}` : operation?.status === "finalizing" ? "Finalizing response..." : "Generating response..."}</p>
+            {streamedText ? <p>{streamedText}</p> : null}
+            {operation ? <Button type="button" onClick={() => api.cancelChatJob(operation.operation_id)}>Cancel</Button> : null}
           </div>
         ) : null}
       </Card>

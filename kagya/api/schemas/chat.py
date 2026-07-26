@@ -2,6 +2,8 @@
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from kagya.operation_status import OperationStatus
+
 
 class AttachmentSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -44,3 +46,25 @@ class ChatResponse(BaseModel):
     response: str
     emotion: EmotionSchema
     model: ModelSchema
+
+
+class ChatJobAccepted(BaseModel):
+    operation: OperationStatus
+    status_url: str
+    result_url: str
+    events_url: str
+    duplicate: bool = False
+
+
+class ChatJobStatus(BaseModel):
+    operation: OperationStatus
+
+
+class ChatJobResult(BaseModel):
+    operation: OperationStatus
+    result: ChatResponse
+
+
+class ChatCancelResponse(BaseModel):
+    disposition: str
+    operation: OperationStatus

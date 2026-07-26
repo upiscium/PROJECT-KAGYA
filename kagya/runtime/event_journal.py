@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from kagya.operation_status import OperationState
 from kagya.runtime.agent_state import AgentStateSnapshot
 from kagya.security import EncryptedCodec, EncryptionError
 
@@ -53,7 +54,7 @@ class JournalTelemetry(Protocol):
 class JournalRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2, 3] = 3
     record_id: str
     timestamp: datetime
     lifecycle: JournalLifecycle
@@ -68,6 +69,7 @@ class JournalRecord(BaseModel):
     state_hash_after: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     failure_category: str | None = None
+    operation_status: OperationState | None = None
     actor_id: str | None = None
     actor_role: str | None = None
     target: str | None = None
@@ -394,6 +396,18 @@ class EventJournal:
     ) -> JournalRecord:
         _reject_private_payload(getattr(event, "payload", {}))
         event_type = getattr(event.event_type, "value", str(event.event_type))
+        operation_status = {
+            JournalLifecycle.ACCEPTED: OperationState.QUEUED,
+            JournalLifecycle.STARTED: OperationState.RUNNING,
+            JournalLifecycle.PREPARED: OperationState.FINALIZING,
+            JournalLifecycle.COMPLETED: OperationState.COMPLETED,
+            JournalLifecycle.FAILED: (
+                OperationState.CANCELED
+                if failure_category is not None
+                and failure_category.startswith("canceled_")
+                else OperationState.FAILED
+            ),
+        }.get(lifecycle)
         return self._append(
             lifecycle=lifecycle,
             event_id=_safe_label(event.event_id),
@@ -407,6 +421,7 @@ class EventJournal:
             snapshot_hash=snapshot_hash,
             snapshot_sequence=snapshot_sequence,
             failure_category=failure_category,
+            operation_status=operation_status,
         )
 
     def _append(self, **values: Any) -> JournalRecord:
@@ -595,7 +610,7 @@ def hash_snapshot(snapshot: AgentStateSnapshot) -> str:
 
 def _new_record(*, previous_record_hash: str | None, **values: Any) -> JournalRecord:
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "record_id": str(uuid4()),
         "timestamp": datetime.now(UTC),
         "previous_record_hash": previous_record_hash,
@@ -609,6 +624,8 @@ def _record_hash(record: JournalRecord) -> str:
     exclude = {"record_hash"}
     if record.schema_version == 1:
         exclude.update({"actor_id", "actor_role", "target", "reauthenticated"})
+    if record.schema_version <= 2:
+        exclude.add("operation_status")
     payload = record.model_dump(mode="json", exclude=exclude)
     canonical = json.dumps(
         payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True

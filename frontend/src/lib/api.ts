@@ -17,6 +17,26 @@ export type ChatResponse = {
   emotion: Emotion;
   model: ModelInfo;
 };
+export type OperationState = "queued" | "running" | "finalizing" | "completed" | "failed" | "canceled";
+export type OperationStatus = {
+  schema_version: 1;
+  operation_id: string;
+  event_id: string;
+  status: OperationState;
+  status_sequence: number;
+  queue_position: number | null;
+  submitted_at: string;
+  started_at: string | null;
+  finalizing_at: string | null;
+  completed_at: string | null;
+  updated_at: string;
+  error_code: "internal_error" | "interrupted" | "timeout" | "provider_error" | null;
+  cancel_code: "client_request" | "timeout" | "shutdown" | null;
+  cancel_requested: boolean;
+  result_available: boolean;
+};
+export type ChatJobAccepted = { operation: OperationStatus; status_url: string; result_url: string; events_url: string; duplicate: boolean };
+export type ChatJobResult = { operation: OperationStatus; result: ChatResponse };
 export type FeedbackSignal = "good" | "bad" | "factual_error" | "style_problem" | "unsafe_behavior" | "remember" | "do_not_remember" | "correction" | "expected_answer" | "exclude_from_training";
 export type FeedbackResponse = {
   feedback_id: string;
@@ -558,6 +578,78 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function streamChatJob(
+  body: ChatRequest,
+  callbacks: { status: (status: OperationStatus) => void; token: (text: string) => void },
+  signal?: AbortSignal,
+): Promise<ChatResponse> {
+  const clientId = getChatClientId();
+  const idempotencyKey = crypto.randomUUID();
+  let submission: ChatJobAccepted | ChatResponse | null = null;
+  for (let attempt = 0; attempt < 3 && submission === null; attempt += 1) {
+    try {
+      submission = await request<ChatJobAccepted | ChatResponse>("/api/chat/jobs", {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey, "X-KAGYA-Client-ID": clientId },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted || attempt === 2) throw error;
+    }
+  }
+  if (submission === null) throw new ApiError("Chat submission failed.");
+  if (!("operation" in submission)) return submission;
+  const accepted = submission;
+  callbacks.status(accepted.operation);
+  let lastEventId = 0;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const response = await fetch(`${API_PROXY_BASE_URL}${accepted.events_url.replace(/^\/api/, "")}`, {
+        headers: lastEventId ? { "Last-Event-ID": String(lastEventId) } : undefined,
+        signal,
+      });
+      if (!response.ok || !response.body) continue;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const frames = pending.split("\n\n");
+        pending = frames.pop() ?? "";
+        for (const frame of frames) {
+          if (!frame || frame.startsWith(":")) continue;
+          const fields = Object.fromEntries(frame.split("\n").map((line) => {
+            const separator = line.indexOf(":");
+            return [line.slice(0, separator), line.slice(separator + 1).trimStart()];
+          }));
+          if (fields.id) lastEventId = Number(fields.id);
+          if (!fields.data) continue;
+          const data = JSON.parse(fields.data) as Record<string, unknown>;
+          if (fields.event === "status") callbacks.status(data as OperationStatus);
+          if (fields.event === "token" && typeof data.text === "string") callbacks.token(data.text);
+          if (fields.event === "final") return data as ChatResponse;
+        }
+        if (done) break;
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+  const final = await request<ChatJobResult>(accepted.result_url);
+  return final.result;
+}
+
+function getChatClientId(): string {
+  const key = "kagya-chat-client-id";
+  const existing = globalThis.localStorage?.getItem(key);
+  if (existing) return existing;
+  const created = crypto.randomUUID();
+  globalThis.localStorage?.setItem(key, created);
+  return created;
+}
+
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error) return error.message;
@@ -608,6 +700,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
+  cancelChatJob: (operationId: string) => request<{ disposition: string; operation: OperationStatus }>(`/api/chat/jobs/${encodeURIComponent(operationId)}`, { method: "DELETE" }),
   feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),

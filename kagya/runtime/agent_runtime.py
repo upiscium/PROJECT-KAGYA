@@ -12,6 +12,12 @@ from threading import Lock, Thread
 from typing import Any, Callable, cast, Generic, Protocol, TypeVar
 from uuid import uuid4
 
+from kagya.runtime.cancellation import (
+    CancellationToken,
+    OperationCanceled,
+    _current_cancellation,
+)
+
 
 T = TypeVar("T")
 _STOP = object()
@@ -130,6 +136,7 @@ class _Envelope(Generic[T]):
     event: AgentEvent
     handler: Callable[[], T]
     future: Future[AgentEventOutcome[T]]
+    cancellation_token: CancellationToken | None = None
 
 
 class EventRecorder(Protocol):
@@ -242,10 +249,12 @@ class AgentRuntime:
         requested_at: datetime | None = None,
         causation_id: str | None = None,
         correlation_id: str | None = None,
+        event_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> Future[AgentEventOutcome[T]]:
         now = datetime.now(UTC)
         event = AgentEvent(
-            event_id=str(uuid4()),
+            event_id=event_id or str(uuid4()),
             event_type=event_type,
             source=source,
             observed_at=now,
@@ -255,7 +264,12 @@ class AgentRuntime:
             correlation_id=correlation_id,
         )
         future: Future[AgentEventOutcome[T]] = Future()
-        envelope = _Envelope(event=event, handler=handler, future=future)
+        envelope = _Envelope(
+            event=event,
+            handler=handler,
+            future=future,
+            cancellation_token=cancellation_token,
+        )
         with self._state_lock:
             if self._state != "accepting":
                 raise AgentRuntimeStopped("Agent runtime is draining or stopped")
@@ -286,6 +300,8 @@ class AgentRuntime:
         payload: dict[str, Any] | None = None,
         causation_id: str | None = None,
         correlation_id: str | None = None,
+        event_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> AgentEventOutcome[T]:
         return self.submit(
             event_type,
@@ -294,6 +310,8 @@ class AgentRuntime:
             payload=payload,
             causation_id=causation_id,
             correlation_id=correlation_id,
+            event_id=event_id,
+            cancellation_token=cancellation_token,
         ).result()
 
     def shutdown(self) -> None:
@@ -379,7 +397,12 @@ class AgentRuntime:
                 self._observe_telemetry("event_started", event, self._queue.qsize())
                 event_token = _current_event.set(event)
                 rollback_token = _rollback_callbacks.set(())
+                cancellation_context = _current_cancellation.set(
+                    envelope.cancellation_token
+                )
                 try:
+                    if envelope.cancellation_token is not None:
+                        envelope.cancellation_token.raise_if_canceled()
                     value = envelope.handler()
                 except Exception as exc:
                     try:
@@ -389,8 +412,13 @@ class AgentRuntime:
                             else self._failure_hook(event, exc)
                         )
                         if self._event_journal is not None:
+                            failure_category = (
+                                f"canceled_{exc.code}"
+                                if isinstance(exc, OperationCanceled)
+                                else type(exc).__name__
+                            )
                             self._event_journal.failed(
-                                event, type(exc).__name__, snapshot_hash
+                                event, failure_category, snapshot_hash
                             )
                     except Exception:
                         self._fail_stop(
@@ -463,6 +491,7 @@ class AgentRuntime:
                                 AgentEventOutcome(event=event, value=value)
                             )
                 finally:
+                    _current_cancellation.reset(cancellation_context)
                     _rollback_callbacks.reset(rollback_token)
                     _current_event.reset(event_token)
             finally:

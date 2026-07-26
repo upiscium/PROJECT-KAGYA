@@ -23,6 +23,7 @@ from transformers import (
     BitsAndBytesConfig,
     StoppingCriteria,
     StoppingCriteriaList,
+    TextIteratorStreamer,
 )
 
 from kagya.config import Settings
@@ -69,6 +70,24 @@ class _StopAfterTopLevelJsonObject(StoppingCriteria):
                 [_has_complete_top_level_json_object(generated)],
                 device=input_ids.device,
                 dtype=torch.bool,
+            ),
+        )
+
+
+class _StopWhenCanceled(StoppingCriteria):
+    def __init__(self, cancellation_token: Any) -> None:
+        self.cancellation_token = cancellation_token
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any
+    ) -> torch.BoolTensor:
+        del scores, kwargs
+        return cast(
+            torch.BoolTensor,
+            torch.tensor(
+                [self.cancellation_token.is_canceled],
+                dtype=torch.bool,
+                device=input_ids.device,
             ),
         )
 
@@ -170,6 +189,31 @@ class TransformersProvider:
         except Exception:
             return self.generate_fallback(prompt)
 
+    def stream_generate(self, prompt: str, cancellation_token: Any = None) -> Iterator[str]:
+        """Yield one raw generation; public callers must parse before disclosure."""
+
+        self.last_model_id = self.model_id
+        self.last_fallback_used = False
+        try:
+            yield from self._stream_with(
+                prompt,
+                self._get_primary_model(),
+                self._get_primary_processor(),
+                cancellation_token,
+            )
+            self.generation_count += 1
+        except Exception:
+            if cancellation_token is not None and cancellation_token.is_canceled:
+                cancellation_token.raise_if_canceled()
+            self.last_model_id = self.fallback_model_id
+            self.last_fallback_used = True
+            yield from self._stream_with(
+                prompt,
+                self._get_fallback_model(),
+                self._get_fallback_processor(),
+                cancellation_token,
+            )
+
     def generate_with_attachments(
         self, prompt: str, attachments: list[dict[str, object]]
     ) -> str:
@@ -241,6 +285,60 @@ class TransformersProvider:
         output_ids = model.generate(**inputs, **generation_kwargs)
         generated_ids = output_ids[0][input_length:]
         return processor.decode(generated_ids, skip_special_tokens=True)
+
+    def _stream_with(
+        self,
+        prompt: str,
+        model: Any,
+        processor: Any,
+        cancellation_token: Any,
+    ) -> Iterator[str]:
+        rendered = self._render_generation_prompt(prompt, processor)
+        inputs = self._move_inputs_to_model_device(
+            processor(text=rendered, return_tensors="pt"), model
+        )
+        input_length = inputs["input_ids"].shape[-1]
+        criteria: list[StoppingCriteria] = [
+            _StopAfterTopLevelJsonObject(processor, input_length)
+        ]
+        if cancellation_token is not None:
+            criteria.append(_StopWhenCanceled(cancellation_token))
+        streamer = TextIteratorStreamer(
+            processor, skip_prompt=True, skip_special_tokens=True
+        )
+        kwargs: dict[str, Any] = {
+            **inputs,
+            "streamer": streamer,
+            "max_new_tokens": self.settings.generation.max_new_tokens,
+            "do_sample": self.settings.generation.do_sample,
+            "repetition_penalty": self.settings.generation.repetition_penalty,
+            "no_repeat_ngram_size": self.settings.generation.no_repeat_ngram_size,
+            "stopping_criteria": StoppingCriteriaList(criteria),
+        }
+        if self.settings.generation.do_sample:
+            kwargs.update(
+                temperature=self.settings.generation.temperature,
+                top_p=self.settings.generation.top_p,
+            )
+        failure: list[BaseException] = []
+
+        def generate() -> None:
+            try:
+                model.generate(**kwargs)
+            except BaseException as exc:
+                failure.append(exc)
+                streamer.on_finalized_text("", stream_end=True)
+
+        worker = threading.Thread(target=generate, name="kagya-transformers-stream")
+        worker.start()
+        try:
+            yield from streamer
+        finally:
+            worker.join()
+        if cancellation_token is not None:
+            cancellation_token.raise_if_canceled()
+        if failure:
+            raise failure[0]
 
     def _render_generation_prompt(
         self,

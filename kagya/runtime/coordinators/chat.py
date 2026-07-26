@@ -30,6 +30,7 @@ from kagya.motivation import (
     GoalStatus,
 )
 from kagya.runtime.agent_runtime import current_agent_event
+from kagya.runtime.cancellation import cancellation_checkpoint
 from kagya.runtime.working_memory import (
     RetentionReason,
     WorkingMemoryItem,
@@ -170,6 +171,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
         previous_relationship_state = self.relationship_store.to_json()
         previous_motivation_state = self.motivation_dynamics.to_json()
         previous_narrative_state = self.narrative_self.to_json()
+        cancellation_checkpoint()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -350,6 +352,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 )
                 self._persist_identity_boundary_state()
             generation_started = time.perf_counter()
+            cancellation_checkpoint()
             try:
                 raw_response = self.agent.generate(
                     prompt, attachments=attachments or []
@@ -358,6 +361,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 if provider_fallback_used(self.provider):
                     raise RuntimeError("Fallback model generation failed") from exc
                 raw_response = generate_fallback(self.provider, prompt)
+            cancellation_checkpoint()
             processed_response = self.postprocessor.process(raw_response)
             model_declared_behavior_class = processed_response.behavior_class
             if boundary_assessment is not None:
@@ -413,6 +417,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 else float("nan"),
                 fallback_used=fallback_used,
             )
+            cancellation_checkpoint()
             if not generation_health.healthy:
                 self._metric(
                     "counter",
@@ -548,6 +553,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     event_sequence=event.processing_sequence,
                 )
                 self._persist_identity_boundary_state()
+            cancellation_checkpoint()
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)

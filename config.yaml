@@ -204,6 +204,10 @@ api:
   host: 127.0.0.1
   port: 8000
   admin_token_env: KAGYA_ADMIN_TOKEN
+  agent_queue_capacity: 32
+  chat_job_registry_path: .kagya/chat_jobs.json
+  chat_timeout_seconds: 300
+  chat_stream_replay_limit: 256
   # Optional identity/role sessions are disabled for the private token-only default.
   admin_auth:
     enabled: false

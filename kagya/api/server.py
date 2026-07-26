@@ -67,6 +67,7 @@ from kagya.runtime import (
     StateWAL,
     StateWalIntegrityError,
     hash_snapshot,
+    cancellation_checkpoint,
     AutonomyLoop,
     SchedulerBudget,
     SubjectScheduler,
@@ -443,6 +444,8 @@ def _build_subject_runtime(
             failure_hook=lambda event, exc: _fail_subject_event(app, event),
             telemetry=app.state.operational_telemetry,
         )
+    if getattr(app.state, "chat_job_registry", None) is None:
+        app.state.chat_job_registry = chat.create_chat_job_registry(app)
     if settings.autonomy.enabled and getattr(app.state, "autonomy_loop", None) is None:
         autonomy_settings = settings.autonomy
         app.state.subject_scheduler = SubjectScheduler(
@@ -509,6 +512,7 @@ def _event_sequence(sequence: int | None) -> int:
 
 
 def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    cancellation_checkpoint()
     started = time.perf_counter()
     status = "failure"
     store = app.state.agent_state_store
@@ -525,6 +529,7 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
         state_hash_before=before_hash,
         state_hash_after=after_hash,
     )
+    cancellation_checkpoint()
     app.state.state_wal.append_transition(event, previous, candidate)
     try:
         saved = store.save(candidate)

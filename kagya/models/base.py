@@ -1,5 +1,6 @@
 """Shared model provider contracts."""
 
+from collections.abc import Iterator
 from typing import Any, Protocol
 
 from kagya.models.boundary_probe import BoundaryPolicyProbe
@@ -29,3 +30,12 @@ class ModelProvider(Protocol):
 
     def get_processor(self) -> Any:
         """Return the underlying processor/tokenizer object."""
+
+
+class StreamingModelProvider(Protocol):
+    """Optional one-generation streaming protocol used internally by chat."""
+
+    def stream_generate(
+        self, prompt: str, cancellation_token: Any = None
+    ) -> Iterator[str]:
+        """Yield raw generation fragments; callers must validate before disclosure."""
