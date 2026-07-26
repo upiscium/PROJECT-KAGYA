@@ -14,6 +14,16 @@ from kagya.decision.records import (
     parse_candidate_output,
     schema_candidate_prompt,
 )
+from kagya.decision.explanations import (
+    DecisionExplanationStore,
+    ExplanationDisposition,
+    NaturalExplanationOutput,
+    PublicDecisionExplanation,
+    RendererState,
+    build_explanation,
+    explanation_input_digest,
+    render_natural,
+)
 
 __all__ = [
     "ActionCandidate",
@@ -28,4 +38,12 @@ __all__ = [
     "PredictedOutcome",
     "parse_candidate_output",
     "schema_candidate_prompt",
+    "DecisionExplanationStore",
+    "ExplanationDisposition",
+    "NaturalExplanationOutput",
+    "PublicDecisionExplanation",
+    "RendererState",
+    "build_explanation",
+    "explanation_input_digest",
+    "render_natural",
 ]

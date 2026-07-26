@@ -25,6 +25,7 @@ from kagya.counterfactual import (
     CounterfactualStore,
 )
 from kagya.decision import (
+    DecisionExplanationStore,
     DecisionStore,
 )
 from kagya.identity import (
@@ -195,6 +196,7 @@ class _MainLoopImplementation(
             high_arousal_cap=1,
         )
         self.decision_store = DecisionStore()
+        self.decision_explanation_store = DecisionExplanationStore()
         self.self_model = SelfModel()
         self.identity_boundary_store = IdentityBoundaryStore()
         self.experience_store = ExperienceStore()
@@ -242,6 +244,7 @@ class _MainLoopImplementation(
         self.restore_value_state()
         self.restore_motivation_state()
         self.restore_decision_state()
+        self.restore_decision_explanation_state()
         self.restore_agency_attribution_state()
         self.restore_counterfactual_state()
         self.restore_self_model_state()

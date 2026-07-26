@@ -14,6 +14,7 @@ const navItems = [
   ["Chat", "/chat"],
   ["Outbox", "/outbox"],
   ["Debug", "/debug"],
+  ["Decisions", "/decisions"],
   ["Memory", "/memory"],
   ["Sleep", "/sleep"],
   ["Datasets", "/datasets"],

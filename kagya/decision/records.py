@@ -17,6 +17,9 @@ class ActionType(StrEnum):
     OBSERVE = "observe"
     REQUEST_INFORMATION = "request_information"
     DELEGATE = "delegate"
+    REFUSE = "refuse"
+    UNABLE = "unable"
+    REPLAN = "replan"
 
 
 class DecisionStatus(StrEnum):
@@ -54,12 +57,16 @@ class ActionCandidate:
     plan_id: str | None = None
     plan_revision: int | None = None
     step_id: str | None = None
-    schema_version: int = 1
+    evidence_refs: tuple[str, ...] = ()
+    goal_refs: tuple[str, ...] = ()
+    commitment_refs: tuple[str, ...] = ()
+    belief_refs: tuple[str, ...] = ()
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         if not self.candidate_id or not self.proposed_action:
             raise ValueError("Candidate ID and proposed action must not be empty")
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError(
                 f"Unsupported action candidate schema version: {self.schema_version}"
             )
@@ -83,6 +90,13 @@ class ActionCandidate:
             raise ValueError("Action candidate Plan references must be complete")
         if self.plan_revision is not None and self.plan_revision < 1:
             raise ValueError("Action candidate Plan revision must be positive")
+        for reference in (
+            *self.evidence_refs,
+            *self.goal_refs,
+            *self.commitment_refs,
+            *self.belief_refs,
+        ):
+            _safe_ref(reference)
 
 
 @dataclass(frozen=True)
@@ -155,12 +169,17 @@ class DecisionRecord:
     boundary_assessment_revision: int | None = None
     boundary_assessment_digest: str | None = None
     boundary_recommendation: str | None = None
-    schema_version: int = 10
+    revision: int = 1
+    goal_revision_refs: dict[str, int] = field(default_factory=dict)
+    commitment_revision_refs: dict[str, int] = field(default_factory=dict)
+    explanation_refs: tuple[str, ...] = ()
+    current_explanation_ref: str | None = None
+    schema_version: int = 11
 
     def __post_init__(self) -> None:
         if not self.decision_id or not self.selected_candidate_id:
             raise ValueError("Decision and selected candidate IDs must not be empty")
-        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}:
+        if self.schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}:
             raise ValueError(
                 f"Unsupported decision record schema version: {self.schema_version}"
             )
@@ -184,6 +203,12 @@ class DecisionRecord:
             raise ValueError("Resolved decision requires outcome and prediction error")
         if _contains_private_key(asdict(self)):
             raise ValueError("Decision record contains a private reasoning field")
+        if self.revision < 1:
+            raise ValueError("Decision revision must be positive")
+        for reference in self.explanation_refs:
+            _safe_ref(reference)
+        if self.current_explanation_ref is not None:
+            _safe_ref(self.current_explanation_ref)
 
 
 ValueEvaluator = Callable[[dict[str, dict[str, float]]], dict[str, dict[str, float]]]
@@ -220,6 +245,8 @@ class DecisionStore:
         identity_origin_refs: dict[str, str] | None = None,
         experience_refs: tuple[str, ...] = (),
         belief_revision_refs: dict[str, int] | None = None,
+        goal_revision_refs: dict[str, int] | None = None,
+        commitment_revision_refs: dict[str, int] | None = None,
         narrative_self_refs: tuple[str, ...] = (),
         metacognition_pre_assessment_id: str | None = None,
         boundary_assessment_id: str | None = None,
@@ -245,6 +272,9 @@ class DecisionStore:
                 ActionType.OBSERVE,
                 ActionType.REQUEST_INFORMATION,
                 ActionType.DELEGATE,
+                ActionType.REFUSE,
+                ActionType.UNABLE,
+                ActionType.REPLAN,
             }
             for item in candidate_values
         ):
@@ -315,6 +345,8 @@ class DecisionStore:
             identity_origin_refs=dict(identity_origin_refs or {}),
             experience_refs=experience_refs,
             belief_revision_refs=dict(belief_revision_refs or {}),
+            goal_revision_refs=dict(goal_revision_refs or {}),
+            commitment_revision_refs=dict(commitment_revision_refs or {}),
             narrative_self_refs=tuple(dict.fromkeys(narrative_self_refs)),
             metacognition_pre_assessment_id=metacognition_pre_assessment_id,
             boundary_assessment_id=boundary_assessment_id,
@@ -370,6 +402,7 @@ class DecisionStore:
         )
         updated = replace(
             record,
+            revision=record.revision + 1,
             status=DecisionStatus.RESOLVED,
             actual_outcome=outcome,
             prediction_error=utility - selected.predicted_utility,
@@ -412,6 +445,7 @@ class DecisionStore:
         )
         updated = replace(
             record,
+            revision=record.revision + 1,
             status=DecisionStatus.RESOLVED,
             actual_outcome=outcome,
             prediction_error=utility - selected.predicted_utility,
@@ -431,6 +465,7 @@ class DecisionStore:
             return record
         updated = replace(
             record,
+            revision=record.revision + 1,
             status=DecisionStatus.AWAITING_OUTCOME,
             actual_outcome=None,
             prediction_error=None,
@@ -469,6 +504,7 @@ class DecisionStore:
         )
         updated = replace(
             record,
+            revision=record.revision + 1,
             actual_outcome=outcome,
             prediction_error=-selected.predicted_utility,
             updated_at=outcome.recorded_at,
@@ -487,6 +523,7 @@ class DecisionStore:
             refs = (*refs, feedback_id)
         updated = replace(
             record,
+            revision=record.revision + 1,
             training_included=not refs,
             training_exclusion_refs=refs,
             updated_at=_now(),
@@ -500,6 +537,7 @@ class DecisionStore:
         record = self.get(decision_id)
         updated = replace(
             record,
+            revision=record.revision + 1,
             value_tradeoff_refs=tuple(
                 dict.fromkeys((*record.value_tradeoff_refs, *tradeoff_ids))
             ),
@@ -516,8 +554,27 @@ class DecisionStore:
         record = self.get(decision_id)
         updated = replace(
             record,
+            revision=record.revision + 1,
             metacognition_post_assessment_id=assessment_id,
             updated_at=_now(),
+        )
+        self.records[decision_id] = updated
+        return updated
+
+    def link_explanation(
+        self, decision_id: str, explanation_id: str, explanation_revision: int
+    ) -> DecisionRecord:
+        if explanation_revision < 1:
+            raise ValueError("Explanation revision must be positive")
+        reference = f"{explanation_id}@{explanation_revision}"
+        _safe_ref(reference)
+        record = self.get(decision_id)
+        updated = replace(
+            record,
+            explanation_refs=tuple(
+                dict.fromkeys((*record.explanation_refs, reference))
+            ),
+            current_explanation_ref=reference,
         )
         self.records[decision_id] = updated
         return updated
@@ -526,6 +583,7 @@ class DecisionStore:
         record = self.get(decision_id)
         updated = replace(
             record,
+            revision=record.revision + 1,
             metacognition_post_assessment_id=None,
             updated_at=_now(),
         )
@@ -637,6 +695,10 @@ def schema_candidate_prompt(situation: str) -> str:
                 "estimated_risk": "0..1",
                 "value_effects": {"value_id": "-1..1"},
                 "appraisal_contributions": {"signal": "-1..1"},
+                "evidence_refs": ["opaque_reference"],
+                "goal_refs": ["goal_id"],
+                "commitment_refs": ["commitment_id"],
+                "belief_refs": ["belief_id"],
             }
         ]
     }
@@ -736,6 +798,10 @@ def _candidate_from_json(payload: Any) -> ActionCandidate:
         "plan_id",
         "plan_revision",
         "step_id",
+        "evidence_refs",
+        "goal_refs",
+        "commitment_refs",
+        "belief_refs",
         "schema_version",
     }
     if set(payload) - allowed:
@@ -749,6 +815,11 @@ def _candidate_from_json(payload: Any) -> ActionCandidate:
     )
     data["value_effects"] = dict(data.get("value_effects", {}))
     data["appraisal_contributions"] = dict(data.get("appraisal_contributions", {}))
+    data["evidence_refs"] = tuple(data.get("evidence_refs", ()))
+    data["goal_refs"] = tuple(data.get("goal_refs", ()))
+    data["commitment_refs"] = tuple(data.get("commitment_refs", ()))
+    data["belief_refs"] = tuple(data.get("belief_refs", ()))
+    data["schema_version"] = 2
     return ActionCandidate(**data)
 
 
@@ -770,7 +841,12 @@ def _record_from_json(payload: dict[str, Any]) -> DecisionRecord:
     data.setdefault("boundary_assessment_revision", None)
     data.setdefault("boundary_assessment_digest", None)
     data.setdefault("boundary_recommendation", None)
-    data["schema_version"] = 10
+    data.setdefault("revision", 1)
+    data.setdefault("goal_revision_refs", {})
+    data.setdefault("commitment_revision_refs", {})
+    data["explanation_refs"] = tuple(data.get("explanation_refs", ()))
+    data.setdefault("current_explanation_ref", None)
+    data["schema_version"] = 11
     evaluations = []
     for raw in data.get("considered_candidates", ()):
         item = dict(raw)
@@ -825,6 +901,19 @@ def _contains_private_key(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_private_key(item) for item in value)
     return False
+
+
+def _safe_ref(value: str) -> None:
+    if (
+        not value
+        or len(value) > 128
+        or any(character in value for character in ("/", "\\", "\x00", "\n", "\r"))
+        or "<think" in value.lower()
+        or any(
+            marker in value.lower() for marker in ("secret", "credential", "raw_prompt")
+        )
+    ):
+        raise ValueError("Reference must be a safe opaque identifier")
 
 
 def _now() -> str:

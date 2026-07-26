@@ -48,7 +48,7 @@ def test_candidate_comparison_tracks_contributions_and_selects_best() -> None:
     assert record.adapter_id == "adapter-1"
     assert record.adapter_hash == "hash-1"
     assert record.activation_sequence == 7
-    assert record.schema_version == 10
+    assert record.schema_version == 11
 
 
 def test_no_op_defer_and_observation_are_regular_candidates() -> None:
@@ -58,6 +58,9 @@ def test_no_op_defer_and_observation_are_regular_candidates() -> None:
         ActionType.OBSERVE,
         ActionType.REQUEST_INFORMATION,
         ActionType.DELEGATE,
+        ActionType.REFUSE,
+        ActionType.UNABLE,
+        ActionType.REPLAN,
     ):
         store = DecisionStore()
         fallback = _fallback_candidate(action_type=action_type)
@@ -182,8 +185,7 @@ def test_v1_record_migrates_without_self_model_contributions() -> None:
     restored.restore(payload)
 
     assert (
-        restored.get("legacy").considered_candidates[0].self_model_contributions
-        == {}
+        restored.get("legacy").considered_candidates[0].self_model_contributions == {}
     )
     assert restored.get("legacy").adapter_id is None
     assert (

@@ -157,6 +157,7 @@ class ActionValidationRecord(_StrictModel):
 
     schema_version: Literal[1] = 1
     validation_id: str
+    decision_id: str | None = None
     intent_id: str | None = None
     tool_name: str
     risk_class: RiskClass | None = None
@@ -236,6 +237,7 @@ class ActionIntent(_StrictModel):
     receipt_id: str | None = None
     failure_code: str | None = None
     validation_record_id: str | None = None
+    explanation_refs: tuple[str, ...] = ()
 
 
 class Observation(_StrictModel):
@@ -280,6 +282,7 @@ class ExecutionReceipt(_StrictModel):
     step_id: str | None = None
     compensation_of: str | None = None
     error_code: str | None = None
+    explanation_refs: tuple[str, ...] = ()
 
 
 class ActionState(_StrictModel):
@@ -439,6 +442,46 @@ class ActionExecutionLayer:
             raise ValueError(f"Unknown action validation record: {validation_id}")
         return record
 
+    def link_explanation(self, decision_id: str, explanation_ref: str) -> None:
+        if (
+            not explanation_ref
+            or len(explanation_ref) > 128
+            or any(
+                character in explanation_ref for character in ("/", "\\", "\n", "\r")
+            )
+        ):
+            raise ValueError("Explanation reference must be a safe opaque identifier")
+        state = self._state()
+        intents = tuple(
+            item.model_copy(
+                update={
+                    "revision": item.revision + 1,
+                    "explanation_refs": tuple(
+                        dict.fromkeys((*item.explanation_refs, explanation_ref))
+                    ),
+                }
+            )
+            if item.provenance.decision_id == decision_id
+            else item
+            for item in state.intents
+        )
+        receipts = tuple(
+            item.model_copy(
+                update={
+                    "explanation_refs": tuple(
+                        dict.fromkeys((*item.explanation_refs, explanation_ref))
+                    )
+                }
+            )
+            if item.decision_id == decision_id
+            else item
+            for item in state.receipts
+        )
+        if intents != state.intents or receipts != state.receipts:
+            self._save(
+                state.model_copy(update={"intents": intents, "receipts": receipts})
+            )
+
     def create_from_decision(
         self,
         decision_id: str,
@@ -495,6 +538,7 @@ class ActionExecutionLayer:
             )
             validation = ActionValidationRecord(
                 validation_id=str(uuid4()),
+                decision_id=decision_id,
                 tool_name=bounded_tool_name,
                 arguments_valid=False,
                 validation_schema_revision=_validation_schema_revision(
@@ -524,6 +568,7 @@ class ActionExecutionLayer:
         spec, validated, error_codes = self._validate_arguments(tool_name, arguments)
         validation = ActionValidationRecord(
             validation_id=str(uuid4()),
+            decision_id=decision_id,
             intent_id=intent_id if validated is not None else None,
             tool_name=tool_name,
             risk_class=None if spec is None else spec.risk,

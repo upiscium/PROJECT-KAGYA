@@ -11,6 +11,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - `KagyaMainLoop` coordinates subsystem inputs and outputs. It is not an alternative state store.
 - The inference host is the authoritative subject in both standalone and future split deployments. Training workers must consume immutable artifacts and cannot mutate memory, emotion, values, goals, decisions, self-model state, or adapter activation directly.
 - Free-form hidden thoughts are not decision authority, capability evidence, or a training target. Public responses, agent-state snapshots, DecisionRecords, and new training datasets exclude them; legacy/internal episodic metadata remains behind the admin and retrieval privacy boundaries.
+- `PublicDecisionExplanation` is a non-authoritative, public-safe projection of one exact DecisionRecord revision. It exposes only strict codes, bounded scores, and validated opaque references already frozen by that Decision and its selected candidate; rendering cannot add decision authority.
 - `IdentityOrigin` separates actor (`self`, user, operator, system, external source, model inference, inherited, unknown), input kind, and endorsement. Caller-declared labels never grant self-origin authority.
 
 ## Identity Origin Boundary
@@ -52,6 +53,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Motivation dynamics | Form persistent Drive, Interest, Desire, Aversion, and bounded intrinsic Goal proposals | `motivation.extensions.dynamics` | Repeated Experience signals, explicit conflict links, elapsed time, and Goal outcomes | `tests/test_motivation_dynamics.py` |
 | Commitment store | Keep proposed requests separate from explicitly self-endorsed responsibilities, including beneficiary, scope, burden, fulfillability, unresolved conflicts, renegotiation, breach, repair, and accountability | `motivation.commitments` | Explicit acceptance and commitment lifecycle events; external requests remain proposed | `tests/test_goal_manager.py`, `tests/test_fastapi_backend.py` |
 | Decision store | Track candidates, predictions, contributions, selection, outcome, and prediction error in one record | `extensions.decision_records` | Schema-constrained candidates and later outcome events | `tests/test_decision_records.py` |
+| Decision explanation | Retain immutable structured public projections and renderer results for exact Decision revisions | `extensions.decision_explanations` | AgentRuntime create/revise/render events over frozen Decision references | `tests/test_decision_explanations.py`, `tests/test_fastapi_backend.py` |
 | Self model | Maintain identity, capabilities, limitations, known unknowns, roles, and references | `identity.self_model` | Resolved declared DecisionRecord outcomes or explicit admin correction; self-reports remain proposals | `tests/test_self_model.py` |
 | Metacognition | Track evidence-backed knowledge/competence boundaries, calibrated confidence, cognitive quality, and recurring error hypotheses | `extensions.metacognition` | Declared capability evidence, resolved Decision outcomes, attention/emotion/load state, and structured operator feedback | `tests/test_metacognition.py` |
 | Identity origin | Separate self endorsement, external evidence/request, and imposed constraints | Embedded in Goal, Commitment, Value evidence/history, identity proposal, and Decision provenance | Typed origin plus explicit endorsement transition | `tests/test_identity_origin.py` |
@@ -68,12 +70,14 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 5. `ValueSystem`, `GoalManager`, and `SelfModel` contribute separate scores to schema-validated `ActionCandidate` records.
 6. Metacognition records a pre-Decision assessment and may steer explicitly scoped choices toward no-op, defer, observation, request-information, or delegation when evidence, competence, or current cognitive quality is insufficient.
 7. `DecisionStore` records all considered candidates, contributions, the selected regular or fallback choice, selection confidence, and the pre-assessment reference.
-8. The DecisionRecord freezes the origin IDs and revisions of active Goals and referenced Values, plus structured Value trade-offs, so later explanation cannot rewrite their authority source.
-9. A later event appends the actual outcome and prediction error to the same `DecisionRecord`; bounded Value reassessment records use that outcome as evidence without allowing one-event reversal.
-10. A post-Decision assessment compares prediction with outcome, updates past-accuracy calibration, records operator feedback provenance, and forms evidence-linked recurring failure or optimism-bias hypotheses only after repeated observations.
-11. Only resolved records whose selected action declared the relevant capability can update capability confidence. Recurring hypotheses are reflected as revisable Narrative Self limitation claims rather than authoritative generated prose.
-12. The completion hook atomically snapshots the resulting subject state.
-13. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
+8. The DecisionRecord freezes the origin IDs and revisions of explicitly referenced Goals, Commitments, Beliefs, and Values, plus structured Value trade-offs, so later explanation cannot rewrite their authority source.
+9. Candidate `value_effects`, `goal_refs`, `commitment_refs`, `belief_refs`, and `evidence_refs` are the only explanation source admission path. Explanation generation never scans all active Values, Goals, Commitments, or Beliefs.
+10. A later event appends the actual outcome and prediction error as a new Decision revision; bounded Value reassessment records use that outcome as evidence without allowing one-event reversal.
+11. Existing explanation revisions remain immutable. A Decision outcome creates a new projection revision with changed-field and outcome codes while retaining the exact prior projection.
+12. A post-Decision assessment compares prediction with outcome, updates past-accuracy calibration, records operator feedback provenance, and forms evidence-linked recurring failure or optimism-bias hypotheses only after repeated observations.
+13. Only resolved records whose selected action declared the relevant capability can update capability confidence. Recurring hypotheses are reflected as revisable Narrative Self limitation claims rather than authoritative generated prose.
+14. The completion hook atomically snapshots the resulting subject state.
+15. The runtime reports success only after `prepared`, atomic snapshot save, and `completed` Journal records are durable. A Journal or snapshot I/O failure fail-stops new subject events and is reconciled on restart.
 
 ## Experience Integration
 
@@ -121,7 +125,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 ## Versioning And Migration
 
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
-- Values, goals, Plans, Steps, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
+- Values, goals, Plans, Steps, commitments, experiences, action candidates, decision records, decision explanations, and self-model state carry their own schema versions or revisions.
 - Legacy flat and v1 Value snapshots migrate to evidence-aware Value schema v2/record schema v3. Goal records migrate to schema v4, Commitment records to schema v3, DecisionRecords to schema v8, and Self Model state to schema v2 at subsystem restore boundaries.
 - Adapter registry entries migrate to schema v11. Legacy drift/behavioral fields never become a passing `IdentityDriftAssessment`; missing, failed, stale, hash-mismatched, or dimension-incomplete evidence remains ineligible.
 - Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
@@ -131,6 +135,10 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Public `POST /api/chat` exposes only the response, opaque episode/Experience/context IDs, emotion, and model metadata.
 - Debug, state, memory, Experience, Belief, value, goal, commitment, decision, self-model, and metacognition inspection require `X-KAGYA-Admin-Token`.
 - Decision candidate generation accepts strict JSON only. Unknown fields and private reasoning keys are rejected.
+- Decision explanation list/get/create/revise/render endpoints are admin-authenticated under `/api/decisions`. This deployment intentionally has no unauthenticated public explanation endpoint because public chat does not establish a durable authorization binding between caller, context, and interlocutor.
+- Admin explanation responses still use only `PublicDecisionExplanation.public_json()`: bounded candidate summaries, actual referenced source IDs/revisions, unavailable/stale codes, uncertainty, policy/approval state, linked current boundary assessment projection, outcomes, and revision links. They never expose source descriptions, propositions, request fingerprints, prompts, memory payloads, attachment content/paths, relationship belief content, credentials, or hidden thought.
+- Context or interlocutor incompatibility removes source contributions and boundary details and records explicit filtering/information-gap codes. Missing, stale, unendorsed, or unavailable references are not replaced by another active record.
+- The deterministic renderer is code/template based and performs no keyword inference. The optional model renderer receives only serialized public-safe explanation JSON and must return exactly `{explanation_id, explanation_revision, visible_explanation}`; malformed output, identity mismatch, new IDs/reason codes, private markers, or provider failure records `renderer_invalid_or_unavailable` and retains deterministic text.
 - Plan ingestion and operator replan endpoints accept strict schema-v1 JSON only. Plan state stores action/condition/observation/verification codes and typed parameters or evidence references, never raw model prose, prompts, hidden reasoning, tool output, or executable handlers.
 - `GET /api/plans` and `GET /api/plans/candidates` inspect current structured state. Plan creation, revision, activation, Step start/completion/failure, and abandonment are admin-only runtime events committed to the snapshot, Journal, and private WAL.
 - Decision-derived training records contain structured candidates, selected action, observed outcome, and prediction error. They do not contain prompts, raw retrieved memory, or hidden thoughts.

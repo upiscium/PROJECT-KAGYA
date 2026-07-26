@@ -62,6 +62,27 @@ export type DebugChatResponse = ChatResponse & {
   emotion_update: { valence_contributions: Record<string, number>; arousal_contributions: Record<string, number>; reasons: string[] };
 };
 
+export type DecisionExplanation = {
+  schema_version: 1;
+  explanation_id: string;
+  revision: number;
+  decision_id: string;
+  decision_revision: number;
+  decision_status: string;
+  disposition: string;
+  selected: { candidate_id: string; action_type: string; eligible: boolean; score: number | null; uncertainty: number; risk: number; disposition_code: string; reason_codes: string[] };
+  major_alternatives: Array<{ candidate_id: string; action_type: string; eligible: boolean; score: number | null; uncertainty: number; risk: number; disposition_code: string; reason_codes: string[] }>;
+  contributions: Array<{ source_type: string; source_id: string; source_revision: number; contribution: number | null; availability: string }>;
+  evidence_refs: string[];
+  uncertainty: Array<{ code: string; severity: number; refs: string[] }>;
+  information_gap_codes: string[];
+  risk: { risk_class: string; policy_status: string; approval_status: string };
+  reason_codes: string[];
+  outcome: { status: string; utility: number | null; prediction_error: number | null };
+  change: { previous_explanation_revision: number | null; changed_fields: string[]; reason_codes: string[] };
+  renderer: { state: string; deterministic_template: string; visible_explanation: string; failure_code: string | null };
+};
+
 export type EpisodeMemory = {
   id: string;
   user_input: string;
@@ -611,6 +632,7 @@ export const api = {
   experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
   experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
   beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
+  decisionExplanations: () => adminRequest<{ explanations: DecisionExplanation[] }>("/decisions/explanations"),
   motivation: () => adminRequest<MotivationState>("/motivation"),
   outboxMessages: () => adminRequest<OutboxMessageListResponse>("/outbox/messages"),
   deliverOutbox: () => adminRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),

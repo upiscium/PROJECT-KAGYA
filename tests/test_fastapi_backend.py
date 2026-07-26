@@ -2404,6 +2404,9 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
             "estimated_risk": 0.1,
             "value_effects": {"honesty": 0.5},
             "appraisal_contributions": {"goal_progress": 0.2},
+            "evidence_refs": [f"experience:{context_response['experience_id']}"],
+            "goal_refs": ["decision-goal"],
+            "belief_refs": ["decision-belief"],
         },
         {
             "candidate_id": "defer",
@@ -2436,15 +2439,15 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert record["triggering_event_id"]
     assert record["triggering_event_sequence"] > 0
     assert record["active_goal_ids"] == ["decision-goal"]
-    assert set(record["value_revision_refs"]) == {"care", "honesty"}
+    assert set(record["value_revision_refs"]) == {"honesty"}
     assert set(record["identity_origin_refs"]) == {
         "belief:decision-belief",
         "goal:decision-goal",
-        "value:care",
         "value:honesty",
     }
     assert len(record["experience_refs"]) == 1
     assert record["belief_revision_refs"] == {"decision-belief": 1}
+    assert record["goal_revision_refs"] == {"decision-goal": 2}
     assert "belief:decision-belief" in record["identity_origin_refs"]
     decision_experience = client.get(
         f"/api/experiences/{record['experience_refs'][0]}", headers=headers
@@ -2458,6 +2461,47 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert record["considered_candidates"][0]["value_contributions"]["honesty"] > 0
     assert record["metacognition_pre_assessment_id"]
     assert record["metacognition_post_assessment_id"] is None
+    explanation_response = client.post(
+        "/api/decisions/decision-api-1/explanations",
+        headers=headers,
+        json={
+            "explanation_id": "explanation-api-1",
+            "context_id": context_id,
+            "idempotency_key": "explanation-create-1",
+        },
+    )
+    assert explanation_response.status_code == 200
+    explanation = explanation_response.json()
+    assert explanation["decision_revision"] == record["revision"]
+    assert explanation["selected"]["candidate_id"] == "respond"
+    assert [item["candidate_id"] for item in explanation["major_alternatives"]] == [
+        "defer"
+    ]
+    assert {
+        (item["source_type"], item["source_id"])
+        for item in explanation["contributions"]
+    } == {
+        ("value", "honesty"),
+        ("goal", "decision-goal"),
+        ("belief", "decision-belief"),
+    }
+    assert not any(item["source_id"] == "care" for item in explanation["contributions"])
+    assert explanation["outcome"]["status"] == "pending"
+    assert explanation["renderer"]["state"] == "deterministic"
+    assert client.get("/api/decisions/explanations").status_code == 401
+    filtered = client.post(
+        "/api/decisions/decision-api-1/explanations",
+        headers=headers,
+        json={
+            "explanation_id": "explanation-filtered",
+            "context_id": "different-context",
+            "interlocutor_id": "different-interlocutor",
+            "idempotency_key": "explanation-filtered-1",
+        },
+    ).json()
+    assert filtered["compatibility"] == "context_filtered"
+    assert filtered["contributions"] == []
+    assert filtered["boundary"] is None
     assert client.get("/api/metacognition").status_code == 401
     pre_assessment = client.get(
         f"/api/metacognition/assessments/{record['metacognition_pre_assessment_id']}",
@@ -2484,6 +2528,39 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert resolved.json()["prediction_error"] == pytest.approx(-0.6)
     assert resolved.json()["actual_outcome"]["observed_event_id"]
     assert resolved.json()["metacognition_post_assessment_id"]
+    revised_explanation = client.get(
+        "/api/decisions/explanations/explanation-api-1", headers=headers
+    ).json()
+    assert revised_explanation["revision"] == 2
+    assert revised_explanation["decision_revision"] == resolved.json()["revision"]
+    assert revised_explanation["outcome"]["status"] == "succeeded"
+    assert "outcome" in revised_explanation["change"]["changed_fields"]
+    serialized_explanation = json.dumps(revised_explanation).lower()
+    for sentinel in (
+        "hidden_thought",
+        "raw_prompt",
+        "<think>",
+        "credential",
+        "attachment_body",
+        "/home/",
+    ):
+        assert sentinel not in serialized_explanation
+    renderer_failure = client.post(
+        "/api/decisions/explanations/explanation-api-1/render",
+        headers=headers,
+        json={
+            "expected_revision": revised_explanation["revision"],
+            "idempotency_key": "explanation-render-1",
+        },
+    )
+    assert renderer_failure.status_code == 200
+    rendered = renderer_failure.json()
+    assert rendered["revision"] == revised_explanation["revision"] + 1
+    assert rendered["renderer"]["state"] == "failed"
+    assert (
+        rendered["renderer"]["visible_explanation"]
+        == revised_explanation["renderer"]["visible_explanation"]
+    )
     metacognition = client.get("/api/metacognition", headers=headers)
     assert metacognition.status_code == 200
     assert metacognition.json()["observations"][0]["decision_id"] == "decision-api-1"
@@ -2511,6 +2588,82 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     assert generated.status_code == 200
     assert generated.json()["candidates"][0]["candidate_type"] == "defer"
     assert "hidden_thought" not in json.dumps(generated.json())
+
+
+def test_decision_explanation_survives_snapshot_wal_and_restart(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    candidate = {
+        "candidate_id": "safe-no-op",
+        "candidate_type": "no_op",
+        "proposed_action": "safe_no_op",
+        "parameters": {},
+        "prerequisites": [],
+        "predicted_outcomes": [],
+        "uncertainty": 0.6,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.0,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    with _client(tmp_path, settings=settings) as client:
+        assert (
+            client.post(
+                "/api/decisions",
+                headers=admin_headers(),
+                json={"decision_id": "restart-decision", "candidates": [candidate]},
+            ).status_code
+            == 200
+        )
+        created = client.post(
+            "/api/decisions/restart-decision/explanations",
+            headers=admin_headers(),
+            json={
+                "explanation_id": "restart-explanation",
+                "idempotency_key": "restart-explanation-create",
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["information_gap_codes"] == ["high_candidate_uncertainty"]
+        failed_render = client.post(
+            "/api/decisions/explanations/restart-explanation/render",
+            headers=admin_headers(),
+            json={
+                "expected_revision": 1,
+                "idempotency_key": "restart-explanation-render",
+            },
+        )
+        assert failed_render.json()["renderer"]["state"] == "failed"
+
+    wal_records = StateWAL(settings.agent_state_wal.path).verify()
+    assert {
+        "decision_explanation_create",
+        "decision_explanation_render",
+    }.issubset({record.event_type for record in wal_records})
+    snapshot_payload = json.loads(settings.agent_state.path.read_text(encoding="utf-8"))
+    persisted = snapshot_payload["extensions"]["decision_explanations"]
+    assert (
+        persisted["records"]["restart-explanation"][-1]["renderer"]["state"] == "failed"
+    )
+    for path in (
+        settings.agent_state.path,
+        settings.agent_state_wal.path,
+        settings.agent_journal.path,
+    ):
+        serialized = path.read_text(encoding="utf-8").lower()
+        assert "<think>" not in serialized
+        assert "debug thought" not in serialized
+        assert "raw_prompt" not in serialized
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get(
+            "/api/decisions/explanations/restart-explanation",
+            headers=admin_headers(),
+        )
+        assert restored.status_code == 200
+        assert restored.json()["revision"] == 2
+        assert restored.json()["renderer"]["state"] == "failed"
 
 
 def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -> None:
