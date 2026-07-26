@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import threading
@@ -30,6 +31,7 @@ from kagya.artifact_provenance import (
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
 _SNAPSHOT_PUBLICATION_LOCK = threading.Lock()
+_IMMUTABLE_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
 
 
 class TransformersProvider:
@@ -66,6 +68,8 @@ class TransformersProvider:
         self.generation_count = 0
         self.resolved_model_revision: str | None = None
         self.resolved_processor_revision: str | None = None
+        self._resolved_model_snapshot: Path | None = None
+        self._resolved_processor_snapshot: Path | None = None
         self.model_artifact_manifest_hash: str | None = None
         self.model_artifact_manifest: Any | None = None
         self.adapter_artifact_manifest_hash: str | None = None
@@ -267,7 +271,12 @@ class TransformersProvider:
             self.processor = AutoProcessor.from_pretrained(
                 self.model_id, revision=self.processor_revision
             )
-            self.resolved_processor_revision = _resolved_revision(self.processor)
+            (
+                self.resolved_processor_revision,
+                self._resolved_processor_snapshot,
+            ) = _resolved_artifact(
+                self.processor, self.model_id, self.processor_revision
+            )
             self._refresh_model_manifest()
         return self.processor
 
@@ -316,7 +325,10 @@ class TransformersProvider:
             )
         model = AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
         if model_id == self.model_id:
-            self.resolved_model_revision = _resolved_revision(model)
+            (
+                self.resolved_model_revision,
+                self._resolved_model_snapshot,
+            ) = _resolved_artifact(model, self.model_id, self.model_revision)
             self._refresh_model_manifest()
         return model
 
@@ -324,19 +336,13 @@ class TransformersProvider:
         if (
             self.resolved_model_revision is None
             or self.resolved_processor_revision is None
+            or self._resolved_model_snapshot is None
+            or self._resolved_processor_snapshot is None
         ):
             return
-        model_snapshot = _snapshot_path(
-            self.model, self.model_id, self.resolved_model_revision
-        )
-        processor_snapshot = _snapshot_path(
-            self.processor, self.model_id, self.resolved_processor_revision
-        )
-        if model_snapshot is None or processor_snapshot is None:
-            return
         manifest = build_model_artifact_manifest(
-            model_snapshot,
-            processor_snapshot=processor_snapshot,
+            self._resolved_model_snapshot,
+            processor_snapshot=self._resolved_processor_snapshot,
             model_id=self.model_id,
             requested_revision=self.model_revision,
             resolved_revision=self.resolved_model_revision,
@@ -600,7 +606,9 @@ def _plain_generation_prompt(prompt: str) -> str:
     )
 
 
-def _resolved_revision(value: Any) -> str | None:
+def _resolved_artifact(
+    value: Any, model_id: str, requested_revision: str
+) -> tuple[str | None, Path | None]:
     candidates = (
         getattr(getattr(value, "config", None), "_commit_hash", None),
         getattr(value, "_commit_hash", None),
@@ -608,25 +616,36 @@ def _resolved_revision(value: Any) -> str | None:
         if isinstance(getattr(value, "init_kwargs", None), dict)
         else None,
     )
-    return next((str(item) for item in candidates if item), None)
-
-
-def _snapshot_path(artifact: Any, model_id: str, revision: str) -> Path | None:
-    candidates = (
-        getattr(getattr(artifact, "config", None), "_name_or_path", None),
-        getattr(artifact, "name_or_path", None),
-    )
-    local = next(
-        (path for item in candidates if item and (path := Path(str(item))).is_dir()),
+    explicit = next(
+        (
+            str(item).lower()
+            for item in candidates
+            if item and _IMMUTABLE_COMMIT.fullmatch(str(item))
+        ),
         None,
     )
-    if local is not None:
-        return local
+    snapshot = _snapshot_path(model_id, requested_revision)
+    if snapshot is None:
+        return explicit, None
+    snapshot_commit = snapshot.name.lower()
+    if explicit is not None and explicit != snapshot_commit:
+        return explicit, None
+    return explicit or snapshot_commit, snapshot
+
+
+def _snapshot_path(model_id: str, revision: str) -> Path | None:
     try:
         from huggingface_hub import snapshot_download
 
-        return Path(
+        snapshot = Path(
             snapshot_download(model_id, revision=revision, local_files_only=True)
-        )
+        ).expanduser().resolve(strict=True)
     except (ImportError, OSError):
         return None
+    if (
+        not snapshot.is_dir()
+        or snapshot.parent.name != "snapshots"
+        or not _IMMUTABLE_COMMIT.fullmatch(snapshot.name)
+    ):
+        return None
+    return snapshot

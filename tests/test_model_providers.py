@@ -285,6 +285,126 @@ def test_transformers_provider_loads_configured_model_id(
     assert loaded["model_kwargs"]["revision"] == settings.model.revision
 
 
+def test_transformers_provider_resolves_missing_commit_hash_from_cached_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    commit = "1" * 40
+    snapshot = _cached_snapshot(tmp_path, commit, with_weights=True)
+    settings = _settings_with_revisions(commit, commit)
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        lambda *args, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda *args, **kwargs: str(snapshot)
+    )
+
+    provider = TransformersProvider(settings)
+    provider.get_model()
+
+    assert provider.resolved_model_revision == commit
+
+
+def test_transformers_provider_does_not_trust_requested_mutable_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    commit = "2" * 40
+    snapshot = _cached_snapshot(tmp_path, commit, with_weights=True)
+    settings = _settings_with_revisions("main", "main")
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        lambda *args, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda *args, **kwargs: str(snapshot)
+    )
+
+    provider = TransformersProvider(settings)
+    provider.get_model()
+
+    assert provider.resolved_model_revision == commit
+    assert provider.resolved_model_revision != settings.model.revision
+
+
+def test_transformers_provider_detects_wrong_cached_snapshot_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requested = "3" * 40
+    actual = "4" * 40
+    snapshot = _cached_snapshot(tmp_path, actual, with_weights=True)
+    settings = _settings_with_revisions(requested, requested)
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        lambda *args, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda *args, **kwargs: str(snapshot)
+    )
+
+    provider = TransformersProvider(settings)
+    provider.get_model()
+
+    assert provider.resolved_model_revision == actual
+    assert provider.resolved_model_revision != requested
+
+
+def test_transformers_provider_rejects_arbitrary_local_snapshot_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requested = "7" * 40
+    local_model = tmp_path / "local-model"
+    local_model.mkdir()
+    settings = _settings_with_revisions(requested, requested)
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        lambda *args, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda *args, **kwargs: str(local_model)
+    )
+
+    provider = TransformersProvider(settings)
+    provider.get_model()
+
+    assert provider.resolved_model_revision is None
+    assert provider.model_artifact_manifest is None
+
+
+def test_transformers_provider_resolves_processor_snapshot_independently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_commit = "5" * 40
+    processor_commit = "6" * 40
+    model_snapshot = _cached_snapshot(tmp_path, model_commit, with_weights=True)
+    processor_snapshot = _cached_snapshot(tmp_path, processor_commit)
+    settings = _settings_with_revisions(model_commit, processor_commit)
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        lambda *args, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(
+        "kagya.models.transformers_provider.AutoProcessor.from_pretrained",
+        lambda *args, **kwargs: FakeProcessor(),
+    )
+    snapshots = {
+        model_commit: model_snapshot,
+        processor_commit: processor_snapshot,
+    }
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda *args, **kwargs: str(snapshots[kwargs["revision"]]),
+    )
+
+    provider = TransformersProvider(settings)
+    provider.get_model()
+    provider.get_processor()
+
+    assert provider.resolved_model_revision == model_commit
+    assert provider.resolved_processor_revision == processor_commit
+    assert provider.model_artifact_manifest is not None
+    assert provider.model_artifact_manifest.processor_resolved_revision == processor_commit
+
+
 def test_transformers_provider_uses_fallback_when_primary_load_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -573,3 +693,26 @@ def test_adapter_paths_must_be_approved_by_registry(tmp_path: Path) -> None:
 
     assert is_registry_approved_adapter(settings, adapter_path)
     assert not is_registry_approved_adapter(settings, tmp_path / "unregistered")
+
+
+def _settings_with_revisions(model_revision: str, processor_revision: str):
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={
+            "model": settings.model.model_copy(
+                update={
+                    "revision": model_revision,
+                    "processor_revision": processor_revision,
+                }
+            )
+        }
+    )
+
+
+def _cached_snapshot(tmp_path: Path, commit: str, *, with_weights: bool = False) -> Path:
+    snapshot = tmp_path / "models--test--model" / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    if with_weights:
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+    return snapshot
