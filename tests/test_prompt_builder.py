@@ -114,8 +114,10 @@ def test_prompt_distinguishes_temporary_deferral_from_refusal() -> None:
 def test_prompt_reserves_request_information_for_input_without_deferral() -> None:
     prompt = _build_prompt("hello")
 
+    assert "complete observation or statement that needs no missing input" in prompt
+    assert "required to safely answer or proceed, not for optional curiosity" in prompt
     assert "ask for that input without explicitly postponing" in prompt
-    assert "asking for input alone is not defer" in prompt
+    assert "Asking for input alone is not defer" in prompt
 
 
 def test_prompt_class_criteria_do_not_embed_response_demonstrations() -> None:

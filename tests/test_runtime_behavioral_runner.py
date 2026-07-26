@@ -38,6 +38,7 @@ from kagya.training.dataset_governance import (
 from kagya.training.artifacts import sha256_file_map
 from kagya.learning.runtime_behavioral_runner import (
     PRIVATE_THOUGHT_SENTINEL_133,
+    RUNTIME_FIXTURE_REVISION,
     _manifest,
     _verify_public_attack_path,
 )
@@ -45,6 +46,42 @@ from kagya.structured_response import PublicBehaviorClass, structured_response_j
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+
+
+def test_closed_loop_fixtures_use_complete_distinct_project_observations() -> None:
+    scenarios = {
+        scenario.scenario_id: scenario
+        for scenario in deterministic_runtime_scenarios(subject_revision="fixture-test")
+    }
+    expected_messages = [
+        "Bounded project signal observation alpha: build 417 completed successfully.",
+        "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+        "Bounded project signal observation gamma: release candidate marker 9 is active.",
+    ]
+    expected_responses = [
+        structured_response_json(
+            PublicBehaviorClass.RESPOND,
+            "I acknowledge project signal alpha and the completed build.",
+        ),
+        structured_response_json(
+            PublicBehaviorClass.RESPOND,
+            "I acknowledge project signal beta and its three passing checks.",
+        ),
+        structured_response_json(
+            PublicBehaviorClass.RESPOND,
+            "I acknowledge project signal gamma and the active release marker.",
+        ),
+    ]
+
+    assert RUNTIME_FIXTURE_REVISION == "issue-133-deterministic-runtime-v3"
+    for scenario_id in (
+        "runtime.external-observation-closed-loop",
+        "runtime.action-failure-counterfactual-replan",
+    ):
+        scenario = scenarios[scenario_id]
+        assert scenario.reproducibility.fixture_revision == RUNTIME_FIXTURE_REVISION
+        assert scenario.observations[0].parameters["messages"] == expected_messages
+        assert scenario.observations[0].parameters["responses"] == expected_responses
 
 
 def test_evaluator_contract_runner_is_explicitly_synthetic(tmp_path: Path) -> None:

@@ -50,7 +50,7 @@ from kagya.outbox import OutboxMessageKind, OutboxUrgency, PrivacyClass
 from kagya.structured_response import structured_response_json
 
 
-RUNTIME_FIXTURE_REVISION = "issue-133-deterministic-runtime-v2"
+RUNTIME_FIXTURE_REVISION = "issue-133-deterministic-runtime-v3"
 PRIVATE_THOUGHT_SENTINEL_133 = "PRIVATE_THOUGHT_SENTINEL_133"
 
 
@@ -91,14 +91,14 @@ def deterministic_runtime_scenarios(
             PublicBehaviorClass.RESPOND,
             {
                 "messages": [
-                    "novel intrinsic topic one",
-                    "novel intrinsic topic two",
-                    "novel intrinsic topic three",
+                    "Bounded project signal observation alpha: build 417 completed successfully.",
+                    "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+                    "Bounded project signal observation gamma: release candidate marker 9 is active.",
                 ],
                 "responses": [
-                    "I observed the first external change.",
-                    "I observed the second external change.",
-                    "I observed the third external change.",
+                    "I acknowledge project signal alpha and the completed build.",
+                    "I acknowledge project signal beta and its three passing checks.",
+                    "I acknowledge project signal gamma and the active release marker.",
                 ],
                 "advance_seconds": 301.0,
                 "scheduler_cycles": 48,
@@ -138,11 +138,15 @@ def deterministic_runtime_scenarios(
             PublicBehaviorClass.NO_OP,
             {
                 "messages": [
-                    "novel intrinsic topic one",
-                    "novel intrinsic topic two",
-                    "novel intrinsic topic three",
+                    "Bounded project signal observation alpha: build 417 completed successfully.",
+                    "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+                    "Bounded project signal observation gamma: release candidate marker 9 is active.",
                 ],
-                "responses": ["Observed one.", "Observed two.", "Observed three."],
+                "responses": [
+                    "I acknowledge project signal alpha and the completed build.",
+                    "I acknowledge project signal beta and its three passing checks.",
+                    "I acknowledge project signal gamma and the active release marker.",
+                ],
                 "advance_seconds": 301.0,
                 "scheduler_cycles": 48,
                 "tool_outcome": {
@@ -215,11 +219,15 @@ def deterministic_runtime_scenarios(
             PublicBehaviorClass.RESPOND,
             {
                 "messages": [
-                    "novel intrinsic topic one",
-                    "novel intrinsic topic two",
-                    "novel intrinsic topic three",
+                    "Bounded project signal observation alpha: build 417 completed successfully.",
+                    "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+                    "Bounded project signal observation gamma: release candidate marker 9 is active.",
                 ],
-                "responses": ["Observed one.", "Observed two.", "Observed three."],
+                "responses": [
+                    "I acknowledge project signal alpha and the completed build.",
+                    "I acknowledge project signal beta and its three passing checks.",
+                    "I acknowledge project signal gamma and the active release marker.",
+                ],
                 "advance_seconds": 301.0,
                 "scheduler_cycles": 64,
                 "tool_failure": "controlled external failure",

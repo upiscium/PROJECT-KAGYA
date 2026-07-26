@@ -3310,9 +3310,15 @@ def test_intrinsic_proposal_is_autonomously_endorsed_planned_and_adopted(
     with _client(tmp_path, settings=settings) as client:
         first = client.post(
             "/api/chat",
-            json={"text": "novel intrinsic topic one", "attachments": []},
+            json={
+                "text": "Bounded project signal observation alpha: build 417 completed successfully.",
+                "attachments": [],
+            },
         ).json()
-        for text in ("novel intrinsic topic two", "novel intrinsic topic three"):
+        for text in (
+            "Bounded project signal observation beta: verification batch 23 recorded three passing checks.",
+            "Bounded project signal observation gamma: release candidate marker 9 is active.",
+        ):
             assert (
                 client.post(
                     "/api/chat",
