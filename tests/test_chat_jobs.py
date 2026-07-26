@@ -31,6 +31,13 @@ def _wait(registry: ChatJobRegistry, operation_id: str, timeout: float = 3.0):
             OperationState.FAILED,
             OperationState.CANCELED,
         }:
+            if (
+                record.status.status == OperationState.COMPLETED
+                and record.terminal_projection_state
+                in {"pending", "projection_failed"}
+            ):
+                time.sleep(0.01)
+                continue
             return record
         time.sleep(0.01)
     raise AssertionError("chat job did not become terminal")
@@ -753,6 +760,9 @@ def test_restart_terminal_event_id_exceeds_persisted_high_water_mark(
 
     values = json.loads(path.read_text())
     values[0]["last_stream_sequence"] = 10_000
+    values[0]["terminal_projection_start_sequence"] = None
+    values[0]["terminal_projection_event_count"] = 0
+    values[0]["terminal_projection_state"] = "none"
     values[0]["status"].update(
         status=terminal_state.value,
         status_sequence=20,
@@ -944,7 +954,7 @@ def test_v1_record_migrates_without_inventing_cancel_authority(tmp_path: Path) -
     restarted_runtime.shutdown()
 
     assert migrated is not None
-    assert migrated.schema_version == 2
+    assert migrated.schema_version == 3
     assert migrated.requested_cancel_code is None
     assert migrated.cancel_requested_at is None
 

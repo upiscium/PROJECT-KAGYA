@@ -25,6 +25,7 @@ from kagya.operation_status import (
     OperationStatus,
     operation_now,
 )
+from kagya.chat_projection import ChatProjectionPublisher
 from kagya.runtime import (
     AgentEventOutcome,
     AgentEventType,
@@ -40,7 +41,7 @@ from kagya.runtime import (
 class ChatJobRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     status: OperationStatus
     enqueue_sequence: int = Field(ge=1)
     client_id: str = Field(min_length=1, max_length=128)
@@ -53,6 +54,11 @@ class ChatJobRecord(BaseModel):
     requested_cancel_code: OperationCancelCode | None = None
     cancel_requested_at: datetime | None = None
     timeout_deadline: datetime | None = None
+    terminal_projection_start_sequence: int | None = Field(default=None, ge=1)
+    terminal_projection_event_count: int = Field(default=0, ge=0)
+    terminal_projection_state: Literal[
+        "none", "pending", "published", "projection_failed"
+    ] = "none"
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,7 @@ class ChatJobRegistry:
         self._replay_stop = Event()
         self._replay_thread: Thread | None = None
         self._replay_complete_callback: ReplayCompleteCallback | None = None
+        self._projection = ChatProjectionPublisher(self)
         self._key = self._load_key()
         self._load()
         self._missing_required_event_ids = self.required_event_ids - {
@@ -146,6 +153,7 @@ class ChatJobRegistry:
         """Start queued replay without blocking API process startup."""
 
         invoke_callback = False
+        self._projection.start()
         with self._lock:
             if completion_callback is not None:
                 self._replay_complete_callback = completion_callback
@@ -177,6 +185,7 @@ class ChatJobRegistry:
         idempotency_key: str,
         correlation_id: str,
     ) -> tuple[ChatJobRecord, bool]:
+        self._projection.start()
         client_id = _safe_identity(client_id)
         idempotency_key = _safe_identity(idempotency_key)
         with self._lock:
@@ -236,6 +245,15 @@ class ChatJobRegistry:
         with self._lock:
             return self._errors.get(operation_id)
 
+    def projection_pending(self, operation_id: str) -> bool:
+        with self._lock:
+            record = self._records.get(operation_id)
+            return bool(
+                record is not None
+                and record.terminal_projection_state
+                in {"pending", "projection_failed"}
+            )
+
     @property
     def is_ready(self) -> bool:
         return (
@@ -262,6 +280,9 @@ class ChatJobRegistry:
             ]
         for operation_id in cancellable:
             self.cancel(operation_id, OperationCancelCode.SHUTDOWN)
+
+    def close(self) -> None:
+        self._projection.shutdown()
 
     def cancel(self, operation_id: str, code: OperationCancelCode) -> str:
         with self._lock:
@@ -455,6 +476,8 @@ class ChatJobRegistry:
                         {"code": OperationErrorCode.INTERRUPTED.value},
                     )
             else:
+                if record.terminal_projection_start_sequence is not None:
+                    continue
                 self._emit(
                     operation_id,
                     "status",
@@ -674,9 +697,71 @@ class ChatJobRegistry:
             except Exception:
                 pass
         self._transition(operation_id, OperationState.COMPLETED)
-        for chunk in _public_chunks(str(result.get("response", ""))):
-            self._emit(operation_id, "token", {"text": chunk})
-        self._emit(operation_id, "final", result)
+        chunks = _public_chunks(str(result.get("response", "")))
+        record = self._records[operation_id]
+        start = self._event_sequences.get(operation_id, 0) + 1
+        count = len(chunks) + 1
+        record.terminal_projection_start_sequence = start
+        record.terminal_projection_event_count = count
+        record.terminal_projection_state = "pending"
+        record.last_stream_sequence = start + count - 1
+        self._event_sequences[operation_id] = record.last_stream_sequence
+        self._persist()
+        self._projection.publish_terminal(operation_id)
+
+    def pending_projection_ids(self) -> list[str]:
+        with self._lock:
+            return [
+                record.status.operation_id
+                for record in self._records.values()
+                if record.terminal_projection_start_sequence is not None
+                and record.terminal_projection_state
+                in {"pending", "projection_failed"}
+            ]
+
+    def projection_ids_for_recovery(self) -> list[str]:
+        with self._lock:
+            return [
+                record.status.operation_id
+                for record in self._records.values()
+                if record.terminal_projection_start_sequence is not None
+            ]
+
+    def publish_terminal_projection(self, operation_id: str) -> None:
+        with self._changed:
+            record = self._records[operation_id]
+            start = record.terminal_projection_start_sequence
+            if start is None or record.result is None:
+                return
+            chunks = _public_chunks(str(record.result.get("response", "")))
+            if record.terminal_projection_event_count != len(chunks) + 1:
+                raise ValueError("terminal projection metadata does not match result")
+            events = self._events.setdefault(
+                operation_id, deque(maxlen=self.replay_limit)
+            )
+            existing = {event.event_id for event in events}
+            bundle = [
+                ChatStreamEvent(start + index, "token", {"text": chunk})
+                for index, chunk in enumerate(chunks)
+            ]
+            bundle.append(
+                ChatStreamEvent(start + len(chunks), "final", record.result)
+            )
+            for event in bundle:
+                if event.event_id not in existing:
+                    events.append(event)
+            if record.terminal_projection_state != "published":
+                record.terminal_projection_state = "published"
+                self._persist()
+            self._changed.notify_all()
+
+    def mark_projection_failed(self, operation_id: str) -> None:
+        with self._lock:
+            record = self._records.get(operation_id)
+            if record is None or record.terminal_projection_state == "published":
+                return
+            record.terminal_projection_state = "projection_failed"
+            self._persist()
 
     def _enter_finalizing(self, operation_id: str, token: CancellationToken) -> None:
         with self._lock:
@@ -791,13 +876,14 @@ class ChatJobRegistry:
             return
         values = json.loads(self.path.read_text(encoding="utf-8"))
         for value in values:
-            if value.get("schema_version", 1) == 1:
-                value.update(
-                    schema_version=2,
-                    requested_cancel_code=None,
-                    cancel_requested_at=None,
-                    timeout_deadline=None,
-                )
+            if value.get("schema_version", 1) in {1, 2}:
+                value["schema_version"] = 3
+                value.setdefault("requested_cancel_code", None)
+                value.setdefault("cancel_requested_at", None)
+                value.setdefault("timeout_deadline", None)
+                value.setdefault("terminal_projection_start_sequence", None)
+                value.setdefault("terminal_projection_event_count", 0)
+                value.setdefault("terminal_projection_state", "none")
         records = [ChatJobRecord.model_validate(value) for value in values]
         self._records = {record.status.operation_id: record for record in records}
         self._enqueue_sequence = max(

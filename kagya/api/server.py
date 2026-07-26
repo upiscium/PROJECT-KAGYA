@@ -226,6 +226,19 @@ def teardown_subject_runtime(app: FastAPI) -> None:
                 getattr(component, shutdown_method)()
             except Exception as exc:
                 failures.append(exc)
+    registry = getattr(app.state, "chat_job_registry", None)
+    if registry is not None:
+        try:
+            registry.close()
+        except Exception as exc:
+            failures.append(exc)
+    for name in (
+        "autonomy_loop",
+        "sleep_coordinator",
+        "emotion_timer",
+        "chat_job_registry",
+        "agent_runtime",
+    ):
         setattr(app.state, name, None)
     for name in ("model_provider", "memory_system", "training_dispatcher"):
         component = getattr(app.state, name, None)
