@@ -337,10 +337,13 @@ def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> 
     )
 
     restarted_runtime = AgentRuntime(queue_capacity=2)
-    restarted_runtime.start()
     restarted = ChatJobRegistry(
         second_path, restarted_runtime, lambda payload: {"response": "safe-result"}
     )
+    assert restarted.is_ready is False
+    restarted_runtime.start()
+    restarted.activate()
+    assert restarted.is_ready is True
     completed = _wait(restarted, job.status.operation_id)
     restarted_runtime.shutdown()
     first_registry.cancel(job.status.operation_id, OperationCancelCode.SHUTDOWN)
@@ -349,6 +352,67 @@ def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> 
 
     assert completed.status.status == OperationState.COMPLETED
     assert "PRIVATE_SENTINEL" not in second_path.read_text()
+
+
+def test_activate_replays_queued_jobs_once_in_enqueue_order(tmp_path: Path) -> None:
+    source_path = tmp_path / "source" / "jobs.json"
+    replay_path = tmp_path / "replay" / "jobs.json"
+    source_runtime = AgentRuntime(queue_capacity=4)
+    source_runtime.start()
+    release = Event()
+    source_runtime.submit(
+        AgentEventType.STATE_SNAPSHOT,
+        source="test.blocker",
+        handler=lambda: release.wait(2),
+    )
+    source_registry = ChatJobRegistry(source_path, source_runtime, _result)
+    jobs = [
+        source_registry.enqueue(
+            {"text": str(index)},
+            client_id="client",
+            idempotency_key=f"replay-{index}",
+            correlation_id="context",
+        )[0]
+        for index in range(3)
+    ]
+    replay_path.parent.mkdir(parents=True)
+    shutil.copy2(source_path, replay_path)
+    shutil.copy2(
+        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
+    )
+
+    executions: list[tuple[str, int | None]] = []
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        event = current_agent_event()
+        assert event is not None
+        executions.append((str(payload["text"]), event.processing_sequence))
+        return _result(payload)
+
+    replay_runtime = AgentRuntime(queue_capacity=1)
+    replay_registry = ChatJobRegistry(replay_path, replay_runtime, execute)
+    assert replay_registry.is_ready is False
+    replay_runtime.start()
+    replay_registry.activate()
+    replay_registry.activate()
+    completed = [
+        _wait(replay_registry, job.status.operation_id) for job in jobs
+    ]
+    replay_runtime.shutdown()
+    source_registry.cancel(jobs[0].status.operation_id, OperationCancelCode.SHUTDOWN)
+    source_registry.cancel(jobs[1].status.operation_id, OperationCancelCode.SHUTDOWN)
+    source_registry.cancel(jobs[2].status.operation_id, OperationCancelCode.SHUTDOWN)
+    release.set()
+    source_runtime.shutdown()
+
+    assert replay_registry.is_ready is True
+    assert [item.result["response"] for item in completed if item.result] == [
+        "0",
+        "1",
+        "2",
+    ]
+    assert [text for text, _sequence in executions] == ["0", "1", "2"]
+    assert [sequence for _text, sequence in executions] == [1, 2, 3]
 
 
 def test_fresh_registry_promotes_journal_committed_finalizing_result(
@@ -458,6 +522,7 @@ def test_missing_journal_accepted_spool_fails_registry_readiness(
         _result,
         required_event_ids={"accepted-without-spool"},
     )
+    registry.activate()
     runtime.shutdown()
 
     assert registry.is_ready is False
@@ -605,6 +670,7 @@ def test_fresh_registry_fails_closed_on_ambiguous_commit(tmp_path: Path) -> None
         _result,
         recovery_dispositions={job.status.event_id: "ambiguous"},
     )
+    restarted.activate()
     recovered = restarted.get(job.status.operation_id)
     restarted_runtime.shutdown()
 

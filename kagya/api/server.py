@@ -493,6 +493,10 @@ def _activate_subject_runtime(app: FastAPI) -> None:
     if runtime is None:
         raise RuntimeError("offline subject runtime graph is unavailable")
     runtime.start()
+    registry = getattr(app.state, "chat_job_registry", None)
+    if registry is None:
+        raise RuntimeError("offline chat job registry is unavailable")
+    registry.activate()
     autonomy = getattr(app.state, "autonomy_loop", None)
     if autonomy is not None:
         autonomy.start()
