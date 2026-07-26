@@ -3,7 +3,7 @@
 from collections.abc import Iterator
 import json
 from threading import RLock
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -13,6 +13,7 @@ from kagya.api.observability import RuntimeEventLog
 from kagya.api.dependencies import get_agent_runtime
 from kagya.api.schemas.chat import (
     ChatCancelResponse,
+    ChatCancelDisposition,
     ChatJobAccepted,
     ChatJobResult,
     ChatJobStatus,
@@ -165,7 +166,9 @@ def cancel_chat_job(
     record = _required_job(registry, operation_id)
     if disposition == "already_finalizing":
         raise HTTPException(status_code=409, detail="already_finalizing")
-    return ChatCancelResponse(disposition=disposition, operation=record.status)
+    return ChatCancelResponse(
+        disposition=cast(ChatCancelDisposition, disposition), operation=record.status
+    )
 
 
 @router.get("/chat/jobs/{operation_id}/events")

@@ -37,6 +37,8 @@ export type OperationStatus = {
 };
 export type ChatJobAccepted = { operation: OperationStatus; status_url: string; result_url: string; events_url: string; duplicate: boolean };
 export type ChatJobResult = { operation: OperationStatus; result: ChatResponse };
+export type ChatCancelDisposition = "canceled" | "cancel_requested" | "already_completed" | "failed";
+export type ChatCancelResponse = { disposition: ChatCancelDisposition; operation: OperationStatus };
 export type FeedbackSignal = "good" | "bad" | "factual_error" | "style_problem" | "unsafe_behavior" | "remember" | "do_not_remember" | "correction" | "expected_answer" | "exclude_from_training";
 export type FeedbackResponse = {
   feedback_id: string;
@@ -555,7 +557,7 @@ async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {
   if (adminCsrfToken && (init?.method ?? "GET") !== "GET") {
     headers.set("X-KAGYA-CSRF-Token", adminCsrfToken);
   }
-  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, { ...init, headers });
+  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, { ...init, headers }, true);
 }
 
 export function initializeAdminSession(): Promise<void> {
@@ -564,7 +566,7 @@ export function initializeAdminSession(): Promise<void> {
   }).then(async (response) => {
     if (!response.ok) {
       const detail = await readErrorDetail(response);
-      throw new ApiError(formatHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
+      throw new ApiError(formatAdminHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
     }
     const body = await response.json() as { csrfToken: string };
     adminCsrfToken = body.csrfToken;
@@ -575,7 +577,7 @@ export function initializeAdminSession(): Promise<void> {
   return adminSessionPromise;
 }
 
-async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
+async function requestUrl<T>(url: string, init?: RequestInit, admin = false): Promise<T> {
   let response: Response;
   try {
     response = await fetch(url, {
@@ -587,7 +589,10 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const detail = await readErrorDetail(response);
-    throw new ApiError(formatHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
+    const message = admin
+      ? formatAdminHttpError(response.status, response.statusText, detail)
+      : formatPublicHttpError(response.status, response.statusText, detail);
+    throw new ApiError(message, response.status, response.statusText, detail);
   }
   return response.json() as Promise<T>;
 }
@@ -687,7 +692,17 @@ async function readErrorDetail(response: Response): Promise<string> {
   }
 }
 
-function formatHttpError(status: number, statusText: string, detail: string): string {
+function formatPublicHttpError(status: number, statusText: string, detail: string): string {
+  if (status === 503) {
+    return detail ? `Chat service is temporarily unavailable: ${detail}` : "Chat service is temporarily unavailable.";
+  }
+  if (status >= 500) {
+    return detail ? `Backend failed: ${detail}` : `Backend failed with ${status} ${statusText}.`;
+  }
+  return detail ? `${status} ${statusText}: ${detail}` : `${status} ${statusText}`;
+}
+
+function formatAdminHttpError(status: number, statusText: string, detail: string): string {
   if (status === 401 || status === 403) {
     return detail ? `Admin access denied: ${detail}` : "Admin access denied. Check the admin token or private access boundary.";
   }
@@ -718,9 +733,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+async function cancelChatJob(operationId: string): Promise<ChatCancelResponse> {
+  const response = await request<ChatCancelResponse>(`/api/chat/jobs/${encodeURIComponent(operationId)}`, { method: "DELETE" });
+  if (!["canceled", "cancel_requested", "already_completed", "failed"].includes(response.disposition)) {
+    throw new ApiError("Unknown cancellation disposition");
+  }
+  return response;
+}
+
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
-  cancelChatJob: (operationId: string) => request<{ disposition: string; operation: OperationStatus }>(`/api/chat/jobs/${encodeURIComponent(operationId)}`, { method: "DELETE" }),
+  chatJobResult: (operationId: string) => request<ChatJobResult>(`/api/chat/jobs/${encodeURIComponent(operationId)}/result`),
+  cancelChatJob,
   feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),

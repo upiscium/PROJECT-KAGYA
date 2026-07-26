@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
@@ -171,7 +171,7 @@ describe("ChatClient", () => {
           },
         });
       })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "cancel_requested", operation: canceled }) });
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "canceled", operation: canceled }) });
     renderWithQuery();
 
     await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
@@ -182,6 +182,56 @@ describe("ChatClient", () => {
     expect(await screen.findByText("Canceled")).toBeInTheDocument();
     expect(screen.queryByText("partial")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("KAGYA is generating a response")).not.toBeInTheDocument();
+  });
+
+  it("keeps SSE active after cancel_requested and accepts normal completion", async () => {
+    const running = operationStatus("running");
+    const result = chatResult("Completed after cancel race");
+    const encoder = new TextEncoder();
+    let stream: ReadableStreamDefaultController<Uint8Array>;
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation: running, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(controller) { stream = controller; controller.enqueue(encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(running)}\n\n`)); } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "cancel_requested", operation: { ...running, cancel_requested: true } }) });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Cancellation requested...")).toBeInTheDocument();
+    stream!.enqueue(encoder.encode(`id: 2\nevent: final\ndata: ${JSON.stringify(result)}\n\n`));
+    stream!.close();
+
+    expect(await screen.findByText("Completed after cancel race")).toBeInTheDocument();
+    expect(screen.queryByText("Canceled")).not.toBeInTheDocument();
+  });
+
+  it("recovers already_completed result without showing canceled", async () => {
+    const running = operationStatus("running");
+    const completed = { ...operationStatus("canceled"), status: "completed" as const, cancel_code: null, result_available: true };
+    const result = chatResult("Recovered completed result");
+    const encoder = new TextEncoder();
+    let stream: ReadableStreamDefaultController<Uint8Array>;
+    let resolveResult: ((value: unknown) => void) | undefined;
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation: running, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(controller) { stream = controller; controller.enqueue(encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(running)}\n\n`)); } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "already_completed", operation: completed }) })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveResult = resolve; }));
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    stream!.enqueue(encoder.encode(`id: 2\nevent: final\ndata: ${JSON.stringify(result)}\n\n`));
+    stream!.close();
+    resolveResult!({ ok: true, json: async () => ({ operation: completed, result }) });
+
+    expect(await screen.findByText("Recovered completed result")).toBeInTheDocument();
+    expect(screen.getAllByText("Recovered completed result")).toHaveLength(1);
+    expect(screen.queryByText("Canceled")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls[3][0]).toBe("/api-proxy/chat/jobs/job-1/result");
   });
 
   it("explains when cancellation loses the finalizing race", async () => {
@@ -205,6 +255,22 @@ describe("ChatClient", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
 
     expect(await screen.findByText("The response is already being committed and can no longer be canceled.")).toBeInTheDocument();
+  });
+
+  it("shows a typed failure for failed cancellation disposition", async () => {
+    const running = operationStatus("running");
+    const encoder = new TextEncoder();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation: running, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockResolvedValueOnce({ ok: true, body: new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(running)}\n\n`)); } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "failed", operation: { ...running, status: "failed" } }) });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText("Cancellation failed")).toBeInTheDocument();
   });
 
   it("reuses the server context id for the next message", async () => {
@@ -293,5 +359,16 @@ function operationStatus(status: "running" | "finalizing" | "canceled") {
     cancel_code: null,
     cancel_requested: false,
     result_available: false,
+  };
+}
+
+function chatResult(response: string) {
+  return {
+    context_id: "ctx-1",
+    episode_id: "episode-1",
+    experience_id: "experience-1",
+    response,
+    emotion: { valence: 0.1, arousal: 0.2, optimal_loss: 0.9 },
+    model: { model_id: "model", adapter_id: null, adapter_hash: null, activation_sequence: null, fallback_used: false },
   };
 }

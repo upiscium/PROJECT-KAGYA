@@ -110,6 +110,18 @@ describe("api client", () => {
     await expect(api.chat({ text: "hello" })).rejects.toThrow("Backend unavailable");
   });
 
+  it("uses public wording for Chat service 503 responses", async () => {
+    fetchMock.mockReturnValue(errorResponse(503, "Service Unavailable", { detail: "Chat job registry is not ready" }));
+
+    await expect(api.chat({ text: "hello" })).rejects.toThrow("Chat service is temporarily unavailable: Chat job registry is not ready");
+  });
+
+  it("rejects unknown cancellation dispositions", async () => {
+    fetchMock.mockReturnValue(jsonResponse({ disposition: "invented", operation: {} }));
+
+    await expect(api.cancelChatJob("job-1")).rejects.toThrow("Unknown cancellation disposition");
+  });
+
   it("reconnects SSE with Last-Event-ID after a reader disconnect", async () => {
     const operation = {
       schema_version: 1 as const, operation_id: "operation-1", event_id: "event-1", status: "running" as const,
