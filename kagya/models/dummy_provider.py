@@ -33,6 +33,13 @@ class DummyProvider:
     def generate(self, prompt: str) -> str:
         return self.response_text
 
+    def stream_generate(self, prompt: str, cancellation_token: Any = None):
+        value = self.generate(prompt)
+        for index in range(0, len(value), 12):
+            if cancellation_token is not None:
+                cancellation_token.raise_if_canceled()
+            yield value[index : index + 12]
+
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         if not target_text:
             raise ValueError("target_text must not be empty")

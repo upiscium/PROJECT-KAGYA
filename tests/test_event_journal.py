@@ -73,7 +73,7 @@ def test_journal_rejects_tamper_and_unsupported_records(tmp_path: Path) -> None:
     with pytest.raises(JournalIntegrityError, match="hash mismatch"):
         EventJournal(journal.path)
 
-    payload["schema_version"] = 3
+    payload["schema_version"] = 4
     journal.path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     with pytest.raises(JournalIntegrityError, match="invalid"):
         EventJournal(journal.path)

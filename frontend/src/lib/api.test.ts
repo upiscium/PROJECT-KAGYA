@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { api } from "./api";
+import { api, streamChatJob } from "./api";
 
 const fetchMock = vi.fn();
 
@@ -108,5 +108,36 @@ describe("api client", () => {
     fetchMock.mockRejectedValue(new TypeError("fetch failed"));
 
     await expect(api.chat({ text: "hello" })).rejects.toThrow("Backend unavailable");
+  });
+
+  it("reconnects SSE with Last-Event-ID after a reader disconnect", async () => {
+    const operation = {
+      schema_version: 1 as const, operation_id: "operation-1", event_id: "event-1", status: "running" as const,
+      status_sequence: 2, queue_position: null, submitted_at: "2026-01-01T00:00:00Z", started_at: "2026-01-01T00:00:01Z",
+      finalizing_at: null, completed_at: null, updated_at: "2026-01-01T00:00:01Z", error_code: null, cancel_code: null,
+      cancel_requested: false, result_available: false,
+    };
+    const encoder = new TextEncoder();
+    const disconnected = {
+      getReader: () => ({
+        read: vi.fn()
+          .mockResolvedValueOnce({ done: false, value: encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(operation)}\n\n`) })
+          .mockRejectedValueOnce(new Error("disconnected")),
+      }),
+    };
+    const result = { context_id: "c", episode_id: "e", experience_id: "x", response: "ok", emotion: { valence: 0, arousal: 0, optimal_loss: 1 }, model: { model_id: "m", adapter_id: null, adapter_hash: null, activation_sequence: null, fallback_used: false } };
+    const completed = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(`id: 2\nevent: final\ndata: ${JSON.stringify(result)}\n\n`));
+        controller.close();
+      },
+    });
+    fetchMock
+      .mockReturnValueOnce(jsonResponse({ operation, status_url: "/api/chat/jobs/operation-1", result_url: "/api/chat/jobs/operation-1/result", events_url: "/api/chat/jobs/operation-1/events", duplicate: false }))
+      .mockResolvedValueOnce({ ok: true, body: disconnected })
+      .mockResolvedValueOnce({ ok: true, body: completed });
+
+    await expect(streamChatJob({ text: "hello" }, { status: vi.fn(), token: vi.fn() })).resolves.toEqual(result);
+    expect(fetchMock.mock.calls[2][1].headers).toEqual({ "Last-Event-ID": "1" });
   });
 });

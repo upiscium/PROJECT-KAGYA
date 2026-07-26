@@ -23,6 +23,7 @@ from kagya.runtime import (
     WorkingMemoryItem,
     WorkingMemoryKind,
     current_agent_event,
+    OperationCanceled,
 )
 from kagya.structured_response import (
     PublicBehaviorClass,
@@ -70,6 +71,26 @@ class ThinkOnlyPrimaryProvider(ThinkingDummyProvider):
         self.last_model_id = "fallback-model"
         self.last_fallback_used = True
         return self.fallback_response
+
+
+class CanceledPrimaryProvider(ThinkOnlyPrimaryProvider):
+    def stream_generate(self, prompt: str, cancellation_token=None):
+        del prompt, cancellation_token
+        raise OperationCanceled()
+        yield "unreachable"
+
+
+def test_canceled_primary_generation_never_invokes_fallback(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = _memory(settings)
+    provider = CanceledPrimaryProvider()
+    loop = KagyaMainLoop(settings, provider, memory)
+
+    with pytest.raises(OperationCanceled):
+        loop.chat("cancel before fallback")
+
+    assert provider.fallback_calls == 0
+    assert memory.db1.get()["ids"] == []
 
 
 def test_inactive_semantic_working_memory_reference_is_not_rendered(

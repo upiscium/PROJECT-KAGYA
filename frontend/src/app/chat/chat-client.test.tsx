@@ -65,7 +65,7 @@ describe("ChatClient", () => {
     await userEvent.click(screen.getByRole("button", { name: "Send" }));
 
     const request = JSON.parse(fetchMock.mock.calls[0][1].body as string);
-    expect(fetchMock.mock.calls[0][0]).toBe("/api-proxy/chat");
+    expect(fetchMock.mock.calls[0][0]).toBe("/api-proxy/chat/jobs");
     expect(request).toEqual({
       text: "please inspect this",
       attachments: [{ type: "audio", url: "file:///tmp/sample.wav", name: "sample.wav" }],

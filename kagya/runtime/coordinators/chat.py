@@ -30,6 +30,11 @@ from kagya.motivation import (
     GoalStatus,
 )
 from kagya.runtime.agent_runtime import current_agent_event
+from kagya.runtime.cancellation import (
+    OperationCanceled,
+    cancellation_checkpoint,
+    enter_finalization_boundary,
+)
 from kagya.runtime.working_memory import (
     RetentionReason,
     WorkingMemoryItem,
@@ -170,6 +175,8 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
         previous_relationship_state = self.relationship_store.to_json()
         previous_motivation_state = self.motivation_dynamics.to_json()
         previous_narrative_state = self.narrative_self.to_json()
+        previous_identity_boundary_state = self.identity_boundary_store.to_json()
+        cancellation_checkpoint()
         current_context = self._resolve_context(
             context_id,
             source_channel=source_channel,
@@ -348,16 +355,20 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 boundary_assessment = self.attach_identity_boundary_probe(
                     boundary_assessment.assessment_id, probe
                 )
-                self._persist_identity_boundary_state()
             generation_started = time.perf_counter()
+            cancellation_checkpoint()
             try:
                 raw_response = self.agent.generate(
                     prompt, attachments=attachments or []
                 )
+            except OperationCanceled:
+                raise
             except Exception as exc:
                 if provider_fallback_used(self.provider):
                     raise RuntimeError("Fallback model generation failed") from exc
+                cancellation_checkpoint()
                 raw_response = generate_fallback(self.provider, prompt)
+            cancellation_checkpoint()
             processed_response = self.postprocessor.process(raw_response)
             model_declared_behavior_class = processed_response.behavior_class
             if boundary_assessment is not None:
@@ -413,6 +424,9 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 else float("nan"),
                 fallback_used=fallback_used,
             )
+            enter_finalization_boundary()
+            if boundary_assessment is not None:
+                self._persist_identity_boundary_state()
             if not generation_health.healthy:
                 self._metric(
                     "counter",
@@ -443,6 +457,15 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 model_id=model_id,
                 model_revision=str(getattr(self.provider, "model_revision", "unknown")),
                 adapter_id=None if fallback_used else self.adapter_id,
+                metadata={
+                    "public_result_recovery": {
+                        "optimal_loss": emotion_state.optimal_loss,
+                        "adapter_hash": None if fallback_used else self.adapter_hash,
+                        "activation_sequence": None
+                        if fallback_used
+                        else self.activation_sequence,
+                    }
+                },
                 validation_status=ValidationStatus.UNVERIFIED,
                 stage_external=event is not None,
             )
@@ -564,6 +587,8 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
             self._persist_motivation_state()
             self.narrative_self.restore(previous_narrative_state)
             self._persist_narrative_self_state()
+            self.identity_boundary_store.restore(previous_identity_boundary_state)
+            self._persist_identity_boundary_state()
             self._sync_self_references()
             self._persist_self_model_state()
             raise

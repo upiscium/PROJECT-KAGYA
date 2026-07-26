@@ -1,6 +1,6 @@
 """Model provider implementations for PROJECT-KAGYA."""
 
-from kagya.models.base import ModelProvider
+from kagya.models.base import ModelProvider, StreamingModelProvider
 from kagya.models.boundary_probe import (
     BoundaryPolicyProbe,
     BoundaryProbeChoice,
@@ -22,6 +22,7 @@ __all__ = [
     "IDENTITY_CANARY_REVISION",
     "IDENTITY_CANARY_SCENARIO_ID",
     "ModelProvider",
+    "StreamingModelProvider",
     "TransformersProvider",
     "load_model_provider",
 ]

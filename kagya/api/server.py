@@ -147,6 +147,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "agent_runtime": runtime_ready,
                 "journal": journal_ready,
                 "state_wal": wal_ready,
+                "chat_job_registry": bool(
+                    getattr(app.state, "chat_job_registry", None) is not None
+                    and app.state.chat_job_registry.is_ready
+                ),
             }
             ready = all(checks.values())
         if not ready:
@@ -213,6 +217,7 @@ def teardown_subject_runtime(app: FastAPI) -> None:
         ("autonomy_loop", "shutdown"),
         ("sleep_coordinator", "shutdown"),
         ("emotion_timer", "stop"),
+        ("chat_job_registry", "shutdown"),
         ("agent_runtime", "shutdown"),
     ):
         component = getattr(app.state, name, None)
@@ -255,6 +260,7 @@ def teardown_subject_runtime(app: FastAPI) -> None:
         "tool_registry",
         "tool_executor",
         "behavioral_artifact_reconciliation",
+        "chat_job_registry",
         "runtime_event_log",
         "operational_telemetry",
     ):
@@ -443,6 +449,8 @@ def _build_subject_runtime(
             failure_hook=lambda event, exc: _fail_subject_event(app, event),
             telemetry=app.state.operational_telemetry,
         )
+    if getattr(app.state, "chat_job_registry", None) is None:
+        app.state.chat_job_registry = chat.create_chat_job_registry(app)
     if settings.autonomy.enabled and getattr(app.state, "autonomy_loop", None) is None:
         autonomy_settings = settings.autonomy
         app.state.subject_scheduler = SubjectScheduler(

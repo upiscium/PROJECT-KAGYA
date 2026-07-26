@@ -1,12 +1,17 @@
 """Shared model provider contracts."""
 
+from collections.abc import Iterator
 from typing import Any, Protocol
 
 from kagya.models.boundary_probe import BoundaryPolicyProbe
 
 
 class ModelProvider(Protocol):
-    """Protocol implemented by all model execution providers."""
+    """Protocol implemented by all model execution providers.
+
+    Providers without ``stream_generate`` support cooperative cancellation only
+    before and after their blocking ``generate`` call.
+    """
 
     def generate(self, prompt: str) -> str:
         """Generate text from a prompt."""
@@ -29,3 +34,12 @@ class ModelProvider(Protocol):
 
     def get_processor(self) -> Any:
         """Return the underlying processor/tokenizer object."""
+
+
+class StreamingModelProvider(Protocol):
+    """Optional one-generation streaming protocol used internally by chat."""
+
+    def stream_generate(
+        self, prompt: str, cancellation_token: Any = None
+    ) -> Iterator[str]:
+        """Yield raw generation fragments; callers must validate before disclosure."""

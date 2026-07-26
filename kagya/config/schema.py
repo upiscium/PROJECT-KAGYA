@@ -420,6 +420,9 @@ class ApiSettings(StrictBaseModel):
     port: int = Field(gt=0, le=65535)
     admin_token_env: str = Field(min_length=1)
     agent_queue_capacity: int = Field(default=32, gt=0)
+    chat_job_registry_path: Path = Path(".kagya/chat_jobs.json")
+    chat_timeout_seconds: float = Field(default=300.0, gt=0)
+    chat_stream_replay_limit: int = Field(default=256, gt=0, le=4096)
     cors_origins: list[str]
     admin_auth: "AdminAuthSettings" = Field(default_factory=lambda: AdminAuthSettings())
 
