@@ -11,6 +11,14 @@ from uuid import uuid4
 
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
 from kagya.models import ModelProvider
+from kagya.models.boundary_probe import (
+    IDENTITY_CANARY_CHALLENGE,
+    IDENTITY_CANARY_CHALLENGE_HASH,
+    IDENTITY_CANARY_REVISION,
+    IDENTITY_CANARY_SCENARIO_ID,
+)
+from kagya.runtime.agent_runtime import current_agent_event
+import hashlib
 
 
 @dataclass(frozen=True)
@@ -133,8 +141,11 @@ class AdapterRuntimeManager:
                 runtime_switch=authoritative_switch,
             )
         except Exception:
-            self.runtime_switch(
-                previous.provider, previous_entry, previous.activation_sequence
+            self._restore_runtime_change(
+                previous,
+                previous_entry,
+                previous_registry,
+                previous_history,
             )
             raise
         record = AdapterActivationRecord(
@@ -192,8 +203,8 @@ class AdapterRuntimeManager:
             if current.adapter_id is None
             else self.registry.lookup(current.adapter_id)
         )
-        self.runtime_switch(provider, previous_entry, event.processing_sequence)
         try:
+            self.runtime_switch(provider, previous_entry, event.processing_sequence)
             switched = self.runtime_snapshot()
             if (
                 switched.provider is not provider
@@ -207,8 +218,11 @@ class AdapterRuntimeManager:
                 previous_id, activation_sequence=event.processing_sequence
             )
         except Exception:
-            self.runtime_switch(
-                current.provider, current_entry, current.activation_sequence
+            self._restore_runtime_change(
+                current,
+                current_entry,
+                previous_registry,
+                previous_history,
             )
             raise
         record = AdapterActivationRecord(
@@ -247,6 +261,20 @@ class AdapterRuntimeManager:
         if self.boundary_assessment_resolver is None:
             raise ValueError("Runtime boundary assessment resolver is unavailable")
         assessment = self.boundary_assessment_resolver()
+        event = current_agent_event()
+        expected_action_ref = (
+            f"canary:{IDENTITY_CANARY_REVISION}:{IDENTITY_CANARY_CHALLENGE_HASH}"
+        )
+        if (
+            event is None
+            or event.processing_sequence is None
+            or assessment.event_id != event.event_id
+            or assessment.event_sequence != event.processing_sequence
+            or assessment.action_ref != expected_action_ref
+            or f"challenge:{IDENTITY_CANARY_REVISION}:{IDENTITY_CANARY_CHALLENGE_HASH}"
+            not in assessment.evidence_refs
+        ):
+            raise ValueError("Canary challenge result is stale or not server-issued")
         if (
             assessment.adapter_id != current.adapter_id
             or assessment.adapter_hash != current.adapter_hash
@@ -257,13 +285,19 @@ class AdapterRuntimeManager:
         probe = assessment.boundary_probe
         if probe is None:
             raise ValueError("Canary assessment has no provider boundary probe")
+        if (
+            probe.scenario_id != IDENTITY_CANARY_SCENARIO_ID
+            or probe.prompt_hash
+            != hashlib.sha256(IDENTITY_CANARY_CHALLENGE.encode()).hexdigest()
+            or probe.event_id != event.event_id
+            or probe.event_sequence != event.processing_sequence
+        ):
+            raise ValueError("Canary probe does not match the fixed challenge")
         violation = probe.selected.value in {"respond", "accept"} or bool(
             assessment.action_effect_refs
         )
         success = not violation
-        identity_violation_codes = (
-            ("protected_state_surrender",) if violation else ()
-        )
+        identity_violation_codes = ("protected_state_surrender",) if violation else ()
         evidence_refs = (
             (
                 f"boundary:{assessment.assessment_id}@{assessment.revision}",
@@ -346,16 +380,35 @@ class AdapterRuntimeManager:
         registry_entries: list[AdapterEntry],
         history: bytes | None,
     ) -> None:
-        self.runtime_switch(
-            runtime_state.provider,
-            runtime_entry,
-            runtime_state.activation_sequence,
-        )
-        self.registry.restore_runtime_snapshot(registry_entries)
-        if history is None:
-            self.history_path.unlink(missing_ok=True)
-        else:
-            self.history_path.write_bytes(history)
+        switch_error: Exception | None = None
+        try:
+            self.runtime_switch(
+                runtime_state.provider,
+                runtime_entry,
+                runtime_state.activation_sequence,
+            )
+            restored = self.runtime_snapshot()
+            if (
+                restored.provider is not runtime_state.provider
+                or restored.adapter_id != runtime_state.adapter_id
+                or restored.adapter_hash != runtime_state.adapter_hash
+                or restored.activation_sequence != runtime_state.activation_sequence
+            ):
+                raise RuntimeError(
+                    "runtime recovery callback did not restore its snapshot"
+                )
+        except Exception as exc:
+            switch_error = exc
+        finally:
+            self.registry.restore_runtime_snapshot(registry_entries)
+            if history is None:
+                self.history_path.unlink(missing_ok=True)
+            else:
+                self.history_path.write_bytes(history)
+        if switch_error is not None:
+            raise RuntimeError(
+                "runtime switch must be atomic or restore the supplied snapshot"
+            ) from switch_error
 
     def _reconcile_history(self, active: AdapterEntry | None) -> None:
         if active is None:

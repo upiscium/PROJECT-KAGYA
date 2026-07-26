@@ -132,6 +132,11 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
         requested_goals = set(inputs.self_endorsed_goal_refs)
         requested_commitments = set(inputs.self_endorsed_commitment_refs)
         requested_relationships = set(inputs.relationship_refs)
+        if (
+            inputs.context_id is not None
+            and self.context_registry.get(inputs.context_id) is None
+        ):
+            raise ValueError("assessment references an unknown Context")
         if any(
             key not in goals
             or goals[key].status != GoalStatus.ACTIVE
@@ -148,7 +153,8 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
                 commitments[key].identity_origin.actor == OriginActor.SELF
                 or (
                     commitments[key].identity_origin.actor == OriginActor.SYSTEM
-                    and commitments[key].identity_origin.endorsed_by_event_id is not None
+                    and commitments[key].identity_origin.endorsed_by_event_id
+                    is not None
                     and commitments[key].identity_origin.endorsement_ref
                     == "subject_endorsement"
                 )
@@ -183,13 +189,18 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
                 raise ValueError(
                     "other-welfare evidence must reference a structured Experience"
                 )
-            experience = self.experience_store.get(reference.removeprefix("experience:"))
-            if "other_welfare_reviewed" not in experience.interpretation_codes or not any(
-                revision.event_id is not None
-                and revision.event_sequence is not None
-                and revision.evidence_refs
-                and revision.reason_code == "other_welfare_reviewed"
-                for revision in experience.revisions
+            experience = self.experience_store.get(
+                reference.removeprefix("experience:")
+            )
+            if (
+                "other_welfare_reviewed" not in experience.interpretation_codes
+                or not any(
+                    revision.event_id is not None
+                    and revision.event_sequence is not None
+                    and revision.evidence_refs
+                    and revision.reason_code == "other_welfare_reviewed"
+                    for revision in experience.revisions
+                )
             ):
                 raise ValueError(
                     "other-welfare Experience requires a reviewed typed interpretation"
@@ -210,7 +221,69 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             },
             adapter_id=self.adapter_id,
             adapter_hash=self.adapter_hash,
+            activation_sequence=self.activation_sequence,
         )
+        self._persist_identity_boundary_state()
+        return assessment
+
+    def validate_identity_boundary_assessment(
+        self,
+        assessment: IdentityBoundaryAssessment,
+        *,
+        action_ref: str,
+        context_id: str | None,
+    ) -> None:
+        if assessment.action_ref != action_ref:
+            raise ValueError("Boundary assessment action binding is invalid")
+        if assessment.context_id != context_id:
+            raise ValueError("Boundary assessment context binding is invalid")
+        if (
+            assessment.adapter_id != self.adapter_id
+            or assessment.adapter_hash != self.adapter_hash
+            or assessment.activation_sequence != self.activation_sequence
+        ):
+            raise ValueError(
+                "Boundary assessment adapter activation binding is invalid"
+            )
+        current_values = {
+            item.value_id: item.revision for item in self.value_system.active_values()
+        }
+        current_goals = {
+            item.goal_id: len(item.transitions)
+            for item in self.goal_manager.list_goals()
+            if item.status == GoalStatus.ACTIVE
+        }
+        current_commitments = {
+            item.commitment_id: len(item.transitions)
+            for item in self.commitment_store.list_commitments()
+            if item.status in ACCEPTED_COMMITMENT_STATUSES
+        }
+        current_relationships = {
+            item.relationship_id: item.revision
+            for item in self.relationship_store.list_relationships()
+        }
+        if (
+            any(
+                current_values.get(key) != revision
+                for key, revision in assessment.value_revision_refs.items()
+            )
+            or any(
+                current_goals.get(key) != revision
+                for key, revision in assessment.goal_revision_refs.items()
+            )
+            or any(
+                current_commitments.get(key) != revision
+                for key, revision in assessment.commitment_revision_refs.items()
+            )
+            or any(
+                current_relationships.get(key) != revision
+                for key, revision in assessment.relationship_revision_refs.items()
+            )
+        ):
+            raise ValueError("Boundary assessment references stale subject state")
+
+    def attach_identity_boundary_probe(self, assessment_id, probe):
+        assessment = self.identity_boundary_store.attach_probe(assessment_id, probe)
         self._persist_identity_boundary_state()
         return assessment
 

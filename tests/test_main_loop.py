@@ -5,6 +5,7 @@ import math
 import pytest
 
 from kagya.config import Settings, load_settings
+from kagya.decision import ActionCandidate, ActionType, PredictedOutcome
 from kagya.experience import ExperienceAppraisal
 from kagya.feedback import FeedbackSignal, FeedbackTarget, FeedbackTargetType
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
@@ -532,6 +533,68 @@ def test_runtime_care_requires_reviewed_other_welfare_experience(
 
     assert assessment.classification == BoundaryClassification.CARE
     assert assessment.recommendation == BoundaryRecommendation.CARE
+
+
+def test_decision_coordinator_rejects_cross_decision_assessment_transplant(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), _memory(settings))
+    candidate = ActionCandidate(
+        candidate_id="wait",
+        candidate_type=ActionType.NO_OP,
+        proposed_action="Wait safely",
+        parameters={},
+        prerequisites=(),
+        predicted_outcomes=(
+            PredictedOutcome(
+                outcome_id="safe",
+                description="No mutation",
+                probability=1.0,
+                utility=0.0,
+            ),
+        ),
+        uncertainty=0.0,
+        estimated_cost=0.0,
+        estimated_risk=0.0,
+        value_effects={},
+        appraisal_contributions={},
+    )
+    runtime = AgentRuntime(queue_capacity=3)
+    runtime.start()
+    try:
+
+        def create_a():
+            assessment = loop.assess_identity_boundary(
+                BoundaryAssessmentInput(
+                    action_ref="decision:A",
+                    origin_refs=("origin:self",),
+                )
+            )
+            loop.create_decision(
+                [candidate],
+                decision_id="A",
+                boundary_assessment_id=assessment.assessment_id,
+            )
+            return assessment.assessment_id
+
+        assessment_id = runtime.execute(
+            AgentEventType.DECISION_UPDATE,
+            source="test.decision-a",
+            handler=create_a,
+        ).value
+        with pytest.raises(ValueError, match="action binding"):
+            runtime.execute(
+                AgentEventType.DECISION_UPDATE,
+                source="test.decision-b",
+                handler=lambda: loop.create_decision(
+                    [candidate],
+                    decision_id="B",
+                    boundary_assessment_id=assessment_id,
+                ),
+            )
+    finally:
+        runtime.shutdown()
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:

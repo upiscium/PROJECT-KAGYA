@@ -2,8 +2,6 @@
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from kagya.identity import RuntimeBoundaryMetadata
-
 
 class AttachmentSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -23,7 +21,6 @@ class ChatRequest(BaseModel):
     context_id: str | None = None
     client_session_id: str | None = None
     interlocutor_key: str | None = None
-    boundary_metadata: RuntimeBoundaryMetadata | None = None
 
 
 class EmotionSchema(BaseModel):

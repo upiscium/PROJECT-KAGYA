@@ -836,7 +836,9 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
     ) -> DecisionRecord:
         event = current_agent_event()
         if event is None or event.processing_sequence is None:
-            raise RuntimeError("Decision creation requires an authoritative AgentRuntime event")
+            raise RuntimeError(
+                "Decision creation requires an authoritative AgentRuntime event"
+            )
         for candidate in candidates:
             self.plan_store.validate_candidate(candidate)
         if context_id is not None and self.context_registry.get(context_id) is None:
@@ -903,6 +905,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
                 BoundaryAssessmentInput(
                     action_ref=f"decision:{identifier}",
                     origin_refs=(f"event:{event.event_id}",),
+                    context_id=context_id,
                 )
             )
             boundary_assessment_id = boundary_assessment.assessment_id
@@ -910,8 +913,16 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             boundary_assessment = self.identity_boundary_store.get_assessment(
                 boundary_assessment_id
             )
-            if self.identity_boundary_store.assessments[-1].assessment_id != boundary_assessment_id:
+            if (
+                self.identity_boundary_store.assessments[-1].assessment_id
+                != boundary_assessment_id
+            ):
                 raise ValueError("Decision boundary assessment is stale")
+        self.validate_identity_boundary_assessment(
+            boundary_assessment,
+            action_ref=f"decision:{identifier}",
+            context_id=context_id,
+        )
         narrative_refs = tuple(
             f"identity-claim:{claim_id}@{self.narrative_self.get_claim(claim_id).revision}"
             for claim_id in narrative_claim_ids

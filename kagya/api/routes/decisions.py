@@ -67,6 +67,7 @@ class ActionCandidateRequest(_RequestModel):
 class DecisionRequest(_RequestModel):
     decision_id: str | None = Field(default=None, min_length=1)
     context_id: str | None = Field(default=None, min_length=1)
+    boundary_assessment_id: str | None = Field(default=None, min_length=1)
     candidates: list[ActionCandidateRequest] = Field(min_length=1)
     satisfied_prerequisites: list[str] = Field(default_factory=list)
 
@@ -121,6 +122,7 @@ def create_decision(
                 context_id=body.context_id,
                 satisfied_prerequisites=set(body.satisfied_prerequisites),
                 decision_id=body.decision_id,
+                boundary_assessment_id=body.boundary_assessment_id,
             ),
             payload={"decision_id": body.decision_id, "context_id": body.context_id},
             correlation_id=body.decision_id,

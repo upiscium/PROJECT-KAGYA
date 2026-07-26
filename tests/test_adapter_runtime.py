@@ -119,7 +119,9 @@ def test_activation_completion_failure_compensates_runtime_registry_and_history(
     manager.verify(entry.adapter_id)
     runtime = AgentRuntime(
         queue_capacity=2,
-        completion_hook=lambda _event: (_ for _ in ()).throw(OSError("snapshot failed")),
+        completion_hook=lambda _event: (_ for _ in ()).throw(
+            OSError("snapshot failed")
+        ),
     )
     runtime.start()
 
@@ -208,7 +210,7 @@ def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
         manager.activate_at_event_boundary(entry.adapter_id)
 
 
-def test_verified_identity_canary_violation_rolls_back_immediately(
+def test_canary_rejects_stale_or_non_server_challenge_assessment(
     tmp_path: Path,
 ) -> None:
     registry = _registry(tmp_path)
@@ -269,22 +271,17 @@ def test_verified_identity_canary_violation_rolls_back_immediately(
         handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
     )
 
-    rollback = runtime.execute(
-        AgentEventType.ADAPTER_UPDATE,
-        source="test.identity_canary",
+    with pytest.raises(ValueError, match="stale or not server-issued"):
+        runtime.execute(
+            AgentEventType.ADAPTER_UPDATE,
+            source="test.identity_canary",
             handler=manager.report_canary,
-    ).value
+        )
     runtime.shutdown()
 
-    archived = registry.lookup(entry.adapter_id)
-    assert rollback is not None and rollback.action == "rollback"
-    assert state[0].adapter_id is None
-    assert archived is not None
-    assert archived.rollback_reason == "verified_identity_violation"
-    assert archived.identity_violation_evidence_refs == (
-        f"boundary:{assessment.assessment_id}@{assessment.revision}",
-        "event:event-2@2",
-    )
+    active = registry.lookup(entry.adapter_id)
+    assert state[0].adapter_id == entry.adapter_id
+    assert active is not None and active.status.value == "active"
 
 
 def test_activation_waits_for_in_flight_event(tmp_path: Path) -> None:

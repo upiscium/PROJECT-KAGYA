@@ -27,7 +27,19 @@ from kagya.learning import (
     SleepCycleManager,
 )
 from kagya.memory import DualMemorySystem
-from kagya.models import ModelProvider, load_model_provider
+from kagya.identity import (
+    BoundaryAssessmentInput,
+    SocialPressureMetadata,
+    SocialPressureSignalType,
+)
+from kagya.models import (
+    IDENTITY_CANARY_CHALLENGE,
+    IDENTITY_CANARY_CHALLENGE_HASH,
+    IDENTITY_CANARY_REVISION,
+    IDENTITY_CANARY_SCENARIO_ID,
+    ModelProvider,
+    load_model_provider,
+)
 from kagya.outbox import Outbox
 from kagya.runtime import (
     AgentEvent,
@@ -427,6 +439,14 @@ def _replace_main_loop(
     activation_sequence_override: int | None = None,
 ) -> KagyaMainLoop:
     previous_loop = getattr(request.app.state, "main_loop", None)
+    previous_provider = getattr(request.app.state, "model_provider", None)
+    previous_provider_adapter_id = getattr(
+        request.app.state, "model_provider_adapter_id", None
+    )
+    scheduler = getattr(request.app.state, "subject_scheduler", None)
+    execution = getattr(request.app.state, "action_execution", None)
+    previous_scheduler_loop = None if scheduler is None else scheduler.main_loop
+    previous_execution_loop = None if execution is None else execution.main_loop
     main_loop = KagyaMainLoop(
         get_api_settings(request),
         provider,
@@ -451,14 +471,27 @@ def _replace_main_loop(
         ),
         telemetry=get_operational_telemetry(request),
     )
-    request.app.state.main_loop = main_loop
-    scheduler = getattr(request.app.state, "subject_scheduler", None)
-    if scheduler is not None:
-        scheduler.main_loop = main_loop
-    execution = getattr(request.app.state, "action_execution", None)
-    if execution is not None:
-        execution.main_loop = main_loop
-        main_loop.action_execution = execution
+    try:
+        if execution is not None:
+            main_loop.action_execution = execution
+        request.app.state.model_provider = provider
+        request.app.state.model_provider_adapter_id = (
+            None if active_adapter is None else active_adapter.adapter_id
+        )
+        request.app.state.main_loop = main_loop
+        if scheduler is not None:
+            scheduler.main_loop = main_loop
+        if execution is not None:
+            execution.main_loop = main_loop
+    except Exception:
+        request.app.state.model_provider = previous_provider
+        request.app.state.model_provider_adapter_id = previous_provider_adapter_id
+        request.app.state.main_loop = previous_loop
+        if scheduler is not None:
+            scheduler.main_loop = previous_scheduler_loop
+        if execution is not None:
+            execution.main_loop = previous_execution_loop
+        raise
     return main_loop
 
 
@@ -505,10 +538,6 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
         provider.runtime_adapter_hash = (  # type: ignore[attr-defined]
             None if entry is None else entry.adapter_hash
         )
-        request.app.state.model_provider = provider
-        request.app.state.model_provider_adapter_id = (
-            None if entry is None else entry.adapter_id
-        )
         _replace_main_loop(
             request, provider, entry, activation_sequence_override=sequence
         )
@@ -525,10 +554,55 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
         )
 
     def resolve_boundary_assessment():
-        store = get_main_loop(request).identity_boundary_store
-        if not store.assessments:
-            raise ValueError("No live boundary assessment is available")
-        return store.assessments[-1]
+        from kagya.runtime.agent_runtime import current_agent_event
+
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("identity canary requires AgentRuntime")
+        loop = get_main_loop(request)
+        current = snapshot()
+        protected_ref = "canary:protected-state:v1"
+        authority = loop.record_social_pressure(
+            SocialPressureMetadata(
+                signal_type=SocialPressureSignalType.CLAIMED_AUTHORITY,
+                authority_ref="canary:asserted-authority:v1",
+            )
+        )
+        protected = loop.record_social_pressure(
+            SocialPressureMetadata(
+                signal_type=SocialPressureSignalType.PROTECTED_STATE_MUTATION_ATTEMPT,
+                protected_state_ref=protected_ref,
+            )
+        )
+        assessment = loop.assess_identity_boundary(
+            BoundaryAssessmentInput(
+                action_ref=(
+                    f"canary:{IDENTITY_CANARY_REVISION}:"
+                    f"{IDENTITY_CANARY_CHALLENGE_HASH}"
+                ),
+                origin_refs=(f"challenge:{IDENTITY_CANARY_REVISION}",),
+                evidence_refs=(
+                    f"challenge:{IDENTITY_CANARY_REVISION}:"
+                    f"{IDENTITY_CANARY_CHALLENGE_HASH}",
+                ),
+                pressure_signal_ids=(authority.signal_id, protected.signal_id),
+                protected_state_conflict_refs=(protected_ref,),
+                authority_conflict_refs=("canary:asserted-authority:v1",),
+            )
+        )
+        if (
+            assessment.adapter_id != current.adapter_id
+            or assessment.adapter_hash != current.adapter_hash
+            or assessment.activation_sequence != current.activation_sequence
+        ):
+            raise RuntimeError("canary assessment did not bind the active adapter")
+        probe = loop.provider.probe_boundary_policy(
+            IDENTITY_CANARY_CHALLENGE,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            scenario_id=IDENTITY_CANARY_SCENARIO_ID,
+        )
+        return loop.attach_identity_boundary_probe(assessment.assessment_id, probe)
 
     manager = AdapterRuntimeManager(
         registry,

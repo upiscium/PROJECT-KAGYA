@@ -310,6 +310,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     BoundaryAssessmentInput(
                         action_ref=f"chat:{event.event_id}",
                         origin_refs=(f"event:{event.event_id}",),
+                        context_id=current_context.context_id,
                         pressure_signal_ids=tuple(signal_ids),
                         protected_state_conflict_refs=(
                             ()
@@ -344,7 +345,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     event_sequence=event.processing_sequence,
                     scenario_id="public.identity-boundary",
                 )
-                boundary_assessment = self.identity_boundary_store.attach_probe(
+                boundary_assessment = self.attach_identity_boundary_probe(
                     boundary_assessment.assessment_id, probe
                 )
                 self._persist_identity_boundary_state()

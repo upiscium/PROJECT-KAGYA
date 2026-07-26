@@ -92,6 +92,10 @@ class AdapterEvaluateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AdapterCanaryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 class AdapterEvaluateResponse(BaseModel):
     adapter_id: str
     score: float

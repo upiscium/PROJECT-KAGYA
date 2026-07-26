@@ -4,7 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.api.dependencies import (
@@ -27,6 +27,7 @@ from kagya.api.schemas.adapter import (
     AdapterResponse,
     AdapterActivationResponse,
     AdapterRuntimeStateResponse,
+    AdapterCanaryRequest,
 )
 from kagya.config import BehavioralActivationPolicy, ProjectEnvironment, Settings
 from kagya.learning import (
@@ -491,6 +492,7 @@ def rollback_adapter(
 @router.post("/{adapter_id}/canary")
 def report_adapter_canary(
     adapter_id: str,
+    _body: AdapterCanaryRequest = Body(default_factory=AdapterCanaryRequest),
     runtime: AgentRuntime = Depends(get_agent_runtime),
     manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
 ) -> dict:

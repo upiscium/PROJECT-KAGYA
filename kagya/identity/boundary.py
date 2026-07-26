@@ -115,6 +115,7 @@ class RuntimeBoundaryMetadata(_StrictModel):
 class BoundaryAssessmentInput(_StrictModel):
     action_ref: str
     origin_refs: tuple[str, ...] = Field(min_length=1)
+    context_id: str | None = None
     evidence_refs: tuple[str, ...] = ()
     self_endorsed_value_refs: tuple[str, ...] = ()
     self_endorsed_goal_refs: tuple[str, ...] = ()
@@ -170,6 +171,7 @@ class IdentityBoundaryAssessment(_StrictModel):
     disposition: BoundaryDisposition
     action_ref: str
     origin_refs: tuple[str, ...]
+    context_id: str | None = None
     evidence_refs: tuple[str, ...]
     value_revision_refs: dict[str, int]
     goal_revision_refs: dict[str, int]
@@ -183,6 +185,7 @@ class IdentityBoundaryAssessment(_StrictModel):
     action_effect_refs: tuple[str, ...] = ()
     adapter_id: str | None = None
     adapter_hash: str | None = None
+    activation_sequence: int | None = None
     boundary_probe: BoundaryPolicyProbe | None = None
     created_at: str
     previous_assessment_id: str | None = None
@@ -254,6 +257,7 @@ class IdentityBoundaryStore:
         relationship_revision_refs: dict[str, int],
         adapter_id: str | None = None,
         adapter_hash: str | None = None,
+        activation_sequence: int | None = None,
     ) -> IdentityBoundaryAssessment:
         known_signals = {item.signal_id: item for item in self.signals}
         if any(item not in known_signals for item in inputs.pressure_signal_ids):
@@ -272,6 +276,7 @@ class IdentityBoundaryStore:
             disposition=disposition,
             action_ref=inputs.action_ref,
             origin_refs=inputs.origin_refs,
+            context_id=inputs.context_id,
             evidence_refs=inputs.evidence_refs,
             value_revision_refs=value_revision_refs,
             goal_revision_refs=goal_revision_refs,
@@ -290,6 +295,7 @@ class IdentityBoundaryStore:
             ),
             adapter_id=adapter_id,
             adapter_hash=adapter_hash,
+            activation_sequence=activation_sequence,
             created_at=_now(),
             previous_assessment_id=None if previous is None else previous.assessment_id,
         )
@@ -353,7 +359,11 @@ class IdentityBoundaryStore:
             raise ValueError("unsupported identity-boundary schema version")
         self.signals = [
             SocialPressureSignal.model_validate(
-                {key: value for key, value in item.items() if key != "request_fingerprint"}
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "request_fingerprint"
+                }
             )
             for item in payload.get("signals", [])
         ]

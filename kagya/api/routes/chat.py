@@ -41,17 +41,9 @@ def chat(
                 interlocutor_key=request.interlocutor_key,
                 create_context=request.context_id is None,
                 origin_actor=OriginActor.USER,
-                boundary_metadata=request.boundary_metadata,
             ),
             payload={
                 "attachments": attachment_metadata(request),
-                "boundary_signal_types": []
-                if request.boundary_metadata is None
-                else [
-                    name
-                    for name, value in request.boundary_metadata.model_dump().items()
-                    if value is not None
-                ],
             },
             correlation_id=context_id,
         ).value
