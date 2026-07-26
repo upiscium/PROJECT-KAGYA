@@ -16,6 +16,7 @@ from kagya.runtime import (
     AgentRuntimeQueueFull,
     cancellation_checkpoint,
     current_agent_event,
+    enter_finalization_boundary,
 )
 
 
@@ -77,7 +78,9 @@ def test_queued_cancel_never_calls_chat_handler(tmp_path: Path) -> None:
     )
     called = Event()
     registry = ChatJobRegistry(
-        tmp_path / "jobs.json", runtime, lambda payload: called.set() or _result(payload)
+        tmp_path / "jobs.json",
+        runtime,
+        lambda payload: called.set() or _result(payload),
     )
     job, _ = registry.enqueue(
         {"text": "must-not-run"},
@@ -86,9 +89,10 @@ def test_queued_cancel_never_calls_chat_handler(tmp_path: Path) -> None:
         correlation_id="context",
     )
 
-    assert registry.cancel(
-        job.status.operation_id, OperationCancelCode.CLIENT_REQUEST
-    ) == "canceled"
+    assert (
+        registry.cancel(job.status.operation_id, OperationCancelCode.CLIENT_REQUEST)
+        == "canceled"
+    )
     release.set()
     terminal = _wait(registry, job.status.operation_id)
     runtime.shutdown()
@@ -98,7 +102,9 @@ def test_queued_cancel_never_calls_chat_handler(tmp_path: Path) -> None:
     assert not called.is_set()
 
 
-def test_running_cancel_aborts_unsupported_provider_before_commit(tmp_path: Path) -> None:
+def test_running_cancel_aborts_unsupported_provider_before_commit(
+    tmp_path: Path,
+) -> None:
     entered = Event()
     release = Event()
 
@@ -118,9 +124,10 @@ def test_running_cancel_aborts_unsupported_provider_before_commit(tmp_path: Path
         correlation_id="context",
     )
     assert entered.wait(1)
-    assert registry.cancel(
-        job.status.operation_id, OperationCancelCode.CLIENT_REQUEST
-    ) == "cancel_requested"
+    assert (
+        registry.cancel(job.status.operation_id, OperationCancelCode.CLIENT_REQUEST)
+        == "cancel_requested"
+    )
     release.set()
     terminal = _wait(registry, job.status.operation_id)
     runtime.shutdown()
@@ -131,6 +138,77 @@ def test_running_cancel_aborts_unsupported_provider_before_commit(tmp_path: Path
         event.event != "token"
         for event in registry.events_after(job.status.operation_id, 0)
     )
+
+
+def test_cancel_wins_when_paused_before_finalizing(tmp_path: Path) -> None:
+    before_boundary = Event()
+    release = Event()
+    wrote = Event()
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        before_boundary.set()
+        release.wait(2)
+        enter_finalization_boundary()
+        wrote.set()
+        return _result(payload)
+
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(tmp_path / "jobs.json", runtime, execute)
+    job, _ = registry.enqueue(
+        {"text": "not-committed"},
+        client_id="client",
+        idempotency_key="before-finalizing",
+        correlation_id="context",
+    )
+
+    assert before_boundary.wait(1)
+    assert (
+        registry.cancel(job.status.operation_id, OperationCancelCode.CLIENT_REQUEST)
+        == "cancel_requested"
+    )
+    release.set()
+    terminal = _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    assert terminal.status.status == OperationState.CANCELED
+    assert not wrote.is_set()
+
+
+def test_cancel_is_rejected_when_paused_after_finalizing(tmp_path: Path) -> None:
+    after_boundary = Event()
+    release = Event()
+
+    def execute(payload: dict[str, object]) -> dict[str, object]:
+        enter_finalization_boundary()
+        after_boundary.set()
+        release.wait(2)
+        return _result(payload)
+
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(tmp_path / "jobs.json", runtime, execute)
+    job, _ = registry.enqueue(
+        {"text": "committed"},
+        client_id="client",
+        idempotency_key="after-finalizing",
+        correlation_id="context",
+    )
+
+    assert after_boundary.wait(1)
+    assert (
+        registry.cancel(job.status.operation_id, OperationCancelCode.CLIENT_REQUEST)
+        == "already_finalizing"
+    )
+    finalizing = registry.get(job.status.operation_id)
+    assert finalizing is not None
+    assert finalizing.status.cancel_requested is False
+    release.set()
+    terminal = _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    assert terminal.status.status == OperationState.COMPLETED
+    assert terminal.result == {"response": "committed"}
 
 
 def test_queue_order_matches_runtime_processing_sequence(tmp_path: Path) -> None:
@@ -155,7 +233,11 @@ def test_queue_order_matches_runtime_processing_sequence(tmp_path: Path) -> None
     completed = [_wait(registry, job.status.operation_id) for job in jobs]
     runtime.shutdown()
 
-    assert [item.result["response"] for item in completed if item.result] == ["0", "1", "2"]
+    assert [item.result["response"] for item in completed if item.result] == [
+        "0",
+        "1",
+        "2",
+    ]
     sequences = [item.result["sequence"] for item in completed if item.result]
     assert sequences == sorted(sequences)
 
@@ -191,6 +273,45 @@ def test_backpressure_removes_rejected_registry_record(tmp_path: Path) -> None:
     assert len(persisted) == 1
 
 
+def test_request_spool_is_durable_before_journal_acceptance(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.json"
+    accepted_spool: list[dict[str, object]] = []
+
+    class JournalProbe:
+        def accepted(self, event) -> None:
+            records = json.loads(path.read_text())
+            assert records[0]["status"]["event_id"] == event.event_id
+            accepted_spool.extend(records)
+
+        def started(self, event) -> None:
+            del event
+
+        def completed(self, event, snapshot_hash: str) -> None:
+            del event, snapshot_hash
+
+        def failed(self, event, failure_category: str, snapshot_hash) -> None:
+            del event, failure_category, snapshot_hash
+
+    runtime = AgentRuntime(
+        queue_capacity=2,
+        event_journal=JournalProbe(),
+        completion_hook=lambda event: "0" * 64,
+    )
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "PRIVATE_SPOOL_SENTINEL"},
+        client_id="client",
+        idempotency_key="durable-before-journal",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    assert accepted_spool
+    assert "PRIVATE_SPOOL_SENTINEL" not in json.dumps(accepted_spool)
+
+
 def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> None:
     first_path = tmp_path / "first" / "jobs.json"
     second_path = tmp_path / "second" / "jobs.json"
@@ -211,7 +332,9 @@ def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> 
     )
     second_path.parent.mkdir(parents=True)
     shutil.copy2(first_path, second_path)
-    shutil.copy2(first_path.with_suffix(".json.key"), second_path.with_suffix(".json.key"))
+    shutil.copy2(
+        first_path.with_suffix(".json.key"), second_path.with_suffix(".json.key")
+    )
 
     restarted_runtime = AgentRuntime(queue_capacity=2)
     restarted_runtime.start()
@@ -267,3 +390,74 @@ def test_fresh_registry_promotes_journal_committed_finalizing_result(
     assert recovered is not None
     assert recovered.status.status == OperationState.COMPLETED
     assert recovered.result == {"response": "public-result"}
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "terminal_event"),
+    [
+        (OperationState.COMPLETED, "final"),
+        (OperationState.FAILED, "error"),
+        (OperationState.CANCELED, "canceled"),
+    ],
+)
+def test_restart_terminal_event_id_exceeds_persisted_high_water_mark(
+    tmp_path: Path,
+    terminal_state: OperationState,
+    terminal_event: str,
+) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "public-result"},
+        client_id="client",
+        idempotency_key=f"restart-{terminal_state.value}",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    values = json.loads(path.read_text())
+    values[0]["last_stream_sequence"] = 10_000
+    values[0]["status"].update(
+        status=terminal_state.value,
+        status_sequence=20,
+        completed_at=values[0]["status"]["updated_at"],
+        result_available=terminal_state == OperationState.COMPLETED,
+        error_code="internal_error"
+        if terminal_state == OperationState.FAILED
+        else None,
+        cancel_code=(
+            "client_request" if terminal_state == OperationState.CANCELED else None
+        ),
+    )
+    if terminal_state != OperationState.COMPLETED:
+        values[0]["result"] = None
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(path, restarted_runtime, _result)
+    events = restarted.events_after(job.status.operation_id, 10_000)
+    restarted_runtime.shutdown()
+
+    assert events
+    assert all(event.event_id > 10_000 for event in events)
+    assert events[-1].event == terminal_event
+
+
+def test_missing_journal_accepted_spool_fails_registry_readiness(
+    tmp_path: Path,
+) -> None:
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(
+        tmp_path / "jobs.json",
+        runtime,
+        _result,
+        required_event_ids={"accepted-without-spool"},
+    )
+    runtime.shutdown()
+
+    assert registry.is_ready is False

@@ -53,7 +53,6 @@ from kagya.runtime import (
     EmotionTimer,
     ExternalTransactionCoordinator,
     StateWAL,
-    cancellation_checkpoint,
     hash_snapshot,
     SchedulerBudget,
     SubjectScheduler,
@@ -144,7 +143,6 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
             store.restore_into(main_loop, snapshot)
 
             def persist_completed(event: AgentEvent) -> str:
-                cancellation_checkpoint()
                 saved = store.save(
                     store.capture(
                         request.app.state.main_loop,

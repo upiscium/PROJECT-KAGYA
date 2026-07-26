@@ -7,7 +7,11 @@ from kagya.models.boundary_probe import BoundaryPolicyProbe
 
 
 class ModelProvider(Protocol):
-    """Protocol implemented by all model execution providers."""
+    """Protocol implemented by all model execution providers.
+
+    Providers without ``stream_generate`` support cooperative cancellation only
+    before and after their blocking ``generate`` call.
+    """
 
     def generate(self, prompt: str) -> str:
         """Generate text from a prompt."""

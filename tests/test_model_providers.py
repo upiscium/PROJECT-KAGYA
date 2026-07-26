@@ -17,6 +17,7 @@ from kagya.models.transformers_smoke import (
     TransformersSmokeError,
     run_transformers_smoke,
 )
+from kagya.runtime import CancellationToken, OperationCanceled
 from kagya.structured_response import parse_structured_response
 
 
@@ -140,7 +141,9 @@ class AutoregressiveFakeModel(FakeModel):
 
 
 class FakeSmokeProvider:
-    def __init__(self, *, fail_step: str | None = None, empty_generation: bool = False) -> None:
+    def __init__(
+        self, *, fail_step: str | None = None, empty_generation: bool = False
+    ) -> None:
         self.fail_step = fail_step
         self.empty_generation = empty_generation
         self.primary_loaded = False
@@ -309,9 +312,7 @@ def test_transformers_provider_loads_configured_model_id(
     TransformersProvider(settings).generate("hello")
 
     assert loaded["processor_model_id"] == settings.model.primary_id
-    assert loaded["processor_kwargs"] == {
-        "revision": settings.model.processor_revision
-    }
+    assert loaded["processor_kwargs"] == {"revision": settings.model.processor_revision}
     assert loaded["model_model_id"] == settings.model.primary_id
     assert "quantization_config" in loaded["model_kwargs"]
     assert loaded["model_kwargs"]["revision"] == settings.model.revision
@@ -434,7 +435,9 @@ def test_transformers_provider_resolves_processor_snapshot_independently(
     assert provider.resolved_model_revision == model_commit
     assert provider.resolved_processor_revision == processor_commit
     assert provider.model_artifact_manifest is not None
-    assert provider.model_artifact_manifest.processor_resolved_revision == processor_commit
+    assert (
+        provider.model_artifact_manifest.processor_resolved_revision == processor_commit
+    )
 
 
 def test_transformers_provider_uses_fallback_when_primary_load_fails(
@@ -504,6 +507,37 @@ def test_transformers_provider_uses_fallback_when_primary_generation_fails(
         load_settings(CONFIG_PATH).model.fallback_id,
     ]
     assert provider.last_fallback_used is True
+
+
+def test_transformers_stopped_primary_does_not_start_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = TransformersProvider(load_settings(CONFIG_PATH))
+    token = CancellationToken()
+    fallback_loaded = False
+
+    def stopped_stream(*args, **kwargs):
+        del args, kwargs
+        token.cancel()
+        raise RuntimeError("generation stopped")
+        yield "unreachable"
+
+    def fallback_component() -> object:
+        nonlocal fallback_loaded
+        fallback_loaded = True
+        return object()
+
+    monkeypatch.setattr(provider, "_stream_with", stopped_stream)
+    monkeypatch.setattr(provider, "_get_primary_model", lambda: object())
+    monkeypatch.setattr(provider, "_get_primary_processor", lambda: object())
+    monkeypatch.setattr(provider, "_get_fallback_model", fallback_component)
+    monkeypatch.setattr(provider, "_get_fallback_processor", fallback_component)
+
+    with pytest.raises(OperationCanceled):
+        list(provider.stream_generate("hello", token))
+
+    assert fallback_loaded is False
+    assert provider.last_fallback_used is False
 
 
 def test_transformers_provider_retries_primary_on_each_request_after_load_failure(
@@ -647,8 +681,14 @@ def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None
     assert "temperature" not in fake_model.generate_kwargs
     assert "top_p" not in fake_model.generate_kwargs
     assert fake_model.generate_kwargs["do_sample"] is False
-    assert fake_model.generate_kwargs["repetition_penalty"] == settings.generation.repetition_penalty
-    assert fake_model.generate_kwargs["no_repeat_ngram_size"] == settings.generation.no_repeat_ngram_size
+    assert (
+        fake_model.generate_kwargs["repetition_penalty"]
+        == settings.generation.repetition_penalty
+    )
+    assert (
+        fake_model.generate_kwargs["no_repeat_ngram_size"]
+        == settings.generation.no_repeat_ngram_size
+    )
 
 
 def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
@@ -669,8 +709,14 @@ def test_transformers_generate_includes_sampling_kwargs_when_sampling() -> None:
     assert fake_model.generate_kwargs["temperature"] == settings.generation.temperature
     assert fake_model.generate_kwargs["top_p"] == settings.generation.top_p
     assert fake_model.generate_kwargs["do_sample"] is True
-    assert fake_model.generate_kwargs["repetition_penalty"] == settings.generation.repetition_penalty
-    assert fake_model.generate_kwargs["no_repeat_ngram_size"] == settings.generation.no_repeat_ngram_size
+    assert (
+        fake_model.generate_kwargs["repetition_penalty"]
+        == settings.generation.repetition_penalty
+    )
+    assert (
+        fake_model.generate_kwargs["no_repeat_ngram_size"]
+        == settings.generation.no_repeat_ngram_size
+    )
 
 
 def test_transformers_generate_uses_processor_chat_template_when_available() -> None:
@@ -690,7 +736,9 @@ def test_transformers_generate_uses_processor_chat_template_when_available() -> 
     assert "Assistant:" not in processor.texts[0]
 
 
-def test_transformers_generate_with_image_attachment_uses_image_inputs(tmp_path: Path) -> None:
+def test_transformers_generate_with_image_attachment_uses_image_inputs(
+    tmp_path: Path,
+) -> None:
     image_path = tmp_path / "sample.png"
     Image.new("RGB", (1, 1), color="white").save(image_path)
     fake_model = FakeModel()
@@ -725,7 +773,9 @@ def test_transformers_rejects_invalid_image_attachment(tmp_path: Path) -> None:
     image_path = tmp_path / "sample.txt"
     image_path.write_text("not an image", encoding="utf-8")
     provider = TransformersProvider(
-        load_settings(CONFIG_PATH), model=FakeModel(), processor=FakeImageChatTemplateProcessor()
+        load_settings(CONFIG_PATH),
+        model=FakeModel(),
+        processor=FakeImageChatTemplateProcessor(),
     )
 
     with pytest.raises(ValueError, match="Unsupported image content type"):
@@ -817,7 +867,9 @@ def _settings_with_revisions(model_revision: str, processor_revision: str):
     )
 
 
-def _cached_snapshot(tmp_path: Path, commit: str, *, with_weights: bool = False) -> Path:
+def _cached_snapshot(
+    tmp_path: Path, commit: str, *, with_weights: bool = False
+) -> Path:
     snapshot = tmp_path / "models--test--model" / "snapshots" / commit
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}", encoding="utf-8")

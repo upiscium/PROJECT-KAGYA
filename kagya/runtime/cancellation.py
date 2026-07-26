@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from threading import Event
+from typing import Callable
 
 
 class OperationCanceled(RuntimeError):
@@ -42,6 +43,9 @@ class CancellationToken:
 _current_cancellation: ContextVar[CancellationToken | None] = ContextVar(
     "kagya_event_cancellation", default=None
 )
+_current_finalization_boundary: ContextVar[Callable[[], None] | None] = ContextVar(
+    "kagya_event_finalization_boundary", default=None
+)
 
 
 def current_cancellation_token() -> CancellationToken | None:
@@ -52,3 +56,13 @@ def cancellation_checkpoint() -> None:
     token = current_cancellation_token()
     if token is not None:
         token.raise_if_canceled()
+
+
+def enter_finalization_boundary() -> None:
+    """Atomically leave the cancellable phase before authoritative writes."""
+
+    boundary = _current_finalization_boundary.get()
+    if boundary is None:
+        cancellation_checkpoint()
+        return
+    boundary()

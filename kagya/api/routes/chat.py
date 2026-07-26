@@ -88,7 +88,9 @@ def chat(
 def create_chat_job(
     request: ChatRequest,
     http_request: Request,
-    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
     client_id: str | None = Header(default=None, alias="X-KAGYA-Client-ID"),
     _runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatJobAccepted:
@@ -100,7 +102,9 @@ def create_chat_job(
     try:
         record, created = registry.enqueue(
             payload,
-            client_id=client_id or request.client_session_id or _request_client(http_request),
+            client_id=client_id
+            or request.client_session_id
+            or _request_client(http_request),
             idempotency_key=idempotency_key,
             correlation_id=context_id,
         )
@@ -157,6 +161,8 @@ def cancel_chat_job(
     if disposition == "not_found":
         raise HTTPException(status_code=404, detail="Chat job not found")
     record = _required_job(registry, operation_id)
+    if disposition == "already_finalizing":
+        raise HTTPException(status_code=409, detail="already_finalizing")
     return ChatCancelResponse(disposition=disposition, operation=record.status)
 
 
@@ -172,7 +178,9 @@ def stream_chat_job(
     try:
         cursor = 0 if last_event_id is None else max(0, int(last_event_id))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Last-Event-ID must be an integer") from exc
+        raise HTTPException(
+            status_code=400, detail="Last-Event-ID must be an integer"
+        ) from exc
 
     def generate() -> Iterator[str]:
         nonlocal cursor
@@ -186,7 +194,11 @@ def stream_chat_job(
             record = registry.get(operation_id)
             if record is None or (
                 record.status.status
-                in {OperationState.COMPLETED, OperationState.FAILED, OperationState.CANCELED}
+                in {
+                    OperationState.COMPLETED,
+                    OperationState.FAILED,
+                    OperationState.CANCELED,
+                }
                 and not registry.events_after(operation_id, cursor)
             ):
                 return
@@ -201,9 +213,7 @@ def stream_chat_job(
 def create_chat_job_registry(app: Any) -> ChatJobRegistry:
     settings = app.state.settings.api
     registry_path = settings.chat_job_registry_path
-    if registry_path == type(settings).model_fields[
-        "chat_job_registry_path"
-    ].default:
+    if registry_path == type(settings).model_fields["chat_job_registry_path"].default:
         registry_path = app.state.settings.agent_state.path.parent / "chat_jobs.json"
 
     def execute(payload: dict[str, Any]) -> dict[str, Any]:
@@ -235,12 +245,13 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
             )
 
     journal = getattr(app.state, "event_journal", None)
+    journal_records = [] if journal is None else journal.verify()
     committed_event_ids = (
         set()
         if journal is None
         else {
             record.event_id
-            for record in journal.verify()
+            for record in journal_records
             if record.lifecycle == JournalLifecycle.COMPLETED
             or (
                 record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
@@ -248,6 +259,20 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
             )
         }
     )
+    latest_chat_records = {
+        record.event_id: record
+        for record in journal_records
+        if record.source == "api.chat.job"
+    }
+    required_event_ids = {
+        event_id
+        for event_id, record in latest_chat_records.items()
+        if record.lifecycle == JournalLifecycle.ACCEPTED
+        or (
+            record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+            and record.failure_category == "accepted_not_started"
+        )
+    }
     return ChatJobRegistry(
         registry_path,
         app.state.agent_runtime,
@@ -256,6 +281,7 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
         timeout_seconds=settings.chat_timeout_seconds,
         completion_observer=observe_completed,
         committed_event_ids=committed_event_ids,
+        required_event_ids=required_event_ids,
     )
 
 

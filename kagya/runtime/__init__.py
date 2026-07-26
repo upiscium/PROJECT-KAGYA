@@ -23,6 +23,7 @@ from kagya.runtime.cancellation import (
     OperationCanceled,
     cancellation_checkpoint,
     current_cancellation_token,
+    enter_finalization_boundary,
 )
 from kagya.runtime.agent_state import (
     AgentStateSnapshot,
@@ -104,6 +105,7 @@ __all__ = [
     "OperationCanceled",
     "cancellation_checkpoint",
     "current_cancellation_token",
+    "enter_finalization_boundary",
     "current_agent_event",
     "register_event_rollback",
     "AgentStateSnapshot",

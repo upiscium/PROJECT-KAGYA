@@ -26,9 +26,10 @@ from kagya.runtime import (
     AgentEventOutcome,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeQueueFull,
+    AgentRuntimeStopped,
     CancellationToken,
     OperationCanceled,
-    cancellation_checkpoint,
 )
 
 
@@ -44,6 +45,7 @@ class ChatJobRecord(BaseModel):
     sealed_request: str
     pending_result: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    last_stream_sequence: int = Field(default=0, ge=0)
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class ChatJobRegistry:
         timeout_seconds: float = 300.0,
         completion_observer: CompletionObserver | None = None,
         committed_event_ids: set[str] | None = None,
+        required_event_ids: set[str] | None = None,
     ) -> None:
         self.path = path
         self.runtime = runtime
@@ -78,6 +81,7 @@ class ChatJobRegistry:
         self.timeout_seconds = timeout_seconds
         self.completion_observer = completion_observer
         self.committed_event_ids = committed_event_ids or set()
+        self.required_event_ids = required_event_ids or set()
         self._lock = RLock()
         self._changed = Condition(self._lock)
         self._records: dict[str, ChatJobRecord] = {}
@@ -89,6 +93,9 @@ class ChatJobRegistry:
         self._enqueue_sequence = 0
         self._key = self._load_key()
         self._load()
+        self._missing_required_event_ids = self.required_event_ids - {
+            record.status.event_id for record in self._records.values()
+        }
         with self._lock:
             self._recover()
 
@@ -141,9 +148,12 @@ class ChatJobRegistry:
             self._emit(operation_id, "status", status.model_dump(mode="json"))
             try:
                 self._submit(record)
-            except Exception:
+            except (AgentRuntimeQueueFull, AgentRuntimeStopped):
                 del self._records[operation_id]
                 self._persist()
+                raise
+            except Exception:
+                # Keep the durable spool when journal acceptance may have succeeded.
                 raise
             return record.model_copy(deep=True), True
 
@@ -155,6 +165,21 @@ class ChatJobRegistry:
     def error(self, operation_id: str) -> BaseException | None:
         with self._lock:
             return self._errors.get(operation_id)
+
+    @property
+    def is_ready(self) -> bool:
+        return not self._missing_required_event_ids
+
+    def shutdown(self) -> None:
+        with self._lock:
+            cancellable = [
+                operation_id
+                for operation_id, record in self._records.items()
+                if record.status.status
+                in {OperationState.QUEUED, OperationState.RUNNING}
+            ]
+        for operation_id in cancellable:
+            self.cancel(operation_id, OperationCancelCode.SHUTDOWN)
 
     def cancel(self, operation_id: str, code: OperationCancelCode) -> str:
         with self._lock:
@@ -168,6 +193,8 @@ class ChatJobRegistry:
                 OperationState.FAILED,
             }:
                 return record.status.status.value
+            if record.status.status == OperationState.FINALIZING:
+                return "already_finalizing"
             token = self._tokens.get(operation_id)
             if token is not None:
                 token.cancel(code.value)
@@ -176,6 +203,7 @@ class ChatJobRegistry:
                     operation_id, OperationState.CANCELED, cancel_code=code
                 )
                 self._refresh_queue_positions()
+                self._emit(operation_id, "canceled", {"code": code.value})
                 return "canceled"
             self._transition(
                 operation_id,
@@ -184,7 +212,9 @@ class ChatJobRegistry:
             )
             return "cancel_requested"
 
-    def events_after(self, operation_id: str, last_event_id: int) -> list[ChatStreamEvent]:
+    def events_after(
+        self, operation_id: str, last_event_id: int
+    ) -> list[ChatStreamEvent]:
         with self._lock:
             return [
                 event
@@ -203,10 +233,12 @@ class ChatJobRegistry:
             return self.events_after(operation_id, last_event_id)
 
     def _recover(self) -> None:
-        for record in sorted(self._records.values(), key=lambda item: item.enqueue_sequence):
+        for record in sorted(
+            self._records.values(), key=lambda item: item.enqueue_sequence
+        ):
             operation_id = record.status.operation_id
             self._events[operation_id] = deque(maxlen=self.replay_limit)
-            self._event_sequences[operation_id] = 0
+            self._event_sequences[operation_id] = record.last_stream_sequence
             if record.status.status == OperationState.QUEUED:
                 self._submit(record)
             elif record.status.status in {
@@ -227,6 +259,11 @@ class ChatJobRegistry:
                         OperationState.FAILED,
                         error_code=OperationErrorCode.INTERRUPTED,
                     )
+                    self._emit(
+                        operation_id,
+                        "error",
+                        {"code": OperationErrorCode.INTERRUPTED.value},
+                    )
             else:
                 self._emit(
                     operation_id,
@@ -235,6 +272,28 @@ class ChatJobRegistry:
                 )
                 if record.result is not None:
                     self._emit(operation_id, "final", record.result)
+                elif record.status.status == OperationState.FAILED:
+                    code = (
+                        record.status.error_code.value
+                        if record.status.error_code
+                        else OperationErrorCode.INTERNAL_ERROR.value
+                    )
+                    self._emit(
+                        operation_id,
+                        "error",
+                        {"code": code},
+                    )
+                elif record.status.status == OperationState.CANCELED:
+                    code = (
+                        record.status.cancel_code.value
+                        if record.status.cancel_code
+                        else OperationCancelCode.CLIENT_REQUEST.value
+                    )
+                    self._emit(
+                        operation_id,
+                        "canceled",
+                        {"code": code},
+                    )
         self._refresh_queue_positions()
 
     def _submit(self, record: ChatJobRecord) -> None:
@@ -254,16 +313,18 @@ class ChatJobRegistry:
             with self._lock:
                 current = self._records[operation_id]
                 if current.status.status == OperationState.CANCELED:
-                    raise OperationCanceled(current.status.cancel_code or "client_request")
+                    raise OperationCanceled(
+                        current.status.cancel_code or "client_request"
+                    )
                 self._transition(operation_id, OperationState.RUNNING)
                 self._refresh_queue_positions()
             token.raise_if_canceled()
             result = self.executor(self._open(record.sealed_request))
-            token.raise_if_canceled()
             with self._lock:
+                if self._records[operation_id].status.status == OperationState.RUNNING:
+                    self._enter_finalizing(operation_id, token)
                 self._records[operation_id].pending_result = result
-                self._transition(operation_id, OperationState.FINALIZING)
-            cancellation_checkpoint()
+                self._persist()
             return result
 
         try:
@@ -275,11 +336,15 @@ class ChatJobRegistry:
                 correlation_id=record.correlation_id,
                 event_id=record.status.event_id,
                 cancellation_token=token,
+                finalization_boundary=lambda: self._enter_finalizing(
+                    operation_id, token
+                ),
             )
         except Exception:
             self._tokens.pop(operation_id, None)
             self._timers.pop(operation_id, None)
             raise
+
         def finish(completed: Future[AgentEventOutcome[dict[str, Any]]]) -> None:
             self._finish(operation_id, completed)
 
@@ -311,6 +376,7 @@ class ChatJobRegistry:
                         OperationState.CANCELED,
                         cancel_code=cancel_code,
                     )
+                    self._emit(operation_id, "canceled", {"code": cancel_code.value})
         except Exception as exc:
             self._errors[operation_id] = exc
             error_code = (
@@ -324,9 +390,7 @@ class ChatJobRegistry:
                     self._transition(
                         operation_id, OperationState.FAILED, error_code=error_code
                     )
-                    self._emit(
-                        operation_id, "error", {"code": error_code.value}
-                    )
+                    self._emit(operation_id, "error", {"code": error_code.value})
         else:
             with self._lock:
                 record = self._records[operation_id]
@@ -354,6 +418,21 @@ class ChatJobRegistry:
             self._emit(operation_id, "token", {"text": chunk})
         self._emit(operation_id, "final", result)
 
+    def _enter_finalizing(self, operation_id: str, token: CancellationToken) -> None:
+        with self._lock:
+            record = self._records[operation_id]
+            if record.status.status == OperationState.FINALIZING:
+                return
+            if record.status.status != OperationState.RUNNING:
+                token.raise_if_canceled()
+                raise RuntimeError(
+                    "chat job cannot enter finalizing from its current state"
+                )
+            if record.status.cancel_requested or token.is_canceled:
+                token.raise_if_canceled()
+                raise OperationCanceled(OperationCancelCode.CLIENT_REQUEST.value)
+            self._transition(operation_id, OperationState.FINALIZING)
+
     def _transition(
         self,
         operation_id: str,
@@ -374,17 +453,35 @@ class ChatJobRegistry:
             status_sequence=previous.status_sequence + 1,
             queue_position=queue_position if state == OperationState.QUEUED else None,
             submitted_at=previous.submitted_at,
-            started_at=now if state == OperationState.RUNNING and previous.started_at is None else previous.started_at,
-            finalizing_at=now if state == OperationState.FINALIZING else previous.finalizing_at,
-            completed_at=now if state in {OperationState.COMPLETED, OperationState.FAILED, OperationState.CANCELED} else None,
+            started_at=(
+                now
+                if state == OperationState.RUNNING and previous.started_at is None
+                else previous.started_at
+            ),
+            finalizing_at=(
+                now if state == OperationState.FINALIZING else previous.finalizing_at
+            ),
+            completed_at=(
+                now
+                if state
+                in {
+                    OperationState.COMPLETED,
+                    OperationState.FAILED,
+                    OperationState.CANCELED,
+                }
+                else None
+            ),
             updated_at=now,
             error_code=error_code,
             cancel_code=cancel_code,
-            cancel_requested=previous.cancel_requested if cancel_requested is None else cancel_requested,
+            cancel_requested=(
+                previous.cancel_requested
+                if cancel_requested is None
+                else cancel_requested
+            ),
             result_available=state == OperationState.COMPLETED,
         )
         record.status = status
-        self._persist()
         self._emit(operation_id, "status", status.model_dump(mode="json"))
 
     def _refresh_queue_positions(self) -> None:
@@ -417,6 +514,8 @@ class ChatJobRegistry:
             )
             sequence = self._event_sequences.get(operation_id, 0) + 1
             self._event_sequences[operation_id] = sequence
+            self._records[operation_id].last_stream_sequence = sequence
+            self._persist()
             events.append(ChatStreamEvent(sequence, event, data))
             self._changed.notify_all()
 
@@ -432,20 +531,26 @@ class ChatJobRegistry:
 
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(
-                [
-                    record.model_dump(mode="json")
-                    for record in sorted(
-                        self._records.values(), key=lambda item: item.enqueue_sequence
-                    )
-                ],
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
+        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        payload = json.dumps(
+            [
+                record.model_dump(mode="json")
+                for record in sorted(
+                    self._records.values(), key=lambda item: item.enqueue_sequence
+                )
+            ],
+            separators=(",", ":"),
         )
-        os.replace(temporary, self.path)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            _fsync_directory(self.path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _load_key(self) -> bytes:
         key_path = self.path.with_suffix(self.path.suffix + ".key")
@@ -458,6 +563,7 @@ class ChatJobRegistry:
             output.write(key)
             output.flush()
             os.fsync(output.fileno())
+        _fsync_directory(key_path.parent)
         return key
 
     def _seal(self, value: dict[str, Any]) -> str:
@@ -496,3 +602,11 @@ def _safe_identity(value: str) -> str:
 
 def _public_chunks(value: str, size: int = 24) -> list[str]:
     return [value[index : index + size] for index in range(0, len(value), size)]
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

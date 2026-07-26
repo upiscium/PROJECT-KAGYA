@@ -16,6 +16,7 @@ from kagya.runtime.cancellation import (
     CancellationToken,
     OperationCanceled,
     _current_cancellation,
+    _current_finalization_boundary,
 )
 
 
@@ -137,6 +138,7 @@ class _Envelope(Generic[T]):
     handler: Callable[[], T]
     future: Future[AgentEventOutcome[T]]
     cancellation_token: CancellationToken | None = None
+    finalization_boundary: Callable[[], None] | None = None
 
 
 class EventRecorder(Protocol):
@@ -251,6 +253,7 @@ class AgentRuntime:
         correlation_id: str | None = None,
         event_id: str | None = None,
         cancellation_token: CancellationToken | None = None,
+        finalization_boundary: Callable[[], None] | None = None,
     ) -> Future[AgentEventOutcome[T]]:
         now = datetime.now(UTC)
         event = AgentEvent(
@@ -269,6 +272,7 @@ class AgentRuntime:
             handler=handler,
             future=future,
             cancellation_token=cancellation_token,
+            finalization_boundary=finalization_boundary,
         )
         with self._state_lock:
             if self._state != "accepting":
@@ -302,6 +306,7 @@ class AgentRuntime:
         correlation_id: str | None = None,
         event_id: str | None = None,
         cancellation_token: CancellationToken | None = None,
+        finalization_boundary: Callable[[], None] | None = None,
     ) -> AgentEventOutcome[T]:
         return self.submit(
             event_type,
@@ -312,6 +317,7 @@ class AgentRuntime:
             correlation_id=correlation_id,
             event_id=event_id,
             cancellation_token=cancellation_token,
+            finalization_boundary=finalization_boundary,
         ).result()
 
     def shutdown(self) -> None:
@@ -399,6 +405,9 @@ class AgentRuntime:
                 rollback_token = _rollback_callbacks.set(())
                 cancellation_context = _current_cancellation.set(
                     envelope.cancellation_token
+                )
+                finalization_context = _current_finalization_boundary.set(
+                    envelope.finalization_boundary
                 )
                 try:
                     if envelope.cancellation_token is not None:
@@ -491,6 +500,7 @@ class AgentRuntime:
                                 AgentEventOutcome(event=event, value=value)
                             )
                 finally:
+                    _current_finalization_boundary.reset(finalization_context)
                     _current_cancellation.reset(cancellation_context)
                     _rollback_callbacks.reset(rollback_token)
                     _current_event.reset(event_token)

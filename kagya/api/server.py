@@ -67,7 +67,6 @@ from kagya.runtime import (
     StateWAL,
     StateWalIntegrityError,
     hash_snapshot,
-    cancellation_checkpoint,
     AutonomyLoop,
     SchedulerBudget,
     SubjectScheduler,
@@ -148,6 +147,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "agent_runtime": runtime_ready,
                 "journal": journal_ready,
                 "state_wal": wal_ready,
+                "chat_job_registry": bool(
+                    getattr(app.state, "chat_job_registry", None) is not None
+                    and app.state.chat_job_registry.is_ready
+                ),
             }
             ready = all(checks.values())
         if not ready:
@@ -214,6 +217,7 @@ def teardown_subject_runtime(app: FastAPI) -> None:
         ("autonomy_loop", "shutdown"),
         ("sleep_coordinator", "shutdown"),
         ("emotion_timer", "stop"),
+        ("chat_job_registry", "shutdown"),
         ("agent_runtime", "shutdown"),
     ):
         component = getattr(app.state, name, None)
@@ -256,6 +260,7 @@ def teardown_subject_runtime(app: FastAPI) -> None:
         "tool_registry",
         "tool_executor",
         "behavioral_artifact_reconciliation",
+        "chat_job_registry",
         "runtime_event_log",
         "operational_telemetry",
     ):
@@ -512,7 +517,6 @@ def _event_sequence(sequence: int | None) -> int:
 
 
 def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
-    cancellation_checkpoint()
     started = time.perf_counter()
     status = "failure"
     store = app.state.agent_state_store
@@ -529,7 +533,6 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
         state_hash_before=before_hash,
         state_hash_after=after_hash,
     )
-    cancellation_checkpoint()
     app.state.state_wal.append_transition(event, previous, candidate)
     try:
         saved = store.save(candidate)
