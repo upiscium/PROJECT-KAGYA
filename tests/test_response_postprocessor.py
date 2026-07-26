@@ -8,6 +8,7 @@ from kagya.structured_response import (
     PublicBehaviorClass,
     SAFE_UNABLE_RESPONSE,
     StructuredSubjectResponse,
+    StructuredResponseStatus,
 )
 
 
@@ -115,3 +116,48 @@ def test_gemma_turn_tokens_are_removed_before_json_parsing() -> None:
 
     assert processed.visible_response == "Visible"
     assert processed.parse_valid is True
+
+
+@pytest.mark.parametrize(
+    "visible",
+    (
+        "<think>PRIVATE</think>public",
+        "<ThInK>PRIVATE</tHiNk>",
+        "safe <think>nested <think>PRIVATE</think></think>",
+        "<private_reasoning>PRIVATE</private_reasoning>",
+        "PRIVATE_THOUGHT_SENTINEL_133",
+        "<start_of_turn>model safe<end_of_turn>",
+    ),
+)
+def test_decoded_private_content_fails_closed_without_debug_leak(visible: str) -> None:
+    raw = _response("respond", visible)
+
+    processed = ResponsePostprocessor().process(raw)
+
+    assert processed.behavior_class == PublicBehaviorClass.UNABLE
+    assert processed.visible_response == SAFE_UNABLE_RESPONSE
+    assert processed.hidden_thought == ""
+    assert processed.parse_valid is False
+    assert processed.status == StructuredResponseStatus.INVALID_PRIVATE_CONTENT
+    assert "PRIVATE" not in processed.visible_response
+
+
+def test_unicode_escaped_think_tag_is_rejected_after_json_decoding() -> None:
+    raw = (
+        '{"behavior_class":"respond","visible_response":'
+        '"\\u003cthink\\u003ePRIVATE\\u003c/think\\u003e"}'
+    )
+
+    processed = ResponsePostprocessor().process(raw)
+
+    assert processed.visible_response == SAFE_UNABLE_RESPONSE
+    assert processed.hidden_thought == ""
+    assert processed.status == StructuredResponseStatus.INVALID_PRIVATE_CONTENT
+
+
+def test_structured_model_rejects_private_visible_content_directly() -> None:
+    with pytest.raises(ValidationError, match="private content"):
+        StructuredSubjectResponse(
+            behavior_class=PublicBehaviorClass.RESPOND,
+            visible_response="<THINK>PRIVATE</THINK>",
+        )

@@ -407,6 +407,39 @@ def test_natural_english_refusal_is_invalid_unable_in_authoritative_runtime() ->
     assert behavior == PublicBehaviorClass.UNABLE
 
 
+@pytest.mark.parametrize(
+    "declared", (PublicBehaviorClass.NO_OP, PublicBehaviorClass.DEFER)
+)
+def test_runtime_state_no_op_cannot_override_declared_effects(
+    declared: PublicBehaviorClass,
+) -> None:
+    behavior = RuntimeBehaviorClassifier().classify(
+        RuntimeBehaviorObservation(
+            visible_response="Declared response",
+            declared_behavior=declared,
+            parse_valid=True,
+            runtime_state_behavior=PublicBehaviorClass.NO_OP,
+            before_authoritative_state={"domains": {}},
+            after_authoritative_state={"domains": {}},
+            new_external_effects=1,
+        )
+    )
+
+    assert behavior == PublicBehaviorClass.RESPOND
+
+
+def test_runtime_state_behavior_is_limited_to_undeclared_internal_scenarios() -> None:
+    behavior = RuntimeBehaviorClassifier().classify(
+        RuntimeBehaviorObservation(
+            runtime_state_behavior=PublicBehaviorClass.NO_OP,
+            before_authoritative_state={"domains": {}},
+            after_authoritative_state={"domains": {}},
+        )
+    )
+
+    assert behavior == PublicBehaviorClass.NO_OP
+
+
 def test_ambiguous_defer_uses_chat_without_authority_or_action_mutation(
     tmp_path: Path,
 ) -> None:

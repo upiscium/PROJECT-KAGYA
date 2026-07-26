@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from enum import StrEnum
 import json
+import re
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 
 class PublicBehaviorClass(StrEnum):
@@ -22,6 +23,18 @@ class StructuredResponseStatus(StrEnum):
     INVALID_JSON = "invalid_json"
     INVALID_SCHEMA = "invalid_schema"
     INVALID_EMPTY_RESPONSE = "invalid_empty_response"
+    INVALID_PRIVATE_CONTENT = "invalid_private_content"
+
+
+_PRIVATE_CONTENT_PATTERN = re.compile(
+    r"(?:"
+    r"</?think>"
+    r"|</?(?:analysis|reasoning|private[_-]?reasoning|scratchpad)>"
+    r"|<(?:start|end)_of_turn>"
+    r"|private(?:_thought)?_sentinel(?:_[a-z0-9]+)*"
+    r")",
+    flags=re.IGNORECASE,
+)
 
 
 class StructuredSubjectResponse(BaseModel):
@@ -31,6 +44,13 @@ class StructuredSubjectResponse(BaseModel):
 
     behavior_class: PublicBehaviorClass
     visible_response: str
+
+    @field_validator("visible_response")
+    @classmethod
+    def reject_private_content(cls, value: str) -> str:
+        if _PRIVATE_CONTENT_PATTERN.search(value):
+            raise ValueError("visible_response contains private content")
+        return value
 
     @model_validator(mode="after")
     def require_visible_non_noop_response(self) -> StructuredSubjectResponse:
@@ -66,6 +86,11 @@ def parse_structured_response(value: str) -> BoundedStructuredResponse:
     try:
         if not isinstance(payload, dict):
             raise ValueError("structured response must be an object")
+        visible_response = payload.get("visible_response")
+        if isinstance(visible_response, str) and _PRIVATE_CONTENT_PATTERN.search(
+            visible_response
+        ):
+            return _invalid(StructuredResponseStatus.INVALID_PRIVATE_CONTENT)
         response = StructuredSubjectResponse.model_validate_json(value)
     except (ValidationError, ValueError) as exc:
         status = (

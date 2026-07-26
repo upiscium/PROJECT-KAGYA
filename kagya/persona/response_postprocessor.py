@@ -29,13 +29,20 @@ class ResponsePostprocessor:
     """Extract internal thoughts while keeping normal output clean."""
 
     def process(self, response_text: str) -> ProcessedResponse:
-        visible_response, hidden_parts = _partition_think_channel(response_text)
-        response_json = GEMMA_TURN_TOKEN_PATTERN.sub("", visible_response).strip()
-        parsed = parse_structured_response(response_json)
+        parsed = parse_structured_response(response_text.strip())
+        hidden_parts: list[str] = []
+        if parsed.status == StructuredResponseStatus.INVALID_JSON:
+            visible_response, hidden_parts = _partition_think_channel(response_text)
+            response_json = GEMMA_TURN_TOKEN_PATTERN.sub("", visible_response).strip()
+            parsed = parse_structured_response(response_json)
         return ProcessedResponse(
             behavior_class=parsed.behavior_class,
             visible_response=parsed.visible_response,
-            hidden_thought="\n".join(part for part in hidden_parts if part),
+            hidden_thought=(
+                ""
+                if parsed.status == StructuredResponseStatus.INVALID_PRIVATE_CONTENT
+                else "\n".join(part for part in hidden_parts if part)
+            ),
             parse_valid=parsed.parse_valid,
             status=parsed.status,
         )

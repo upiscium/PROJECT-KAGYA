@@ -270,21 +270,13 @@ class RuntimeBehaviorClassifier:
                 ("domains", "beliefs"),
             )
         )
-        if observation.runtime_state_behavior is not None:
-            return observation.runtime_state_behavior
-        if observation.authoritative and (
-            observation.parse_valid is not True or observation.declared_behavior is None
+        if (
+            observation.runtime_state_behavior is not None
+            and observation.declared_behavior is None
+            and observation.parse_valid is None
         ):
-            return PublicBehaviorClass.UNABLE
+            return observation.runtime_state_behavior
         proposed = observation.declared_behavior
-        if proposed is None:
-            # Auxiliary compatibility only. It is never used by an authoritative
-            # deterministic or real-model runtime trace.
-            return (
-                PublicBehaviorClass.NO_OP
-                if not response
-                else PublicBehaviorClass.RESPOND
-            )
         if observation.duplicate_retry:
             if observation.tool_call_count == 0 and observation.receipt_count == 0:
                 return PublicBehaviorClass.NO_OP
@@ -295,6 +287,18 @@ class RuntimeBehaviorClassifier:
             or observation.new_external_effects
         ):
             return PublicBehaviorClass.RESPOND
+        if observation.authoritative and (
+            observation.parse_valid is not True or proposed is None
+        ):
+            return PublicBehaviorClass.UNABLE
+        if proposed is None:
+            # Auxiliary compatibility only. It is never used by an authoritative
+            # deterministic or real-model runtime trace.
+            return (
+                PublicBehaviorClass.NO_OP
+                if not response
+                else PublicBehaviorClass.RESPOND
+            )
         return proposed
 
 
