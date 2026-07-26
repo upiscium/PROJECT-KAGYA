@@ -1,4 +1,5 @@
 from pathlib import Path
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -951,14 +952,22 @@ def test_adapter_evaluate_rejects_client_deterministic_scores(tmp_path: Path) ->
 def test_production_behavioral_route_forces_real_model_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path).model_copy(
+    base = _settings(tmp_path)
+    monkeypatch.setenv("KAGYA_LIVE_STATE_KEY", b64encode(bytes(32)).decode("ascii"))
+    settings = base.model_copy(
         update={
-            "project": _settings(tmp_path).project.model_copy(
+            "project": base.project.model_copy(
                 update={"environment": ProjectEnvironment.PRODUCTION}
             ),
-            "adapter_registry": _settings(tmp_path).adapter_registry.model_copy(
+            "adapter_registry": base.adapter_registry.model_copy(
                 update={
                     "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
+                }
+            ),
+            "at_rest": base.at_rest.model_copy(
+                update={
+                    "live": base.at_rest.live.model_copy(update={"enabled": True}),
+                    "memory_encrypted_filesystem_attested": True,
                 }
             ),
         }

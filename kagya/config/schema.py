@@ -303,6 +303,53 @@ class AgentStateWalSettings(StrictBaseModel):
     path: Path = Path(".kagya/private/agent_state_wal.jsonl")
 
 
+class KeyRingSettings(StrictBaseModel):
+    current_key_id: str = Field(default="current", pattern=r"^[A-Za-z0-9._-]+$")
+    current_key_env: str = Field(
+        default="KAGYA_LIVE_STATE_KEY", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    )
+    allowed_old_key_envs: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_key_ring(self) -> "KeyRingSettings":
+        if self.current_key_id in self.allowed_old_key_envs:
+            raise ValueError("current key ID must not also be an old key ID")
+        for key_id, env_name in self.allowed_old_key_envs.items():
+            if re.fullmatch(r"[A-Za-z0-9._-]+", key_id) is None:
+                raise ValueError("old key ID contains unsafe characters")
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name) is None:
+                raise ValueError("old key environment name is invalid")
+        return self
+
+
+class LiveEncryptionSettings(StrictBaseModel):
+    enabled: bool = False
+    keys: KeyRingSettings = Field(default_factory=KeyRingSettings)
+
+
+class BackupEncryptionSettings(StrictBaseModel):
+    directory: Path = Path(".kagya/backups")
+    keys: KeyRingSettings = Field(
+        default_factory=lambda: KeyRingSettings(
+            current_key_env="KAGYA_BACKUP_KEY"
+        )
+    )
+    adapter_keys: KeyRingSettings = Field(
+        default_factory=lambda: KeyRingSettings(
+            current_key_env="KAGYA_ADAPTER_ARTIFACT_KEY"
+        )
+    )
+    retention_count: int = Field(default=7, ge=1, le=1000)
+    schedule_interval_seconds: int = Field(default=86400, ge=60)
+    incremental_full_every: int = Field(default=7, ge=1, le=1000)
+
+
+class AtRestSecuritySettings(StrictBaseModel):
+    live: LiveEncryptionSettings = Field(default_factory=LiveEncryptionSettings)
+    backup: BackupEncryptionSettings = Field(default_factory=BackupEncryptionSettings)
+    memory_encrypted_filesystem_attested: bool = False
+
+
 class AutonomySettings(StrictBaseModel):
     enabled: bool = True
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
@@ -412,6 +459,7 @@ class Settings(StrictBaseModel):
     agent_state_wal: AgentStateWalSettings = Field(
         default_factory=AgentStateWalSettings
     )
+    at_rest: AtRestSecuritySettings = Field(default_factory=AtRestSecuritySettings)
     autonomy: AutonomySettings = Field(default_factory=AutonomySettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
@@ -430,6 +478,15 @@ class Settings(StrictBaseModel):
         ):
             raise ValueError(
                 "production requires behavioral_activation_policy=real_model_required"
+            )
+        if environment == ProjectEnvironment.PRODUCTION and not self.at_rest.live.enabled:
+            raise ValueError("production requires live authoritative encryption")
+        if (
+            environment == ProjectEnvironment.PRODUCTION
+            and not self.at_rest.memory_encrypted_filesystem_attested
+        ):
+            raise ValueError(
+                "production memory requires encrypted filesystem attestation"
             )
         if (
             policy == BehavioralActivationPolicy.DETERMINISTIC_RUNTIME_ONLY

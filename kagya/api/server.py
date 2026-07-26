@@ -71,6 +71,8 @@ from kagya.runtime import (
     SchedulerBudget,
     SubjectScheduler,
 )
+from kagya.security import build_live_codecs
+from kagya.security.backup import assert_no_incomplete_restore
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -218,6 +220,11 @@ def _lifespan(settings: Settings):
 
 
 def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
+    assert_no_incomplete_restore(settings)
+    live_codecs = getattr(app.state, "live_codecs", None)
+    if live_codecs is None:
+        live_codecs = build_live_codecs(settings)
+        app.state.live_codecs = live_codecs
     if getattr(app.state, "runtime_event_log", None) is None:
         app.state.runtime_event_log = RuntimeEventLog()
     if getattr(app.state, "operational_telemetry", None) is None:
@@ -231,7 +238,9 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
         )
     if getattr(app.state, "agent_state_store", None) is None:
         app.state.agent_state_store = AgentStateStore(
-            settings.agent_state.path, app.state.runtime_event_log
+            settings.agent_state.path,
+            app.state.runtime_event_log,
+            codec=live_codecs.snapshot,
         )
     snapshot = app.state.agent_state_store.load(settings.emotion.baseline_surprisal)
     if getattr(app.state, "event_journal", None) is None:
@@ -240,9 +249,12 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             max_bytes=settings.agent_journal.max_bytes,
             retained_files=settings.agent_journal.retained_files,
             telemetry=app.state.operational_telemetry,
+            codec=live_codecs.journal,
         )
     if getattr(app.state, "state_wal", None) is None:
-        app.state.state_wal = StateWAL(settings.agent_state_wal.path)
+        app.state.state_wal = StateWAL(
+            settings.agent_state_wal.path, codec=live_codecs.wal
+        )
     snapshot = _reconcile_state_wal(app, snapshot)
     app.state.event_journal.reconcile(snapshot)
     if getattr(app.state, "memory_system", None) is None:

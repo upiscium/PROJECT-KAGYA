@@ -8,6 +8,7 @@ dependencies = [
     "accelerate",
     "bitsandbytes",
     "chromadb",
+    "cryptography>=49.0.0",
     "datasets",
     "fastapi",
     "numpy",
@@ -29,6 +30,7 @@ dependencies = [
 
 [project.scripts]
 kagya-worker = "kagya.training.worker_cli:main"
+kagya-backup = "kagya.security.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -61,6 +61,22 @@ qlora-prod-check config="config.yaml":
     @echo "==> Checking production QLoRA prerequisites..."
     uv run python -m kagya.learning.qlora_requirements --config {{config}}
 
+# Offline encrypted backup/restore administration. Extra arguments follow `--`.
+backup-create config="config.yaml":
+    uv run kagya-backup --config {{config}} create
+
+backup-verify backup_id config="config.yaml":
+    uv run kagya-backup --config {{config}} verify {{backup_id}}
+
+backup-scheduled config="config.yaml":
+    uv run kagya-backup --config {{config}} scheduled
+
+live-encryption-migrate config="config.yaml":
+    uv run kagya-backup --config {{config}} migrate-live
+
+live-encryption-rotate config="config.yaml":
+    uv run kagya-backup --config {{config}} rotate-live
+
 # FastAPI サーバーを起動します
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."

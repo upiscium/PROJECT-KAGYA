@@ -69,6 +69,7 @@ from kagya.training import (
     TrainingBundleBuilder,
     TrainingJobRegistry,
 )
+from kagya.security import build_live_codecs
 from kagya.learning import QloraTrainer
 
 
@@ -188,9 +189,11 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
 def get_agent_state_store(request: Request) -> AgentStateStore:
     store = getattr(request.app.state, "agent_state_store", None)
     if store is None:
+        codecs = _get_live_codecs(request)
         store = AgentStateStore(
             get_api_settings(request).agent_state.path,
             get_runtime_event_log(request),
+            codec=codecs.snapshot,
         )
         request.app.state.agent_state_store = store
     return store
@@ -199,9 +202,20 @@ def get_agent_state_store(request: Request) -> AgentStateStore:
 def get_state_wal(request: Request) -> StateWAL:
     wal = getattr(request.app.state, "state_wal", None)
     if wal is None:
-        wal = StateWAL(get_api_settings(request).agent_state_wal.path)
+        wal = StateWAL(
+            get_api_settings(request).agent_state_wal.path,
+            codec=_get_live_codecs(request).wal,
+        )
         request.app.state.state_wal = wal
     return wal
+
+
+def _get_live_codecs(request: Request):
+    codecs = getattr(request.app.state, "live_codecs", None)
+    if codecs is None:
+        codecs = build_live_codecs(get_api_settings(request))
+        request.app.state.live_codecs = codecs
+    return codecs
 
 
 def get_subject_scheduler(request: Request) -> SubjectScheduler:

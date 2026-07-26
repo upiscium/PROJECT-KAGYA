@@ -150,6 +150,31 @@ agent_journal:
 agent_state_wal:
   path: .kagya/private/agent_state_wal.jsonl
 
+# Development explicitly permits plaintext authoritative files. Production must
+# enable this and provide strict 32-byte base64 keys through the named env vars.
+at_rest:
+  live:
+    enabled: false
+    keys:
+      current_key_id: live-v1
+      current_key_env: KAGYA_LIVE_STATE_KEY
+      allowed_old_key_envs: {}
+  backup:
+    directory: .kagya/backups
+    keys:
+      current_key_id: backup-v1
+      current_key_env: KAGYA_BACKUP_KEY
+      allowed_old_key_envs: {}
+    adapter_keys:
+      current_key_id: adapter-v1
+      current_key_env: KAGYA_ADAPTER_ARTIFACT_KEY
+      allowed_old_key_envs: {}
+    retention_count: 7
+    schedule_interval_seconds: 86400
+    incremental_full_every: 7
+  # Chroma does not expose transparent application-level encryption.
+  memory_encrypted_filesystem_attested: false
+
 autonomy:
   enabled: true
   poll_interval_seconds: 1.0
@@ -188,6 +213,8 @@ api:
       - /api/state/restore
       - /api/state/reset
       - /api/state/restore/*
+      - /api/state/backups/*/restore
+      - /api/state/backups/*/rotate
       - /api/sleep/jobs
       - /api/sleep/jobs/*
       - /api/sleep/cleanup

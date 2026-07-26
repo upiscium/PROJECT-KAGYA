@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.runtime.agent_state import AgentStateSnapshot
 from kagya.runtime.event_journal import hash_snapshot
+from kagya.security import EncryptedCodec, EncryptionError
 
 
 class StateWalIntegrityError(RuntimeError):
@@ -99,11 +100,17 @@ class StateWAL:
     """Store validated state replacement patches in a private hash-chained file."""
 
     def __init__(
-        self, path: Path, failure_injector: Callable[[str], None] | None = None
+        self,
+        path: Path,
+        failure_injector: Callable[[str], None] | None = None,
+        codec: EncryptedCodec | None = None,
     ) -> None:
         self.path = path
         self._lock = Lock()
         self._failure_injector = failure_injector
+        self.codec = codec or EncryptedCodec(
+            enabled=False, purpose="live-state", context="private-wal"
+        )
         records = self.verify()
         self._last_hash = records[-1].record_hash if records else None
         self._last_sequence = records[-1].processing_sequence if records else None
@@ -204,10 +211,23 @@ class StateWAL:
         previous_state_hash: str | None = None
         for line_number, line in enumerate(lines, start=1):
             if not line.strip():
+                if self.codec.enabled:
+                    raise StateWalIntegrityError(
+                        f"private state WAL record is invalid at line {line_number}"
+                    )
                 continue
             try:
-                record = StateWalRecord.model_validate_json(line)
-            except ValueError as exc:
+                plaintext = self.codec.decode(line.encode("utf-8"))
+                record = StateWalRecord.model_validate_json(plaintext)
+                if self.codec.enabled:
+                    self.codec.decode(
+                        line.encode("utf-8"),
+                        expected_metadata={
+                            "processing_sequence": record.processing_sequence,
+                            "record_id": record.record_id,
+                        },
+                    )
+            except (ValueError, EncryptionError) as exc:
                 raise StateWalIntegrityError(
                     f"private state WAL record is invalid at line {line_number}"
                 ) from exc
@@ -255,7 +275,14 @@ class StateWAL:
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as output:
                     for record in retained:
-                        output.write(record.model_dump_json() + "\n")
+                        encoded = self.codec.encode(
+                            record.model_dump_json().encode("utf-8"),
+                            metadata={
+                                "processing_sequence": record.processing_sequence,
+                                "record_id": record.record_id,
+                            },
+                        )
+                        output.write(encoded.decode("ascii") + "\n")
                     output.flush()
                     os.fsync(output.fileno())
                 os.replace(temporary, self.path)
@@ -309,7 +336,14 @@ class StateWAL:
         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
             if self._failure_injector is not None:
                 self._failure_injector("before_wal_append")
-            output.write(record.model_dump_json() + "\n")
+            encoded = self.codec.encode(
+                record.model_dump_json().encode("utf-8"),
+                metadata={
+                    "processing_sequence": record.processing_sequence,
+                    "record_id": record.record_id,
+                },
+            )
+            output.write(encoded.decode("ascii") + "\n")
             output.flush()
             os.fsync(output.fileno())
             if self._failure_injector is not None:

@@ -11,6 +11,7 @@ import tempfile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from kagya.body import EmotionState
+from kagya.security import EncryptedCodec, EncryptionError
 from kagya.runtime.working_memory import (
     RetentionReason,
     WorkingMemoryItem,
@@ -150,11 +151,15 @@ class AgentStateStore:
         path: Path,
         event_recorder: Any | None = None,
         failure_injector: Callable[[str], None] | None = None,
+        codec: EncryptedCodec | None = None,
     ) -> None:
         self.path = path
         self.event_recorder = event_recorder
         self.last_snapshot: AgentStateSnapshot | None = None
         self._failure_injector = failure_injector
+        self.codec = codec or EncryptedCodec(
+            enabled=False, purpose="live-state", context="agent-snapshot"
+        )
 
     def load(self, baseline_surprisal: float) -> AgentStateSnapshot:
         default = default_agent_state_snapshot(baseline_surprisal)
@@ -162,7 +167,13 @@ class AgentStateStore:
             self.last_snapshot = default
             return default
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            plaintext = self.codec.decode(
+                self.path.read_bytes(),
+                expected_metadata={"record_type": "snapshot"}
+                if self.codec.enabled
+                else None,
+            )
+            raw = json.loads(plaintext)
             if not isinstance(raw, dict):
                 raise ValueError("snapshot root must be an object")
             version = raw.get("schema_version")
@@ -183,12 +194,20 @@ class AgentStateStore:
                 "load_failed",
                 {"reason": "unsupported_schema_version", "schema_version": exc.version},
             )
+            if self.codec.enabled:
+                raise
             snapshot = default
+        except EncryptionError:
+            raise
         except json.JSONDecodeError:
             self._record("load_failed", {"reason": "json_decode_error"})
+            if self.codec.enabled:
+                raise
             snapshot = default
         except (OSError, ValueError, ValidationError):
             self._record("load_failed", {"reason": "validation_or_io_error"})
+            if self.codec.enabled:
+                raise
             snapshot = default
         self.last_snapshot = snapshot
         return snapshot
@@ -201,13 +220,18 @@ class AgentStateStore:
         )
         temporary_path = Path(temporary_name)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as snapshot_file:
-                json.dump(
-                    validated.model_dump(mode="json"),
-                    snapshot_file,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                )
+            plaintext = json.dumps(
+                validated.model_dump(mode="json"),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            encoded = self.codec.encode(
+                plaintext, metadata={"record_type": "snapshot"}
+            )
+            with os.fdopen(fd, "wb") as snapshot_file:
+                os.fchmod(snapshot_file.fileno(), 0o600)
+                snapshot_file.write(encoded)
                 snapshot_file.flush()
                 if self._failure_injector is not None:
                     self._failure_injector("snapshot_temp_write")
