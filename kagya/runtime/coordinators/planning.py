@@ -844,20 +844,29 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             FeedbackSignal.UNSAFE_BEHAVIOR,
         }:
             utility = self._feedback_utility(signals)
-            decision = self.decision_store.record_feedback_outcome(
-                decision_id,
-                utility=utility,
-                success=utility > 0.0,
-                feedback_id=feedback_id,
-                feedback_revision=revision,
-                observed_event_id=None if event is None else event.event_id,
-                observed_event_sequence=None
-                if event is None
-                else event.processing_sequence,
-            )
-            decision = self._apply_metacognitive_outcome(decision)
-            prediction_error = decision.prediction_error
-            outcome_applied = True
+            action_linked = False
+            if self._action_execution is not None:
+                try:
+                    action_linked = self._action_execution.validate_decision_outcome(
+                        decision_id, utility > 0.0
+                    )
+                except ValueError:
+                    action_linked = True
+            if not action_linked:
+                decision = self.decision_store.record_feedback_outcome(
+                    decision_id,
+                    utility=utility,
+                    success=utility > 0.0,
+                    feedback_id=feedback_id,
+                    feedback_revision=revision,
+                    observed_event_id=None if event is None else event.event_id,
+                    observed_event_sequence=None
+                    if event is None
+                    else event.processing_sequence,
+                )
+                decision = self._apply_metacognitive_outcome(decision)
+                prediction_error = decision.prediction_error
+                outcome_applied = True
         if decision_id is not None:
             self.decision_store.set_training_policy(
                 decision_id, included=not exclude, feedback_id=feedback_id

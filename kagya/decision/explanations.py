@@ -714,63 +714,63 @@ def _risk(
         if item.provenance.decision_id == decision.decision_id
         and item.provenance.candidate_id == decision.selected_candidate_id
     ]
-    terminal = {"succeeded", "failed", "cancelled", "rejected", "compensated"}
-    intent = max(
-        intents,
-        key=lambda item: (
-            item.status.value in terminal,
-            item.updated_at,
-            item.revision,
-        ),
-        default=None,
+    validations = execution.list_validation_records()
+    receipts = execution.list_receipts()
+    attempts: list[tuple[int, int, str, Any]] = []
+    for intent in intents:
+        sequences = [
+            item.validated_event_sequence
+            for item in validations
+            if item.validation_id == intent.validation_record_id
+        ]
+        sequences.extend(
+            item.event_sequence
+            for item in receipts
+            if item.intent_id == intent.intent_id and item.event_sequence is not None
+        )
+        attempts.append((max(sequences, default=0), intent.revision, "intent", intent))
+    attempts.extend(
+        (item.event_sequence, 0, "blocked", item)
+        for item in getattr(execution, "list_policy_rejections", lambda: ())()
+        if item.decision_id == decision.decision_id
+        and item.candidate_id == decision.selected_candidate_id
     )
-    if intent is None:
-        rejections = getattr(execution, "list_policy_rejections", lambda: ())()
-        blocked = max(
-            (
-                item
-                for item in rejections
-                if item.decision_id == decision.decision_id
-                and item.candidate_id == decision.selected_candidate_id
-            ),
-            key=lambda item: item.event_sequence,
-            default=None,
-        )
-        invalid = max(
-            (
-                item
-                for item in execution.list_validation_records()
-                if item.decision_id == decision.decision_id and not item.arguments_valid
-            ),
-            key=lambda item: item.validated_event_sequence,
-            default=None,
-        )
+    attempts.extend(
+        (item.validated_event_sequence, 0, "invalid", item)
+        for item in validations
+        if item.decision_id == decision.decision_id and not item.arguments_valid
+    )
+    canonical = max(attempts, key=lambda item: item[:2], default=None)
+    if canonical is None:
         return (
             RiskProjection(
-                risk_class="unclassified" if blocked is None else blocked.risk_class.value,
-                policy_status=(
-                    "blocked"
-                    if blocked is not None
-                    else "invalid"
-                    if invalid is not None
-                    else "not_evaluated"
-                ),
+                risk_class="unclassified",
+                policy_status="not_evaluated",
                 approval_status="not_required",
-                policy_ref=None
-                if blocked is None
-                else _public_optional_ref(blocked.rejection_id),
-                policy_reason_codes=() if blocked is None else (blocked.reason_code,),
             ),
-            ExplanationDisposition.BLOCKED_POLICY
-            if blocked is not None
-            else ExplanationDisposition.UNABLE
-            if invalid is not None
-            else None,
+            None,
         )
+    _sequence, _revision, attempt_type, attempt = canonical
+    if attempt_type == "blocked":
+        return RiskProjection(
+            risk_class=attempt.risk_class.value,
+            policy_status="blocked",
+            approval_status="not_required",
+            policy_ref=_public_optional_ref(attempt.rejection_id),
+            policy_reason_codes=(attempt.reason_code,),
+        ), ExplanationDisposition.BLOCKED_POLICY
+    if attempt_type == "invalid":
+        return RiskProjection(
+            risk_class="unclassified",
+            policy_status="invalid",
+            approval_status="not_required",
+            validation_ref=_public_optional_ref(attempt.validation_id),
+        ), ExplanationDisposition.UNABLE
+    intent = attempt
     receipt = next(
         (
             item
-            for item in execution.list_receipts()
+            for item in receipts
             if item.receipt_id == intent.receipt_id and item.intent_id == intent.intent_id
         ),
         None,

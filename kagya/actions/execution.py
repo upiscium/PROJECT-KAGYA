@@ -157,6 +157,8 @@ class ActionValidationRecord(_StrictModel):
 
     schema_version: Literal[1] = 1
     validation_id: str
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     decision_id: str | None = None
     intent_id: str | None = None
     tool_name: str
@@ -303,7 +305,7 @@ class ExecutionReceipt(_StrictModel):
 
 
 class ActionState(_StrictModel):
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     intents: tuple[ActionIntent, ...] = ()
     validation_records: tuple[ActionValidationRecord, ...] = ()
     policy_rejections: tuple[ActionPolicyRejectionRecord, ...] = ()
@@ -463,7 +465,7 @@ class ActionExecutionLayer:
             raise ValueError(f"Unknown action validation record: {validation_id}")
         return record
 
-    def validate_decision_outcome(self, decision_id: str, success: bool) -> None:
+    def validate_decision_outcome(self, decision_id: str, success: bool) -> bool:
         state = self._state()
         decision = self.main_loop.decision_store.get(decision_id)
         intents = [
@@ -473,7 +475,17 @@ class ActionExecutionLayer:
             and item.provenance.candidate_id == decision.selected_candidate_id
         ]
         if not intents:
-            return
+            linked_validation = any(
+                item.decision_id == decision_id for item in state.validation_records
+            )
+            linked_rejection = any(
+                item.decision_id == decision_id
+                and item.candidate_id == decision.selected_candidate_id
+                for item in state.policy_rejections
+            )
+            if linked_validation or linked_rejection:
+                raise ValueError("Linked action has no verified terminal outcome")
+            return False
         intent = max(intents, key=lambda item: (item.revision, item.updated_at))
         terminal = {
             IntentStatus.SUCCEEDED,
@@ -527,6 +539,7 @@ class ActionExecutionLayer:
             receipt.status == ReceiptStatus.SUCCEEDED
         ):
             raise ValueError("Decision outcome contradicts action verification")
+        return True
 
     def link_explanation(self, decision_id: str, explanation_ref: str) -> None:
         if (
@@ -583,6 +596,8 @@ class ActionExecutionLayer:
             raise RuntimeError(
                 "Action validation requires an authoritative AgentRuntime event"
             )
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ActionPolicyError("Idempotency key must contain 1 to 128 characters")
         state = self._state()
         prior_rejection = next(
             (
@@ -609,11 +624,6 @@ class ActionExecutionLayer:
                 )
             return duplicate
         decision = self.main_loop.decision_store.get(decision_id)
-        self._validate_boundary_assessment(decision)
-        if decision.status != DecisionStatus.AWAITING_OUTCOME:
-            raise ActionPolicyError(
-                "Action requires a selected decision awaiting outcome"
-            )
         selected = next(
             item.candidate
             for item in decision.considered_candidates
@@ -627,6 +637,38 @@ class ActionExecutionLayer:
         contract = selected.parameters["action"] if not malformed_parameters else {}
         tool_name = contract.get("tool_name")
         arguments = contract.get("arguments")
+        request_digest = _digest(
+            cast(
+                JsonValue,
+                {
+                    "decision_id": decision_id,
+                    "candidate_id": selected.candidate_id,
+                    "action": selected.parameters.get("action"),
+                    "dry_run": dry_run,
+                    "budget": (budget or ActionBudget()).model_dump(mode="json"),
+                },
+            )
+        )
+        prior_validation = next(
+            (
+                item
+                for item in state.validation_records
+                if not item.arguments_valid
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+        if prior_validation is not None:
+            if prior_validation.request_digest != request_digest:
+                raise ActionPolicyError(
+                    "Idempotency key is already bound to a different action request"
+                )
+            return prior_validation
+        self._validate_boundary_assessment(decision)
+        if decision.status != DecisionStatus.AWAITING_OUTCOME:
+            raise ActionPolicyError(
+                "Action requires a selected decision awaiting outcome"
+            )
         now = self.clock()
         intent_id = str(uuid4())
         if (
@@ -640,6 +682,8 @@ class ActionExecutionLayer:
             )
             validation = ActionValidationRecord(
                 validation_id=str(uuid4()),
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
                 decision_id=decision_id,
                 tool_name=bounded_tool_name,
                 arguments_valid=False,
@@ -670,6 +714,8 @@ class ActionExecutionLayer:
         spec, validated, error_codes = self._validate_arguments(tool_name, arguments)
         validation = ActionValidationRecord(
             validation_id=str(uuid4()),
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
             decision_id=decision_id,
             intent_id=intent_id if validated is not None else None,
             tool_name=tool_name,
@@ -823,6 +869,8 @@ class ActionExecutionLayer:
         state = self._state()
         intent = self.get_intent(intent_id)
         decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        if decision.status == DecisionStatus.RESOLVED:
+            raise ActionPolicyError("Decision already has a terminal outcome")
         self._validate_boundary_assessment(decision)
         if (
             intent.status != IntentStatus.AWAITING_APPROVAL
@@ -972,6 +1020,8 @@ class ActionExecutionLayer:
             if approval is None or approval.status != "approved":
                 raise ActionPolicyError("Approved operator record is required")
         decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        if decision.status == DecisionStatus.RESOLVED:
+            raise ActionPolicyError("Decision already has a terminal outcome")
         self._validate_boundary_assessment(decision)
         if (
             intent.provenance.boundary_assessment_id != decision.boundary_assessment_id
@@ -1645,7 +1695,13 @@ class ActionExecutionLayer:
         self, intent: ActionIntent, success: bool, description: str
     ) -> None:
         decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        self.validate_decision_outcome(decision.decision_id, success)
         if decision.status == DecisionStatus.RESOLVED:
+            if (
+                decision.actual_outcome is None
+                or decision.actual_outcome.success != success
+            ):
+                raise ValueError("Terminal decision outcome contradicts action verification")
             return
         record_experience = getattr(
             self.main_loop, "record_verified_action_experience", None
@@ -1666,12 +1722,40 @@ class ActionExecutionLayer:
             self._save(state)
             return state
         try:
-            legacy_v1 = isinstance(raw, dict) and raw.get("schema_version") == 1
-            migrated = isinstance(raw, dict) and raw.get("schema_version") in {1, 2}
+            version = raw.get("schema_version") if isinstance(raw, dict) else None
+            legacy_v1 = version == 1
+            migrated = version in {1, 2, 3}
             if legacy_v1:
                 raw = {**raw, "validation_records": []}
+            if version in {1, 2}:
+                raw = {**raw, "policy_rejections": []}
             if migrated:
-                raw = {**raw, "schema_version": 3, "policy_rejections": []}
+                intent_keys = {
+                    item.get("validation_record_id"): item.get("idempotency_key")
+                    for item in raw.get("intents", [])
+                    if isinstance(item, dict)
+                }
+                validations = []
+                for item in raw.get("validation_records", []):
+                    if not isinstance(item, dict):
+                        validations.append(item)
+                        continue
+                    validation_id = str(item.get("validation_id", "unknown"))
+                    key = intent_keys.get(validation_id) or f"legacy:{validation_id}"
+                    validations.append(
+                        {
+                            **item,
+                            "idempotency_key": str(key)[:128],
+                            "request_digest": _digest(
+                                {"legacy_validation_id": validation_id}
+                            ),
+                        }
+                    )
+                raw = {
+                    **raw,
+                    "schema_version": 4,
+                    "validation_records": validations,
+                }
             state = ActionState.model_validate(raw)
             if legacy_v1:
                 pending = {

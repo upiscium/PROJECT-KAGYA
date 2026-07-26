@@ -1032,6 +1032,7 @@ class ActionCoordinator(RuntimeDomainMixin):
             else event.processing_sequence,
         )
         self._persist_decision_state()
+        self._revise_current_decision_explanation(decision_id)
         return record
 
     def _metacognitive_candidate_scores(
