@@ -17,6 +17,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.runtime.agent_state import AgentStateSnapshot
+from kagya.security import EncryptedCodec, EncryptionError
 
 
 class JournalIntegrityError(RuntimeError):
@@ -123,6 +124,7 @@ class EventJournal:
         max_bytes: int = 10 * 1024 * 1024,
         retained_files: int = 3,
         telemetry: JournalTelemetry | None = None,
+        codec: EncryptedCodec | None = None,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("journal max_bytes must be positive")
@@ -132,6 +134,9 @@ class EventJournal:
         self.max_bytes = max_bytes
         self.retained_files = retained_files
         self._telemetry = telemetry
+        self.codec = codec or EncryptedCodec(
+            enabled=False, purpose="live-state", context="operator-journal"
+        )
         self._lock = Lock()
         self._last_hash: str | None = None
         self._last_sequence = 0
@@ -317,10 +322,23 @@ class EventJournal:
                 raise JournalIntegrityError(f"journal cannot be read: {path}") from exc
             for line_number, line in enumerate(lines, start=1):
                 if not line.strip():
+                    if self.codec.enabled:
+                        raise JournalIntegrityError(
+                            f"journal record is invalid: {path}:{line_number}"
+                        )
                     continue
                 try:
-                    record = JournalRecord.model_validate_json(line)
-                except ValueError as exc:
+                    plaintext = self.codec.decode(line.encode("utf-8"))
+                    record = JournalRecord.model_validate_json(plaintext)
+                    if self.codec.enabled:
+                        self.codec.decode(
+                            line.encode("utf-8"),
+                            expected_metadata={
+                                "processing_sequence": record.processing_sequence,
+                                "record_id": record.record_id,
+                            },
+                        )
+                except (ValueError, EncryptionError) as exc:
                     raise JournalIntegrityError(
                         f"journal record is invalid: {path}:{line_number}"
                     ) from exc
@@ -399,7 +417,16 @@ class EventJournal:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 self._rotate_if_needed()
                 record = _new_record(previous_record_hash=self._last_hash, **values)
-                line = record.model_dump_json() + "\n"
+                line = (
+                    self.codec.encode(
+                        record.model_dump_json().encode("utf-8"),
+                        metadata={
+                            "processing_sequence": record.processing_sequence,
+                            "record_id": record.record_id,
+                        },
+                    ).decode("ascii")
+                    + "\n"
+                )
                 with self.path.open("a", encoding="utf-8") as output:
                     output.write(line)
                     output.flush()
@@ -448,7 +475,14 @@ class EventJournal:
             snapshot_hash=self._last_snapshot_hash,
         )
         with self.path.open("x", encoding="utf-8") as output:
-            output.write(checkpoint.model_dump_json() + "\n")
+            encoded = self.codec.encode(
+                checkpoint.model_dump_json().encode("utf-8"),
+                metadata={
+                    "processing_sequence": checkpoint.processing_sequence,
+                    "record_id": checkpoint.record_id,
+                },
+            )
+            output.write(encoded.decode("ascii") + "\n")
             output.flush()
             os.fsync(output.fileno())
         _fsync_directory(self.path.parent)

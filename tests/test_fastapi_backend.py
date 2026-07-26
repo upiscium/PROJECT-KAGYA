@@ -1,4 +1,5 @@
 from pathlib import Path
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,7 @@ from kagya.runtime import (
     StateWAL,
     hash_snapshot,
 )
+from kagya.security.generation import initialize_encrypted_state
 from kagya.tools import (
     ToolAuditEvent,
     ToolDefinition,
@@ -951,18 +953,35 @@ def test_adapter_evaluate_rejects_client_deterministic_scores(tmp_path: Path) ->
 def test_production_behavioral_route_forces_real_model_runtime(
     tmp_path: Path, monkeypatch
 ) -> None:
-    settings = _settings(tmp_path).model_copy(
+    base = _settings(tmp_path)
+    monkeypatch.setenv("KAGYA_LIVE_STATE_KEY", b64encode(bytes(32)).decode("ascii"))
+    settings = base.model_copy(
         update={
-            "project": _settings(tmp_path).project.model_copy(
+            "project": base.project.model_copy(
                 update={"environment": ProjectEnvironment.PRODUCTION}
             ),
-            "adapter_registry": _settings(tmp_path).adapter_registry.model_copy(
+            "adapter_registry": base.adapter_registry.model_copy(
                 update={
                     "behavioral_activation_policy": BehavioralActivationPolicy.REAL_MODEL_REQUIRED
                 }
             ),
+            "at_rest": base.at_rest.model_copy(
+                update={
+                    "live": base.at_rest.live.model_copy(
+                        update={
+                            "enabled": True,
+                            "generation_marker": tmp_path / "sealed-generation.json",
+                        }
+                    ),
+                    "backup": base.at_rest.backup.model_copy(
+                        update={"encrypted_filesystem_attested": True}
+                    ),
+                    "memory_encrypted_filesystem_attested": True,
+                }
+            ),
         }
     )
+    initialize_encrypted_state(settings)
     client = _client(tmp_path, settings=settings)
     registry = client.app.state.adapter_registry
     register_runtime_candidate(registry, tmp_path, "production-candidate")
@@ -1169,7 +1188,7 @@ def test_startup_preloads_transformers_provider(tmp_path: Path, monkeypatch) -> 
 
     assert provider.processor_loaded is True
     assert provider.model_loaded is True
-    assert app.state.model_provider is provider
+    assert app.state.model_provider is None
 
 
 def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None:

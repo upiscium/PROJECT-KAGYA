@@ -68,10 +68,10 @@ npm run dev
 
 7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. Optional browser authentication is disabled by default, so keep this token-only mode on loopback, a private LAN/VPN, or an SSH tunnel and off the public internet.
 
-8. After the first useful session, create a backup because `.kagya/` contains private runtime state:
+8. After the first useful session, create a streaming encrypted backup because `.kagya/` contains private runtime state. Set the independent backup and adapter-artifact key env vars named by `at_rest.backup` first:
 
 ```bash
-KAGYA_BACKUP_DIR=.kagya/backups scripts/private-backup.sh
+scripts/private-backup.sh
 ```
 
 ## Admin Access
@@ -406,7 +406,7 @@ PROJECT-KAGYA is intended to run as a private/local application, not as a public
 
 The backend uses one process-local agent event queue to serialize chat, sleep, memory administration, and adapter lifecycle operations. Run exactly one Uvicorn worker; multiple workers would create independent subjects and independent event sequences. `api.agent_queue_capacity` bounds waiting work. A full queue returns HTTP 429, shutdown stops accepting work and drains accepted events, and an accepted event continues even if its client disconnects.
 
-The subject's versioned internal-state snapshot defaults to `.kagya/agent_state.json`. Each accepted event is returned only after its sequence and internal state have been atomically written and fsynced. Startup validates or migrates the snapshot and safely falls back to baseline state if it is corrupt. Admin endpoints under `/api/state` provide snapshot, export, restore, and reset operations. Snapshots intentionally exclude conversation turns, event payloads, prompts, attachments, generated text, and hidden thoughts.
+The subject's versioned internal-state snapshot defaults to `.kagya/agent_state.json`. Each accepted event is returned only after its sequence and internal state have been atomically written and fsynced. With live encryption enabled, startup fails closed on corrupt, plaintext, mixed-generation, or unauthenticated state; plaintext development mode retains its legacy baseline fallback. Production requires live encryption and an encrypted-filesystem attestation for Chroma. Admin endpoints under `/api/state` provide snapshot, backup, verified restore, and reset operations. Snapshots intentionally exclude conversation turns, event payloads, prompts, attachments, generated text, and hidden thoughts. See [the encrypted restore runbook](docs/encrypted-backup-restore.md).
 
 ### 1. Prepare Host
 
@@ -487,7 +487,7 @@ Normal chat is unauthenticated on the private listener at `POST /api/chat`; dire
 
 ### 7. Back Up Runtime Data
 
-Backups must include both runtime data and private environment files:
+The standard backup includes configured authoritative runtime roots and adapter artifacts:
 
 - `.kagya/chroma`: Chroma memory storage.
 - `.kagya/dreams`: generated dream datasets.
@@ -498,16 +498,16 @@ Backups must include both runtime data and private environment files:
 - `.kagya/agent_journal.jsonl*`: fsynced event lifecycle journal and retained hash-chain rotation files.
 - `.kagya/operational_metrics.json`: atomic persistent bounded-cardinality metric aggregates.
 - `.kagya/operational_traces.json`: atomic bounded recent correlation/causation spans.
-- `/etc/project-kagya/*.env`: backend/frontend env files, including `KAGYA_ADMIN_TOKEN`.
+- Environment files and encryption keys are deliberately excluded. Recover them independently from the deployment secret manager.
 
-Create a restricted archive on the deployment host:
+Create the encrypted streaming bundle on the deployment host:
 
 ```bash
 cd /opt/project-kagya
-sudo -u kagya KAGYA_BACKUP_DIR=/var/backups/project-kagya scripts/private-backup.sh
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/backend.env; set +a; scripts/private-backup.sh'
 ```
 
-Treat backup archives as secrets. They may contain private memories, hidden training thoughts, local paths, adapter artifacts, and admin tokens. Store them with `0600` permissions, encrypt them before off-host transfer, and avoid attaching them to issues or logs.
+The standard path never writes a plaintext tar/archive. Bundles remain sensitive ciphertext and are mode `0600`; avoid attaching them to issues or logs. Public sidecars contain no filenames, config, secrets, or private state.
 
 Before large maintenance, inspect disk usage:
 
@@ -520,14 +520,14 @@ Model caches are usually reproducible and large; back them up only if bandwidth 
 
 ### 8. Restore Runtime Data
 
-Restore onto a host with the same runtime tools installed and the application checkout present. Stop services before replacing local data:
+Restore onto a host with the same source/model revisions, runtime tools, config, and independently recovered key rings. Stop services, verify, preview, and provide the exact decrypted manifest hash before replacing local data:
 
 ```bash
 sudo systemctl stop kagya-api kagya-frontend
 cd /opt/project-kagya
-sudo KAGYA_APP_DIR=/opt/project-kagya KAGYA_CONFIG_DIR=/etc/project-kagya scripts/private-backup.sh --restore /var/backups/project-kagya/project-kagya-YYYYMMDDTHHMMSSZ.tar.gz
-sudo chown -R kagya:kagya /opt/project-kagya/.kagya /etc/project-kagya
-sudo chmod 600 /etc/project-kagya/*.env
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/backend.env; set +a; cd /opt/project-kagya && uv run kagya-backup verify <backup-id>'
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/backend.env; set +a; cd /opt/project-kagya && uv run kagya-backup preview <backup-id>'
+sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/backend.env; set +a; cd /opt/project-kagya && uv run kagya-backup restore <backup-id> --manifest-hash <sha256>'
 ```
 
 Rebuild the frontend if `frontend.env` changed, then restart services:
