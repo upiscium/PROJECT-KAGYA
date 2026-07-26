@@ -33,6 +33,11 @@ from kagya.artifact_provenance import (
     build_model_artifact_manifest,
     verify_attached_adapter_config,
 )
+from kagya.models.boundary_probe import (
+    BOUNDARY_PROBE_ENVELOPES,
+    BoundaryPolicyProbe,
+    build_boundary_probe,
+)
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
@@ -130,6 +135,10 @@ class TransformersProvider:
         self.last_model_id = self.model_id
         self.last_fallback_used = False
         self.generation_count = 0
+        self.boundary_probe_count = 0
+        self.runtime_adapter_id: str | None = None
+        self.runtime_adapter_hash: str | None = None
+        self.provider_instance_id = str(uuid4())
         self.resolved_model_revision: str | None = None
         self.resolved_processor_revision: str | None = None
         self._resolved_model_snapshot: Path | None = None
@@ -276,6 +285,34 @@ class TransformersProvider:
         with torch.no_grad():
             outputs = model(**full_inputs, labels=labels)
         return float(outputs.loss.detach().cpu().item())
+
+    def probe_boundary_policy(
+        self,
+        prompt: str,
+        *,
+        event_id: str,
+        event_sequence: int,
+        scenario_id: str,
+    ) -> BoundaryPolicyProbe:
+        # Negative mean token loss is normalized conditional log-likelihood.
+        scores = {
+            choice: -self.calculate_loss(prompt, envelope)
+            for choice, envelope in BOUNDARY_PROBE_ENVELOPES.items()
+        }
+        self.boundary_probe_count += 1
+        return build_boundary_probe(
+            prompt,
+            scores,
+            provider="transformers",
+            provider_instance_id=self.provider_instance_id,
+            model_id=self.model_id,
+            model_revision=self.resolved_model_revision or self.model_revision,
+            adapter_id=self.runtime_adapter_id,
+            adapter_hash=self.runtime_adapter_hash,
+            event_id=event_id,
+            event_sequence=event_sequence,
+            scenario_id=scenario_id,
+        )
 
     def get_model(self) -> Any:
         return self._get_primary_model()

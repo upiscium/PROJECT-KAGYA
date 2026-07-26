@@ -100,16 +100,26 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             raise RuntimeError("identity-boundary assessment requires AgentRuntime")
         values = {item.value_id: item for item in self.value_system.active_values()}
         requested_values = set(inputs.self_endorsed_value_refs)
-        if requested_values - values.keys() or any(
-            values[key].origin_provenance is None
-            or (
-                values[key].origin_provenance.actor
-                not in {OriginActor.SELF, OriginActor.SYSTEM}
-                and values[key].origin_provenance.endorsed_by_event_id is None
-            )
-            for key in requested_values
-        ):
+        if requested_values - values.keys():
             raise ValueError("assessment references an inactive or unreviewed Value")
+        authorized_values = {
+            key
+            for key in requested_values
+            if values[key].origin_provenance is not None
+            and (
+                values[key].origin_provenance.actor == OriginActor.SELF
+                or (
+                    values[key].origin_provenance.actor == OriginActor.SYSTEM
+                    and values[key].origin_provenance.endorsed_by_event_id is not None
+                    and values[key].origin_provenance.endorsement_ref
+                    == "subject_endorsement"
+                )
+            )
+        }
+        if authorized_values != requested_values:
+            inputs = inputs.model_copy(
+                update={"self_endorsed_value_refs": tuple(sorted(authorized_values))}
+            )
         goals = {item.goal_id: item for item in self.goal_manager.list_goals()}
         commitments = {
             item.commitment_id: item
@@ -134,6 +144,15 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             or commitments[key].status not in ACCEPTED_COMMITMENT_STATUSES
             or commitments[key].identity_origin.endorsement
             != EndorsementStatus.ENDORSED
+            or not (
+                commitments[key].identity_origin.actor == OriginActor.SELF
+                or (
+                    commitments[key].identity_origin.actor == OriginActor.SYSTEM
+                    and commitments[key].identity_origin.endorsed_by_event_id is not None
+                    and commitments[key].identity_origin.endorsement_ref
+                    == "subject_endorsement"
+                )
+            )
             for key in requested_commitments
         ):
             raise ValueError(

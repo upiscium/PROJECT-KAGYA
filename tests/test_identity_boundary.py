@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from kagya.belief import (
@@ -363,3 +365,85 @@ def test_quarantined_value_holds_updates_and_config_seed_cannot_be_reviewed() ->
             event_id="event-reject",
             event_sequence=1,
         )
+
+
+def test_value_and_belief_reviews_cannot_be_transplanted_between_records() -> None:
+    first = ValueState(
+        value_id="value-a",
+        name="A",
+        weight=0.5,
+        confidence=0.8,
+        stability=0.2,
+        source="legacy",
+        origin="legacy",
+        last_updated_at="2026-01-01T00:00:00+00:00",
+        allowed_update_rate=0.1,
+        origin_provenance=new_identity_origin(
+            OriginActor.INHERITED,
+            OriginInputKind.LEGACY,
+            endorsement=EndorsementStatus.UNCERTAIN,
+        ),
+    )
+    second = replace(first, value_id="value-b", name="B")
+    values = ValueSystem(seeds=[first, second])
+    values.review_origin(
+        "value-a",
+        accept=True,
+        reviewer_id="operator:one",
+        reviewer_authority="operator",
+        evidence_refs=("evidence:a",),
+        reason_code="reviewed",
+        event_id="event:a",
+        event_sequence=1,
+    )
+    payload = values.to_json()
+    payload["values"]["value-b"]["origin_review"] = payload["values"]["value-a"][
+        "origin_review"
+    ]
+    restored_values = ValueSystem(seeds=[first, second])
+    restored_values.restore(payload)
+    assert restored_values.get("value-b") not in restored_values.active_values()
+
+    beliefs = BeliefStore()
+    for belief_id, text in (("belief:a", "claim a"), ("belief:b", "claim b")):
+        beliefs.propose(
+            Proposition.create(text),
+            identity_origin=new_identity_origin(
+                OriginActor.UNKNOWN,
+                OriginInputKind.LEGACY,
+                endorsement=EndorsementStatus.UNCERTAIN,
+            ),
+            evidence=(
+                BeliefEvidence(
+                    reference=f"evidence:{belief_id[-1]}",
+                    evidence_type="legacy",
+                    source_trust=0.5,
+                    observed_at="2026-01-01T00:00:00+00:00",
+                ),
+            ),
+            confidence=0.5,
+            belief_id=belief_id,
+        )
+    beliefs.resolve(
+        "belief:a",
+        accept=True,
+        confidence=0.8,
+        epistemic_status=EpistemicStatus.PROBABLE,
+        reason_code="reviewed",
+        evidence_refs=("evidence:a",),
+        event_id="event:a",
+        event_sequence=1,
+        reviewer_id="operator:one",
+        reviewer_authority="operator",
+    )
+    belief_payload = beliefs.to_json()
+    source_revision = belief_payload["records"][0]["revisions"][-1]
+    target = next(
+        item for item in belief_payload["records"] if item["belief_id"] == "belief:b"
+    )
+    target["revisions"] = [source_revision]
+    target["lifecycle"] = "active"
+    target["identity_origin"] = belief_payload["records"][0]["identity_origin"]
+    restored_beliefs = BeliefStore()
+    restored_beliefs.restore(belief_payload)
+    assert restored_beliefs.get("belief:b") not in restored_beliefs.active()

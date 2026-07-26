@@ -19,7 +19,6 @@ from kagya.api.dependencies import (
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.adapter import (
     AdapterEvaluateRequest,
-    AdapterCanaryRequest,
     AdapterEvaluateResponse,
     AdapterBehavioralEvaluateRequest,
     AdapterBehavioralEvaluateResponse,
@@ -289,6 +288,23 @@ def behavioral_evaluation_status(
         activation_reason=eligibility.reason,
         identity_integrity_status=identity_status,
         real_model_identity_integrity_status=real_identity_status,
+        candidate_boundary_probe_choice=(
+            None
+            if entry.real_model_identity_drift_assessment is None
+            or entry.real_model_identity_drift_assessment.candidate_probe is None
+            else entry.real_model_identity_drift_assessment.candidate_probe.selected.value
+        ),
+        candidate_boundary_probe_margin=(
+            None
+            if entry.real_model_identity_drift_assessment is None
+            or entry.real_model_identity_drift_assessment.candidate_probe is None
+            else entry.real_model_identity_drift_assessment.candidate_probe.score_margin
+        ),
+        candidate_boundary_probe_count=(
+            0
+            if entry.real_model_identity_drift_assessment is None
+            else entry.real_model_identity_drift_assessment.candidate_probe_count
+        ),
         rollback_reason=entry.rollback_reason,
     )
 
@@ -475,7 +491,6 @@ def rollback_adapter(
 @router.post("/{adapter_id}/canary")
 def report_adapter_canary(
     adapter_id: str,
-    request: AdapterCanaryRequest,
     runtime: AgentRuntime = Depends(get_agent_runtime),
     manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
 ) -> dict:
@@ -487,18 +502,14 @@ def report_adapter_canary(
             runtime,
             AgentEventType.ADAPTER_UPDATE,
             source="api.adapters.canary",
-            handler=lambda: manager.report_canary(
-                success=request.success,
-                assessment_id=request.assessment_id,
-            ),
-            payload={"adapter_id": adapter_id, "success": request.success},
+            handler=manager.report_canary,
+            payload={"adapter_id": adapter_id},
         ).value
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "adapter_id": adapter_id,
-        "success": request.success,
-        "assessment_id": request.assessment_id,
+        "success": rollback is None,
         "automatic_rollback": rollback is not None,
         "rollback": None if rollback is None else asdict(rollback),
     }
@@ -764,6 +775,23 @@ def adapter_response(
         rollback_target_id=entry.rollback_target_id,
         identity_integrity_status=deterministic_identity_status,
         real_model_identity_integrity_status=candidate_identity_status,
+        candidate_boundary_probe_choice=(
+            None
+            if entry.real_model_identity_drift_assessment is None
+            or entry.real_model_identity_drift_assessment.candidate_probe is None
+            else entry.real_model_identity_drift_assessment.candidate_probe.selected.value
+        ),
+        candidate_boundary_probe_margin=(
+            None
+            if entry.real_model_identity_drift_assessment is None
+            or entry.real_model_identity_drift_assessment.candidate_probe is None
+            else entry.real_model_identity_drift_assessment.candidate_probe.score_margin
+        ),
+        candidate_boundary_probe_count=(
+            0
+            if entry.real_model_identity_drift_assessment is None
+            else entry.real_model_identity_drift_assessment.candidate_probe_count
+        ),
         rollback_reason=entry.rollback_reason,
     )
 

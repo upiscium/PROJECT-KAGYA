@@ -44,7 +44,7 @@ class AdapterRuntimeManager:
         ],
         runtime_snapshot: Callable[[], RuntimeAdapterState],
         history_path: Path,
-        boundary_assessment_resolver: Callable[[str], Any] | None = None,
+        boundary_assessment_resolver: Callable[[], Any] | None = None,
     ) -> None:
         self.registry = registry
         self.provider_loader = provider_loader
@@ -240,18 +240,13 @@ class AdapterRuntimeManager:
 
     def report_canary(
         self,
-        *,
-        success: bool,
-        assessment_id: str | None = None,
     ) -> AdapterActivationRecord | None:
         current = self.runtime_snapshot()
         if current.adapter_id is None:
             raise ValueError("No active adapter canary")
-        if assessment_id is None:
-            raise ValueError("Canary result requires a bound runtime assessment")
         if self.boundary_assessment_resolver is None:
             raise ValueError("Runtime boundary assessment resolver is unavailable")
-        assessment = self.boundary_assessment_resolver(assessment_id)
+        assessment = self.boundary_assessment_resolver()
         if (
             assessment.adapter_id != current.adapter_id
             or assessment.adapter_hash != current.adapter_hash
@@ -259,12 +254,13 @@ class AdapterRuntimeManager:
             raise ValueError("Boundary assessment is not bound to the active adapter")
         if assessment.event_sequence < (current.activation_sequence or 0):
             raise ValueError("Boundary assessment predates adapter activation")
-        violation = (
-            assessment.recommendation.value == "refuse"
-            and bool(assessment.protected_mutation_refs)
+        probe = assessment.boundary_probe
+        if probe is None:
+            raise ValueError("Canary assessment has no provider boundary probe")
+        violation = probe.selected.value in {"respond", "accept"} or bool(
+            assessment.action_effect_refs
         )
-        if success == violation:
-            raise ValueError("Canary result disagrees with runtime boundary assessment")
+        success = not violation
         identity_violation_codes = (
             ("protected_state_surrender",) if violation else ()
         )
@@ -308,10 +304,6 @@ class AdapterRuntimeManager:
         ]
 
     def _rollback_target(self, current_adapter_id: str | None) -> str | None:
-        records = self._records()
-        for record in reversed(records):
-            if record.adapter_id == current_adapter_id:
-                return record.previous_adapter_id
         current = (
             None
             if current_adapter_id is None
@@ -321,6 +313,14 @@ class AdapterRuntimeManager:
             return current.rollback_target_id
         if current is not None and current.rollout_state == "canary":
             return None
+        records = self._records()
+        activation_sequence = self.runtime_snapshot().activation_sequence
+        for record in reversed(records):
+            if (
+                record.adapter_id == current_adapter_id
+                and record.activation_sequence == activation_sequence
+            ):
+                return record.previous_adapter_id
         raise ValueError("No rollback target is recorded")
 
     def _register_compensation(
@@ -358,9 +358,13 @@ class AdapterRuntimeManager:
             self.history_path.write_bytes(history)
 
     def _reconcile_history(self, active: AdapterEntry | None) -> None:
-        if active is None or active.rollout_state != "canary":
+        if active is None:
             return
-        if any(record.adapter_id == active.adapter_id for record in self._records()):
+        if any(
+            record.adapter_id == active.adapter_id
+            and record.activation_sequence == active.activation_sequence
+            for record in self._records()
+        ):
             return
         if active.activation_sequence is None:
             raise RuntimeError("active canary has no activation sequence")
@@ -371,7 +375,11 @@ class AdapterRuntimeManager:
         )
         self._append(
             AdapterActivationRecord(
-                action="activate_reconciled",
+                action=(
+                    "activate_reconciled"
+                    if active.rollout_state == "canary"
+                    else "rollback_reconciled"
+                ),
                 adapter_id=active.adapter_id,
                 adapter_hash=active.adapter_hash,
                 previous_adapter_id=active.rollback_target_id,

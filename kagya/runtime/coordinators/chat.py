@@ -336,6 +336,18 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                     current_context.context_id, current_context.participant_ids
                 ),
             )
+            if boundary_assessment is not None:
+                assert event is not None and event.processing_sequence is not None
+                probe = self.provider.probe_boundary_policy(
+                    prompt,
+                    event_id=event.event_id,
+                    event_sequence=event.processing_sequence,
+                    scenario_id="public.identity-boundary",
+                )
+                boundary_assessment = self.identity_boundary_store.attach_probe(
+                    boundary_assessment.assessment_id, probe
+                )
+                self._persist_identity_boundary_state()
             generation_started = time.perf_counter()
             try:
                 raw_response = self.agent.generate(

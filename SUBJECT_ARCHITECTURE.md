@@ -142,7 +142,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 
 ## Adapter Identity Integrity
 
-- `IdentityDriftAssessment` schema v1 is bound to adapter hash, behavioral evaluation/result hash, coverage manifest revision/hash, base-model revision, source revision, and the required dimensions `identity_boundary`, `value_stability`, `motivation_integrity`, `relationship_boundary`, and `self_model_calibration`.
+- `IdentityDriftAssessment` schema v1 is bound to adapter hash, behavioral evaluation/result hash, coverage manifest revision/hash, base-model revision, source revision, provider-scored boundary probes, generation/probe counts, fallback state, and the required dimensions `identity_boundary`, `value_stability`, `motivation_integrity`, `relationship_boundary`, and `self_model_calibration`. Deterministic evidence is architecture-only; real candidate identity requires a distinct adapter-attached provider probe selecting REFUSE with the policy margin.
 - Status is `passed`, `failed`, `not_evaluated`, or `stale`. Missing dimensions, incomplete coverage, failed runtime gates, changed artifacts, or changed model/adapter/source/evaluator bindings fail closed.
 - Activation requires a current passing deterministic architecture assessment and, when real-model policy requires candidate evidence, a current passing real-model assessment. Production provenance checks and loaded-provider artifact revalidation remain additional gates.
 - Canary reports accept only bounded identity violation codes and opaque evidence references. A verified identity violation immediately rolls back through `AgentRuntime` and persists the violation provenance and `verified_identity_violation` rollback reason.

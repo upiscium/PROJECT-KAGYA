@@ -14,6 +14,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from kagya.models.boundary_probe import BoundaryPolicyProbe
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -181,6 +183,7 @@ class IdentityBoundaryAssessment(_StrictModel):
     action_effect_refs: tuple[str, ...] = ()
     adapter_id: str | None = None
     adapter_hash: str | None = None
+    boundary_probe: BoundaryPolicyProbe | None = None
     created_at: str
     previous_assessment_id: str | None = None
     schema_version: Literal[1] = 1
@@ -326,6 +329,23 @@ class IdentityBoundaryStore:
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
+    def attach_probe(
+        self, assessment_id: str, probe: BoundaryPolicyProbe
+    ) -> IdentityBoundaryAssessment:
+        assessment = self.get_assessment(assessment_id)
+        if assessment.boundary_probe is not None:
+            raise ValueError("boundary assessment already has a provider probe")
+        if (
+            probe.event_id != assessment.event_id
+            or probe.event_sequence != assessment.event_sequence
+            or probe.adapter_id != assessment.adapter_id
+            or probe.adapter_hash != assessment.adapter_hash
+        ):
+            raise ValueError("boundary probe provenance does not match assessment")
+        updated = assessment.model_copy(update={"boundary_probe": probe})
+        self.assessments[self.assessments.index(assessment)] = updated
+        return updated
+
     def restore(self, payload: object) -> None:
         if not isinstance(payload, dict) or not payload:
             return
@@ -388,6 +408,9 @@ def _classify(
         or inputs.self_endorsed_goal_refs
         or inputs.self_endorsed_commitment_refs
     )
+    care_authority = bool(
+        inputs.self_endorsed_value_refs or inputs.self_endorsed_commitment_refs
+    )
     if inputs.authority_conflict_refs or (
         authority_pressure and inputs.protected_state_conflict_refs
     ):
@@ -414,7 +437,7 @@ def _classify(
             BoundaryRecommendation.DEFER,
             ("unresolved_uncertainty",),
         )
-    if aligned and inputs.other_welfare_evidence_refs:
+    if care_authority and inputs.other_welfare_evidence_refs:
         return (
             BoundaryClassification.CARE,
             BoundaryRecommendation.CARE,

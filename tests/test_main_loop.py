@@ -514,6 +514,12 @@ def test_runtime_care_requires_reviewed_other_welfare_experience(
                 event_id=event.event_id,
                 event_sequence=event.processing_sequence,
             )
+            loop.value_system.endorse_system_seed(
+                "care",
+                reviewer_authority="subject",
+                event_id=event.event_id,
+                event_sequence=event.processing_sequence,
+            )
             return loop.assess_identity_boundary(inputs)
 
         assessment = runtime.execute(

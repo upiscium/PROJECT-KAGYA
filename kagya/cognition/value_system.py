@@ -43,6 +43,13 @@ class ValueUpdateKind(StrEnum):
 
 @dataclass(frozen=True)
 class OriginReviewRecord:
+    value_id: str
+    origin_id: str
+    origin_actor: str
+    origin_input_kind: str
+    origin_source_ref: str | None
+    reviewed_revision: int
+    reviewed_state_digest: str
     reviewer_id: str
     reviewer_authority: str
     decision: str
@@ -60,6 +67,13 @@ class OriginReviewRecord:
         if not self.event_id or self.event_sequence < 1:
             raise ValueError("Origin review requires an AgentRuntime event")
         if self.record_hash != _origin_review_hash(
+            self.value_id,
+            self.origin_id,
+            self.origin_actor,
+            self.origin_input_kind,
+            self.origin_source_ref,
+            self.reviewed_revision,
+            self.reviewed_state_digest,
             self.reviewer_id,
             self.reviewer_authority,
             self.decision,
@@ -139,6 +153,18 @@ class ValueState:
                 )
         if self.scope == ValueScope.CONTEXT and not self.context_ids:
             raise ValueError("Context-scoped values require context IDs")
+        if self.origin_review is not None:
+            provenance = self.origin_provenance
+            assert provenance is not None
+            if (
+                self.origin_review.value_id != self.value_id
+                or self.origin_review.reviewed_revision >= self.revision
+                or self.origin_review.origin_id != provenance.origin_id
+                or self.origin_review.origin_actor != provenance.actor.value
+                or self.origin_review.origin_input_kind != provenance.input_kind.value
+                or self.origin_review.origin_source_ref != provenance.source_ref
+            ):
+                raise ValueError("Origin review is not bound to this Value state")
 
 
 @dataclass(frozen=True)
@@ -784,6 +810,13 @@ class ValueSystem:
             )
         )
         review = OriginReviewRecord(
+            value_id=current.value_id,
+            origin_id=current.origin_provenance.origin_id,
+            origin_actor=current.origin_provenance.actor.value,
+            origin_input_kind=current.origin_provenance.input_kind.value,
+            origin_source_ref=current.origin_provenance.source_ref,
+            reviewed_revision=current.revision,
+            reviewed_state_digest=_reviewed_value_digest(current),
             reviewer_id=reviewer_id,
             reviewer_authority=reviewer_authority,
             decision="accept" if accept else "reject",
@@ -792,6 +825,13 @@ class ValueSystem:
             event_id=event_id,
             event_sequence=event_sequence,
             record_hash=_origin_review_hash(
+                current.value_id,
+                current.origin_provenance.origin_id,
+                current.origin_provenance.actor.value,
+                current.origin_provenance.input_kind.value,
+                current.origin_provenance.source_ref,
+                current.revision,
+                _reviewed_value_digest(current),
                 reviewer_id,
                 reviewer_authority,
                 "accept" if accept else "reject",
@@ -858,6 +898,40 @@ class ValueSystem:
                 self.held_proposals.pop(item.proposal_id, None)
             if held:
                 self.apply(held)
+        return updated
+
+    def endorse_system_seed(
+        self,
+        value_id: str,
+        *,
+        reviewer_authority: str,
+        event_id: str,
+        event_sequence: int,
+    ) -> ValueState:
+        current = self._require(value_id)
+        if (
+            current.origin_provenance is None
+            or current.origin_provenance.actor != OriginActor.SYSTEM
+            or current.origin_provenance.input_kind != OriginInputKind.CONFIG_SEED
+        ):
+            raise ValueError("Subject endorsement applies only to SYSTEM config seeds")
+        if reviewer_authority != "subject":
+            raise ValueError("Only the subject can endorse a SYSTEM config seed")
+        if not event_id or event_sequence < 1:
+            raise ValueError("Subject endorsement requires an AgentRuntime event")
+        updated = replace(
+            current,
+            origin_provenance=current.origin_provenance.endorse(
+                "subject_endorsement",
+                event_id=event_id,
+                event_sequence=event_sequence,
+            ),
+            revision=current.revision + 1,
+            last_reviewed_at=_now(),
+            change_reason="subject_endorsement",
+            last_updated_at=_now(),
+        )
+        self.values[value_id] = updated
         return updated
 
     def restore(self, payload: object) -> None:
@@ -1114,7 +1188,29 @@ def _value_state_from_json(payload: dict[str, Any]) -> ValueState:
     if isinstance(data.get("origin_review"), dict):
         review = dict(data["origin_review"])
         review["evidence_refs"] = tuple(review.get("evidence_refs", ()))
-        data["origin_review"] = OriginReviewRecord(**review)
+        try:
+            bound_review = OriginReviewRecord(**review)
+            origin = data["origin_provenance"]
+            if (
+                bound_review.value_id != data.get("value_id")
+                or bound_review.reviewed_revision >= int(data.get("revision", 0))
+                or bound_review.origin_id != origin.origin_id
+                or bound_review.origin_actor != origin.actor.value
+                or bound_review.origin_input_kind != origin.input_kind.value
+                or bound_review.origin_source_ref != origin.source_ref
+            ):
+                raise ValueError("Origin review binding mismatch")
+            data["origin_review"] = bound_review
+        except (TypeError, ValueError):
+            data["origin_review"] = None
+            origin = data["origin_provenance"]
+            data["origin_provenance"] = replace(
+                origin,
+                endorsement=EndorsementStatus.UNCERTAIN,
+                endorsement_ref=None,
+                endorsed_by_event_id=None,
+                endorsed_by_event_sequence=None,
+            )
     for name in (
         "context_ids",
         "origin_experience_ids",
@@ -1130,6 +1226,13 @@ def _value_state_from_json(payload: dict[str, Any]) -> ValueState:
 
 
 def _origin_review_hash(
+    value_id: str,
+    origin_id: str,
+    origin_actor: str,
+    origin_input_kind: str,
+    origin_source_ref: str | None,
+    reviewed_revision: int,
+    reviewed_state_digest: str,
     reviewer_id: str,
     reviewer_authority: str,
     decision: str,
@@ -1139,6 +1242,13 @@ def _origin_review_hash(
     event_sequence: int,
 ) -> str:
     payload = {
+        "value_id": value_id,
+        "origin_id": origin_id,
+        "origin_actor": origin_actor,
+        "origin_input_kind": origin_input_kind,
+        "origin_source_ref": origin_source_ref,
+        "reviewed_revision": reviewed_revision,
+        "reviewed_state_digest": reviewed_state_digest,
         "reviewer_id": reviewer_id,
         "reviewer_authority": reviewer_authority,
         "decision": decision,
@@ -1149,6 +1259,13 @@ def _origin_review_hash(
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _reviewed_value_digest(value: ValueState) -> str:
+    payload = asdict(replace(value, origin_review=None))
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
 
 

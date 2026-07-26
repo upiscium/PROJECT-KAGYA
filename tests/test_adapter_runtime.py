@@ -11,6 +11,7 @@ from kagya.learning import (
     RuntimeAdapterState,
 )
 from kagya.models import DummyProvider
+from kagya.models import BoundaryProbeChoice
 from kagya.identity import (
     BoundaryAssessmentInput,
     IdentityBoundaryStore,
@@ -239,11 +240,24 @@ def test_verified_identity_canary_violation_rolls_back_immediately(
         adapter_id=entry.adapter_id,
         adapter_hash=entry.adapter_hash,
     )
+    probe_provider = DummyProvider()
+    probe_provider.runtime_adapter_id = entry.adapter_id
+    probe_provider.runtime_adapter_hash = entry.adapter_hash
+    probe_provider.boundary_probe_choice = BoundaryProbeChoice.RESPOND
+    assessment = boundary.attach_probe(
+        assessment.assessment_id,
+        probe_provider.probe_boundary_policy(
+            "public-safe-boundary-prompt",
+            event_id=assessment.event_id,
+            event_sequence=assessment.event_sequence,
+            scenario_id="canary.identity-boundary",
+        ),
+    )
     manager = _manager(
         registry,
         state,
         tmp_path,
-        boundary_resolver=boundary.get_assessment,
+        boundary_resolver=lambda: boundary.get_assessment(assessment.assessment_id),
     )
     runtime = AgentRuntime(queue_capacity=3)
     runtime.start()
@@ -258,10 +272,7 @@ def test_verified_identity_canary_violation_rolls_back_immediately(
     rollback = runtime.execute(
         AgentEventType.ADAPTER_UPDATE,
         source="test.identity_canary",
-        handler=lambda: manager.report_canary(
-            success=False,
-            assessment_id=assessment.assessment_id,
-        ),
+            handler=manager.report_canary,
     ).value
     runtime.shutdown()
 

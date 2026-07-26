@@ -499,6 +499,12 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
     def switch(
         provider: ModelProvider, entry: AdapterEntry | None, sequence: int | None
     ) -> None:
+        provider.runtime_adapter_id = (  # type: ignore[attr-defined]
+            None if entry is None else entry.adapter_id
+        )
+        provider.runtime_adapter_hash = (  # type: ignore[attr-defined]
+            None if entry is None else entry.adapter_hash
+        )
         request.app.state.model_provider = provider
         request.app.state.model_provider_adapter_id = (
             None if entry is None else entry.adapter_id
@@ -518,12 +524,11 @@ def get_adapter_runtime_manager(request: Request) -> AdapterRuntimeManager:
             provider=loop.provider,
         )
 
-    def resolve_boundary_assessment(assessment_id: str):
+    def resolve_boundary_assessment():
         store = get_main_loop(request).identity_boundary_store
-        assessment = store.get_assessment(assessment_id)
-        if not store.assessments or store.assessments[-1].assessment_id != assessment_id:
-            raise ValueError("Boundary assessment is stale")
-        return assessment
+        if not store.assessments:
+            raise ValueError("No live boundary assessment is available")
+        return store.assessments[-1]
 
     manager = AdapterRuntimeManager(
         registry,
@@ -705,8 +710,19 @@ def _get_runtime_model_provider(
                 expected_adapter_manifest=manifest,
             )
             request.app.state.model_provider_adapter_id = active_adapter.adapter_id
-        return request.app.state.model_provider
+        provider = request.app.state.model_provider
+        provider.runtime_adapter_id = active_adapter.adapter_id  # type: ignore[attr-defined]
+        provider.runtime_adapter_hash = active_adapter.adapter_hash  # type: ignore[attr-defined]
+        return provider
 
     provider = get_model_provider(request)
-    request.app.state.model_provider_adapter_id = None
+    provider.runtime_adapter_id = (  # type: ignore[attr-defined]
+        None if active_adapter is None else active_adapter.adapter_id
+    )
+    provider.runtime_adapter_hash = (  # type: ignore[attr-defined]
+        None if active_adapter is None else active_adapter.adapter_hash
+    )
+    request.app.state.model_provider_adapter_id = (
+        None if active_adapter is None else active_adapter.adapter_id
+    )
     return provider

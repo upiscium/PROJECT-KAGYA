@@ -231,11 +231,11 @@ def test_unbound_canary_failure_cannot_trigger_automatic_rollback(
         source="test.activate",
         handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
     )
-    with pytest.raises(ValueError, match="bound runtime assessment"):
+    with pytest.raises(ValueError, match="resolver is unavailable"):
         runtime.execute(
             AgentEventType.ADAPTER_UPDATE,
             source="test.canary",
-            handler=lambda: manager.report_canary(success=False),
+            handler=manager.report_canary,
         )
     runtime.shutdown()
 

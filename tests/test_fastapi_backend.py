@@ -961,6 +961,9 @@ def test_behavioral_status_is_bounded_and_redacted(tmp_path: Path) -> None:
             "activation_reason": "quality_unevaluated",
             "identity_integrity_status": "not_evaluated",
             "real_model_identity_integrity_status": "not_evaluated",
+            "candidate_boundary_probe_choice": None,
+            "candidate_boundary_probe_margin": None,
+            "candidate_boundary_probe_count": 0,
             "rollback_reason": None,
         }
     assert str(tmp_path) not in response.text

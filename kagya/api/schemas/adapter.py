@@ -78,6 +78,9 @@ class AdapterResponse(BaseModel):
     real_model_identity_integrity_status: IdentityDriftStatus = (
         IdentityDriftStatus.NOT_EVALUATED
     )
+    candidate_boundary_probe_choice: str | None = None
+    candidate_boundary_probe_margin: float | None = None
+    candidate_boundary_probe_count: int = 0
     rollback_reason: str | None = None
 
 
@@ -87,13 +90,6 @@ class AdapterListResponse(BaseModel):
 
 class AdapterEvaluateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-class AdapterCanaryRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    success: bool
-    assessment_id: str = Field(pattern=r"^boundary-[A-Za-z0-9-]+$")
 
 
 class AdapterEvaluateResponse(BaseModel):
@@ -152,6 +148,9 @@ class AdapterBehavioralStatusResponse(BaseModel):
     activation_reason: ActivationEligibilityReason
     identity_integrity_status: IdentityDriftStatus
     real_model_identity_integrity_status: IdentityDriftStatus
+    candidate_boundary_probe_choice: str | None = None
+    candidate_boundary_probe_margin: float | None = None
+    candidate_boundary_probe_count: int = 0
     rollback_reason: str | None = None
 
 

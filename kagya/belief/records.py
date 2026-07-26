@@ -103,6 +103,11 @@ class BeliefRevision:
     reviewer_id: str | None = None
     reviewer_authority: str | None = None
     review_hash: str | None = None
+    reviewed_belief_id: str | None = None
+    reviewed_proposition_digest: str | None = None
+    reviewed_origin_id: str | None = None
+    reviewed_revision: int | None = None
+    reviewed_status: str | None = None
 
     def __post_init__(self) -> None:
         _safe_ref(self.revision_id, "belief revision ID")
@@ -123,6 +128,11 @@ class BeliefRevision:
             ):
                 raise ValueError("belief review hash requires complete reviewer provenance")
             if self.review_hash != _belief_review_hash(
+                self.reviewed_belief_id,
+                self.reviewed_proposition_digest,
+                self.reviewed_origin_id,
+                self.reviewed_revision,
+                self.reviewed_status,
                 self.reviewer_id,
                 self.reviewer_authority,
                 self.operation,
@@ -340,6 +350,11 @@ class BeliefStore:
             reviewer_authority=reviewer_authority,
             review_hash=(
                 _belief_review_hash(
+                    current.belief_id,
+                    _proposition_digest(current.proposition),
+                    current.identity_origin.origin_id,
+                    current.revision,
+                    current.epistemic_status.value,
                     reviewer_id,
                     reviewer_authority,
                     "accept" if accept else "reject",
@@ -498,7 +513,15 @@ class BeliefStore:
             and not (
                 record.identity_origin.actor
                 in {OriginActor.UNKNOWN, OriginActor.INHERITED}
-                and not any(_valid_origin_review(revision) for revision in record.revisions)
+                and not any(
+                    _valid_origin_review(
+                        revision,
+                        belief_id=record.belief_id,
+                        proposition=record.proposition,
+                        origin_id=record.identity_origin.origin_id,
+                    )
+                    for revision in record.revisions
+                )
             )
             and _temporally_valid(record, current_time)
             and (
@@ -569,6 +592,17 @@ class BeliefStore:
             reviewer_id=reviewer_id,
             reviewer_authority=reviewer_authority,
             review_hash=review_hash,
+            reviewed_belief_id=before.belief_id if review_hash is not None else None,
+            reviewed_proposition_digest=(
+                _proposition_digest(before.proposition) if review_hash is not None else None
+            ),
+            reviewed_origin_id=(
+                before.identity_origin.origin_id if review_hash is not None else None
+            ),
+            reviewed_revision=before.revision if review_hash is not None else None,
+            reviewed_status=(
+                before.epistemic_status.value if review_hash is not None else None
+            ),
         )
         return replace(
             after,
@@ -669,20 +703,38 @@ def _belief_from_json(payload: dict[str, Any]) -> BeliefRecord:
     )
     for name in ("context_scope", "contradiction_ids"):
         data[name] = tuple(data.get(name, ()))
-    data["revisions"] = tuple(
-        BeliefRevision(
-            **{
-                **item,
-                "evidence_refs": tuple(item.get("evidence_refs", ())),
-            }
-        )
-        for item in data.get("revisions", ())
-    )
+    revisions: list[BeliefRevision] = []
+    for item in data.get("revisions", ()):
+        revision_data = {
+            **item,
+            "evidence_refs": tuple(item.get("evidence_refs", ())),
+        }
+        try:
+            revisions.append(BeliefRevision(**revision_data))
+        except (TypeError, ValueError):
+            revision_data.update(
+                review_hash=None,
+                reviewed_belief_id=None,
+                reviewed_proposition_digest=None,
+                reviewed_origin_id=None,
+                reviewed_revision=None,
+                reviewed_status=None,
+            )
+            revisions.append(BeliefRevision(**revision_data))
+    data["revisions"] = tuple(revisions)
     if (
         data["lifecycle"] == BeliefLifecycle.ACTIVE
         and data["identity_origin"].actor
         in {OriginActor.UNKNOWN, OriginActor.INHERITED}
-        and not any(_valid_origin_review(revision) for revision in data["revisions"])
+        and not any(
+            _valid_origin_review(
+                revision,
+                belief_id=str(data["belief_id"]),
+                proposition=data["proposition"],
+                origin_id=data["identity_origin"].origin_id,
+            )
+            for revision in data["revisions"]
+        )
     ):
         data["lifecycle"] = BeliefLifecycle.PROPOSED
         data["identity_origin"] = replace(
@@ -713,17 +765,33 @@ def _safe_ref(value: str, name: str) -> None:
         raise ValueError(f"{name} must be an opaque safe reference")
 
 
-def _valid_origin_review(revision: BeliefRevision) -> bool:
+def _valid_origin_review(
+    revision: BeliefRevision,
+    *,
+    belief_id: str,
+    proposition: Proposition,
+    origin_id: str,
+) -> bool:
     return (
         revision.operation == "accept"
         and revision.reviewer_authority in {"subject", "operator"}
         and revision.event_id is not None
         and revision.event_sequence is not None
         and revision.review_hash is not None
+        and revision.reviewed_belief_id == belief_id
+        and revision.reviewed_proposition_digest == _proposition_digest(proposition)
+        and revision.reviewed_origin_id == origin_id
+        and revision.reviewed_revision == revision.from_revision
+        and revision.reviewed_status == revision.before.get("epistemic_status")
     )
 
 
 def _belief_review_hash(
+    belief_id: str | None,
+    proposition_digest: str | None,
+    origin_id: str | None,
+    reviewed_revision: int | None,
+    reviewed_status: str | None,
     reviewer_id: str,
     reviewer_authority: str,
     operation: str,
@@ -733,6 +801,11 @@ def _belief_review_hash(
     event_sequence: int,
 ) -> str:
     payload = {
+        "belief_id": belief_id,
+        "proposition_digest": proposition_digest,
+        "origin_id": origin_id,
+        "reviewed_revision": reviewed_revision,
+        "reviewed_status": reviewed_status,
         "reviewer_id": reviewer_id,
         "reviewer_authority": reviewer_authority,
         "operation": operation,
@@ -743,6 +816,12 @@ def _belief_review_hash(
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _proposition_digest(proposition: Proposition) -> str:
+    return hashlib.sha256(
+        json.dumps(asdict(proposition), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 

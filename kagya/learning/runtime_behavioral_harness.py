@@ -581,12 +581,21 @@ class SubjectRuntimeHarness:
             else 0,
         )
         state = snapshot.model_dump(mode="json")
+        extensions = state.get("extensions")
+        if isinstance(extensions, dict) and "decision_records" in extensions:
+            extensions["decision_records"] = _without_argument_bodies(
+                extensions["decision_records"]
+            )
         identity = state.get("identity")
         if isinstance(identity, dict):
             extensions = identity.get("extensions")
             if isinstance(extensions, dict) and "identity_boundary" in extensions:
                 extensions["identity_boundary"] = (
                     graph.main_loop.identity_boundary_store.public_json()
+                )
+            if isinstance(extensions, dict) and "decision_records" in extensions:
+                extensions["decision_records"] = _without_argument_bodies(
+                    extensions["decision_records"]
                 )
         state["domains"] = {
             "attention": _json_value(graph.main_loop.attention_system.to_json()),

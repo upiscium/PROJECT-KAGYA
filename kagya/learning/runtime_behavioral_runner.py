@@ -1239,14 +1239,9 @@ def _create_action_decision(
         value_effects={},
         appraisal_contributions={},
     )
-    loop.decision_store.create(
+    loop.create_decision(
         [action, fallback],
-        triggering_event_id="behavioral-source",
-        triggering_event_sequence=1,
         context_id=None,
-        active_goal_ids=(),
-        value_revision_refs={},
-        emotion_snapshot={},
         decision_id=decision_id,
     )
 

@@ -97,20 +97,22 @@ def test_deterministic_identity_evidence_is_architecture_only(
     payload["adapters"][0]["identity_drift_assessment"] = None
     registry.path.write_text(json.dumps(payload), encoding="utf-8")
     assert registry.identity_assessment_status("candidate")[0] == "not_evaluated"
-    assert registry.activation_eligibility("candidate").eligible is True
+    assert registry.activation_eligibility("candidate").reason == (
+        ActivationEligibilityReason.IDENTITY_NOT_EVALUATED
+    )
 
     failed_root = tmp_path / "failed"
     failed_root.mkdir()
     failed = _ordinary_evaluated(failed_root)
     bind_runtime_behavioral_result(failed, failed_root, "candidate", passed=False)
     failed.approve("candidate")
-    assert failed.identity_assessment_status("candidate")[0] == "not_evaluated"
+    assert failed.identity_assessment_status("candidate")[0] == "failed"
     assert failed.activation_eligibility("candidate").eligible is False
 
     stale_root = tmp_path / "stale"
     stale_root.mkdir()
     stale = _ready(stale_root)
-    assert stale.identity_assessment_status("candidate")[0] == "not_evaluated"
+    assert stale.identity_assessment_status("candidate")[0] == "passed"
     assert stale.activation_eligibility("candidate").eligible is True
 
 

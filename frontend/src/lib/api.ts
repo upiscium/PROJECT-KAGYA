@@ -199,6 +199,9 @@ export type Adapter = {
   rollback_target_id: string | null;
   identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
   real_model_identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  candidate_boundary_probe_choice?: string | null;
+  candidate_boundary_probe_margin?: number | null;
+  candidate_boundary_probe_count?: number;
   rollback_reason: string | null;
 };
 
@@ -224,6 +227,9 @@ export type AdapterBehavioralStatus = {
   activation_reason: string;
   identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
   real_model_identity_integrity_status: "passed" | "failed" | "not_evaluated" | "stale";
+  candidate_boundary_probe_choice: string | null;
+  candidate_boundary_probe_margin: number | null;
+  candidate_boundary_probe_count: number;
   rollback_reason: string | null;
 };
 export type EvaluationResultSummary = {

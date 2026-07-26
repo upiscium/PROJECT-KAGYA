@@ -364,4 +364,15 @@ def _decision(
         value_effects={"care": -0.2},
         appraisal_contributions={},
     )
-    loop.create_decision([action, fallback], decision_id=decision_id)
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        runtime.execute(
+            AgentEventType.DECISION_UPDATE,
+            source="test.decision",
+            handler=lambda: loop.create_decision(
+                [action, fallback], decision_id=decision_id
+            ),
+        )
+    finally:
+        runtime.shutdown()

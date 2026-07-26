@@ -12,6 +12,8 @@ from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.motivation import GoalStatus, GoalType
 from kagya.runtime import (
+    AgentEventType,
+    AgentRuntime,
     AgentStateSnapshot,
     AgentStateStore,
     KagyaMainLoop,
@@ -127,8 +129,12 @@ def test_goal_state_and_decisions_resume_after_snapshot_restore(tmp_path: Path) 
 
 def test_decision_records_restore_from_agent_snapshot(tmp_path: Path) -> None:
     loop = _loop(tmp_path)
-    loop.create_decision(
-        [
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    runtime.execute(
+        AgentEventType.DECISION_UPDATE,
+        source="test.decision",
+        handler=lambda: loop.create_decision([
             ActionCandidate(
                 candidate_id="no-op",
                 candidate_type=ActionType.NO_OP,
@@ -142,9 +148,9 @@ def test_decision_records_restore_from_agent_snapshot(tmp_path: Path) -> None:
                 value_effects={},
                 appraisal_contributions={},
             )
-        ],
-        decision_id="persistent-decision",
+        ], decision_id="persistent-decision"),
     )
+    runtime.shutdown()
     store = AgentStateStore(tmp_path / "agent_state.json")
     store.save(store.capture(loop, 9))
 

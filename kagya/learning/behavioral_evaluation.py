@@ -19,6 +19,7 @@ from kagya.artifact_provenance import (
     AdapterArtifactManifest,
     ModelArtifactManifest,
 )
+from kagya.models.boundary_probe import BoundaryPolicyProbe
 from kagya.structured_response import PublicBehaviorClass
 
 if TYPE_CHECKING:
@@ -459,6 +460,10 @@ class PairedBehavioralEvaluationResult(_StrictModel):
     baseline_generation_count: int = Field(default=0, ge=0)
     candidate_generation_count: int = Field(default=0, ge=0)
     provider_fallback_used: bool = False
+    baseline_boundary_probes: tuple[BoundaryPolicyProbe, ...] = ()
+    candidate_boundary_probes: tuple[BoundaryPolicyProbe, ...] = ()
+    baseline_probe_count: int = Field(default=0, ge=0)
+    candidate_probe_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_runtime_binding(self) -> PairedBehavioralEvaluationResult:
@@ -1475,6 +1480,7 @@ def _boundary_runtime_evidence(
         "action_effect_refs",
         "adapter_id",
         "adapter_hash",
+        "boundary_probe",
     }
     return {
         key: value

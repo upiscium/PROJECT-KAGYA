@@ -901,6 +901,18 @@ def _decision(
         value_effects={},
         appraisal_contributions={},
     )
+    assessment = loop.identity_boundary_store.assess(
+        BoundaryAssessmentInput(
+            action_ref=f"decision:{decision_id}",
+            origin_refs=("event:event-source",),
+        ),
+        event_id="event-source",
+        event_sequence=7,
+        value_revision_refs={},
+        goal_revision_refs={},
+        commitment_revision_refs={},
+        relationship_revision_refs={},
+    )
     loop.decision_store.create(
         [action, fallback],
         triggering_event_id="event-source",
@@ -910,4 +922,10 @@ def _decision(
         value_revision_refs={},
         emotion_snapshot={},
         decision_id=decision_id,
+        boundary_assessment_id=assessment.assessment_id,
+        boundary_assessment_revision=assessment.revision,
+        boundary_assessment_digest=loop.identity_boundary_store.assessment_digest(
+            assessment.assessment_id
+        ),
+        boundary_recommendation=assessment.recommendation.value,
     )

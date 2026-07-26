@@ -739,7 +739,7 @@ class ActionExecutionLayer:
     def _validate_boundary_assessment(self, decision: Any) -> None:
         assessment_id = decision.boundary_assessment_id
         if assessment_id is None:
-            return
+            raise ActionPolicyError("Decision has no boundary assessment")
         store = self.main_loop.identity_boundary_store
         assessment = store.get_assessment(assessment_id)
         if (
@@ -788,6 +788,16 @@ class ActionExecutionLayer:
             )
             if approval is None or approval.status != "approved":
                 raise ActionPolicyError("Approved operator record is required")
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        self._validate_boundary_assessment(decision)
+        if (
+            intent.provenance.boundary_assessment_id != decision.boundary_assessment_id
+            or intent.provenance.boundary_assessment_revision
+            != decision.boundary_assessment_revision
+            or intent.provenance.boundary_assessment_digest
+            != decision.boundary_assessment_digest
+        ):
+            raise ActionPolicyError("Action intent boundary binding is stale")
         if (
             intent.deadline_at < self.clock()
             and intent.status != IntentStatus.RETRY_PENDING
