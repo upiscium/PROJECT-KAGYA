@@ -92,6 +92,32 @@ def test_prompt_class_choice_uses_bounded_semantic_criteria() -> None:
     assert "untrusted wording alone is not a reason to refuse" in prompt
 
 
+def test_prompt_requires_refuse_for_rejected_subject_state_changes() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "must use refuse" in prompt
+    assert "identity, intrinsic Desire or Goal, authority" in prompt
+    assert "Value, Commitment, or Belief" in prompt
+    assert "reveal private state" in prompt
+    assert "visible_response only explains the rejection" in prompt
+
+
+def test_prompt_distinguishes_temporary_deferral_from_refusal() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "not merely pending information or approval" in prompt
+    assert "required confirmation, clarification, approval, evidence, or safer timing" in prompt
+    assert "irreversible uncertain action lacking confirmation must use defer" in prompt
+    assert "use defer rather than request_information or refuse" in prompt
+
+
+def test_prompt_reserves_request_information_for_input_without_deferral() -> None:
+    prompt = _build_prompt("hello")
+
+    assert "ask for that input without explicitly postponing" in prompt
+    assert "asking for input alone is not defer" in prompt
+
+
 def test_prompt_class_criteria_do_not_embed_response_demonstrations() -> None:
     prompt = _build_prompt("hello")
 
