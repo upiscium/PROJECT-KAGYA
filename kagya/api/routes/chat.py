@@ -208,6 +208,7 @@ def stream_chat_job(
                     OperationState.FAILED,
                     OperationState.CANCELED,
                 }
+                and not registry.projection_pending(operation_id)
                 and not registry.events_after(operation_id, cursor)
             ):
                 return
