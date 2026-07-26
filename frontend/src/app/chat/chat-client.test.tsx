@@ -126,6 +126,87 @@ describe("ChatClient", () => {
     expect(screen.getByText("Generating response...")).toBeInTheDocument();
   });
 
+  it("does not offer cancellation while a response is finalizing", async () => {
+    const operation = operationStatus("finalizing");
+    const encoder = new TextEncoder();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(operation)}\n\n`));
+          },
+        }),
+      });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Finalizing response...")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("ends pending UI and clears streamed text after cancellation", async () => {
+    const running = operationStatus("running");
+    const canceled = { ...operationStatus("canceled"), cancel_code: "client_request" as const };
+    const encoder = new TextEncoder();
+    let streamSignal: AbortSignal | undefined;
+    let reads = 0;
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation: running, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockImplementationOnce((_url, init) => {
+        streamSignal = init?.signal;
+        return Promise.resolve({
+          ok: true,
+          body: {
+            getReader: () => ({
+              read: () => {
+                reads += 1;
+                if (reads === 1) return Promise.resolve({ done: false, value: encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(running)}\n\nid: 2\nevent: token\ndata: {"text":"partial"}\n\n`) });
+                return new Promise((_resolve, reject) => streamSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }));
+              },
+            }),
+          },
+        });
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ disposition: "cancel_requested", operation: canceled }) });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("partial")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText("Canceled")).toBeInTheDocument();
+    expect(screen.queryByText("partial")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("KAGYA is generating a response")).not.toBeInTheDocument();
+  });
+
+  it("explains when cancellation loses the finalizing race", async () => {
+    const running = operationStatus("running");
+    const encoder = new TextEncoder();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ operation: running, status_url: "/api/chat/jobs/job-1", result_url: "/api/chat/jobs/job-1/result", events_url: "/api/chat/jobs/job-1/events", duplicate: false }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(`id: 1\nevent: status\ndata: ${JSON.stringify(running)}\n\n`));
+          },
+        }),
+      })
+      .mockResolvedValueOnce({ ok: false, status: 409, statusText: "Conflict", text: async () => JSON.stringify({ detail: "already_finalizing" }) });
+    renderWithQuery();
+
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText("The response is already being committed and can no longer be canceled.")).toBeInTheDocument();
+  });
+
   it("reuses the server context id for the next message", async () => {
     fetchMock.mockResolvedValue({
       ok: true,
@@ -193,3 +274,24 @@ describe("ChatClient", () => {
     expect(feedbackRequest).not.toHaveProperty("reward");
   });
 });
+
+function operationStatus(status: "running" | "finalizing" | "canceled") {
+  const terminal = status === "canceled";
+  return {
+    schema_version: 1 as const,
+    operation_id: "job-1",
+    event_id: "event-1",
+    status,
+    status_sequence: terminal ? 3 : 2,
+    queue_position: null,
+    submitted_at: "2026-01-01T00:00:00Z",
+    started_at: "2026-01-01T00:00:01Z",
+    finalizing_at: status === "finalizing" ? "2026-01-01T00:00:02Z" : null,
+    completed_at: terminal ? "2026-01-01T00:00:03Z" : null,
+    updated_at: "2026-01-01T00:00:03Z",
+    error_code: null,
+    cancel_code: null,
+    cancel_requested: false,
+    result_available: false,
+  };
+}
