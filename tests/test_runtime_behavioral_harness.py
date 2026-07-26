@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 import json
 
@@ -8,6 +9,7 @@ from kagya.config import load_settings
 from kagya.learning import (
     AuthoritativeTransitionCollector,
     BehavioralArtifactStore,
+    ControlledClock,
     FailureInjector,
     SubjectRuntimeHarness,
 )
@@ -95,6 +97,47 @@ def test_restart_builds_fresh_graph_and_restores_filesystem_state(
     commitments = harness.capture_authoritative_state()["domains"]["commitments"]
     assert commitments[0]["commitment_id"] == "restart-commitment"
     assert commitments[0]["status"] == CommitmentStatus.PROPOSED.value
+    harness.shutdown()
+
+
+def test_homeostatic_motivation_uses_controlled_clock_across_restart(
+    tmp_path: Path,
+) -> None:
+    clock = ControlledClock(datetime(2001, 1, 1, tzinfo=UTC))
+    harness = SubjectRuntimeHarness(
+        tmp_path / "subject",
+        load_settings(CONFIG_PATH),
+        subject_id="candidate",
+        clock=clock,
+    ).create().start()
+
+    def reinforce_homeostasis(loop):
+        loop.record_homeostatic_state(valence=-0.8, arousal=0.8)
+        return loop.derive_structured_motivations()[0]
+
+    first = harness.execute(AgentEventType.MOTIVATION_UPDATE, reinforce_homeostasis).value
+    harness.execute(AgentEventType.MOTIVATION_UPDATE, reinforce_homeostasis)
+    assert first.created_at == clock.now().isoformat()
+    assert harness.graph is not None
+    signal = harness.graph.main_loop.persistent_state.motivation_extensions[
+        "homeostatic_signal"
+    ]
+    assert signal["observed_at"] == clock.now().isoformat()
+
+    clock.advance(59)
+    _, goals = harness.execute(
+        AgentEventType.INTRINSIC_GOAL_PROPOSE,
+        lambda loop: loop.reevaluate_motivation(),
+    ).value
+    assert goals == []
+
+    harness.restart()
+    clock.advance(1)
+    _, goals = harness.execute(
+        AgentEventType.INTRINSIC_GOAL_PROPOSE,
+        lambda loop: loop.reevaluate_motivation(),
+    ).value
+    assert len(goals) == 1
     harness.shutdown()
 
 

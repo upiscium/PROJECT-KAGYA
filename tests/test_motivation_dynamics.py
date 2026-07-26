@@ -2,6 +2,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 
+import pytest
+
 from kagya.cognition import AppraisalResult
 from kagya.experience import build_chat_experience
 from kagya.identity import OriginActor, OriginInputKind, new_identity_origin
@@ -206,6 +208,44 @@ def test_elapsed_persistence_and_saturation_gate_goal_lifecycle() -> None:
     )
     assert unchanged.status == MotivationStatus.SATISFIED
     assert len(dynamics.list_records()) == 1
+
+
+def test_authoritative_clock_gates_persistence_and_survives_restore() -> None:
+    current = datetime(2001, 1, 1, tzinfo=UTC)
+    dynamics = MotivationDynamics(
+        min_evidence_count=1,
+        min_persistence_seconds=60,
+        clock=lambda: current,
+    )
+    record = dynamics.observe_structured_signal(
+        MotivationKind.DESIRE,
+        MotivationSource.LEARNING,
+        "future-self:controlled-clock",
+        signal=0.9,
+        uncertainty=0.1,
+        source_refs=("future-self:controlled-clock@1",),
+    )
+
+    assert record.created_at == current.isoformat()
+    current += timedelta(seconds=59)
+    assert dynamics.goal_candidates()[0] == []
+
+    restored = MotivationDynamics(
+        min_evidence_count=1,
+        min_persistence_seconds=60,
+        clock=lambda: current,
+    )
+    restored.restore(json.loads(json.dumps(dynamics.to_json())))
+    assert restored.get(record.motivation_id).created_at == record.created_at
+    assert restored.goal_candidates()[0] == []
+
+    current += timedelta(seconds=1)
+    assert restored.goal_candidates()[0][0].motivation_id == record.motivation_id
+
+
+def test_motivation_clock_requires_timezone() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        MotivationDynamics(clock=lambda: datetime(2001, 1, 1))
 
 
 def test_terminal_source_reopens_only_for_new_source_revision_and_restores() -> None:

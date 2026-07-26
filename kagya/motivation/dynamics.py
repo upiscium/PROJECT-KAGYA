@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from kagya.experience import ExperienceRecord
@@ -145,6 +145,7 @@ class MotivationDynamics:
         min_persistence: float = 0.4,
         min_evidence_count: int = 2,
         min_persistence_seconds: float = 60.0,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if max_goal_proposals_per_cycle <= 0 or min_evidence_count <= 0:
             raise ValueError("motivation budgets must be positive")
@@ -157,6 +158,8 @@ class MotivationDynamics:
         self.min_persistence = min_persistence
         self.min_evidence_count = min_evidence_count
         self.min_persistence_seconds = min_persistence_seconds
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._now_datetime()
         self.records: dict[str, MotivationRecord] = {}
         self.episodes: list[MotivationEpisode] = []
 
@@ -286,7 +289,7 @@ class MotivationDynamics:
             value_ids=related_value_ids,
             evidence=_structured_evidence(
                 source_ref,
-                observed_at=_now(),
+                observed_at=self._now(),
                 signal=gap,
                 uncertainty=uncertainty,
                 measurements=(("gap", gap),),
@@ -315,7 +318,7 @@ class MotivationDynamics:
         evidence = tuple(
             _structured_evidence(
                 reference,
-                observed_at=observed_at or _now(),
+                observed_at=observed_at or self._now(),
                 signal=signal,
                 uncertainty=uncertainty,
                 measurements=measurements,
@@ -342,7 +345,7 @@ class MotivationDynamics:
             )
             if terminal is not None:
                 return terminal
-            now = _now()
+            now = self._now()
             record = MotivationRecord(
                 motivation_id=f"motivation-{uuid4()}",
                 kind=kind,
@@ -388,7 +391,7 @@ class MotivationDynamics:
                 persistence=max(existing.persistence, signal, 0.4),
                 uncertainty=min(existing.uncertainty, uncertainty),
                 evidence_count=existing.evidence_count + len(novel_refs),
-                updated_at=_now(),
+                updated_at=self._now(),
                 evidence=(
                     *existing.evidence,
                     *(item for item in evidence if item.evidence_ref in novel_refs),
@@ -425,7 +428,7 @@ class MotivationDynamics:
                 current,
                 status=MotivationStatus.DECAYED,
                 strength=0.0,
-                updated_at=_now(),
+                updated_at=self._now(),
             ),
             "source_signal_retired",
             (source_state_ref,),
@@ -445,7 +448,7 @@ class MotivationDynamics:
             replace(
                 left,
                 conflict_ids=tuple(dict.fromkeys((*left.conflict_ids, right_id))),
-                updated_at=_now(),
+                updated_at=self._now(),
             ),
             "conflict_registered",
             (f"motivation:{right_id}",),
@@ -455,7 +458,7 @@ class MotivationDynamics:
             replace(
                 right,
                 conflict_ids=tuple(dict.fromkeys((*right.conflict_ids, left_id))),
-                updated_at=_now(),
+                updated_at=self._now(),
             ),
             "conflict_registered",
             (f"motivation:{left_id}",),
@@ -469,7 +472,7 @@ class MotivationDynamics:
             if max_candidates < 0:
                 raise ValueError("goal candidate limit must not be negative")
             limit = min(limit, max_candidates)
-        reviewed_at = review_at or datetime.now(UTC)
+        reviewed_at = review_at or self._now_datetime()
         if reviewed_at.tzinfo is None:
             raise ValueError("motivation review time must include a timezone")
         eligible = [
@@ -514,7 +517,7 @@ class MotivationDynamics:
                 current,
                 kind=MotivationKind.DESIRE,
                 related_goal_ids=(*current.related_goal_ids, goal_id),
-                updated_at=_now(),
+                updated_at=self._now(),
             ),
             "goal_proposed",
             (f"goal:{goal_id}",),
@@ -535,7 +538,7 @@ class MotivationDynamics:
                     status=status,
                     strength=0.0 if success else max(0.0, current.strength - 0.25),
                     satiation=1.0 if success else current.satiation,
-                    updated_at=_now(),
+                    updated_at=self._now(),
                 ),
                 "goal_satisfied" if success else "goal_failed",
                 (f"goal:{goal_id}",),
@@ -563,7 +566,7 @@ class MotivationDynamics:
                     strength=strength,
                     satiation=satiation,
                     status=status,
-                    updated_at=_now(),
+                    updated_at=self._now(),
                 ),
                 "time_decay",
                 (),
@@ -590,7 +593,7 @@ class MotivationDynamics:
                 strength=strength,
                 satiation=satiation,
                 status=status,
-                updated_at=_now(),
+                updated_at=self._now(),
             ),
             "time_decay",
             (),
@@ -642,7 +645,7 @@ class MotivationDynamics:
             budget=resolved_budget,
             event_id=event_id,
             event_sequence=event_sequence,
-            created_at=_now(),
+            created_at=self._now(),
         )
         self.episodes.append(episode)
         return episode
@@ -677,7 +680,7 @@ class MotivationDynamics:
                 -0.1, min(0.1, desired - current.strength)
             )
             before = current.to_json()
-            now = _now()
+            now = self._now()
             revision = MotivationRevision(
                 revision_id=f"motivation-revision-{uuid4()}",
                 operation="experience_reassessment",
@@ -783,7 +786,7 @@ class MotivationDynamics:
             )
             if terminal is not None:
                 return terminal
-            now = _now()
+            now = self._now()
             record = MotivationRecord(
                 motivation_id=f"motivation-{uuid4()}",
                 kind=kind,
@@ -835,7 +838,7 @@ class MotivationDynamics:
                     dict.fromkeys((*existing.related_value_ids, *value_ids))
                 ),
                 evidence_count=existing.evidence_count + 1,
-                updated_at=_now(),
+                updated_at=self._now(),
                 evidence=(*existing.evidence, evidence),
             ),
             "experience_reinforcement",
@@ -844,8 +847,8 @@ class MotivationDynamics:
         self.records[existing.motivation_id] = updated
         return updated
 
-    @staticmethod
     def _revise(
+        self,
         before: MotivationRecord,
         after: MotivationRecord,
         operation: str,
@@ -857,13 +860,22 @@ class MotivationDynamics:
             before=_state(before),
             after=_state(after),
             evidence_refs=evidence_refs,
-            created_at=_now(),
+            created_at=self._now(),
         )
         return replace(
             after,
             revision=before.revision + 1,
             revisions=(*before.revisions, revision),
         )
+
+    def _now_datetime(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise ValueError("motivation clock must return a timezone-aware datetime")
+        return now
+
+    def _now(self) -> str:
+        return self._now_datetime().isoformat()
 
 
 def _goal_candidate(record: MotivationRecord) -> GoalFormationCandidate:
@@ -996,7 +1008,3 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     return value
-
-
-def _now() -> str:
-    return datetime.now(UTC).isoformat()

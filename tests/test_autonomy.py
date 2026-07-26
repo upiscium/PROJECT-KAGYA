@@ -56,12 +56,19 @@ class _DecisionStore:
 
 
 class _MainLoop:
-    def __init__(self, extensions: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        extensions: dict[str, object] | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.persistent_state = SimpleNamespace(extensions=extensions or {})
         self.goal_manager = _GoalManager()
         self.commitment_store = _CommitmentStore()
         self.decision_store = _DecisionStore()
-        self.motivation_dynamics = MotivationDynamics(max_goal_proposals_per_cycle=1)
+        self.motivation_dynamics = MotivationDynamics(
+            max_goal_proposals_per_cycle=1, clock=clock
+        )
         self.reevaluations = 0
         self.commitment_reevaluations = 0
         self.motivation_reevaluations = 0
@@ -417,7 +424,7 @@ def test_skewed_domain_changes_use_scheduler_time_but_explicit_boundaries_do_not
     scheduler_now = datetime(2026, 7, 24, tzinfo=UTC)
     current = scheduler_now
     runtime, _ = _runtime(tmp_path / "journal.jsonl")
-    loop = _MainLoop()
+    loop = _MainLoop(clock=lambda: current)
     record = loop.motivation_dynamics.observe_structured_signal(
         MotivationKind.DESIRE,
         MotivationSource.LEARNING,

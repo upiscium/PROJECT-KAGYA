@@ -74,10 +74,12 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
         motivations: MotivationDynamics,
         *,
         persist: Callable[[], None],
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._goals = goals
         self._motivations = motivations
         self._persist = persist
+        self._motivation_clock = clock or (lambda: datetime.now(UTC))
 
     def resolve_goal_motivation(self, goal: Goal, status: GoalStatus) -> None:
         if status in {GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.ABANDONED}:
@@ -341,7 +343,7 @@ class MotivationGoalCoordinator(RuntimeDomainMixin):
         )
         self.persistent_state.motivation_extensions["homeostatic_signal"] = {
             "revision": revision,
-            "observed_at": (observed_at or datetime.now(UTC)).isoformat(),
+            "observed_at": (observed_at or self._motivation_clock()).isoformat(),
             "valence": valence,
             "arousal": arousal,
             "tension": min(1.0, max(arousal, max(0.0, -valence))),
