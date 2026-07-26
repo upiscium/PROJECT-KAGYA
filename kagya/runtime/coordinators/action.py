@@ -316,7 +316,7 @@ class ActionCoordinator(RuntimeDomainMixin):
             prediction_error=None,
             value_revision_refs={
                 value.value_id: value.revision
-                for value in self.value_system.list_values()
+                for value in self.value_system.active_values()
             },
             active_goal_refs=tuple(
                 goal.goal_id for goal in self.goal_manager.list_goals(GoalStatus.ACTIVE)

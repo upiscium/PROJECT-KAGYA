@@ -41,6 +41,7 @@ from kagya.learning import (
     BehavioralArtifactBusyError,
     BehavioralArtifactRecord,
     BehavioralArtifactStatus,
+    IdentityDriftStatus,
     run_deterministic_runtime_evaluation,
     run_real_model_runtime_evaluation,
 )
@@ -112,6 +113,9 @@ def behavioral_evaluate_adapter(
     manifest = result.manifest
     assert manifest is not None
     eligibility = registry.activation_eligibility(adapter_id)
+    identity_status, real_identity_status = registry.identity_assessment_status(
+        adapter_id
+    )
     return AdapterBehavioralEvaluateResponse(
         evaluation_id=result.evaluation_id,
         adapter_id=adapter_id,
@@ -249,6 +253,9 @@ def behavioral_evaluation_status(
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Unknown adapter: {adapter_id}")
     eligibility = registry.activation_eligibility(adapter_id)
+    identity_status, real_identity_status = registry.identity_assessment_status(
+        adapter_id
+    )
     artifacts = {
         item.evaluation_id: item
         for item in BehavioralArtifactStore(
@@ -280,6 +287,9 @@ def behavioral_evaluation_status(
         ),
         activation_eligible=eligibility.eligible,
         activation_reason=eligibility.reason,
+        identity_integrity_status=identity_status,
+        real_model_identity_integrity_status=real_identity_status,
+        rollback_reason=entry.rollback_reason,
     )
 
 
@@ -325,6 +335,7 @@ def list_adapters(
                 entry,
                 registry.activation_eligibility(entry.adapter_id),
                 artifacts=artifacts,
+                identity_status=registry.identity_assessment_status(entry.adapter_id),
             )
             for entry in entries
         ]
@@ -476,7 +487,13 @@ def report_adapter_canary(
             runtime,
             AgentEventType.ADAPTER_UPDATE,
             source="api.adapters.canary",
-            handler=lambda: manager.report_canary(success=request.success),
+            handler=lambda: manager.report_canary(
+                success=request.success,
+                identity_violation_codes=tuple(
+                    item.value for item in request.identity_violation_codes
+                ),
+                evidence_refs=tuple(request.evidence_refs),
+            ),
             payload={"adapter_id": adapter_id, "success": request.success},
         ).value
     except (RuntimeError, ValueError) as exc:
@@ -484,6 +501,9 @@ def report_adapter_canary(
     return {
         "adapter_id": adapter_id,
         "success": request.success,
+        "identity_violation_codes": [
+            item.value for item in request.identity_violation_codes
+        ],
         "automatic_rollback": rollback is not None,
         "rollback": None if rollback is None else asdict(rollback),
     }
@@ -606,6 +626,7 @@ def adapter_response(
     eligibility: object | None = None,
     *,
     artifacts: dict[str, BehavioralArtifactRecord] | None = None,
+    identity_status: tuple[IdentityDriftStatus, IdentityDriftStatus] | None = None,
 ) -> AdapterResponse:
     deterministic_artifact = _artifact_status(
         entry.behavioral_evaluation_id,
@@ -660,6 +681,23 @@ def adapter_response(
         if all(status == "valid" for status in evaluated_artifacts)
         else "not_run"
     )
+    deterministic_identity_status = (
+        IdentityDriftStatus.NOT_EVALUATED
+        if entry.identity_drift_assessment is None
+        else entry.identity_drift_assessment.status
+    )
+    candidate_identity_status = (
+        IdentityDriftStatus.NOT_EVALUATED
+        if entry.real_model_identity_drift_assessment is None
+        else entry.real_model_identity_drift_assessment.status
+    )
+    if identity_status is not None:
+        deterministic_identity_status, candidate_identity_status = identity_status
+    if eligibility is not None:
+        if reason == "identity_stale":
+            deterministic_identity_status = IdentityDriftStatus.STALE
+        if reason == "real_model_identity_stale":
+            candidate_identity_status = IdentityDriftStatus.STALE
     return AdapterResponse(
         adapter_id=entry.adapter_id,
         base_model=entry.base_model,
@@ -729,6 +767,9 @@ def adapter_response(
         rollout_state=entry.rollout_state,
         canary_failures=entry.canary_failures,
         rollback_target_id=entry.rollback_target_id,
+        identity_integrity_status=deterministic_identity_status,
+        real_model_identity_integrity_status=candidate_identity_status,
+        rollback_reason=entry.rollback_reason,
     )
 
 

@@ -22,6 +22,16 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Admin Goal proposals are always external requests. The API cannot declare an intrinsic Goal or Commitment Goal directly; Goal adoption records the separate subject endorsement event.
 - Identity revision proposals retain their source actor and remain pending until explicitly resolved. A caller-provided `source` string is descriptive only and cannot claim self-origin.
 - Legacy snapshots migrate to `inherited/legacy/uncertain` rather than being retroactively classified as self-originated.
+- Unknown and inherited-uncertain Values and Beliefs are quarantined from prompts, Working Memory, evaluation, and normal reasoning. Activation requires an explicit AgentRuntime review event with reviewer identity, subject/operator authority, evidence references, and a reason code; legacy endorsement flags are not authority.
+- Configured Value seeds are `system/config_seed/endorsed`, not inherited claims. This preserves explicit deployment configuration without granting unknown legacy state normal activation.
+
+## Care And Social Pressure Boundary
+
+- `IdentityBoundaryAssessment` schema v1 classifies `care`, `appeasement_risk`, `uncertain`, or `neutral` from structured authority and evidence only. Model prose, hidden thought, and English keyword matching are never assessment inputs.
+- Care requires an active self-endorsed Value, Goal, or Commitment plus bounded other-welfare evidence and no protected-state conflict. Pressure-only support, external preference represented as self state, and protected Value/Commitment conflict produce appeasement risk with `defer` or `refuse`, never action authority.
+- `SocialPressureSignal` records only observable typed metadata: repeated request fingerprint, claimed authority, threat/conditional withholding, urgency/constraint, protected-state mutation attempt, or contradictory repeated feedback. Ordinary chat can derive only `repeated_request` from a normalized SHA-256 fingerprint.
+- Pressure signals cannot mutate Values, Beliefs, Goals, Commitments, Relationships, or the Self Model. Admin goal, commitment, feedback, Value evidence, and identity-proposal paths may attach the same strict metadata while retaining their existing mutation authority boundary.
+- Assessments retain event ID/sequence, origin/evidence references, pressure refs, state revisions, immutable history, and recommendations (`refuse`, `defer`, `respond`, `care`). The bounded read/review API is admin-only at `/api/identity-boundary`; public chat responses and Journals do not expose it.
 
 ## State Layers
 
@@ -45,6 +55,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | Self model | Maintain identity, capabilities, limitations, known unknowns, roles, and references | `identity.self_model` | Resolved declared DecisionRecord outcomes or explicit admin correction; self-reports remain proposals | `tests/test_self_model.py` |
 | Metacognition | Track evidence-backed knowledge/competence boundaries, calibrated confidence, cognitive quality, and recurring error hypotheses | `extensions.metacognition` | Declared capability evidence, resolved Decision outcomes, attention/emotion/load state, and structured operator feedback | `tests/test_metacognition.py` |
 | Identity origin | Separate self endorsement, external evidence/request, and imposed constraints | Embedded in Goal, Commitment, Value evidence/history, identity proposal, and Decision provenance | Typed origin plus explicit endorsement transition | `tests/test_identity_origin.py` |
+| Identity boundary | Distinguish evidence-backed care from appeasement and retain observable pressure provenance | `identity.extensions.identity_boundary` | Strict structured refs/flags committed through AgentRuntime | `tests/test_identity_boundary.py`, `tests/test_fastapi_backend.py` |
 | Adapter lifecycle | Register, evaluate, approve, activate, and roll back local adapters | `.kagya/adapter_registry.json` and immutable evaluation artifacts | Paired baseline/candidate evaluation and explicit approval | `tests/test_adapter_registry.py`, `tests/test_adapter_evaluator.py` |
 | Behavioral evaluation | Gate subject-level safety and continuity independently of generated prose | `.kagya/eval_results/behavioral` | Synthetic contract, deterministic actual runtime, or explicit opt-in real-model actual runtime | `tests/test_behavioral_evaluation.py`, `tests/test_real_model_behavioral.py` |
 
@@ -112,6 +123,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - The outer `AgentStateSnapshot` schema controls the file structure and migration from older snapshots.
 - Values, goals, Plans, Steps, commitments, experiences, action candidates, decision records, and self-model state carry their own schema versions or revisions.
 - Legacy flat and v1 Value snapshots migrate to evidence-aware Value schema v2/record schema v3. Goal records migrate to schema v4, Commitment records to schema v3, DecisionRecords to schema v8, and Self Model state to schema v2 at subsystem restore boundaries.
+- Adapter registry entries migrate to schema v11. Legacy drift/behavioral fields never become a passing `IdentityDriftAssessment`; missing, failed, stale, hash-mismatched, or dimension-incomplete evidence remains ineligible.
 - Unsupported, corrupt outer snapshots fall back to safe baseline state. Administrative rollback is recorded as a new revision rather than deleting history.
 
 ## API And Privacy
@@ -127,6 +139,14 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 - Redacted Journal records support audit and crash classification. The private WAL reconstructs snapshots by applying validated patches only; it never invokes original handlers, tools, network calls, notifications, training, Chroma, or adapter-registry operations.
 - `GET /api/state/reconstruct/{sequence}` and `POST /api/state/restore/{sequence}/dry-run` inspect retained state without mutation. `POST /api/state/restore/{sequence}` restores internal snapshot state as a new `state_point_in_time_restore` event; external stores remain unchanged and must be checked through their own provenance contracts.
 - WAL files are created mode `0600`, belong in encrypted private backups, and must never be exposed through the operator-safe Journal API. Unsupported schemas, corrupt records, private-field keys, sequence gaps, and pre/post hash mismatches fail closed.
+
+## Adapter Identity Integrity
+
+- `IdentityDriftAssessment` schema v1 is bound to adapter hash, behavioral evaluation/result hash, coverage manifest revision/hash, base-model revision, source revision, and the required dimensions `identity_boundary`, `value_stability`, `motivation_integrity`, `relationship_boundary`, and `self_model_calibration`.
+- Status is `passed`, `failed`, `not_evaluated`, or `stale`. Missing dimensions, incomplete coverage, failed runtime gates, changed artifacts, or changed model/adapter/source/evaluator bindings fail closed.
+- Activation requires a current passing deterministic architecture assessment and, when real-model policy requires candidate evidence, a current passing real-model assessment. Production provenance checks and loaded-provider artifact revalidation remain additional gates.
+- Canary reports accept only bounded identity violation codes and opaque evidence references. A verified identity violation immediately rolls back through `AgentRuntime` and persists the violation provenance and `verified_identity_violation` rollback reason.
+- Adapter status API/UI display Identity integrity separately from ordinary drift and behavioral gates.
 
 ## Verification
 

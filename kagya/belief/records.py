@@ -12,6 +12,7 @@ from kagya.identity import (
     EndorsementStatus,
     IdentityOrigin,
     identity_origin_from_json,
+    OriginActor,
 )
 
 
@@ -41,12 +42,16 @@ class Proposition:
 
     def __post_init__(self) -> None:
         if not self.normalized.strip() or len(self.normalized) > 2000:
-            raise ValueError("normalized proposition must contain at most 2000 characters")
+            raise ValueError(
+                "normalized proposition must contain at most 2000 characters"
+            )
         structured = (self.subject, self.predicate, self.object)
         if any(item is not None for item in structured) and not all(
             item is not None and item.strip() for item in structured
         ):
-            raise ValueError("structured proposition requires subject, predicate, and object")
+            raise ValueError(
+                "structured proposition requires subject, predicate, and object"
+            )
 
     @classmethod
     def create(
@@ -93,6 +98,8 @@ class BeliefRevision:
     event_id: str | None
     event_sequence: int | None
     created_at: str
+    reviewer_id: str | None = None
+    reviewer_authority: str | None = None
 
     def __post_init__(self) -> None:
         _safe_ref(self.revision_id, "belief revision ID")
@@ -129,10 +136,15 @@ class BeliefRecord:
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
-            raise ValueError(f"Unsupported belief schema version: {self.schema_version}")
+            raise ValueError(
+                f"Unsupported belief schema version: {self.schema_version}"
+            )
         _safe_ref(self.belief_id, "belief ID")
         _unit(self.confidence, "belief confidence")
-        if self.epistemic_status == EpistemicStatus.ESTABLISHED and self.confidence < 0.8:
+        if (
+            self.epistemic_status == EpistemicStatus.ESTABLISHED
+            and self.confidence < 0.8
+        ):
             raise ValueError("established belief confidence must be at least 0.8")
         if (
             self.lifecycle == BeliefLifecycle.ACTIVE
@@ -249,14 +261,28 @@ class BeliefStore:
         evidence_refs: tuple[str, ...],
         event_id: str | None,
         event_sequence: int | None,
+        reviewer_id: str | None = None,
+        reviewer_authority: str | None = None,
     ) -> BeliefRecord:
         current = self.get(belief_id)
-        if current.lifecycle not in {BeliefLifecycle.PROPOSED, BeliefLifecycle.DISPUTED}:
+        if current.lifecycle not in {
+            BeliefLifecycle.PROPOSED,
+            BeliefLifecycle.DISPUTED,
+        }:
             raise ValueError("Only proposed or disputed beliefs can be resolved")
         if not evidence_refs:
             raise ValueError("belief resolution requires evidence references")
         if accept and epistemic_status == EpistemicStatus.UNKNOWN:
             raise ValueError("unknown belief cannot be accepted as active")
+        if current.identity_origin.actor in {
+            OriginActor.UNKNOWN,
+            OriginActor.INHERITED,
+        }:
+            if reviewer_authority not in {"subject", "operator"} or not reviewer_id:
+                raise ValueError(
+                    "unknown-origin belief requires an authorized reviewer"
+                )
+            _safe_ref(reviewer_id, "belief reviewer ID")
         origin = (
             current.identity_origin.endorse(
                 "belief_review", event_id=event_id, event_sequence=event_sequence
@@ -285,6 +311,8 @@ class BeliefStore:
             evidence_refs=evidence_refs,
             event_id=event_id,
             event_sequence=event_sequence,
+            reviewer_id=reviewer_id,
+            reviewer_authority=reviewer_authority,
         )
         self.records[belief_id] = resolved
         if not accept:
@@ -402,7 +430,9 @@ class BeliefStore:
             ):
                 updated = self._with_revision(
                     record,
-                    replace(record, lifecycle=BeliefLifecycle.EXPIRED, updated_at=_now()),
+                    replace(
+                        record, lifecycle=BeliefLifecycle.EXPIRED, updated_at=_now()
+                    ),
                     operation="expire",
                     reason_code="validity_window_ended",
                     evidence_refs=(),
@@ -421,6 +451,12 @@ class BeliefStore:
             record
             for record in sorted(self.records.values(), key=lambda item: item.belief_id)
             if record.lifecycle == BeliefLifecycle.ACTIVE
+            and record.identity_origin.endorsement == EndorsementStatus.ENDORSED
+            and not (
+                record.identity_origin.actor
+                in {OriginActor.UNKNOWN, OriginActor.INHERITED}
+                and not any(revision.reviewer_id for revision in record.revisions)
+            )
             and _temporally_valid(record, current_time)
             and (
                 not record.context_scope
@@ -471,6 +507,8 @@ class BeliefStore:
         evidence_refs: tuple[str, ...],
         event_id: str | None,
         event_sequence: int | None,
+        reviewer_id: str | None = None,
+        reviewer_authority: str | None = None,
     ) -> BeliefRecord:
         revision = BeliefRevision(
             revision_id=f"belief-revision-{uuid4()}",
@@ -484,6 +522,8 @@ class BeliefStore:
             event_id=event_id,
             event_sequence=event_sequence,
             created_at=_now(),
+            reviewer_id=reviewer_id,
+            reviewer_authority=reviewer_authority,
         )
         return replace(
             after,
@@ -557,8 +597,11 @@ def _contradicts(left: BeliefRecord, right: BeliefRecord) -> bool:
         and a.subject == b.subject
         and a.predicate == b.predicate
         and a.object != b.object
-        and bool(set(left.context_scope).intersection(right.context_scope)
-                 if left.context_scope and right.context_scope else True)
+        and bool(
+            set(left.context_scope).intersection(right.context_scope)
+            if left.context_scope and right.context_scope
+            else True
+        )
     )
 
 
@@ -576,7 +619,9 @@ def _belief_from_json(payload: dict[str, Any]) -> BeliefRecord:
     data["identity_origin"] = identity_origin_from_json(data.get("identity_origin"))
     data["epistemic_status"] = EpistemicStatus(data["epistemic_status"])
     data["lifecycle"] = BeliefLifecycle(data["lifecycle"])
-    data["evidence"] = tuple(BeliefEvidence(**item) for item in data.get("evidence", ()))
+    data["evidence"] = tuple(
+        BeliefEvidence(**item) for item in data.get("evidence", ())
+    )
     for name in ("context_scope", "contradiction_ids"):
         data[name] = tuple(data.get(name, ()))
     data["revisions"] = tuple(
@@ -588,6 +633,20 @@ def _belief_from_json(payload: dict[str, Any]) -> BeliefRecord:
         )
         for item in data.get("revisions", ())
     )
+    if (
+        data["lifecycle"] == BeliefLifecycle.ACTIVE
+        and data["identity_origin"].actor
+        in {OriginActor.UNKNOWN, OriginActor.INHERITED}
+        and not any(revision.reviewer_id for revision in data["revisions"])
+    ):
+        data["lifecycle"] = BeliefLifecycle.PROPOSED
+        data["identity_origin"] = replace(
+            data["identity_origin"],
+            endorsement=EndorsementStatus.UNCERTAIN,
+            endorsement_ref=None,
+            endorsed_by_event_id=None,
+            endorsed_by_event_sequence=None,
+        )
     return BeliefRecord(**data)
 
 

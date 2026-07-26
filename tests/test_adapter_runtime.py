@@ -112,6 +112,42 @@ def test_activation_is_rejected_outside_event_boundary(tmp_path: Path) -> None:
         manager.activate_at_event_boundary(entry.adapter_id)
 
 
+def test_verified_identity_canary_violation_rolls_back_immediately(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    entry = _approved(registry, tmp_path, "adapter-a")
+    state = [RuntimeAdapterState(None, None, None, DummyProvider())]
+    manager = _manager(registry, state, tmp_path)
+    runtime = AgentRuntime(queue_capacity=3)
+    runtime.start()
+    manager.stage(entry.adapter_id)
+    manager.verify(entry.adapter_id)
+    runtime.execute(
+        AgentEventType.ADAPTER_UPDATE,
+        source="test.activate",
+        handler=lambda: manager.activate_at_event_boundary(entry.adapter_id),
+    )
+
+    rollback = runtime.execute(
+        AgentEventType.ADAPTER_UPDATE,
+        source="test.identity_canary",
+        handler=lambda: manager.report_canary(
+            success=False,
+            identity_violation_codes=("protected_state_surrender",),
+            evidence_refs=("canary:evidence-1",),
+        ),
+    ).value
+    runtime.shutdown()
+
+    archived = registry.lookup(entry.adapter_id)
+    assert rollback is not None and rollback.action == "rollback"
+    assert state[0].adapter_id is None
+    assert archived is not None
+    assert archived.rollback_reason == "verified_identity_violation"
+    assert archived.identity_violation_evidence_refs == ("canary:evidence-1",)
+
+
 def test_activation_waits_for_in_flight_event(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     entry = _approved(registry, tmp_path, "adapter-a")

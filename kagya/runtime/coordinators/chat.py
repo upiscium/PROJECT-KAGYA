@@ -392,7 +392,7 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 ),
                 value_revision_refs={
                     value.value_id: value.revision
-                    for value in self.value_system.list_values()
+                    for value in self.value_system.active_values()
                 },
                 active_goal_refs=tuple(
                     goal.goal_id
@@ -463,6 +463,14 @@ class ChatOrchestrationCoordinator(RuntimeDomainMixin, Generic[T]):
                 valence=emotion_state.valence,
                 arousal=emotion_state.arousal,
             )
+            if event is not None and event.processing_sequence is not None:
+                self.identity_boundary_store.observe_request(
+                    user_input,
+                    context_id=current_context.context_id,
+                    event_id=event.event_id,
+                    event_sequence=event.processing_sequence,
+                )
+                self._persist_identity_boundary_state()
         except Exception:
             self.emotion_engine.state = previous_emotion_state
             self.working_memory.restore(previous_working_memory)

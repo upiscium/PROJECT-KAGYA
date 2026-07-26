@@ -35,13 +35,29 @@ from kagya.identity.narrative_self import (
     NarrativeSelf,
     UnresolvedSelfConflict,
 )
+from kagya.identity.boundary import (
+    BoundaryAssessmentInput,
+    BoundaryClassification,
+    BoundaryRecommendation,
+    IdentityBoundaryAssessment,
+    IdentityBoundaryStore,
+    SocialPressureMetadata,
+    SocialPressureSignal,
+    SocialPressureSignalType,
+    request_fingerprint,
+)
 
 __all__ = [
     "Capability",
+    "BoundaryAssessmentInput",
+    "BoundaryClassification",
+    "BoundaryRecommendation",
     "CapabilityEvidence",
     "EndorsementStatus",
     "EpistemicUncertainty",
     "IdentityOrigin",
+    "IdentityBoundaryAssessment",
+    "IdentityBoundaryStore",
     "IdentityClaim",
     "IdentityClaimKind",
     "IdentityClaimRevision",
@@ -59,6 +75,9 @@ __all__ = [
     "SelfModelSelection",
     "SelfModelState",
     "SelfModelUpdateRecord",
+    "SocialPressureMetadata",
+    "SocialPressureSignal",
+    "SocialPressureSignalType",
     "AutobiographicalEpisode",
     "ContinuityLink",
     "FutureSelfProjection",
@@ -66,4 +85,5 @@ __all__ = [
     "identity_origin_from_json",
     "legacy_identity_origin",
     "new_identity_origin",
+    "request_fingerprint",
 ]

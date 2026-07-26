@@ -18,6 +18,8 @@ from kagya.identity import (
     OriginInputKind,
 )
 from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.identity import SocialPressureMetadata
+from kagya.api.routes._identity_boundary import retain_pressure_observation
 
 
 class _RequestModel(BaseModel):
@@ -63,6 +65,7 @@ class IdentityProposalRequest(_RequestModel):
     proposed_traits: dict[str, float] = Field(default_factory=dict)
     evidence_refs: list[str] = Field(default_factory=list)
     source: str = Field(min_length=1)
+    social_pressure: SocialPressureMetadata | None = None
 
 
 class IdentityResolutionRequest(_RequestModel):
@@ -195,9 +198,7 @@ def add_uncertainty(
         runtime,
         AgentEventType.SELF_MODEL_UPDATE,
         source="api.self_model.uncertainty",
-        handler=lambda: main_loop.add_self_uncertainty(
-            uncertainty, reason=body.reason
-        ),
+        handler=lambda: main_loop.add_self_uncertainty(uncertainty, reason=body.reason),
         payload={"uncertainty_id": body.uncertainty_id},
     ).value
     return asdict(state)
@@ -215,14 +216,18 @@ def propose_identity_revision(
             runtime,
             AgentEventType.SELF_MODEL_UPDATE,
             source="api.self_model.identity_proposal",
-            handler=lambda: main_loop.propose_identity_revision(
-                proposed_summary=body.proposed_summary,
-                proposed_traits=body.proposed_traits,
-                evidence_refs=tuple(body.evidence_refs),
-                source="operator_proposal",
-                origin_actor=OriginActor.OPERATOR,
-                origin_input_kind=OriginInputKind.SUGGESTION,
-                proposal_id=body.proposal_id,
+            handler=lambda: retain_pressure_observation(
+                main_loop,
+                main_loop.propose_identity_revision(
+                    proposed_summary=body.proposed_summary,
+                    proposed_traits=body.proposed_traits,
+                    evidence_refs=tuple(body.evidence_refs),
+                    source="operator_proposal",
+                    origin_actor=OriginActor.OPERATOR,
+                    origin_input_kind=OriginInputKind.SUGGESTION,
+                    proposal_id=body.proposal_id,
+                ),
+                body.social_pressure,
             ),
             payload={"proposal_id": body.proposal_id},
             correlation_id=body.proposal_id,

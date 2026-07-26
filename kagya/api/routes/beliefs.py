@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.api.dependencies import (
+    AdminActor,
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
@@ -71,9 +72,11 @@ def list_beliefs(
         runtime,
         AgentEventType.BELIEF_READ,
         source="api.beliefs.list",
-        handler=lambda: main_loop.belief_store.active(context_id=context_id)
-        if active_only
-        else main_loop.list_beliefs(),
+        handler=lambda: (
+            main_loop.belief_store.active(context_id=context_id)
+            if active_only
+            else main_loop.list_beliefs()
+        ),
     ).value
     return {"beliefs": [record.to_json() for record in records]}
 
@@ -117,6 +120,7 @@ def resolve_belief(
     body: BeliefResolutionRequest,
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
+    actor: AdminActor = Depends(require_admin),
 ) -> dict[str, object]:
     try:
         record = execute_agent_event(
@@ -130,6 +134,8 @@ def resolve_belief(
                 epistemic_status=body.epistemic_status,
                 reason_code=body.reason_code,
                 evidence_refs=tuple(body.evidence_refs),
+                reviewer_id=actor.actor_id,
+                reviewer_authority="operator",
             ),
             correlation_id=belief_id,
         ).value

@@ -467,6 +467,8 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
         epistemic_status: EpistemicStatus,
         reason_code: str,
         evidence_refs: tuple[str, ...],
+        reviewer_id: str | None = None,
+        reviewer_authority: str | None = None,
     ) -> BeliefRecord:
         event = current_agent_event()
         record = self.belief_store.resolve(
@@ -478,6 +480,8 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
             evidence_refs=evidence_refs,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
+            reviewer_id=reviewer_id,
+            reviewer_authority=reviewer_authority,
         )
         self._persist_belief_state()
         self._sync_belief_working_memory(None)
@@ -917,7 +921,7 @@ class ExperienceIntegrationCoordinator(RuntimeDomainMixin):
             values=tuple(
                 f"{value.name}; importance={value.weight:.3f}; "
                 f"confidence={value.confidence:.3f}; protectedness={value.protectedness:.3f}"
-                for value in self.value_system.list_values()[:5]
+                for value in self.value_system.active_values()[:5]
             ),
             goals=tuple(
                 f"{goal.description}; status={goal.status.value}; "

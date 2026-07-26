@@ -931,7 +931,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
             ),
             value_revision_refs={
                 value.value_id: value.revision
-                for value in self.value_system.list_values()
+                for value in self.value_system.active_values()
             },
             emotion_snapshot={
                 "valence": emotion.valence,
@@ -948,7 +948,7 @@ class PlanDecisionCoordinator(RuntimeDomainMixin):
                 },
                 **{
                     f"value:{value.value_id}": value.origin_provenance.origin_id
-                    for value in self.value_system.list_values()
+                    for value in self.value_system.active_values()
                     if value.origin_provenance is not None
                 },
                 **{

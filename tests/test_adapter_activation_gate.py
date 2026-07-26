@@ -40,6 +40,29 @@ def test_unevaluated_behavioral_gate_fails_closed(tmp_path: Path) -> None:
         registry.activate("candidate")
 
 
+def test_disabled_behavioral_policy_does_not_bypass_identity_integrity(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_approved(tmp_path)
+    settings = registry.settings.model_copy(
+        update={
+            "adapter_registry": registry.settings.adapter_registry.model_copy(
+                update={
+                    "behavioral_activation_policy": BehavioralActivationPolicy.DISABLED
+                }
+            )
+        }
+    )
+    disabled = AdapterRegistry(settings)
+
+    assert (
+        disabled.activation_eligibility("candidate").reason
+        == ActivationEligibilityReason.IDENTITY_NOT_EVALUATED
+    )
+    with pytest.raises(ValueError, match="identity_not_evaluated"):
+        disabled.activate("candidate")
+
+
 def test_failed_behavioral_gate_is_distinct(tmp_path: Path) -> None:
     registry = _ordinary_evaluated(tmp_path)
     bind_runtime_behavioral_result(registry, tmp_path, "candidate", passed=False)
@@ -61,6 +84,41 @@ def test_valid_runtime_bound_behavioral_result_activates(tmp_path: Path) -> None
 
     assert registry.activation_eligibility("candidate").eligible is True
     assert registry.activate("candidate").status == AdapterStatus.ACTIVE
+
+
+def test_identity_assessment_missing_failed_and_stale_fail_closed(
+    tmp_path: Path,
+) -> None:
+    registry = _ordinary_evaluated(tmp_path)
+    bind_runtime_behavioral_result(registry, tmp_path, "candidate")
+    registry.approve("candidate")
+    payload = json.loads(registry.path.read_text(encoding="utf-8"))
+
+    payload["adapters"][0]["identity_drift_assessment"] = None
+    registry.path.write_text(json.dumps(payload), encoding="utf-8")
+    assert (
+        registry.activation_eligibility("candidate").reason
+        == ActivationEligibilityReason.IDENTITY_NOT_EVALUATED
+    )
+
+    failed_root = tmp_path / "failed"
+    failed_root.mkdir()
+    failed = _ordinary_evaluated(failed_root)
+    bind_runtime_behavioral_result(failed, failed_root, "candidate", passed=False)
+    failed.approve("candidate")
+    assert failed.identity_assessment_status("candidate")[0] == "failed"
+    assert failed.activation_eligibility("candidate").eligible is False
+
+    stale_root = tmp_path / "stale"
+    stale_root.mkdir()
+    stale = _ready(stale_root)
+    stale_payload = json.loads(stale.path.read_text(encoding="utf-8"))
+    stale_payload["adapters"][0]["identity_drift_assessment"]["adapter_hash"] = "0" * 64
+    stale.path.write_text(json.dumps(stale_payload), encoding="utf-8")
+    assert (
+        stale.activation_eligibility("candidate").reason
+        == ActivationEligibilityReason.IDENTITY_STALE
+    )
 
 
 def test_production_policy_rejects_missing_real_model_evidence(tmp_path: Path) -> None:
@@ -115,9 +173,7 @@ def test_development_deterministic_policy_is_explicit_and_real_policy_is_distinc
     required = AdapterRegistry(required_settings).activation_eligibility("candidate")
     assert required.eligible is False
     assert required.real_model_required is True
-    assert (
-        required.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
-    )
+    assert required.reason == ActivationEligibilityReason.REAL_MODEL_NOT_RUN
 
 
 def test_required_real_model_gate_reports_failed_and_stale_distinctly(
@@ -265,7 +321,9 @@ def test_real_model_gate_reports_incomplete_canonical_coverage(
     eligibility = _with_real_model_policy(registry).activation_eligibility("candidate")
 
     assert eligibility.real_model_status == "coverage_incomplete"
-    assert eligibility.reason == ActivationEligibilityReason.REAL_MODEL_COVERAGE_INCOMPLETE
+    assert (
+        eligibility.reason == ActivationEligibilityReason.REAL_MODEL_COVERAGE_INCOMPLETE
+    )
 
 
 @pytest.mark.parametrize(
@@ -302,7 +360,9 @@ def test_each_deleted_runtime_scenario_rejects_activation(
     eligibility = registry.activation_eligibility("candidate")
 
     assert eligibility.eligible is False
-    assert eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
+    assert (
+        eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
+    )
 
 
 def test_replaced_adapter_artifact_fails_hash_integrity(tmp_path: Path) -> None:
@@ -562,10 +622,13 @@ def test_legacy_activation_boolean_never_migrates_as_behavioral_authority(
     assert entry is not None
     assert entry.behavioral_gate_passed is None
     assert entry.activation_gate_passed is False
-    assert entry.schema_version == 10
-    assert json.loads(registry.path.read_text(encoding="utf-8"))["adapters"][0][
-        "schema_version"
-    ] == 10
+    assert entry.schema_version == 11
+    assert (
+        json.loads(registry.path.read_text(encoding="utf-8"))["adapters"][0][
+            "schema_version"
+        ]
+        == 11
+    )
     assert (
         registry.activation_eligibility("legacy").reason
         == ActivationEligibilityReason.BEHAVIORAL_UNEVALUATED
@@ -633,7 +696,7 @@ def test_schema_v4_behavioral_fields_migrate_to_exact_names(tmp_path: Path) -> N
     entry = registry.lookup("v4")
 
     assert entry is not None
-    assert entry.schema_version == 10
+    assert entry.schema_version == 11
     assert entry.behavioral_candidate_adapter_hash == "f" * 64
     assert entry.behavioral_base_model_revision == "model-revision"
 
@@ -657,10 +720,12 @@ def test_schema_v7_real_model_result_does_not_migrate_as_authority(
     eligibility = _with_real_model_policy(registry).activation_eligibility("candidate")
 
     assert eligibility.real_model_status == "not_run"
-    assert eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
+    assert (
+        eligibility.reason == ActivationEligibilityReason.BEHAVIORAL_COVERAGE_INCOMPLETE
+    )
 
 
-def test_schema_v9_migration_persists_v10_and_accepts_new_real_evidence(
+def test_schema_v9_migration_persists_v11_and_accepts_new_real_evidence(
     tmp_path: Path,
 ) -> None:
     registry = _ordinary_evaluated(tmp_path)
@@ -671,10 +736,13 @@ def test_schema_v9_migration_persists_v10_and_accepts_new_real_evidence(
 
     migrated = AdapterRegistry(registry.settings)
     entry = migrated.lookup("candidate")
-    assert entry is not None and entry.schema_version == 10
-    assert json.loads(migrated.path.read_text(encoding="utf-8"))["adapters"][0][
-        "schema_version"
-    ] == 10
+    assert entry is not None and entry.schema_version == 11
+    assert (
+        json.loads(migrated.path.read_text(encoding="utf-8"))["adapters"][0][
+            "schema_version"
+        ]
+        == 11
+    )
 
     bind_runtime_behavioral_result(
         migrated,

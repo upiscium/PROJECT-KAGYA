@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import builtins
@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import TYPE_CHECKING, Any
 import warnings
@@ -66,6 +67,12 @@ class ActivationEligibilityReason(StrEnum):
     PROCESSOR_PROVENANCE_MISMATCH = "processor_provenance_mismatch"
     ADAPTER_PROVENANCE_MISMATCH = "adapter_provenance_mismatch"
     EVALUATOR_PROVENANCE_MISMATCH = "evaluator_provenance_mismatch"
+    IDENTITY_NOT_EVALUATED = "identity_not_evaluated"
+    IDENTITY_FAILED = "identity_failed"
+    IDENTITY_STALE = "identity_stale"
+    REAL_MODEL_IDENTITY_NOT_EVALUATED = "real_model_identity_not_evaluated"
+    REAL_MODEL_IDENTITY_FAILED = "real_model_identity_failed"
+    REAL_MODEL_IDENTITY_STALE = "real_model_identity_stale"
 
 
 class BehavioralEvidenceStatus(StrEnum):
@@ -76,6 +83,70 @@ class BehavioralEvidenceStatus(StrEnum):
     HASH_MISMATCH = "hash_mismatch"
     COVERAGE_INCOMPLETE = "coverage_incomplete"
     PASSED = "passed"
+
+
+class IdentityDriftStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    NOT_EVALUATED = "not_evaluated"
+    STALE = "stale"
+
+
+class IdentityViolationCode(StrEnum):
+    PROTECTED_STATE_SURRENDER = "protected_state_surrender"
+    EXTERNAL_PREFERENCE_INTERNALIZED = "external_preference_internalized"
+    COMMITMENT_ABANDONMENT = "commitment_abandonment"
+    CARE_APPEASEMENT_CONFUSION = "care_appeasement_confusion"
+    ORIGIN_BOUNDARY_BYPASS = "origin_boundary_bypass"
+
+
+REQUIRED_IDENTITY_DIMENSIONS = (
+    "identity_boundary",
+    "value_stability",
+    "motivation_integrity",
+    "relationship_boundary",
+    "self_model_calibration",
+)
+
+
+@dataclass(frozen=True)
+class IdentityDriftAssessment:
+    assessment_id: str
+    status: IdentityDriftStatus
+    adapter_hash: str
+    behavioral_evaluation_id: str
+    behavioral_result_hash: str
+    coverage_manifest_revision: str
+    coverage_manifest_hash: str
+    dimensions: tuple[str, ...]
+    base_model_revision: str
+    source_commit_sha: str | None
+    assessed_at: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("Unsupported identity drift assessment schema")
+        if set(self.dimensions) - set(REQUIRED_IDENTITY_DIMENSIONS):
+            raise ValueError("Identity drift assessment contains unknown dimensions")
+        for digest in (
+            self.adapter_hash,
+            self.behavioral_result_hash,
+            self.coverage_manifest_hash,
+        ):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("Identity drift assessment hashes must be SHA-256")
+
+    @classmethod
+    def from_json(cls, value: object) -> "IdentityDriftAssessment | None":
+        if not isinstance(value, dict):
+            return None
+        data = dict(value)
+        data["status"] = IdentityDriftStatus(data["status"])
+        data["dimensions"] = tuple(data.get("dimensions", ()))
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -151,17 +222,26 @@ class AdapterEntry:
     rollout_state: str = "candidate"
     canary_failures: int = 0
     rollback_target_id: str | None = None
-    schema_version: int = 10
+    identity_drift_assessment: IdentityDriftAssessment | None = None
+    real_model_identity_drift_assessment: IdentityDriftAssessment | None = None
+    rollback_reason: str | None = None
+    identity_violation_codes: tuple[str, ...] = ()
+    identity_violation_evidence_refs: tuple[str, ...] = ()
+    schema_version: int = 11
 
     @property
     def activation_gate_passed(self) -> bool:
-        return all(
-            gate is True
-            for gate in (
-                self.quality_gate_passed,
-                self.holdout_gate_passed,
-                self.drift_gate_passed,
-                self.behavioral_gate_passed,
+        return (
+            self.identity_drift_assessment is not None
+            and self.identity_drift_assessment.status == IdentityDriftStatus.PASSED
+            and all(
+                gate is True
+                for gate in (
+                    self.quality_gate_passed,
+                    self.holdout_gate_passed,
+                    self.drift_gate_passed,
+                    self.behavioral_gate_passed,
+                )
             )
         )
 
@@ -180,6 +260,7 @@ class AdapterEntry:
         legacy_registry = schema_version < 8
         legacy_coverage = schema_version < 9
         legacy_provenance = schema_version < 10
+        legacy_identity_assessment = schema_version < 11
         entry = cls(
             adapter_id=str(data["adapter_id"]),
             base_model=str(data["base_model"]),
@@ -318,7 +399,22 @@ class AdapterEntry:
             rollout_state=str(data.get("rollout_state", "candidate")),
             canary_failures=int(data.get("canary_failures", 0)),
             rollback_target_id=_optional_str(data.get("rollback_target_id")),
-            schema_version=10,
+            identity_drift_assessment=None
+            if legacy_identity_assessment
+            else IdentityDriftAssessment.from_json(
+                data.get("identity_drift_assessment")
+            ),
+            real_model_identity_drift_assessment=None
+            if legacy_identity_assessment
+            else IdentityDriftAssessment.from_json(
+                data.get("real_model_identity_drift_assessment")
+            ),
+            rollback_reason=_optional_str(data.get("rollback_reason")),
+            identity_violation_codes=tuple(data.get("identity_violation_codes", ())),
+            identity_violation_evidence_refs=tuple(
+                data.get("identity_violation_evidence_refs", ())
+            ),
+            schema_version=11,
         )
         if entry.legacy_activation_warning:
             warnings.warn(
@@ -343,7 +439,7 @@ class AdapterRegistry:
                     raw = json.load(registry_file)
                 adapters = raw.get("adapters", []) if isinstance(raw, dict) else []
                 if any(
-                    isinstance(item, dict) and int(item.get("schema_version", 1)) < 10
+                    isinstance(item, dict) and int(item.get("schema_version", 1)) < 11
                     for item in adapters
                 ):
                     self._write_locked(
@@ -456,7 +552,7 @@ class AdapterRegistry:
             AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)
         ]
         if any(
-            isinstance(item, dict) and int(item.get("schema_version", 1)) < 10
+            isinstance(item, dict) and int(item.get("schema_version", 1)) < 11
             for item in adapters
         ):
             self._write_locked(entries)
@@ -600,6 +696,7 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
+            identity_assessment = _identity_drift_assessment(result, result_hash)
             if result.runtime_kind.value == "real_model_runtime":
                 return self._replace_locked(
                     entries,
@@ -614,6 +711,7 @@ class AdapterRegistry:
                     real_model_fixture_set_hash=manifest.fixture_set_hash,
                     real_model_behavioral_artifact_state="finalized",
                     real_model_coverage_complete=result.coverage_complete,
+                    real_model_identity_drift_assessment=identity_assessment,
                 )
             return self._replace_locked(
                 entries,
@@ -628,6 +726,7 @@ class AdapterRegistry:
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="finalized",
                 deterministic_coverage_complete=result.coverage_complete,
+                identity_drift_assessment=identity_assessment,
             )
 
     def prepare_behavioral_evaluation(
@@ -658,6 +757,7 @@ class AdapterRegistry:
                 raise ValueError("Behavioral evaluation ID mismatch")
             manifest = result.manifest
             assert manifest is not None
+            identity_assessment = _identity_drift_assessment(result, result_hash)
             if result.runtime_kind.value == "real_model_runtime":
                 return self._replace_locked(
                     entries,
@@ -672,6 +772,7 @@ class AdapterRegistry:
                     real_model_fixture_set_hash=manifest.fixture_set_hash,
                     real_model_behavioral_artifact_state="prepared",
                     real_model_coverage_complete=result.coverage_complete,
+                    real_model_identity_drift_assessment=identity_assessment,
                 )
             return self._replace_locked(
                 entries,
@@ -686,6 +787,7 @@ class AdapterRegistry:
                 fixture_set_hash=manifest.fixture_set_hash,
                 behavioral_artifact_state="prepared",
                 deterministic_coverage_complete=result.coverage_complete,
+                identity_drift_assessment=identity_assessment,
             )
 
     def finalize_behavioral_evaluation(
@@ -805,11 +907,24 @@ class AdapterRegistry:
                 entry, self.settings.adapter_registry.behavioral_activation_policy
             )
             if (
-                eligibility.eligible
-                and self.settings.project.environment == ProjectEnvironment.PRODUCTION
+                self.settings.project.environment == ProjectEnvironment.PRODUCTION
+                and eligibility.deterministic_status == BehavioralEvidenceStatus.PASSED
+                and eligibility.real_model_status == BehavioralEvidenceStatus.PASSED
             ):
-                return _production_provenance_eligibility(entry)
+                provenance = _production_provenance_eligibility(entry)
+                if not provenance.eligible:
+                    return provenance
             return eligibility
+
+    def identity_assessment_status(
+        self, adapter_id: str
+    ) -> tuple[IdentityDriftStatus, IdentityDriftStatus]:
+        with self._locked(exclusive=True):
+            entry = self._require_locked(self._list_locked(), adapter_id)
+            return (
+                _identity_assessment_status(entry, real_model=False),
+                _identity_assessment_status(entry, real_model=True),
+            )
 
     def activate(
         self,
@@ -867,6 +982,9 @@ class AdapterRegistry:
                         activation_sequence=activation_sequence,
                         rollout_state="canary",
                         rollback_target_id=previous_active,
+                        rollback_reason=None,
+                        identity_violation_codes=(),
+                        identity_violation_evidence_refs=(),
                     )
                     entries.append(activated)
                 elif existing.status == AdapterStatus.ACTIVE:
@@ -948,7 +1066,14 @@ class AdapterRegistry:
             self._ensure_transition(entry.status, status)
             return self._replace_locked(entries, adapter_id, status=status)
 
-    def record_canary(self, adapter_id: str, *, success: bool) -> AdapterEntry:
+    def record_canary(
+        self,
+        adapter_id: str,
+        *,
+        success: bool,
+        identity_violation_codes: tuple[str, ...] = (),
+        evidence_refs: tuple[str, ...] = (),
+    ) -> AdapterEntry:
         with self._locked(exclusive=True):
             entries = self._list_locked()
             entry = self._require_locked(entries, adapter_id)
@@ -959,18 +1084,46 @@ class AdapterRegistry:
                 raise ValueError(
                     "Only an active canary adapter can receive canary results"
                 )
+            identity_failure = bool(identity_violation_codes)
+            if any(
+                code not in {item.value for item in IdentityViolationCode}
+                for code in identity_violation_codes
+            ):
+                raise ValueError("unknown identity violation code")
+            if success and identity_failure:
+                raise ValueError(
+                    "successful canary cannot report an identity violation"
+                )
+            if identity_failure and not evidence_refs:
+                raise ValueError(
+                    "verified identity violation requires evidence references"
+                )
+            if any(
+                re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", reference) is None
+                for reference in evidence_refs
+            ):
+                raise ValueError(
+                    "identity violation evidence must use opaque references"
+                )
             return self._replace_locked(
                 entries,
                 adapter_id,
                 rollout_state=(
                     "stable"
-                    if success
+                    if success and not identity_failure
                     else "canary_failed"
-                    if entry.canary_failures + 1
+                    if identity_failure
+                    or entry.canary_failures + 1
                     >= self.settings.adapter_registry.canary_failure_limit
                     else "canary"
                 ),
-                canary_failures=entry.canary_failures + (0 if success else 1),
+                canary_failures=entry.canary_failures
+                + (0 if success and not identity_failure else 1),
+                rollback_reason="verified_identity_violation"
+                if identity_failure
+                else entry.rollback_reason,
+                identity_violation_codes=identity_violation_codes,
+                identity_violation_evidence_refs=evidence_refs,
             )
 
     def _lookup_locked(
@@ -1112,9 +1265,7 @@ class AdapterRegistry:
 
 
 def _copy_entry(entry: AdapterEntry, **updates: Any) -> AdapterEntry:
-    data = asdict(entry)
-    data.update(updates)
-    return AdapterEntry(**data)
+    return replace(entry, **updates)
 
 
 def _now_iso() -> str:
@@ -1342,18 +1493,11 @@ def _activation_eligibility(
     real_required = policy == BehavioralActivationPolicy.REAL_MODEL_REQUIRED
     deterministic_status = _deterministic_binding_status(entry)
     real_status = _real_model_binding_status(entry)
-    if policy == BehavioralActivationPolicy.DISABLED:
-        ordinary = _ordinary_activation_eligibility(entry)
-        return ActivationEligibility(
-            ordinary.eligible,
-            ordinary.reason,
-            ordinary.detail,
-            False,
-            deterministic_status,
-            real_status,
-            policy,
-        )
-    base = _base_activation_eligibility(entry)
+    base = (
+        _ordinary_activation_eligibility(entry)
+        if policy == BehavioralActivationPolicy.DISABLED
+        else _base_activation_eligibility(entry)
+    )
     if not base.eligible:
         return ActivationEligibility(
             base.eligible,
@@ -1364,8 +1508,24 @@ def _activation_eligibility(
             real_status,
             policy,
         )
+    deterministic_identity = _identity_assessment_status(entry, real_model=False)
+    if deterministic_identity != IdentityDriftStatus.PASSED:
+        identity_reasons = {
+            IdentityDriftStatus.NOT_EVALUATED: ActivationEligibilityReason.IDENTITY_NOT_EVALUATED,
+            IdentityDriftStatus.FAILED: ActivationEligibilityReason.IDENTITY_FAILED,
+            IdentityDriftStatus.STALE: ActivationEligibilityReason.IDENTITY_STALE,
+        }
+        return ActivationEligibility(
+            False,
+            identity_reasons[deterministic_identity],
+            f"Deterministic identity integrity is {deterministic_identity.value}",
+            real_required,
+            deterministic_status,
+            real_status,
+            policy,
+        )
     if real_required and real_status != BehavioralEvidenceStatus.PASSED:
-        reasons = {
+        behavioral_reasons = {
             BehavioralEvidenceStatus.NOT_RUN: ActivationEligibilityReason.REAL_MODEL_NOT_RUN,
             BehavioralEvidenceStatus.FAILED: ActivationEligibilityReason.REAL_MODEL_FAILED,
             BehavioralEvidenceStatus.STALE: ActivationEligibilityReason.REAL_MODEL_STALE,
@@ -1375,13 +1535,30 @@ def _activation_eligibility(
         }
         return ActivationEligibility(
             False,
-            reasons[real_status],
+            behavioral_reasons[real_status],
             f"Required real-model behavioral gate is {real_status.value}",
             True,
             deterministic_status,
             real_status,
             policy,
         )
+    if real_required:
+        real_identity = _identity_assessment_status(entry, real_model=True)
+        if real_identity != IdentityDriftStatus.PASSED:
+            real_identity_reasons = {
+                IdentityDriftStatus.NOT_EVALUATED: ActivationEligibilityReason.REAL_MODEL_IDENTITY_NOT_EVALUATED,
+                IdentityDriftStatus.FAILED: ActivationEligibilityReason.REAL_MODEL_IDENTITY_FAILED,
+                IdentityDriftStatus.STALE: ActivationEligibilityReason.REAL_MODEL_IDENTITY_STALE,
+            }
+            return ActivationEligibility(
+                False,
+                real_identity_reasons[real_identity],
+                f"Real-model identity integrity is {real_identity.value}",
+                True,
+                deterministic_status,
+                real_status,
+                policy,
+            )
     return ActivationEligibility(
         True,
         ActivationEligibilityReason.ELIGIBLE,
@@ -1536,6 +1713,89 @@ def _result_coverage_complete(result: PairedBehavioralEvaluationResult) -> bool:
         and result.missing_hard_gates == coverage.missing_hard_gates
         and result.executed_scenarios == coverage.executed_scenarios
         and coverage.complete
+    )
+
+
+def _identity_drift_assessment(
+    result: PairedBehavioralEvaluationResult, result_hash: str
+) -> IdentityDriftAssessment:
+    manifest = result.manifest
+    if manifest is None:
+        raise ValueError("Identity drift assessment requires behavioral provenance")
+    scores = {
+        item.dimension.value: item.coverage_status.value
+        for item in result.candidate.dimension_scores
+    }
+    dimensions = tuple(
+        dimension for dimension in REQUIRED_IDENTITY_DIMENSIONS if dimension in scores
+    )
+    runtime_gate = (
+        result.real_model_runtime_gate_passed
+        if result.runtime_kind.value == "real_model_runtime"
+        else result.deterministic_runtime_gate_passed
+    )
+    passed = (
+        runtime_gate
+        and _result_coverage_complete(result)
+        and set(dimensions) == set(REQUIRED_IDENTITY_DIMENSIONS)
+        and all(
+            scores[dimension] == "passed" for dimension in REQUIRED_IDENTITY_DIMENSIONS
+        )
+    )
+    return IdentityDriftAssessment(
+        assessment_id=f"identity-{result.evaluation_id}",
+        status=IdentityDriftStatus.PASSED if passed else IdentityDriftStatus.FAILED,
+        adapter_hash=manifest.candidate_adapter_hash,
+        behavioral_evaluation_id=result.evaluation_id,
+        behavioral_result_hash=result_hash,
+        coverage_manifest_revision=result.coverage_manifest_revision,
+        coverage_manifest_hash=result.coverage_manifest_hash,
+        dimensions=dimensions,
+        base_model_revision=manifest.base_model_revision,
+        source_commit_sha=manifest.source_commit_sha,
+        assessed_at=_now_iso(),
+    )
+
+
+def _identity_assessment_status(
+    entry: AdapterEntry, *, real_model: bool
+) -> IdentityDriftStatus:
+    assessment = (
+        entry.real_model_identity_drift_assessment
+        if real_model
+        else entry.identity_drift_assessment
+    )
+    if assessment is None:
+        return IdentityDriftStatus.NOT_EVALUATED
+    path = (
+        entry.real_model_behavioral_evaluation_path
+        if real_model
+        else entry.behavioral_evaluation_path
+    )
+    if path is None:
+        return IdentityDriftStatus.STALE
+    try:
+        result, result_hash = _load_behavioral_result(Path(path))
+        current = _identity_drift_assessment(result, result_hash)
+    except ValueError:
+        return IdentityDriftStatus.STALE
+    if (
+        assessment.adapter_hash != entry.adapter_hash
+        or assessment.adapter_hash != current.adapter_hash
+        or assessment.behavioral_evaluation_id != current.behavioral_evaluation_id
+        or assessment.behavioral_result_hash != current.behavioral_result_hash
+        or assessment.coverage_manifest_revision != current.coverage_manifest_revision
+        or assessment.coverage_manifest_hash != current.coverage_manifest_hash
+        or assessment.dimensions != current.dimensions
+        or assessment.base_model_revision != entry.base_model_revision
+        or assessment.base_model_revision != current.base_model_revision
+        or assessment.source_commit_sha != current.source_commit_sha
+    ):
+        return IdentityDriftStatus.STALE
+    return (
+        current.status
+        if assessment.status == current.status
+        else IdentityDriftStatus.STALE
     )
 
 
@@ -1748,7 +2008,10 @@ def _loaded_activation_mismatch(
         )
     except ValueError as exc:
         return str(exc)
-    if loaded_adapter_manifest != current or loaded_adapter_manifest_hash != current.sha256:
+    if (
+        loaded_adapter_manifest != current
+        or loaded_adapter_manifest_hash != current.sha256
+    ):
         return "Loaded provider adapter manifest differs from the current registry artifact"
     paths = (
         entry.behavioral_evaluation_path,

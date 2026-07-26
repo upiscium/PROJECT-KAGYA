@@ -326,6 +326,9 @@ def _system() -> ValueSystem:
                 origin="test",
                 last_updated_at="2026-01-01T00:00:00+00:00",
                 allowed_update_rate=0.05,
+                origin_provenance=new_identity_origin(
+                    OriginActor.SELF, OriginInputKind.INTERNAL_STATE
+                ),
             ),
             ValueState(
                 value_id="honesty",
@@ -337,6 +340,9 @@ def _system() -> ValueSystem:
                 origin="test",
                 last_updated_at="2026-01-01T00:00:00+00:00",
                 allowed_update_rate=0.05,
+                origin_provenance=new_identity_origin(
+                    OriginActor.SELF, OriginInputKind.INTERNAL_STATE
+                ),
             ),
         ],
         conflicts=[ValueConflictDefinition("care", "honesty", "compassionate-honesty")],

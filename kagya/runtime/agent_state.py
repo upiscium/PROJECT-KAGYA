@@ -285,6 +285,7 @@ class AgentStateStore:
         main_loop.restore_agency_attribution_state()
         main_loop.restore_counterfactual_state()
         main_loop.restore_self_model_state()
+        main_loop.restore_identity_boundary_state()
         main_loop.restore_experience_state()
         main_loop.restore_narrative_self_state()
         main_loop.restore_belief_state()

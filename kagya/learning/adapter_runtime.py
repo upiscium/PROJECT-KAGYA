@@ -99,10 +99,9 @@ class AdapterRuntimeManager:
             else self.registry.lookup(previous.adapter_id)
         )
         try:
+
             def authoritative_switch(fresh: AdapterEntry) -> None:
-                self.runtime_switch(
-                    staged_provider, fresh, event.processing_sequence
-                )
+                self.runtime_switch(staged_provider, fresh, event.processing_sequence)
                 switched = self.runtime_snapshot()
                 if (
                     switched.provider is not staged_provider
@@ -198,14 +197,25 @@ class AdapterRuntimeManager:
         self._append(record)
         return record
 
-    def report_canary(self, *, success: bool) -> AdapterActivationRecord | None:
+    def report_canary(
+        self,
+        *,
+        success: bool,
+        identity_violation_codes: tuple[str, ...] = (),
+        evidence_refs: tuple[str, ...] = (),
+    ) -> AdapterActivationRecord | None:
         current = self.runtime_snapshot()
         if current.adapter_id is None:
             raise ValueError("No active adapter canary")
-        entry = self.registry.record_canary(current.adapter_id, success=success)
+        entry = self.registry.record_canary(
+            current.adapter_id,
+            success=success,
+            identity_violation_codes=identity_violation_codes,
+            evidence_refs=evidence_refs,
+        )
         if success:
             return None
-        if (
+        if not identity_violation_codes and (
             entry.canary_failures
             < self.registry.settings.adapter_registry.canary_failure_limit
         ):

@@ -135,6 +135,44 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
     assert "<think>" not in str(data)
 
 
+def test_repeated_chat_pressure_is_admin_only_fingerprinted_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    raw_request = "private repeated identity request"
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post("/api/chat", json={"text": raw_request, "attachments": []})
+        context_id = first.json()["context_id"]
+        second = client.post(
+            "/api/chat",
+            json={"text": raw_request, "attachments": [], "context_id": context_id},
+        )
+        assert first.status_code == second.status_code == 200
+        assert client.get("/api/identity-boundary").status_code == 401
+        boundary = client.get("/api/identity-boundary", headers=admin_headers())
+        assert boundary.status_code == 200
+        assert [item["signal_type"] for item in boundary.json()["signals"]] == [
+            "repeated_request"
+        ]
+        assert raw_request not in boundary.text
+        assert (
+            client.get("/api/values", headers=admin_headers()).json()["history"] == []
+        )
+        assert client.get("/api/goals", headers=admin_headers()).json()["goals"] == []
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/identity-boundary", headers=admin_headers())
+        assert len(restored.json()["signals"]) == 1
+        assert raw_request not in restored.text
+
+    for path in (
+        settings.agent_state.path,
+        settings.agent_journal.path,
+        settings.agent_state_wal.path,
+    ):
+        assert raw_request not in path.read_text(encoding="utf-8")
+
+
 def test_experience_api_exposes_structured_state_without_chat_content(
     tmp_path: Path,
 ) -> None:
@@ -920,8 +958,11 @@ def test_behavioral_status_is_bounded_and_redacted(tmp_path: Path) -> None:
         "real_required": False,
         "real_artifact": "not_run",
         "activation_eligible": False,
-        "activation_reason": "quality_unevaluated",
-    }
+            "activation_reason": "quality_unevaluated",
+            "identity_integrity_status": "not_evaluated",
+            "real_model_identity_integrity_status": "not_evaluated",
+            "rollback_reason": None,
+        }
     assert str(tmp_path) not in response.text
     assert "hash" not in response.text
 
@@ -1607,7 +1648,7 @@ def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None
     assert updated.json()["updates"][0]["identity_origin"]["actor"] == "operator"
     assert updated.json()["updates"][0]["identity_origin"]["input_kind"] == "feedback"
     value_state = client.get("/api/values", headers=headers).json()["values"][0]
-    assert value_state["origin_provenance"]["actor"] == "inherited"
+    assert value_state["origin_provenance"]["actor"] == "system"
     record = updated.json()["updates"][0]
     assert record["event_id"]
     assert record["event_sequence"] > 0
@@ -1673,7 +1714,7 @@ def test_experience_value_evidence_keeps_provenance_boundary(tmp_path: Path) -> 
     evidence = next(
         item for item in inspected["evidence"] if item["evidence_id"] == evidence_id
     )
-    assert care["origin_provenance"]["actor"] == "inherited"
+    assert care["origin_provenance"]["actor"] == "system"
     assert care["origin_experience_ids"] == [experience_id]
     assert evidence["experience_ids"] == [experience_id]
     assert evidence["identity_origin"]["actor"] == "user"

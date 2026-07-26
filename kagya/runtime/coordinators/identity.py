@@ -4,6 +4,7 @@ from kagya.decision import (
 from kagya.identity import (
     AutobiographicalEpisode,
     ContinuityLink,
+    EndorsementStatus,
     EpistemicUncertainty,
     IdentityRevisionProposal,
     KnownLimitation,
@@ -18,9 +19,15 @@ from kagya.identity import (
     SelfModel,
     SelfModelState,
     new_identity_origin,
+    BoundaryAssessmentInput,
+    IdentityBoundaryAssessment,
+    SocialPressureMetadata,
+    SocialPressureSignal,
 )
 from kagya.motivation import (
+    ACCEPTED_COMMITMENT_STATUSES,
     CommitmentStatus,
+    GoalStatus,
 )
 from kagya.runtime.agent_runtime import current_agent_event
 from kagya.runtime.working_memory import (
@@ -58,6 +65,104 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
 
     def _persist_self_model_state(self) -> None:
         self.persistent_state.self_model = self.self_model.to_json()
+
+    def restore_identity_boundary_state(self) -> None:
+        self.identity_boundary_store.restore(
+            self.persistent_state.identity_extensions.get("identity_boundary")
+        )
+        self._persist_identity_boundary_state()
+
+    def _persist_identity_boundary_state(self) -> None:
+        self.persistent_state.identity_extensions["identity_boundary"] = (
+            self.identity_boundary_store.to_json()
+        )
+
+    def record_social_pressure(
+        self, metadata: SocialPressureMetadata, *, context_id: str | None = None
+    ) -> SocialPressureSignal:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("social pressure mutation requires AgentRuntime")
+        signal = self.identity_boundary_store.add_pressure(
+            metadata,
+            context_id=context_id,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+        )
+        self._persist_identity_boundary_state()
+        return signal
+
+    def assess_identity_boundary(
+        self, inputs: BoundaryAssessmentInput
+    ) -> IdentityBoundaryAssessment:
+        event = current_agent_event()
+        if event is None or event.processing_sequence is None:
+            raise RuntimeError("identity-boundary assessment requires AgentRuntime")
+        values = {item.value_id: item for item in self.value_system.active_values()}
+        requested_values = set(inputs.self_endorsed_value_refs)
+        if requested_values - values.keys() or any(
+            values[key].origin_provenance is None
+            or (
+                values[key].origin_provenance.actor != OriginActor.SELF
+                and values[key].origin_provenance.endorsed_by_event_id is None
+            )
+            for key in requested_values
+        ):
+            raise ValueError("assessment references an inactive or unreviewed Value")
+        goals = {item.goal_id: item for item in self.goal_manager.list_goals()}
+        commitments = {
+            item.commitment_id: item
+            for item in self.commitment_store.list_commitments()
+        }
+        relationships = {
+            item.relationship_id: item
+            for item in self.relationship_store.list_relationships()
+        }
+        requested_goals = set(inputs.self_endorsed_goal_refs)
+        requested_commitments = set(inputs.self_endorsed_commitment_refs)
+        requested_relationships = set(inputs.relationship_refs)
+        if any(
+            key not in goals
+            or goals[key].status != GoalStatus.ACTIVE
+            or goals[key].identity_origin.endorsement != EndorsementStatus.ENDORSED
+            for key in requested_goals
+        ):
+            raise ValueError("assessment references an inactive or unendorsed Goal")
+        if any(
+            key not in commitments
+            or commitments[key].status not in ACCEPTED_COMMITMENT_STATUSES
+            or commitments[key].identity_origin.endorsement
+            != EndorsementStatus.ENDORSED
+            for key in requested_commitments
+        ):
+            raise ValueError(
+                "assessment references an inactive or unendorsed Commitment"
+            )
+        if requested_relationships - relationships.keys():
+            raise ValueError("assessment references an unknown Relationship")
+        for reference in inputs.other_welfare_evidence_refs:
+            if not reference.startswith("experience:"):
+                raise ValueError(
+                    "other-welfare evidence must reference a structured Experience"
+                )
+            self.experience_store.get(reference.removeprefix("experience:"))
+        assessment = self.identity_boundary_store.assess(
+            inputs,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            value_revision_refs={key: values[key].revision for key in requested_values},
+            goal_revision_refs={
+                key: len(goals[key].transitions) for key in requested_goals
+            },
+            commitment_revision_refs={
+                key: len(commitments[key].transitions) for key in requested_commitments
+            },
+            relationship_revision_refs={
+                key: relationships[key].revision for key in requested_relationships
+            },
+        )
+        self._persist_identity_boundary_state()
+        return assessment
 
     def update_capability_from_decision(
         self,
@@ -340,7 +445,7 @@ class IdentityNarrativeCoordinator(RuntimeDomainMixin):
             ),
             value_revision_refs={
                 value.value_id: value.revision
-                for value in self.value_system.list_values()
+                for value in self.value_system.active_values()
             },
             autobiographical_summary_refs=(
                 f"narrative:{episode.episode_id}"

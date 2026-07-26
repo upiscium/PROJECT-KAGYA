@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 import math
+import re
 from typing import TYPE_CHECKING, Any, Iterable
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from kagya.cognition.value_records import (
     ValueTradeoffRecord,
 )
 from kagya.identity import (
+    EndorsementStatus,
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -158,6 +160,8 @@ class ValueUpdateRecord:
     rollback_target_revision: int | None = None
     evidence_ids: tuple[str, ...] = ()
     revision_diff: ValueRevisionDiff | None = None
+    reviewer_id: str | None = None
+    reviewer_authority: str | None = None
 
 
 @dataclass(frozen=True)
@@ -597,6 +601,7 @@ class ValueSystem:
                 )
                 for value_id, effect in sorted(effects.items())
                 if value_id in self.values
+                and self._is_active(self.values[value_id])
                 and self._applies(self.values[value_id], context_id)
             )
             contribution_map = {
@@ -685,6 +690,98 @@ class ValueSystem:
 
     def list_values(self) -> list[ValueState]:
         return [self.values[value_id] for value_id in sorted(self.values)]
+
+    def active_values(self) -> list[ValueState]:
+        return [item for item in self.list_values() if self._is_active(item)]
+
+    def review_origin(
+        self,
+        value_id: str,
+        *,
+        accept: bool,
+        reviewer_id: str,
+        reviewer_authority: str,
+        evidence_refs: tuple[str, ...],
+        reason_code: str,
+        event_id: str,
+        event_sequence: int,
+    ) -> ValueState:
+        current = self._require(value_id)
+        if (
+            current.origin_provenance is None
+            or current.origin_provenance.actor == OriginActor.SELF
+            or current.origin_provenance.endorsed_by_event_id is not None
+        ):
+            raise ValueError("Value origin is already self-endorsed")
+        if reviewer_authority not in {"subject", "operator"}:
+            raise ValueError("Value review requires subject or operator authority")
+        if not reviewer_id or not evidence_refs or not reason_code:
+            raise ValueError("Value review requires reviewer, evidence, and reason")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", reference) is None
+            for reference in (reviewer_id, reason_code, *evidence_refs)
+        ):
+            raise ValueError("Value review provenance must use opaque safe references")
+        origin = (
+            current.origin_provenance.endorse(
+                f"value_review:{reviewer_authority}",
+                event_id=event_id,
+                event_sequence=event_sequence,
+            )
+            if accept
+            else current.origin_provenance.reject(
+                f"value_review:{reviewer_authority}",
+                event_id=event_id,
+                event_sequence=event_sequence,
+            )
+        )
+        updated = replace(
+            current,
+            origin_provenance=origin,
+            revision=current.revision + 1,
+            last_reviewed_at=_now(),
+            change_reason=reason_code,
+            last_updated_at=_now(),
+        )
+        self.values[value_id] = updated
+        self.history.append(
+            ValueUpdateRecord(
+                update_id=str(uuid4()),
+                operation="origin_accept" if accept else "origin_reject",
+                value_id=value_id,
+                event_id=event_id,
+                event_sequence=event_sequence,
+                memory_ids=(),
+                kind=ValueUpdateKind.ADMIN.value,
+                reason_codes=(reason_code,),
+                identity_origin=origin,
+                requested_delta=0.0,
+                applied_delta=0.0,
+                before=_revision_snapshot(current),
+                after=_revision_snapshot(updated),
+                created_at=_now(),
+                evidence_ids=evidence_refs,
+                revision_diff=ValueRevisionDiff(
+                    from_revision=current.revision,
+                    to_revision=updated.revision,
+                    changed_fields={
+                        "origin_provenance": (
+                            current.origin_provenance.to_json(),
+                            origin.to_json(),
+                        ),
+                        "last_reviewed_at": (
+                            current.last_reviewed_at,
+                            updated.last_reviewed_at,
+                        ),
+                    },
+                    reason_codes=(reason_code,),
+                    evidence_ids=evidence_refs,
+                ),
+                reviewer_id=reviewer_id,
+                reviewer_authority=reviewer_authority,
+            )
+        )
+        return updated
 
     def restore(self, payload: object) -> None:
         if not isinstance(payload, dict) or not payload:
@@ -858,6 +955,11 @@ class ValueSystem:
         return state.scope == ValueScope.SUBJECT or (
             context_id is not None and context_id in state.context_ids
         )
+
+    @staticmethod
+    def _is_active(state: ValueState) -> bool:
+        origin = state.origin_provenance
+        return origin is not None and origin.endorsement == EndorsementStatus.ENDORSED
 
     def _require(self, value_id: str) -> ValueState:
         state = self.values.get(value_id)

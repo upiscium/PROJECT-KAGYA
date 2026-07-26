@@ -20,6 +20,8 @@ from kagya.motivation import (
     GoalType,
 )
 from kagya.identity import OriginActor
+from kagya.identity import SocialPressureMetadata
+from kagya.api.routes._identity_boundary import retain_pressure_observation
 from kagya.runtime import AgentEventType, AgentRuntime, KagyaMainLoop
 
 
@@ -38,6 +40,7 @@ class GoalProposalRequest(BaseModel):
     deadline: datetime | None = None
     value_effects: dict[str, float] = Field(default_factory=dict)
     needs_information: bool = False
+    social_pressure: SocialPressureMetadata | None = None
 
 
 class GoalTransitionRequest(BaseModel):
@@ -61,6 +64,7 @@ class CommitmentRequest(BaseModel):
     conflicting_desire_ids: list[str] = Field(default_factory=list)
     conflicting_value_ids: list[str] = Field(default_factory=list)
     conflicting_commitment_ids: list[str] = Field(default_factory=list)
+    social_pressure: SocialPressureMetadata | None = None
 
 
 class CommitmentAcceptanceRequest(BaseModel):
@@ -160,23 +164,27 @@ def propose_goal(
             runtime,
             AgentEventType.GOAL_UPDATE,
             source="api.goals.propose",
-            handler=lambda: main_loop.propose_goal(
-                goal_type=body.goal_type,
-                description=body.description,
-                structured_target=body.structured_target,
-                origin_value_id=body.origin_value_id,
-                origin_actor=OriginActor.OPERATOR,
-                origin_source_ref="admin:goal_proposal",
-                priority=body.priority,
-                urgency=body.urgency,
-                expected_utility=body.expected_utility,
-                confidence=body.confidence,
-                dependency_ids=tuple(body.dependency_ids),
-                conflict_ids=tuple(body.conflict_ids),
-                deadline=_deadline(body.deadline),
-                value_effects=body.value_effects,
-                needs_information=body.needs_information,
-                goal_id=body.goal_id,
+            handler=lambda: retain_pressure_observation(
+                main_loop,
+                main_loop.propose_goal(
+                    goal_type=body.goal_type,
+                    description=body.description,
+                    structured_target=body.structured_target,
+                    origin_value_id=body.origin_value_id,
+                    origin_actor=OriginActor.OPERATOR,
+                    origin_source_ref="admin:goal_proposal",
+                    priority=body.priority,
+                    urgency=body.urgency,
+                    expected_utility=body.expected_utility,
+                    confidence=body.confidence,
+                    dependency_ids=tuple(body.dependency_ids),
+                    conflict_ids=tuple(body.conflict_ids),
+                    deadline=_deadline(body.deadline),
+                    value_effects=body.value_effects,
+                    needs_information=body.needs_information,
+                    goal_id=body.goal_id,
+                ),
+                body.social_pressure,
             ),
             payload={"goal_id": body.goal_id, "goal_type": body.goal_type.value},
             correlation_id=body.goal_id,
@@ -281,23 +289,27 @@ def create_commitment(
             runtime,
             AgentEventType.GOAL_UPDATE,
             source="api.commitments.create",
-            handler=lambda: main_loop.create_commitment(
-                description=body.description,
-                deadline=_deadline(body.deadline),
-                beneficiary=body.beneficiary,
-                scope=body.scope,
-                cost=body.cost,
-                burden=body.burden,
-                fulfillability=body.fulfillability,
-                fulfillability_reason=body.fulfillability_reason,
-                related_desire_ids=tuple(body.related_desire_ids),
-                conflicting_desire_ids=tuple(body.conflicting_desire_ids),
-                conflicting_value_ids=tuple(body.conflicting_value_ids),
-                conflicting_commitment_ids=tuple(body.conflicting_commitment_ids),
-                commitment_id=body.commitment_id,
-                origin_actor=OriginActor.OPERATOR,
-                origin_source_ref="admin:commitment_request",
-                interlocutor_key=body.interlocutor_key,
+            handler=lambda: retain_pressure_observation(
+                main_loop,
+                main_loop.create_commitment(
+                    description=body.description,
+                    deadline=_deadline(body.deadline),
+                    beneficiary=body.beneficiary,
+                    scope=body.scope,
+                    cost=body.cost,
+                    burden=body.burden,
+                    fulfillability=body.fulfillability,
+                    fulfillability_reason=body.fulfillability_reason,
+                    related_desire_ids=tuple(body.related_desire_ids),
+                    conflicting_desire_ids=tuple(body.conflicting_desire_ids),
+                    conflicting_value_ids=tuple(body.conflicting_value_ids),
+                    conflicting_commitment_ids=tuple(body.conflicting_commitment_ids),
+                    commitment_id=body.commitment_id,
+                    origin_actor=OriginActor.OPERATOR,
+                    origin_source_ref="admin:commitment_request",
+                    interlocutor_key=body.interlocutor_key,
+                ),
+                body.social_pressure,
             ),
             payload={"commitment_id": body.commitment_id},
             correlation_id=body.commitment_id,
