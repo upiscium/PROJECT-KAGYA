@@ -351,6 +351,115 @@ def test_backup_aborts_when_source_mutates_during_create(
     assert list(settings.at_rest.backup.directory.glob("*.kgb")) == []
 
 
+@pytest.mark.parametrize("mutation", ["change_streamed", "add_file"])
+def test_backup_requires_identical_complete_post_stream_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    mutated = False
+
+    def mutate(checkpoint: str) -> None:
+        nonlocal mutated
+        if checkpoint != "backup_before_second_inventory" or mutated:
+            return
+        mutated = True
+        if mutation == "change_streamed":
+            settings.tools.path.write_bytes(b"changed-after-stream")
+        else:
+            added = settings.actions.document_root / "added-after-stream.txt"
+            added.parent.mkdir(parents=True, exist_ok=True)
+            added.write_bytes(b"new path")
+
+    with pytest.raises(BackupError, match="inventory changed while streaming"):
+        BackupManager(settings, failure_injector=mutate).create()
+    assert BackupManager(settings).list() == []
+
+
+@pytest.mark.parametrize(
+    "checkpoint,occurrence",
+    [
+        ("restore_forward_planned", 1),
+        ("restore_forward_replace", 1),
+        ("restore_forward_replaced", 1),
+        ("restore_forward_completed", 1),
+        ("restore_forward_planned", 2),
+        ("restore_forward_replace", 2),
+        ("restore_forward_replaced", 2),
+        ("restore_forward_completed", 2),
+    ],
+)
+def test_write_ahead_restore_journal_recovers_every_rename_instruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    occurrence: int,
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    preview = BackupManager(settings).create()
+    settings.tools.path.write_bytes(b"verified-prior-generation")
+    seen = 0
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash(current: str) -> None:
+        nonlocal seen
+        if current == checkpoint:
+            seen += 1
+            if seen == occurrence:
+                raise SimulatedProcessCrash
+
+    with pytest.raises(SimulatedProcessCrash):
+        BackupManager(settings, failure_injector=crash).restore(
+            preview.backup_id, expected_manifest_hash=preview.manifest_hash
+        )
+    manager = BackupManager(settings)
+    assert manager.recovery_status()["status"] == "recovery_required"
+    assert manager.recover()["status"] == "rolled_back"
+    assert settings.tools.path.read_bytes() == b"verified-prior-generation"
+
+
+def test_restore_offline_failure_never_activates_and_activation_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    _authoritative_graph(settings, SENTINEL)
+    preview = BackupManager(settings).create()
+    settings.tools.path.write_bytes(b"prior")
+    activated = False
+
+    def activate() -> None:
+        nonlocal activated
+        activated = True
+
+    with pytest.raises(RuntimeError, match="offline build"):
+        BackupManager(settings).restore(
+            preview.backup_id,
+            expected_manifest_hash=preview.manifest_hash,
+            after_publish=lambda: (_ for _ in ()).throw(RuntimeError("offline build")),
+            activate=activate,
+        )
+    assert activated is False
+    assert settings.tools.path.read_bytes() == b"prior"
+
+    def fail_activation() -> None:
+        raise RuntimeError("activation")
+
+    with pytest.raises(BackupError, match="activation failed"):
+        BackupManager(settings).restore(
+            preview.backup_id,
+            expected_manifest_hash=preview.manifest_hash,
+            activate=fail_activation,
+        )
+    manager = BackupManager(settings)
+    assert manager.recovery_status()["phase"] == "activation_failed"
+    assert settings.tools.path.read_bytes() == SENTINEL
+    assert manager.recover()["status"] == "rolled_back"
+    assert settings.tools.path.read_bytes() == b"prior"
+
+
 def test_retention_keeps_complete_transitive_chains_and_prunes_by_full_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -435,6 +544,29 @@ def test_encrypted_production_requires_explicit_init_and_detects_file_loss(
         require_encrypted_generation(settings)
 
 
+@pytest.mark.parametrize(
+    "required",
+    ["snapshot", "wal", "journal", "generation_marker"],
+)
+def test_backup_rejects_each_missing_initialized_authoritative_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    settings = _settings(tmp_path, monkeypatch, live=True)
+    initialize_encrypted_state(settings)
+    paths = {
+        "snapshot": settings.agent_state.path,
+        "wal": settings.agent_state_wal.path,
+        "journal": settings.agent_journal.path,
+        "generation_marker": settings.at_rest.live.generation_marker,
+    }
+    paths[required].unlink()
+
+    with pytest.raises(BackupError, match="incomplete|marker is missing"):
+        BackupManager(settings).create()
+
+
 def test_restore_staging_is_dedicated_private_cleaned_and_attested(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -509,6 +641,7 @@ def _settings(
             "live": settings.at_rest.live.model_copy(
                 update={
                     "enabled": live,
+                    "generation_marker": tmp_path / "sealed-generation.json",
                     "keys": settings.at_rest.live.keys.model_copy(
                         update={"current_key_env": "TEST_LIVE_KEY"}
                     ),

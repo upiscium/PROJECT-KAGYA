@@ -331,39 +331,51 @@ def commit_encrypted_restore(
             backup_id,
             expected_manifest_hash=body.expected_manifest_hash,
             prepare=lambda _root: _teardown_subject_runtime(request),
-            after_publish=lambda: _rebuild_subject_runtime(
+            after_publish=lambda: _build_subject_runtime_offline(
                 request, settings, initialized_caches
             ),
-            after_rollback=lambda: _reset_and_rebuild_subject_runtime(
+            activate=lambda: _activate_subject_runtime(request),
+            after_rollback=lambda: _reset_build_and_activate_subject_runtime(
                 request, settings, initialized_caches
             ),
         )
         return restored
     except Exception as exc:
-        if getattr(request.app.state, "agent_runtime", None) is None:
-            _reset_and_rebuild_subject_runtime(request, settings, initialized_caches)
         if isinstance(exc, (BackupError, EncryptionError)):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
 
-def _rebuild_subject_runtime(
-    request: Request, settings: Settings, initialized_caches: set[str] | None = None
+def _build_subject_runtime_offline(
+    request: Request,
+    settings: Settings,
+    initialized_caches: set[str],
 ) -> None:
-    from kagya.api.server import _preload_subject_runtime
+    from kagya.api.server import _build_subject_runtime
 
-    _preload_subject_runtime(request.app, settings)
-    initialized = initialized_caches or set()
-    if "dataset_governance" in initialized:
+    _build_subject_runtime(
+        request.app, settings, reconcile=False, allow_restore_marker=True
+    )
+    if "dataset_governance" in initialized_caches:
         get_dataset_governance(request)
-    if "sleep_coordinator" in initialized:
+    if "sleep_coordinator" in initialized_caches:
         get_sleep_coordinator(request)
-    if "adapter_runtime_manager" in initialized:
+    if "adapter_runtime_manager" in initialized_caches:
         get_adapter_runtime_manager(request)
-    if "tool_registry" in initialized:
+    if "tool_registry" in initialized_caches:
         get_tool_registry(request)
-    if "tool_executor" in initialized:
+    if "tool_executor" in initialized_caches:
         get_tool_executor(request)
+
+
+def _activate_subject_runtime(request: Request) -> None:
+    from kagya.api.server import _activate_subject_runtime as activate
+
+    try:
+        activate(request.app)
+    except Exception:
+        _teardown_subject_runtime(request)
+        raise
 
 
 def _teardown_subject_runtime(request: Request) -> None:
@@ -372,11 +384,12 @@ def _teardown_subject_runtime(request: Request) -> None:
     teardown_subject_runtime(request.app)
 
 
-def _reset_and_rebuild_subject_runtime(
+def _reset_build_and_activate_subject_runtime(
     request: Request, settings: Settings, initialized_caches: set[str]
 ) -> None:
     _teardown_subject_runtime(request)
-    _rebuild_subject_runtime(request, settings, initialized_caches)
+    _build_subject_runtime_offline(request, settings, initialized_caches)
+    _activate_subject_runtime(request)
 
 
 def _current_snapshot(store: AgentStateStore) -> AgentStateSnapshot:

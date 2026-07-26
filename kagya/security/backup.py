@@ -45,6 +45,7 @@ class BackupFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     root: str = Field(pattern=r"^[a-z0-9_]+$")
     relative_path: str
+    file_type: Literal["file"] = "file"
     size: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     adapter_artifact: bool = False
@@ -61,6 +62,9 @@ class BackupManifest(BaseModel):
     model_revision: str
     processor_revision: str
     adapter_revision: str | None = None
+    captured_sequence: int = Field(ge=0)
+    captured_state_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    captured_inventory_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     base_backup_id: str | None = None
     base_manifest_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     roots: dict[str, bool]
@@ -123,6 +127,9 @@ class BackupManager:
             if base_manifest.backup_id != base_backup_id:
                 raise BackupError("incremental base backup ID does not match")
         files = self._inventory(base_manifest)
+        roots = {source.label: _source_exists(source) for source in self._source_list()}
+        captured_sequence, captured_state_hash = self._validate_authoritative_live(roots)
+        captured_inventory_hash = _inventory_hash(roots, files)
         self._inject("backup_after_inventory")
         manifest = BackupManifest(
             backup_id=backup_id,
@@ -132,11 +139,12 @@ class BackupManager:
             model_revision=self.settings.model.revision,
             processor_revision=self.settings.model.processor_revision,
             adapter_revision=self._active_adapter_revision(),
+            captured_sequence=captured_sequence,
+            captured_state_hash=captured_state_hash,
+            captured_inventory_hash=captured_inventory_hash,
             base_backup_id=None if base_manifest is None else base_manifest.backup_id,
             base_manifest_hash=None if base_manifest is None else base_manifest.sha256,
-            roots={
-                source.label: _source_exists(source) for source in self._source_list()
-            },
+            roots=roots,
             files=files,
         )
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -242,6 +250,24 @@ class BackupManager:
                             header_hash=header_hash,
                         )
                         record_index += 1
+                self._inject("backup_before_second_inventory")
+                final_files = self._inventory(base_manifest)
+                final_roots = {
+                    source.label: _source_exists(source)
+                    for source in self._source_list()
+                }
+                final_sequence, final_state_hash = self._validate_authoritative_live(
+                    final_roots
+                )
+                if (
+                    final_files != files
+                    or final_roots != roots
+                    or final_sequence != captured_sequence
+                    or final_state_hash != captured_state_hash
+                    or _inventory_hash(final_roots, final_files)
+                    != captured_inventory_hash
+                ):
+                    raise BackupError("backup source inventory changed while streaming")
                 _write_record(
                     output,
                     codec,
@@ -322,6 +348,7 @@ class BackupManager:
         expected_manifest_hash: str,
         prepare: Callable[[Path], None] | None = None,
         after_publish: Callable[[], None] | None = None,
+        activate: Callable[[], None] | None = None,
         after_rollback: Callable[[], None] | None = None,
     ) -> RestorePreview:
         self._require_staging_attestation()
@@ -342,6 +369,7 @@ class BackupManager:
                 temporary,
                 manifest,
                 after_publish=after_publish,
+                activate=activate,
                 after_rollback=after_rollback,
             )
             return _preview(manifest)
@@ -434,7 +462,23 @@ class BackupManager:
 
         for backup_id in candidates:
             accept(backup_id)
-        return valid
+        verified: dict[str, BackupManifest] = {}
+        self._require_staging_attestation()
+        staging = self._staging_directory()
+        for backup_id, manifest in valid.items():
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="kagya-retention-verify-", dir=staging
+                ) as temporary:
+                    root = Path(temporary)
+                    extracted = self._extract_chain(backup_id, root)
+                    if extracted != manifest:
+                        raise BackupError("backup chain manifest changed")
+                    self._verify_staged(root, manifest)
+                verified[backup_id] = manifest
+            except (BackupError, EncryptionError, OSError, ValueError):
+                continue
+        return verified
 
     def _chain_root(self, backup_id: str, manifests: dict[str, BackupManifest]) -> str:
         current = manifests[backup_id]
@@ -468,6 +512,35 @@ class BackupManager:
                     )
                 )
         return sorted(files, key=lambda item: (item.root, item.relative_path))
+
+    def _validate_authoritative_live(
+        self, roots: dict[str, bool]
+    ) -> tuple[int, str]:
+        if not all(roots[label] for label in ("agent_state", "state_wal", "journal")):
+            raise BackupError("initialized authoritative generation is incomplete")
+        if self.settings.at_rest.live.enabled and not roots["generation_marker"]:
+            raise BackupError("sealed authoritative generation marker is missing")
+        if roots["generation_marker"]:
+            _validate_generation_marker(self.settings.at_rest.live.generation_marker)
+        codecs = build_live_codecs(self.settings)
+        snapshot = AgentStateStore(
+            self.settings.agent_state.path, codec=codecs.snapshot
+        ).load(self.settings.emotion.baseline_surprisal)
+        wal = StateWAL(
+            self.settings.agent_state_wal.path, codec=codecs.wal
+        ).reconstruct()
+        snapshot_hash = hash_snapshot(snapshot)
+        if (
+            wal.sequence != snapshot.last_processed_event_sequence
+            or wal.snapshot_hash != snapshot_hash
+        ):
+            raise BackupError("live snapshot and WAL do not describe the same state")
+        EventJournal(
+            self.settings.agent_journal.path,
+            retained_files=self.settings.agent_journal.retained_files,
+            codec=codecs.journal,
+        ).verify()
+        return snapshot.last_processed_event_sequence, snapshot_hash
 
     def _read_manifest(self, path: Path) -> tuple[BackupManifest, dict[str, Any]]:
         manifest: BackupManifest | None = None
@@ -689,10 +762,26 @@ class BackupManager:
                 raise BackupError("isolated restore checksum validation failed")
         by_root = {source.label: source for source in _sources(self.settings)}
         live = build_live_codecs(self.settings)
+        authoritative = {
+            "agent_state": manifest.roots["agent_state"],
+            "state_wal": manifest.roots["state_wal"],
+            "journal": manifest.roots["journal"],
+        }
+        if not all(authoritative.values()):
+            raise BackupError("authoritative restore graph is incomplete")
+        if self.settings.at_rest.live.enabled and not manifest.roots["generation_marker"]:
+            raise BackupError("sealed restore generation marker is missing")
+        if manifest.roots["generation_marker"]:
+            generation_source = by_root["generation_marker"]
+            _validate_generation_marker(
+                _staged_file(
+                    root, "generation_marker", generation_source.path.name
+                )
+            )
         state_source = by_root["agent_state"]
         state_path = _staged_file(root, "agent_state", state_source.path.name)
-        if not state_path.exists():
-            return
+        if not state_path.is_file():
+            raise BackupError("authoritative restore snapshot is missing")
         snapshot = AgentStateStore(state_path, codec=live.snapshot).load(
             self.settings.emotion.baseline_surprisal
         )
@@ -721,6 +810,14 @@ class BackupManager:
             for record in records
         ):
             raise BackupError("snapshot and Journal do not describe the same state")
+        if snapshot.last_processed_event_sequence != manifest.captured_sequence:
+            raise BackupError("backup captured sequence does not match its snapshot")
+        if hash_snapshot(snapshot) != manifest.captured_state_hash:
+            raise BackupError("backup captured state hash does not match its snapshot")
+        if _inventory_hash(manifest.roots, manifest.files) != (
+            manifest.captured_inventory_hash
+        ):
+            raise BackupError("backup captured inventory hash is invalid")
         if manifest.model_id != self.settings.model.primary_id:
             raise BackupError("backup model identity does not match this runtime")
         if (
@@ -749,92 +846,104 @@ class BackupManager:
         manifest: BackupManifest,
         *,
         after_publish: Callable[[], None] | None,
+        activate: Callable[[], None] | None,
         after_rollback: Callable[[], None] | None,
     ) -> None:
         assert_no_incomplete_restore(self.settings)
+        self._verify_live_generation()
         sources = {source.label: source for source in _sources(self.settings)}
         labels = set(manifest.roots)
         rollback = self.directory / "previous-generation"
         pending_rollback = self.directory / f".previous-{uuid4()}"
         pending_rollback.mkdir(mode=0o700)
         marker = self.directory / _RESTORE_MARKER
+        logical_operations: list[dict[str, Any]] = []
+        for label in sorted(labels):
+            source = sources[label]
+            staged_root = root / label
+            root_exists = manifest.roots[label]
+            operations: list[tuple[Path | None, Path, str]]
+            if not root_exists and source.directory and source.allowed_names:
+                operations = [
+                    (None, source.path / name, f"{label}-{name}")
+                    for name in sorted(source.allowed_names)
+                ]
+            elif not root_exists:
+                operations = [(None, source.path, label)]
+            elif source.directory and source.allowed_names is None:
+                operations = [(staged_root, source.path, label)]
+            elif source.directory:
+                operations = [
+                    (
+                        staged_root / name if (staged_root / name).exists() else None,
+                        source.path / name,
+                        f"{label}-{name.replace('/', '_')}",
+                    )
+                    for name in sorted(source.allowed_names or ())
+                ]
+            else:
+                operations = [(staged_root / source.path.name, source.path, label)]
+            for staged, destination, rollback_name in operations:
+                logical_operations.append(
+                    {
+                        "destination": str(destination),
+                        "previous": str(pending_rollback / rollback_name),
+                        "staged": None if staged is None else str(staged),
+                        "prior_identity": _path_identity(destination),
+                        "staged_identity": _path_identity(staged) if staged else None,
+                        "prior_fingerprint": _path_fingerprint(destination),
+                        "staged_fingerprint": _path_fingerprint(staged),
+                    }
+                )
         metadata: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "backup_id": manifest.backup_id,
-            "pending_generation": pending_rollback.name,
+            "prior_generation": str(uuid4()),
+            "restored_generation": manifest.backup_id,
             "phase": "forward",
-            "completed_operations": 0,
-            "previous_operations": [],
+            "logical_operations": logical_operations,
+            "rename_records": [],
         }
         _atomic_json(marker, metadata)
-        swapped: builtins.list[tuple[Path, Path | None]] = []
         try:
-            for label in sorted(labels):
-                source = sources[label]
-                staged_root = root / label
-                operations: builtins.list[tuple[Path | None, Path, str]]
-                root_exists = manifest.roots[label]
-                if not root_exists and source.directory and source.allowed_names:
-                    operations = [
-                        (None, source.path / name, f"{label}-{name}")
-                        for name in sorted(source.allowed_names)
-                    ]
-                elif not root_exists:
-                    operations = [(None, source.path, label)]
-                elif source.directory and source.allowed_names is None:
-                    operations = [(staged_root, source.path, label)]
-                elif source.directory:
-                    operations = [
-                        (
-                            staged_root / name
-                            if (staged_root / name).exists()
-                            else None,
-                            source.path / name,
-                            f"{label}-{name.replace('/', '_')}",
-                        )
-                        for name in sorted(source.allowed_names or ())
-                    ]
-                else:
-                    operations = [(staged_root / source.path.name, source.path, label)]
-                for staged, destination, rollback_name in operations:
-                    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    previous: Path | None = None
-                    if destination.exists():
-                        previous = pending_rollback / rollback_name
-                        previous.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                        self._restore_replace(destination, previous, "forward")
-                    swapped.append((destination, previous))
-                    metadata["completed_operations"] = len(swapped)
-                    metadata["previous_operations"].append(previous is not None)
-                    _atomic_json(marker, metadata)
-                    if staged is not None:
-                        self._restore_replace(staged, destination, "forward")
-                    self._restore_fsync(destination.parent, "forward")
+            for operation in logical_operations:
+                destination = Path(operation["destination"])
+                previous = Path(operation["previous"])
+                staged_value = operation["staged"]
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if operation["prior_fingerprint"] is not None:
+                    previous.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    self._journaled_replace(
+                        destination,
+                        previous,
+                        generation=metadata["prior_generation"],
+                        phase="forward",
+                        marker=marker,
+                        metadata=metadata,
+                    )
+                if staged_value is not None:
+                    self._journaled_replace(
+                        Path(staged_value),
+                        destination,
+                        generation=metadata["restored_generation"],
+                        phase="forward",
+                        marker=marker,
+                        metadata=metadata,
+                    )
             self._inject("restore_after_swap")
             if after_publish is not None:
                 after_publish()
             self._verify_live_generation()
-            if rollback.exists():
-                shutil.rmtree(rollback)
-            self._restore_replace(pending_rollback, rollback, "forward")
-            self._restore_fsync(self.directory, "forward")
-            marker.unlink(missing_ok=True)
-            _fsync_directory(self.directory)
+            metadata["phase"] = "activation_pending"
+            _atomic_json(marker, metadata)
         except Exception as forward_error:
             metadata["phase"] = "rollback"
             _atomic_json(marker, metadata)
             try:
-                for index, (destination, previous) in enumerate(reversed(swapped)):
-                    if destination.exists():
-                        failed = pending_rollback / f"failed-{index}"
-                        self._restore_replace(destination, failed, "rollback")
-                    if previous is not None and previous.exists():
-                        self._restore_replace(previous, destination, "rollback")
-                    self._restore_fsync(destination.parent, "rollback")
+                self._rollback_operations(marker, metadata)
                 self._verify_live_generation()
                 if after_rollback is not None:
                     after_rollback()
-                shutil.rmtree(pending_rollback)
                 marker.unlink()
                 _fsync_directory(self.directory)
             except Exception as rollback_error:
@@ -845,15 +954,147 @@ class BackupManager:
                 ) from rollback_error
             raise forward_error
 
-    def _restore_replace(self, source: Path, destination: Path, phase: str) -> None:
+        try:
+            if activate is not None:
+                activate()
+        except Exception as activation_error:
+            metadata["phase"] = "activation_failed"
+            _atomic_json(marker, metadata)
+            raise BackupError(
+                "restored generation activation failed; recovery marker was preserved"
+            ) from activation_error
+        if rollback.exists():
+            superseded = self.directory / f".superseded-{uuid4()}"
+            self._journaled_replace(
+                rollback,
+                superseded,
+                generation="superseded",
+                phase="finalize",
+                marker=marker,
+                metadata=metadata,
+            )
+        self._journaled_replace(
+            pending_rollback,
+            rollback,
+            generation=metadata["prior_generation"],
+            phase="finalize",
+            marker=marker,
+            metadata=metadata,
+        )
+        marker.unlink()
+        _fsync_directory(self.directory)
+
+    def _journaled_replace(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        generation: str,
+        phase: str,
+        marker: Path,
+        metadata: dict[str, Any],
+    ) -> None:
+        identity = _path_identity(source)
+        if identity is None:
+            raise BackupError("restore rename source is unavailable")
+        record = {
+            "source": str(source),
+            "destination": str(destination),
+            "generation": generation,
+            "phase": phase,
+            "identity": identity,
+            "fingerprint": _path_fingerprint(source),
+            "completed": False,
+        }
+        records = metadata["rename_records"]
+        records.append(record)
+        _atomic_json(marker, metadata)
+        self._inject(f"restore_{phase}_planned")
         self._inject(f"restore_{phase}_replace")
         os.replace(source, destination)
+        self._inject(f"restore_{phase}_replaced")
+        _fsync_directory(source.parent)
+        if destination.parent != source.parent:
+            _fsync_directory(destination.parent)
+        record["completed"] = True
+        _atomic_json(marker, metadata)
+        self._inject(f"restore_{phase}_completed")
 
-    def _restore_fsync(self, path: Path, phase: str) -> None:
-        self._inject(f"restore_{phase}_fsync")
-        _fsync_directory(path)
+    def _rollback_operations(
+        self, marker: Path, metadata: dict[str, Any]
+    ) -> None:
+        pending = Path(metadata["logical_operations"][0]["previous"]).parent
+        for index, operation in enumerate(reversed(metadata["logical_operations"])):
+            destination = Path(operation["destination"])
+            previous = Path(operation["previous"])
+            prior = operation["prior_fingerprint"]
+            staged = operation["staged_fingerprint"]
+            prior_identity = operation["prior_identity"]
+            staged_identity = operation["staged_identity"]
+            destination_identity = _path_identity(destination)
+            destination_fingerprint = _path_fingerprint(destination)
+            previous_identity = _path_identity(previous)
+            previous_fingerprint = _path_fingerprint(previous)
+            if previous_fingerprint is None:
+                stable_previous = self.directory / "previous-generation" / previous.name
+                if _path_fingerprint(stable_previous) == prior:
+                    previous = stable_previous
+                    previous_identity = _path_identity(previous)
+                    previous_fingerprint = prior
+            if prior is not None and destination_identity == prior_identity:
+                if previous_identity == prior_identity:
+                    raise BackupError("restore recovery found ambiguous prior copies")
+                continue
+            if (
+                prior is not None
+                and (
+                    previous_identity != prior_identity
+                    or previous_fingerprint != prior
+                )
+            ):
+                raise BackupError("verified prior generation copy is unavailable")
+            if destination_fingerprint is not None:
+                if (
+                    staged is None
+                    or destination_identity != staged_identity
+                    or destination_fingerprint != staged
+                ):
+                    raise BackupError("restore recovery destination is ambiguous")
+                failed = pending / f"recovery-restored-{index}"
+                if _path_fingerprint(failed) is None:
+                    self._journaled_replace(
+                        destination,
+                        failed,
+                        generation=metadata["restored_generation"],
+                        phase="rollback",
+                        marker=marker,
+                        metadata=metadata,
+                    )
+                elif _path_fingerprint(failed) != staged:
+                    raise BackupError("restore recovery quarantine is ambiguous")
+            if prior is not None:
+                self._journaled_replace(
+                    previous,
+                    destination,
+                    generation=metadata["prior_generation"],
+                    phase="rollback",
+                    marker=marker,
+                    metadata=metadata,
+                )
 
     def _verify_live_generation(self) -> None:
+        required = (
+            self.settings.agent_state.path,
+            self.settings.agent_state_wal.path,
+            self.settings.agent_journal.path,
+        )
+        if not all(path.is_file() for path in required):
+            raise BackupError("live authoritative generation is incomplete")
+        if (
+            self.settings.at_rest.live.enabled
+            and not self.settings.at_rest.live.generation_marker.is_file()
+        ):
+            raise BackupError("live sealed generation marker is missing")
         codecs = build_live_codecs(self.settings)
         snapshot = AgentStateStore(
             self.settings.agent_state.path, codec=codecs.snapshot
@@ -865,11 +1106,17 @@ class BackupManager:
             wal.snapshot_hash != hash_snapshot(snapshot)
         ):
             raise BackupError("live snapshot and WAL are inconsistent after restore")
-        EventJournal(
+        records = EventJournal(
             self.settings.agent_journal.path,
             retained_files=self.settings.agent_journal.retained_files,
             codec=codecs.journal,
         ).verify()
+        if snapshot.last_processed_event_sequence and not any(
+            record.snapshot_sequence == snapshot.last_processed_event_sequence
+            and record.snapshot_hash == hash_snapshot(snapshot)
+            for record in records
+        ):
+            raise BackupError("live snapshot and Journal are inconsistent after restore")
 
     def recovery_status(self) -> dict[str, Any]:
         marker = self.directory / _RESTORE_MARKER
@@ -882,18 +1129,28 @@ class BackupManager:
         allowed = {
             "schema_version",
             "backup_id",
-            "pending_generation",
+            "prior_generation",
+            "restored_generation",
             "phase",
-            "completed_operations",
-            "previous_operations",
+            "logical_operations",
+            "rename_records",
         }
-        if not isinstance(payload, dict) or set(payload) != allowed:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != allowed
+            or payload.get("schema_version") != 2
+            or not isinstance(payload.get("rename_records"), list)
+        ):
             raise BackupError("restore recovery marker schema is invalid")
         return {
             "status": "recovery_required",
             "backup_id": payload["backup_id"],
             "phase": payload["phase"],
-            "completed_operations": payload["completed_operations"],
+            "completed_operations": sum(
+                bool(record.get("completed"))
+                for record in payload["rename_records"]
+                if isinstance(record, dict)
+            ),
         }
 
     def recover(self) -> dict[str, Any]:
@@ -903,46 +1160,23 @@ class BackupManager:
         try:
             payload = json.loads(marker.read_bytes())
             backup_id = str(payload["backup_id"])
-            pending_name = str(payload["pending_generation"])
-            completed = int(payload["completed_operations"])
-            previous_flags = payload["previous_operations"]
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise BackupError("restore recovery marker is invalid") from exc
         if (
-            not pending_name.startswith(".previous-")
-            or Path(pending_name).name != pending_name
-            or not isinstance(previous_flags, list)
-            or len(previous_flags) != completed
-            or not all(isinstance(item, bool) for item in previous_flags)
+            payload.get("schema_version") != 2
+            or not isinstance(payload.get("logical_operations"), list)
+            or not payload["logical_operations"]
+            or not isinstance(payload.get("rename_records"), list)
         ):
             raise BackupError("restore recovery marker schema is invalid")
         manifest, _header = self._read_manifest(self._bundle_path(backup_id))
-        operations = self._manifest_operation_destinations(manifest)
-        if completed < 0 or completed > len(operations):
-            raise BackupError("restore recovery operation count is invalid")
-        pending = self.directory / pending_name
-        if not pending.is_dir():
-            raise BackupError("restore recovery generation is unavailable")
+        self._validate_recovery_paths(payload, manifest)
+        self._reconcile_planned_renames(marker, payload)
         payload["phase"] = "rollback"
         _atomic_json(marker, payload)
         try:
-            for index in range(completed - 1, -1, -1):
-                destination, rollback_name = operations[index]
-                previous = pending / rollback_name
-                if previous.exists():
-                    if destination.exists():
-                        self._restore_replace(
-                            destination,
-                            pending / f"recovery-failed-{index}",
-                            "rollback",
-                        )
-                    self._restore_replace(previous, destination, "rollback")
-                elif not previous_flags[index] and destination.exists():
-                    failed = pending / f"recovery-failed-{index}"
-                    self._restore_replace(destination, failed, "rollback")
-                self._restore_fsync(destination.parent, "rollback")
+            self._rollback_operations(marker, payload)
             self._verify_live_generation()
-            shutil.rmtree(pending)
             marker.unlink()
             _fsync_directory(self.directory)
             return {"status": "rolled_back", "backup_id": backup_id}
@@ -953,6 +1187,97 @@ class BackupManager:
                 "restore recovery retry failed; recovery marker was preserved"
             ) from exc
 
+    def _reconcile_planned_renames(
+        self, marker: Path, metadata: dict[str, Any]
+    ) -> None:
+        changed = False
+        for record in metadata["rename_records"]:
+            if not isinstance(record, dict) or set(record) != {
+                "source",
+                "destination",
+                "generation",
+                "phase",
+                "identity",
+                "fingerprint",
+                "completed",
+            }:
+                raise BackupError("restore rename journal schema is invalid")
+            if record["completed"]:
+                continue
+            source_matches = _path_identity(Path(record["source"])) == record["identity"]
+            destination_matches = (
+                _path_identity(Path(record["destination"])) == record["identity"]
+            )
+            if source_matches and destination_matches:
+                raise BackupError("restore planned rename is ambiguous")
+            if destination_matches:
+                if _path_fingerprint(Path(record["destination"])) != record["fingerprint"]:
+                    raise BackupError("restore planned rename content is ambiguous")
+                record["completed"] = True
+                changed = True
+            elif not source_matches:
+                # A later journaled rename may already have moved this inode again.
+                fingerprints = {
+                    _path_fingerprint(Path(operation["destination"]))
+                    for operation in metadata["logical_operations"]
+                } | {
+                    _path_fingerprint(Path(operation["previous"]))
+                    for operation in metadata["logical_operations"]
+                }
+                if record["fingerprint"] not in fingerprints:
+                    raise BackupError("restore planned rename state is ambiguous")
+        if changed:
+            _atomic_json(marker, metadata)
+
+    def _validate_recovery_paths(
+        self, metadata: dict[str, Any], manifest: BackupManifest
+    ) -> None:
+        expected = self._manifest_operation_destinations(manifest)
+        operations = metadata["logical_operations"]
+        if len(operations) != len(expected):
+            raise BackupError("restore recovery operation set is invalid")
+        pending_parents = {Path(operation["previous"]).parent for operation in operations}
+        if len(pending_parents) != 1:
+            raise BackupError("restore recovery generation path is invalid")
+        pending = pending_parents.pop()
+        if pending.parent != self.directory or not pending.name.startswith(".previous-"):
+            raise BackupError("restore recovery generation path is invalid")
+        try:
+            UUID(pending.name.removeprefix(".previous-"))
+        except ValueError as exc:
+            raise BackupError("restore recovery generation path is invalid") from exc
+        staging = self.settings.at_rest.backup.restore_staging_directory
+        logical_paths: set[Path] = {pending, self.directory / "previous-generation"}
+        for operation, (destination, rollback_name) in zip(
+            operations, expected, strict=True
+        ):
+            if (
+                Path(operation["destination"]) != destination
+                or Path(operation["previous"]) != pending / rollback_name
+            ):
+                raise BackupError("restore recovery destination set is invalid")
+            staged = operation["staged"]
+            if staged is not None and not Path(staged).is_relative_to(staging):
+                raise BackupError("restore recovery staged path is invalid")
+            logical_paths.update({destination, pending / rollback_name})
+            if staged is not None:
+                logical_paths.add(Path(staged))
+        for record in metadata["rename_records"]:
+            if not isinstance(record, dict):
+                raise BackupError("restore rename journal schema is invalid")
+            for key in ("source", "destination"):
+                path = Path(record.get(key, ""))
+                if not (
+                    path in logical_paths
+                    or path.is_relative_to(pending)
+                    or path.is_relative_to(staging)
+                    or (
+                        path.parent == self.directory
+                        and path.name.startswith(".superseded-")
+                    )
+                ):
+                    raise BackupError("restore rename journal path is invalid")
+
     def _manifest_operation_destinations(
         self, manifest: BackupManifest
     ) -> builtins.list[tuple[Path, str]]:
@@ -962,7 +1287,7 @@ class BackupManager:
             source = sources[label]
             if source.directory and source.allowed_names:
                 operations.extend(
-                    (source.path / name, f"{label}-{name}")
+                    (source.path / name, f"{label}-{name.replace('/', '_')}")
                     for name in sorted(source.allowed_names)
                 )
             else:
@@ -1072,6 +1397,9 @@ def _sources(settings: Settings) -> list[_Source]:
             allowed_names=journal_names,
         ),
         _Source("state_wal", settings.agent_state_wal.path, False),
+        _Source(
+            "generation_marker", settings.at_rest.live.generation_marker, False
+        ),
         _Source("memory", settings.memory.persist_directory, True),
         _Source("dreams", settings.sleep.dream_dataset_path, False),
         _Source("training_jobs", settings.sleep.job_registry_path, False),
@@ -1148,6 +1476,25 @@ def _validate_staged_adapter_hashes(
             raise BackupError("restored adapter artifact is invalid") from exc
         if actual != expected_hash:
             raise BackupError("restored adapter artifact hash does not match registry")
+
+
+def _validate_generation_marker(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version",
+            "generation_id",
+            "created_at",
+        }:
+            raise ValueError
+        if payload["schema_version"] != 1:
+            raise ValueError
+        UUID(str(payload["generation_id"]))
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
+        if created_at.tzinfo is None:
+            raise ValueError
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise BackupError("sealed generation marker is invalid") from exc
 
 
 def _walk_source(source: _Source) -> Iterator[tuple[Path, str]]:
@@ -1297,6 +1644,55 @@ def _hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _path_identity(path: Path) -> dict[str, int] | None:
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BackupError("restore path identity cannot be inspected") from exc
+    if stat.S_ISLNK(item.st_mode):
+        raise BackupError("restore path symlinks are forbidden")
+    if not (stat.S_ISREG(item.st_mode) or stat.S_ISDIR(item.st_mode)):
+        raise BackupError("restore path type is unsupported")
+    return {"device": item.st_dev, "inode": item.st_ino}
+
+
+def _path_fingerprint(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    identity = _path_identity(path)
+    if identity is None:
+        return None
+    item = path.lstat()
+    if stat.S_ISREG(item.st_mode):
+        digest, size = _hash_file(path)
+        payload: Any = {"type": "file", "size": size, "sha256": digest}
+    else:
+        entries: list[dict[str, Any]] = []
+        for child in sorted(path.rglob("*")):
+            child_stat = child.lstat()
+            relative = child.relative_to(path).as_posix()
+            if stat.S_ISLNK(child_stat.st_mode):
+                raise BackupError("restore generation symlinks are forbidden")
+            if stat.S_ISDIR(child_stat.st_mode):
+                entries.append({"path": relative, "type": "directory"})
+            elif stat.S_ISREG(child_stat.st_mode):
+                digest, size = _hash_file(child)
+                entries.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "size": size,
+                        "sha256": digest,
+                    }
+                )
+            else:
+                raise BackupError("restore generation contains a special file")
+        payload = {"type": "directory", "entries": entries}
+    return hashlib.sha256(_canonical(payload)).hexdigest()
+
+
 def _open_regular_nofollow(path: Path) -> BinaryIO:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -1331,6 +1727,14 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
     ).encode("ascii")
+
+
+def _inventory_hash(roots: dict[str, bool], files: list[BackupFile]) -> str:
+    payload = {
+        "roots": roots,
+        "files": [item.model_dump(mode="json") for item in files],
+    }
+    return hashlib.sha256(_canonical(payload)).hexdigest()
 
 
 def _source_revision() -> str:

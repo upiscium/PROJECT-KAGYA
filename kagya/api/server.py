@@ -266,7 +266,21 @@ def teardown_subject_runtime(app: FastAPI) -> None:
 
 
 def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
-    assert_no_incomplete_restore(settings)
+    _build_subject_runtime(app, settings, reconcile=True)
+    _activate_subject_runtime(app)
+
+
+def _build_subject_runtime(
+    app: FastAPI,
+    settings: Settings,
+    *,
+    reconcile: bool,
+    allow_restore_marker: bool = False,
+) -> None:
+    """Construct and validate the subject graph without starting background writers."""
+
+    if not allow_restore_marker:
+        assert_no_incomplete_restore(settings)
     require_encrypted_generation(settings)
     live_codecs = getattr(app.state, "live_codecs", None)
     if live_codecs is None:
@@ -302,8 +316,19 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
         app.state.state_wal = StateWAL(
             settings.agent_state_wal.path, codec=live_codecs.wal
         )
-    snapshot = _reconcile_state_wal(app, snapshot)
-    app.state.event_journal.reconcile(snapshot)
+    if reconcile:
+        snapshot = _reconcile_state_wal(app, snapshot)
+        app.state.event_journal.reconcile(snapshot)
+    else:
+        reconstructed = app.state.state_wal.reconstruct()
+        if (
+            reconstructed.sequence != snapshot.last_processed_event_sequence
+            or reconstructed.snapshot_hash != hash_snapshot(snapshot)
+        ):
+            raise StateWalIntegrityError(
+                "offline snapshot and private state WAL disagree"
+            )
+        app.state.event_journal.verify()
     if getattr(app.state, "memory_system", None) is None:
         app.state.memory_system = DualMemorySystem(settings)
     if getattr(app.state, "external_transaction_coordinator", None) is None:
@@ -418,7 +443,6 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             failure_hook=lambda event, exc: _fail_subject_event(app, event),
             telemetry=app.state.operational_telemetry,
         )
-        app.state.agent_runtime.start()
     if settings.autonomy.enabled and getattr(app.state, "autonomy_loop", None) is None:
         autonomy_settings = settings.autonomy
         app.state.subject_scheduler = SubjectScheduler(
@@ -438,7 +462,6 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             app.state.subject_scheduler,
             poll_interval_seconds=autonomy_settings.poll_interval_seconds,
         )
-        app.state.autonomy_loop.start()
     if (
         settings.appraisal.timer_enabled
         and getattr(app.state, "emotion_timer", None) is None
@@ -448,12 +471,26 @@ def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
             lambda elapsed: app.state.main_loop.advance_time(elapsed),
             interval_seconds=settings.appraisal.timer_interval_seconds,
         )
-        app.state.emotion_timer.start()
     if settings.deployment.node.role == NodeRole.INFERENCE:
         remote = settings.deployment.training.remote_worker
         if remote is None:
             raise RuntimeError("Inference role requires remote worker settings")
         app.state.training_dispatcher = RemoteTrainingDispatcher.from_settings(remote)
+
+
+def _activate_subject_runtime(app: FastAPI) -> None:
+    """Start an already validated graph as the final non-destructive phase."""
+
+    runtime = getattr(app.state, "agent_runtime", None)
+    if runtime is None:
+        raise RuntimeError("offline subject runtime graph is unavailable")
+    runtime.start()
+    autonomy = getattr(app.state, "autonomy_loop", None)
+    if autonomy is not None:
+        autonomy.start()
+    timer = getattr(app.state, "emotion_timer", None)
+    if timer is not None:
+        timer.start()
 
 
 def _preload_worker_runtime(app: FastAPI, settings: Settings) -> None:
