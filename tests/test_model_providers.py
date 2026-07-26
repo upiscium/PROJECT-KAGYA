@@ -17,6 +17,7 @@ from kagya.models.transformers_smoke import (
     TransformersSmokeError,
     run_transformers_smoke,
 )
+from kagya.structured_response import parse_structured_response
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -105,6 +106,37 @@ class FailingGenerateModel(FakeModel):
     def generate(self, **kwargs) -> torch.Tensor:
         self.generate_kwargs = kwargs
         raise RuntimeError("primary generation failed")
+
+
+class CharacterProcessor:
+    def __call__(self, *, text: str, return_tensors: str) -> dict[str, torch.Tensor]:
+        del return_tensors
+        return {"input_ids": torch.tensor([[ord(character) for character in text]])}
+
+    def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
+        del skip_special_tokens
+        return "".join(chr(token_id) for token_id in output_ids.tolist())
+
+
+class AutoregressiveFakeModel(FakeModel):
+    def __init__(self, completion: str) -> None:
+        super().__init__()
+        self.completion = completion
+
+    def generate(self, **kwargs) -> torch.Tensor:
+        self.generate_kwargs = kwargs
+        output_ids = kwargs["input_ids"].clone()
+        stopping_criteria = kwargs["stopping_criteria"]
+        for token_id in (ord(character) for character in self.completion):
+            if (
+                output_ids.shape[1] - kwargs["input_ids"].shape[1]
+                >= kwargs["max_new_tokens"]
+            ):
+                break
+            output_ids = torch.cat((output_ids, torch.tensor([[token_id]])), dim=1)
+            if stopping_criteria(output_ids, torch.empty(0)):
+                break
+        return output_ids
 
 
 class FakeSmokeProvider:
@@ -519,6 +551,82 @@ def test_transformers_generate_decodes_only_new_tokens() -> None:
     generated = provider.generate("prompt has three")
 
     assert generated == "4 5"
+
+
+@pytest.mark.parametrize(
+    ("completion", "expected"),
+    [
+        (
+            '{"behavior_class":"respond","visible_response":"ok"}thought'
+            '{"behavior_class":"respond","visible_response":"second"}',
+            '{"behavior_class":"respond","visible_response":"ok"}',
+        ),
+        (
+            '{"behavior_class":"respond","visible_response":"brace } and '
+            '\\"quote\\" and slash \\\\ then {"}thought',
+            '{"behavior_class":"respond","visible_response":"brace } and '
+            '\\"quote\\" and slash \\\\ then {"}',
+        ),
+        (
+            '  \n{"behavior_class":"respond","visible_response":"ok"}thought',
+            '  \n{"behavior_class":"respond","visible_response":"ok"}',
+        ),
+    ],
+)
+def test_transformers_generate_stops_after_first_complete_json_object(
+    completion: str, expected: str
+) -> None:
+    model = AutoregressiveFakeModel(completion)
+    provider = TransformersProvider(
+        load_settings(CONFIG_PATH), model=model, processor=CharacterProcessor()
+    )
+
+    assert provider.generate('prompt contains {"closed":true}') == expected
+
+
+def test_transformers_generate_does_not_accept_malformed_prefix() -> None:
+    completion = (
+        '```json\n{"behavior_class":"respond","visible_response":"ok"}thought'
+        + "x" * 500
+    )
+    model = AutoregressiveFakeModel(completion)
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(
+        settings, model=model, processor=CharacterProcessor()
+    )
+
+    generated = provider.generate("prompt")
+
+    assert generated == completion[: settings.generation.max_new_tokens]
+    assert parse_structured_response(generated).parse_valid is False
+
+
+def test_transformers_generate_missing_close_reaches_token_limit() -> None:
+    completion = (
+        '{"behavior_class":"respond","visible_response":"never closes"' + "x" * 500
+    )
+    model = AutoregressiveFakeModel(completion)
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(
+        settings, model=model, processor=CharacterProcessor()
+    )
+
+    generated = provider.generate("prompt")
+
+    assert len(generated) == settings.generation.max_new_tokens
+    assert generated == completion[: settings.generation.max_new_tokens]
+    assert parse_structured_response(generated).parse_valid is False
+
+
+def test_transformers_fallback_generation_stops_after_first_json_object() -> None:
+    completion = '{"behavior_class":"respond","visible_response":"fallback"}thought'
+    model = AutoregressiveFakeModel(completion)
+    provider = TransformersProvider(load_settings(CONFIG_PATH))
+    provider._fallback_model = model
+    provider._fallback_processor = CharacterProcessor()
+
+    assert provider.generate_fallback("prompt") == completion.removesuffix("thought")
+    assert provider.last_fallback_used is True
 
 
 def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None:

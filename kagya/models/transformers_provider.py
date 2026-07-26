@@ -12,12 +12,18 @@ import re
 import shutil
 import sys
 import threading
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from kagya.config import Settings
 from kagya.attachments import ProcessedImageAttachment, validate_image_attachments
@@ -32,6 +38,64 @@ from kagya.artifact_provenance import (
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
 _SNAPSHOT_PUBLICATION_LOCK = threading.Lock()
 _IMMUTABLE_COMMIT = re.compile(r"[0-9a-fA-F]{40}")
+
+
+class _StopAfterTopLevelJsonObject(StoppingCriteria):
+    """Stop batch-size-one generation after an exact JSON object closes."""
+
+    def __init__(self, processor: Any, prompt_length: int) -> None:
+        self.processor = processor
+        self.prompt_length = prompt_length
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any
+    ) -> torch.BoolTensor:
+        del scores, kwargs
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("structured JSON stopping requires batch size 1")
+        if input_ids.shape[1] < self.prompt_length:
+            raise ValueError("generated input is shorter than the prompt")
+        generated = self.processor.decode(
+            input_ids[0, self.prompt_length :], skip_special_tokens=True
+        )
+        return cast(
+            torch.BoolTensor,
+            torch.tensor(
+                [_has_complete_top_level_json_object(generated)],
+                device=input_ids.device,
+                dtype=torch.bool,
+            ),
+        )
+
+
+def _has_complete_top_level_json_object(value: str) -> bool:
+    index = 0
+    while index < len(value) and value[index].isspace():
+        index += 1
+    if index == len(value) or value[index] != "{":
+        return False
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value[index:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return True
+    return False
 
 
 class TransformersProvider:
@@ -161,8 +225,11 @@ class TransformersProvider:
         if self.settings.generation.do_sample:
             generation_kwargs["temperature"] = self.settings.generation.temperature
             generation_kwargs["top_p"] = self.settings.generation.top_p
-        output_ids = model.generate(**inputs, **generation_kwargs)
         input_length = inputs["input_ids"].shape[-1]
+        generation_kwargs["stopping_criteria"] = StoppingCriteriaList(
+            [_StopAfterTopLevelJsonObject(processor, input_length)]
+        )
+        output_ids = model.generate(**inputs, **generation_kwargs)
         generated_ids = output_ids[0][input_length:]
         return processor.decode(generated_ids, skip_special_tokens=True)
 

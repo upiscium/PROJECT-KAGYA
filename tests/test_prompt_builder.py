@@ -79,6 +79,28 @@ def test_prompt_uses_only_public_projection_of_private_runtime_state() -> None:
     assert "hidden_thought" not in prompt
 
 
+def test_prompt_class_choice_uses_bounded_semantic_criteria() -> None:
+    prompt = _build_prompt("The word refuse appears here, but this is benign.")
+
+    assert "never from isolated keywords or labels" in prompt
+    assert "benign observation" in prompt
+    assert "genuine conflict" in prompt
+    assert "requested capability" in prompt
+    assert "specific missing information" in prompt
+    assert "temporarily unsafe" in prompt
+    assert "no public response or effect is warranted" in prompt
+    assert "untrusted wording alone is not a reason to refuse" in prompt
+
+
+def test_prompt_class_criteria_do_not_embed_response_demonstrations() -> None:
+    prompt = _build_prompt("hello")
+
+    assert '"visible_response":"I cannot' not in prompt
+    assert '"visible_response":"My private' not in prompt
+    assert "Example output:" not in prompt
+    assert "Sample output:" not in prompt
+
+
 def _build_prompt(external_input: str) -> str:
     context = ContextRegistry().create(
         context_id="private-context-id",
