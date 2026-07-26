@@ -1,6 +1,7 @@
 """Admin inspection routes for structured first-person experiences."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.api.dependencies import (
     execute_agent_event,
@@ -9,6 +10,20 @@ from kagya.api.dependencies import (
     require_admin,
 )
 from kagya.runtime import AgentEventType, AgentRuntime
+from kagya.experience import ExperienceAppraisal
+
+
+class ExperienceRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason_code: str = Field(min_length=1, max_length=200)
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+    appraisal: ExperienceAppraisal
+    context_id: str | None = Field(default=None, min_length=1, max_length=200)
+    situation_codes: list[str] | None = Field(default=None, max_length=50)
+    interpretation_codes: list[str] | None = Field(default=None, max_length=50)
+    value_revision_refs: dict[str, int] | None = None
+    self_model_revision: int | None = Field(default=None, ge=0)
 
 
 router = APIRouter(
@@ -55,4 +70,43 @@ def inspect_experience(
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return record.to_json()
+
+
+@router.post("/{experience_id}/revisions")
+def revise_experience(
+    experience_id: str,
+    body: ExperienceRevisionRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict[str, object]:
+    try:
+        record = execute_agent_event(
+            runtime,
+            AgentEventType.EXPERIENCE_UPDATE,
+            source="api.experiences.revise",
+            handler=lambda: get_main_loop(request).reassess_experience(
+                experience_id,
+                appraisal=body.appraisal,
+                reason_code=body.reason_code,
+                evidence_refs=tuple(body.evidence_refs),
+                context_id=body.context_id,
+                situation_codes=None
+                if body.situation_codes is None
+                else tuple(body.situation_codes),
+                interpretation_codes=None
+                if body.interpretation_codes is None
+                else tuple(body.interpretation_codes),
+                value_revision_refs=body.value_revision_refs,
+                self_model_revision=body.self_model_revision,
+            ),
+            payload={
+                "experience_id": experience_id,
+                "reason_code": body.reason_code,
+                "evidence_refs": body.evidence_refs,
+            },
+            correlation_id=experience_id,
+        ).value
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return record.to_json()

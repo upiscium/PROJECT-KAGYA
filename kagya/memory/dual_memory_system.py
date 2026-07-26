@@ -116,7 +116,12 @@ class DualMemorySystem:
         self.embedding_function = embedding_function or create_embedding_function(
             settings
         )
-        self.evaluator = evaluator or MemoryEvaluator()
+        self.evaluator = evaluator or MemoryEvaluator(
+            min_arousal=settings.memory.consolidation_min_arousal,
+            min_subjective_salience=(
+                settings.memory.consolidation_min_subjective_salience
+            ),
+        )
         self.client = chromadb.PersistentClient(
             path=str(settings.memory.persist_directory)
         )

@@ -1419,6 +1419,11 @@ class ActionExecutionLayer:
         decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
         if decision.status == DecisionStatus.RESOLVED:
             return
+        record_experience = getattr(
+            self.main_loop, "record_verified_action_experience", None
+        )
+        if callable(record_experience) and current_agent_event() is not None:
+            record_experience(intent.intent_id)
         self.main_loop.record_decision_outcome(
             decision.decision_id,
             description=description,

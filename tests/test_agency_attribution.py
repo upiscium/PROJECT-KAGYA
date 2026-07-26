@@ -102,6 +102,12 @@ def test_autonomous_verification_schedules_shared_attribution_and_all_projection
             source="test.agency.execute",
             handler=lambda: execution.execute(intent.intent_id),
         )
+        action_experience = loop.experience_store.list_records()[0]
+        assert action_experience.source_event_sequence == 2
+        assert action_experience.external_observation_refs[0].startswith("observation:")
+        assert action_experience.result_refs["decision"] == (
+            "decision:decision-success",
+        )
         assert loop.agency_attribution_store.list_current() == ()
 
         scheduler = SubjectScheduler(

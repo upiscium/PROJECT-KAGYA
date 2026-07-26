@@ -242,6 +242,44 @@ class RelationshipStore:
         self._experience_index.add(experience.experience_id)
         return tuple(updated)
 
+    def reassess_experience(
+        self,
+        experience: ExperienceRecord,
+        *,
+        evidence_refs: tuple[str, ...],
+        event_id: str | None = None,
+        event_sequence: int | None = None,
+    ) -> tuple[RelationshipState, ...]:
+        updated: list[RelationshipState] = []
+        experience_ref = f"experience:{experience.experience_id}"
+        for key in experience.interlocutor_ids:
+            current = self.for_interlocutor(key)
+            if current is None:
+                continue
+            desired_unresolved = (
+                _unique((*current.unresolved_matter_refs, experience_ref))
+                if experience.unresolved_tension >= 0.6
+                else tuple(
+                    ref
+                    for ref in current.unresolved_matter_refs
+                    if ref != experience_ref
+                )
+            )
+            if desired_unresolved == current.unresolved_matter_refs:
+                continue
+            updated.append(
+                self._revise(
+                    current,
+                    reason_code="experience_reassessed",
+                    evidence_refs=evidence_refs,
+                    changed_fields=("unresolved_matter_refs",),
+                    event_id=event_id,
+                    event_sequence=event_sequence,
+                    unresolved_matter_refs=desired_unresolved,
+                )
+            )
+        return tuple(updated)
+
     def influence(self, interlocutor_keys: Iterable[str]) -> RelationshipInfluence:
         states = [
             state
@@ -426,9 +464,7 @@ class RelationshipStore:
             )
             changes: dict[str, Any] = {"unresolved_matter_refs": unresolved}
             if status == "breached":
-                changes["unresolved_matter_refs"] = _unique(
-                    (*unresolved, evidence_ref)
-                )
+                changes["unresolved_matter_refs"] = _unique((*unresolved, evidence_ref))
                 changes["conflict_refs"] = _unique(
                     (*current.conflict_refs, evidence_ref)
                 )

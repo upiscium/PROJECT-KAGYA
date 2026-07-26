@@ -521,6 +521,50 @@ class MotivationDynamics:
     def list_records(self) -> list[MotivationRecord]:
         return sorted(self.records.values(), key=lambda item: item.motivation_id)
 
+    def reassess_experience(
+        self, experience: ExperienceRecord
+    ) -> list[MotivationRecord]:
+        evidence_ref = f"experience:{experience.experience_id}@{experience.revision}"
+        updated: list[MotivationRecord] = []
+        for current in tuple(self.records.values()):
+            if experience.experience_id not in current.related_experience_ids:
+                continue
+            if evidence_ref in current.source_refs:
+                continue
+            signal = {
+                MotivationKind.INTEREST: experience.appraisal.novelty or 0.0,
+                MotivationKind.DRIVE: experience.unresolved_tension,
+                MotivationKind.AVERSION: experience.appraisal.threat,
+                MotivationKind.DESIRE: max(0.0, experience.appraisal.goal_progress),
+            }[current.kind]
+            desired = min(1.0, 0.35 + 0.4 * signal)
+            strength = current.strength + max(
+                -0.1, min(0.1, desired - current.strength)
+            )
+            before = current.to_json()
+            now = _now()
+            revision = MotivationRevision(
+                revision_id=f"motivation-revision-{uuid4()}",
+                operation="experience_reassessment",
+                before=before,
+                after={},
+                evidence_refs=(evidence_ref,),
+                created_at=now,
+            )
+            record = replace(
+                current,
+                strength=strength,
+                uncertainty=1.0 - experience.appraisal.certainty,
+                source_refs=(*current.source_refs, evidence_ref),
+                updated_at=now,
+                revision=current.revision + 1,
+            )
+            revision = replace(revision, after=record.to_json())
+            record = replace(record, revisions=(*current.revisions, revision))
+            self.records[record.motivation_id] = record
+            updated.append(record)
+        return updated
+
     def to_json(self) -> dict[str, Any]:
         return {
             "schema_version": self.SCHEMA_VERSION,

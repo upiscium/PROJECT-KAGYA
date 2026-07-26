@@ -47,6 +47,8 @@ memory:
   db2_top_k: 5
   embedding_model_id: sentence-transformers/all-MiniLM-L6-v2
   default_record_type: episodic
+  consolidation_min_arousal: 0.55
+  consolidation_min_subjective_salience: 0.55
 
 working_memory:
   item_capacity: 32

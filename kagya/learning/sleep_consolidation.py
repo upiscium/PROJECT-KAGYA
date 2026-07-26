@@ -137,9 +137,13 @@ class SleepCycleManager:
 
     def select_high_emotion_episodes(self) -> list[EpisodicMemoryRecord]:
         episodes = self.memory_system._get_unarchived_episodic_records()
-        threshold = self.settings.sleep.min_emotion_score
+        arousal_threshold = self.settings.memory.consolidation_min_arousal
+        salience_threshold = self.settings.memory.consolidation_min_subjective_salience
         selected = [
-            episode for episode in episodes if _is_high_emotion(episode, threshold)
+            episode
+            for episode in episodes
+            if episode.emotion_arousal >= arousal_threshold
+            or episode.subjective_salience >= salience_threshold
         ]
         selected = [
             episode

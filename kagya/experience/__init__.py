@@ -7,6 +7,7 @@ from kagya.experience.records import (
     ExperienceRevision,
     ExperienceStore,
     build_chat_experience,
+    build_observation_experience,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "ExperienceRevision",
     "ExperienceStore",
     "build_chat_experience",
+    "build_observation_experience",
 ]

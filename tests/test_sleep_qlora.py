@@ -13,7 +13,11 @@ from kagya.learning import (
     format_training_text,
 )
 from kagya.learning.qlora_requirements import check_qlora_production_readiness
-from kagya.memory import ConsolidationStatus, DeterministicEmbeddingFunction, DualMemorySystem
+from kagya.memory import (
+    ConsolidationStatus,
+    DeterministicEmbeddingFunction,
+    DualMemorySystem,
+)
 from kagya.models import DummyProvider
 
 
@@ -23,26 +27,50 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 def test_high_emotion_episode_selection_follows_threshold_rules(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     memory = _memory(settings)
-    threshold = settings.sleep.min_emotion_score
-    high_arousal = memory.save_episodic("high arousal", "out", emotion_arousal=threshold + 0.01)
-    high_valence = memory.save_episodic("high valence", "out", emotion_valence=-(threshold + 0.01))
-    memory.save_episodic("low emotion", "out", emotion_arousal=threshold, emotion_valence=threshold)
-    manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
+    arousal_threshold = settings.memory.consolidation_min_arousal
+    salience_threshold = settings.memory.consolidation_min_subjective_salience
+    high_arousal = memory.save_episodic(
+        "high arousal", "out", emotion_arousal=arousal_threshold
+    )
+    high_salience = memory.save_episodic("high salience", "out")
+    memory.link_experience(
+        high_salience,
+        experience_id="experience-high",
+        subjective_salience=salience_threshold,
+        autobiographical_importance=salience_threshold,
+    )
+    memory.save_episodic("low emotion", "out", emotion_arousal=arousal_threshold - 0.01)
+    manager = SleepCycleManager(
+        settings, memory, DummyProvider(), AdapterRegistry(settings)
+    )
 
     selected = manager.select_high_emotion_episodes()
 
-    assert {episode.id for episode in selected} == {high_arousal, high_valence}
+    assert {episode.id for episode in selected} == {high_arousal, high_salience}
 
 
-def test_high_emotion_episode_selection_uses_configured_sleep_threshold(tmp_path: Path) -> None:
+def test_high_emotion_episode_selection_uses_typed_retention_threshold(
+    tmp_path: Path,
+) -> None:
     base_settings = _settings_for_sleep(tmp_path)
     settings = base_settings.model_copy(
-        update={"sleep": base_settings.sleep.model_copy(update={"min_emotion_score": 0.4})}
+        update={
+            "memory": base_settings.memory.model_copy(
+                update={
+                    "consolidation_min_arousal": 0.4,
+                    "consolidation_min_subjective_salience": 0.4,
+                }
+            )
+        }
     )
     memory = _memory(settings)
-    selected_by_config = memory.save_episodic("configured threshold", "out", emotion_arousal=0.41)
-    memory.save_episodic("below threshold", "out", emotion_valence=-0.4)
-    manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
+    selected_by_config = memory.save_episodic(
+        "configured threshold", "out", emotion_arousal=0.41
+    )
+    memory.save_episodic("below threshold", "out", emotion_arousal=0.39)
+    manager = SleepCycleManager(
+        settings, memory, DummyProvider(), AdapterRegistry(settings)
+    )
 
     selected = manager.select_high_emotion_episodes()
 
@@ -60,13 +88,13 @@ def test_dream_dataset_jsonl_is_generated_with_expected_fields(tmp_path: Path) -
     episode = memory._get_unarchived_episodic_records()[0]
     assert episode.id == episode_id
 
-    records = DreamDatasetGenerator().generate([episode], settings.sleep.dream_dataset_path)
+    records = DreamDatasetGenerator().generate(
+        [episode], settings.sleep.dream_dataset_path
+    )
 
     lines = settings.sleep.dream_dataset_path.read_text(encoding="utf-8").splitlines()
     assert records == [
-        DreamDatasetRecord(
-            "dream input", "", "dream output", source_id=episode_id
-        )
+        DreamDatasetRecord("dream input", "", "dream output", source_id=episode_id)
     ]
     assert json.loads(lines[0]) == {
         "schema_version": 2,
@@ -121,16 +149,22 @@ def test_qlora_dry_run_returns_adapter_candidate_result(tmp_path: Path) -> None:
     assert result.dry_run is True
     assert result.adapter_id.startswith("adapter-")
     assert result.adapter_path.exists()
-    manifest = json.loads((result.adapter_path / "dry_run_manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (result.adapter_path / "dry_run_manifest.json").read_text(encoding="utf-8")
+    )
     assert manifest["qlora"]["alpha"] == settings.qlora.alpha
     assert manifest["qlora"]["dropout"] == settings.qlora.dropout
     assert manifest["qlora"]["max_steps"] == settings.qlora.max_steps
     assert result.training_records == 1
 
 
-def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatch) -> None:
+def test_qlora_non_dry_run_trains_and_writes_manifest(
+    tmp_path: Path, monkeypatch
+) -> None:
     settings = _settings_for_sleep(tmp_path)
-    settings = settings.model_copy(update={"qlora": settings.qlora.model_copy(update={"dry_run": False})})
+    settings = settings.model_copy(
+        update={"qlora": settings.qlora.model_copy(update={"dry_run": False})}
+    )
     dataset_path = settings.sleep.dream_dataset_path
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     dataset_path.write_text(
@@ -154,9 +188,13 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
         def from_pretrained(model_id: str, **kwargs: object) -> object:
             calls["model_id"] = model_id
             calls["model_kwargs"] = kwargs
+
             class Model:
                 def named_modules(self):
-                    return [(f"model.{name}", object()) for name in settings.qlora.target_modules]
+                    return [
+                        (f"model.{name}", object())
+                        for name in settings.qlora.target_modules
+                    ]
 
             return Model()
 
@@ -206,7 +244,9 @@ def test_qlora_non_dry_run_trains_and_writes_manifest(tmp_path: Path, monkeypatc
 
     result = QloraTrainer(settings).train(dataset_path)
 
-    manifest = json.loads((result.adapter_path / "training_manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (result.adapter_path / "training_manifest.json").read_text(encoding="utf-8")
+    )
     assert result.dry_run is False
     assert result.training_records == 1
     assert calls["processor_model_id"] == settings.model.primary_id
@@ -266,7 +306,9 @@ def test_qlora_prod_check_rejects_default_dry_run_config(tmp_path: Path) -> None
 def test_qlora_prod_check_accepts_ready_boundaries(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     eval_set = tmp_path / "eval_set.json"
-    eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
+    eval_set.write_text(
+        '{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8"
+    )
     settings = settings.model_copy(
         update={
             "model": settings.model.model_copy(
@@ -296,7 +338,9 @@ def test_qlora_prod_check_accepts_ready_boundaries(tmp_path: Path) -> None:
 def test_qlora_prod_check_reports_missing_dependency_and_cuda(tmp_path: Path) -> None:
     settings = _settings_for_sleep(tmp_path)
     eval_set = tmp_path / "eval_set.json"
-    eval_set.write_text('{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8")
+    eval_set.write_text(
+        '{"cases": [{"prompt": "p", "expected": "e"}]}', encoding="utf-8"
+    )
     settings = settings.model_copy(
         update={
             "model": settings.model.model_copy(
@@ -391,9 +435,7 @@ def test_sleep_failure_keeps_staged_semantics_hidden_and_episode_retryable(
     settings = _settings_for_sleep(tmp_path)
     memory = _memory(settings)
     registry = AdapterRegistry(settings)
-    episode_id = memory.save_episodic(
-        "sleep failure", "output", emotion_arousal=0.9
-    )
+    episode_id = memory.save_episodic("sleep failure", "output", emotion_arousal=0.9)
     monkeypatch.setattr(
         registry,
         "register_candidate",
@@ -443,4 +485,6 @@ def _settings_for_sleep(tmp_path: Path) -> Settings:
 
 
 def _memory(settings: Settings) -> DualMemorySystem:
-    return DualMemorySystem(settings, embedding_function=DeterministicEmbeddingFunction())
+    return DualMemorySystem(
+        settings, embedding_function=DeterministicEmbeddingFunction()
+    )

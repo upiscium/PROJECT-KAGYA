@@ -11,7 +11,9 @@ from kagya.experience import (
 from kagya.identity import OriginActor, OriginInputKind, new_identity_origin
 
 
-def test_chat_experience_separates_observation_interpretation_and_private_content() -> None:
+def test_chat_experience_separates_observation_interpretation_and_private_content() -> (
+    None
+):
     record = _experience(event_id="event-1", episode_id="episode-1")
 
     payload = record.to_json()
@@ -36,9 +38,22 @@ def test_store_deduplicates_source_event_and_observation() -> None:
         _experience(event_id=None, episode_id="episode-1")
     )
 
-    assert duplicate_event == first
+    assert duplicate_event != first
     assert duplicate_observation == first
-    assert len(store.list_records()) == 1
+    assert len(store.list_records()) == 2
+
+
+def test_store_allows_same_event_observation_semantics_in_another_context() -> None:
+    store = ExperienceStore()
+    first = store.integrate(_experience(event_id="event-1", episode_id="episode-1"))
+    other = store.integrate(
+        _experience(
+            event_id="event-1", episode_id="episode-1", context_id="context-other"
+        )
+    )
+
+    assert other.experience_id != first.experience_id
+    assert len(store.list_records()) == 2
 
 
 def test_context_and_appraisal_change_subjective_meaning_and_salience() -> None:
@@ -111,7 +126,9 @@ def test_store_round_trip_preserves_indexes_and_rejects_unknown_version() -> Non
     restored = ExperienceStore()
     restored.restore(payload)
 
-    duplicate = restored.integrate(_experience(event_id="event-1", episode_id="other"))
+    duplicate = restored.integrate(
+        _experience(event_id="event-1", episode_id="episode-1")
+    )
 
     assert duplicate == original
     assert restored.to_json() == payload
@@ -127,6 +144,7 @@ def _experience(
     arousal: float = 0.3,
     social_relevance: float = 0.2,
     interlocutor_ids: tuple[str, ...] = (),
+    context_id: str = "context-one",
 ):
     return build_chat_experience(
         source_event_id=event_id,
@@ -138,7 +156,7 @@ def _experience(
             source_ref="context:one",
             event_id=event_id,
         ),
-        context_id="context-one",
+        context_id=context_id,
         interlocutor_ids=interlocutor_ids,
         appraisal=AppraisalResult(
             novelty=novelty,

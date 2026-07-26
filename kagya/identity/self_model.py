@@ -476,7 +476,10 @@ class SelfModel:
         commitment_refs: Iterable[str],
         autobiographical_summary_refs: Iterable[str] | None = None,
         value_revision_refs: dict[str, int] | None = None,
-    ) -> None:
+        evidence_refs: tuple[str, ...] = (),
+        event_id: str | None = None,
+        event_sequence: int | None = None,
+    ) -> SelfModelState:
         commitments = tuple(sorted(set(commitment_refs)))
         autobiography = (
             self.state.autobiographical_summary_refs
@@ -493,14 +496,25 @@ class SelfModel:
             and autobiography == self.state.autobiographical_summary_refs
             and values == self.state.value_revision_refs
         ):
-            return
+            return self.state
+        before = self._snapshot()
         self.state = replace(
             self.state,
             commitment_refs=commitments,
             autobiographical_summary_refs=autobiography,
             value_revision_refs=values,
+            revision=self.state.revision + 1,
             updated_at=_now(),
         )
+        self._record(
+            "sync_references",
+            "authoritative_reference_synchronization",
+            evidence_refs,
+            before,
+            event_id,
+            event_sequence,
+        )
+        return self.state
 
     def select_relevant(self, candidate: ActionCandidate) -> SelfModelSelection:
         capability_ids = _string_tuple(candidate.parameters.get("capability_ids"))

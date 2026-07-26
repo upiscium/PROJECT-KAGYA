@@ -200,6 +200,8 @@ class MemorySettings(StrictBaseModel):
     db2_top_k: int = Field(gt=0)
     embedding_model_id: str = Field(min_length=1)
     default_record_type: str = Field(min_length=1)
+    consolidation_min_arousal: float = Field(default=0.55, gt=0.0, le=1.0)
+    consolidation_min_subjective_salience: float = Field(default=0.55, gt=0.0, le=1.0)
 
 
 class SleepSettings(StrictBaseModel):

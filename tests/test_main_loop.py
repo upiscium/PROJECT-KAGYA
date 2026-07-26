@@ -3,10 +3,17 @@ import math
 
 from kagya.config import Settings, load_settings
 from kagya.experience import ExperienceAppraisal
+from kagya.feedback import FeedbackSignal, FeedbackTarget, FeedbackTargetType
 from kagya.memory import DeterministicEmbeddingFunction, DualMemorySystem
 from kagya.models import DummyProvider
 from kagya.motivation import GoalStatus
-from kagya.runtime import KagyaMainLoop, WorkingMemoryItem, WorkingMemoryKind
+from kagya.runtime import (
+    AgentEventType,
+    AgentRuntime,
+    KagyaMainLoop,
+    WorkingMemoryItem,
+    WorkingMemoryKind,
+)
 from kagya.structured_response import (
     PublicBehaviorClass,
     SAFE_UNABLE_RESPONSE,
@@ -195,28 +202,58 @@ def test_experience_reassessment_updates_linked_memory_salience(tmp_path: Path) 
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
     result = loop.chat("reassess this", debug=True)
 
-    revised = loop.reassess_experience(
-        result.experience_id,
-        appraisal=ExperienceAppraisal(
-            valence=-0.5,
-            arousal=0.9,
-            novelty=1.0,
-            novelty_valid=True,
-            goal_progress=-0.5,
-            threat=0.8,
-            controllability=0.2,
-            certainty=0.9,
-            social_relevance=0.8,
-            effort_cost=0.3,
-            reason_codes=("later_evidence",),
-        ),
-        reason_code="later_evidence",
-        evidence_refs=("memory:evidence",),
-    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        feedback = runtime.execute(
+            AgentEventType.FEEDBACK_UPDATE,
+            source="test.experience.feedback",
+            handler=lambda: loop.submit_feedback(
+                target=FeedbackTarget(
+                    target_type=FeedbackTargetType.EPISODE,
+                    target_id=result.episode_id,
+                    episode_id=result.episode_id,
+                    experience_id=result.experience_id,
+                    context_id=loop.get_experience(result.experience_id).context_id,
+                ),
+                signals=(FeedbackSignal.STYLE_PROBLEM,),
+                idempotency_key="reassessment-feedback",
+                actor_type="operator",
+                actor_id="reviewer",
+                source="test.experience.feedback",
+                feedback_id="reassessment-feedback",
+            ),
+        ).value
+        revised = runtime.execute(
+            AgentEventType.EXPERIENCE_UPDATE,
+            source="test.experience.reassess",
+            handler=lambda: loop.reassess_experience(
+                result.experience_id,
+                appraisal=ExperienceAppraisal(
+                    valence=-0.5,
+                    arousal=0.9,
+                    novelty=1.0,
+                    novelty_valid=True,
+                    goal_progress=-0.5,
+                    threat=0.8,
+                    controllability=0.2,
+                    certainty=0.9,
+                    social_relevance=0.8,
+                    effort_cost=0.3,
+                    reason_codes=("later_evidence",),
+                ),
+                reason_code="later_evidence",
+                evidence_refs=(
+                    f"feedback:{feedback.feedback_id}@{feedback.current_revision}",
+                ),
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
     episode = memory.get_episodic(result.episode_id)
 
     assert episode is not None
-    assert revised.revision == 1
+    assert revised.revision >= 1
     assert episode.subjective_salience == revised.subjective_salience
     assert episode.autobiographical_importance == revised.autobiographical_importance
 

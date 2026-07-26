@@ -32,7 +32,7 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 | State transition WAL | Deterministically reconstruct retained authoritative snapshots | `.kagya/private/agent_state_wal.jsonl` | Fsynced schema-v1 state replacement patches | `tests/test_state_wal.py` |
 | Working memory | Select a finite, attention-ranked current view | `working_memory` snapshot | Runtime admission and retention rules | `tests/test_working_memory.py` |
 | Context/interlocutor | Identify situation, channel, participants, and source compatibility | `context_state` snapshot | Context lifecycle events and explicit interlocutor metadata | `tests/test_context_model.py` |
-| Experience integration | Bind an event, context, appraisal, subjective salience, and downstream references into one first-person unit | `extensions.experiences` | Structured Observation/interaction events; later reassessment requires evidence refs | `tests/test_experience_store.py` |
+| Experience integration | Bind an event, context, appraisal, subjective salience, and downstream references into one first-person unit | `extensions.experiences` | Verified structured Observation/interaction events; later reassessment requires verified Observation or reviewed Feedback refs | `tests/test_experience_store.py`, `tests/test_experience_runtime.py` |
 | Belief revision | Separate currently adopted propositions from observations and memory records | `extensions.beliefs` | Experience-backed proposals followed by explicit evidence review | `tests/test_belief_store.py` |
 | Emotion/appraisal | Convert calibrated novelty and structured appraisal into valence/arousal | `emotion_state`; calibration under snapshot extensions | Valid loss measurement, explicit appraisal signals, elapsed-time events | `tests/test_appraisal.py`, `tests/test_emotion_engine.py` |
 | Long-term memory | Store episodic/semantic records with provenance, validation, and quarantine | `.kagya/chroma` plus snapshot references | Validated runtime episodes and idempotent sleep attempts | `tests/test_dual_memory_system.py`, `tests/test_memory_quality.py` |
@@ -66,10 +66,11 @@ PROJECT-KAGYA runs as one persistent subject. Conversation contexts identify sit
 
 ## Experience Integration
 
-- A successful chat event creates one idempotent `ExperienceRecord` linked to its source event, external input observation, generated subject action, context, and interlocutor IDs.
+- A successful chat or verified autonomous Action outcome creates one idempotent `ExperienceRecord` through `ExperienceIntegrationCoordinator`. Deduplication uses event/Observation semantics within context, so one event can carry distinct meanings in distinct contexts.
 - Experience state stores opaque observation/action references and structured situation/interpretation codes. It does not copy user text, generated responses, prompts, attachments, or hidden thoughts into the subject snapshot.
 - Subjective salience is derived from calibrated novelty, affect intensity, self relevance, unresolved tension, and prediction error. It controls the linked episode's Working Memory score, contributes to retrieval ranking, and can qualify low-arousal episodes for consolidation.
-- Reassessment requires explicit evidence references and appends an immutable revision record. Updated salience and autobiographical importance are propagated to the linked episodic memory.
+- `POST /api/experiences/{experience_id}/revisions` emits `EXPERIENCE_UPDATE`. Reassessment accepts only verified Observation or reviewed Feedback references, appends immutable field history, and boundedly refreshes linked episodic metadata, Working Memory, Attention, Motivation, Relationship, Narrative, and revisioned SelfModel references.
+- Consolidation uses typed nonzero `memory.consolidation_min_arousal` and `memory.consolidation_min_subjective_salience` thresholds. Experience salience affects real runtime Working Memory selection, Attention competition, retrieval ranking, and retention selection.
 - DecisionRecords freeze their source Experience IDs, while the Experience records the resulting Decision reference. Future Belief, Value, Goal, and Self Model layers use the same result-reference boundary.
 - Experience-backed Belief proposals remain outside normal reasoning until reviewed. Accepted Beliefs link back to Experience and are versioned independently from their source Memory records.
 
