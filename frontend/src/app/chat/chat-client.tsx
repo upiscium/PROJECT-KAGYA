@@ -1,8 +1,8 @@
 "use client";
 
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
-import { api, errorMessage, streamChatJob, type Attachment, type ChatResponse, type FeedbackSignal, type OperationStatus } from "@/lib/api";
+import { useRef, useState } from "react";
+import { ApiError, ChatJobCanceledError, api, errorMessage, streamChatJob, type Attachment, type ChatResponse, type FeedbackSignal, type OperationStatus } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Input, Textarea } from "@/components/ui/input";
@@ -69,11 +69,22 @@ export function ChatClient() {
   const [contextId, setContextId] = useState<string | undefined>();
   const [operation, setOperation] = useState<OperationStatus | null>(null);
   const [streamedText, setStreamedText] = useState("");
+  const [canceled, setCanceled] = useState(false);
+  const [cancelMessage, setCancelMessage] = useState<string | null>(null);
+  const streamController = useRef<AbortController | null>(null);
   const mutation = useMutation({
-    mutationFn: (request: Parameters<typeof api.chat>[0]) => streamChatJob(request, {
-      status: setOperation,
-      token: (text) => setStreamedText((current) => current + text),
-    }),
+    mutationFn: (request: Parameters<typeof api.chat>[0]) => {
+      const controller = new AbortController();
+      streamController.current = controller;
+      return streamChatJob(request, {
+        status: setOperation,
+        token: (text) => setStreamedText((current) => current + text),
+      }, controller.signal);
+    },
+    onMutate: () => {
+      setCanceled(false);
+      setCancelMessage(null);
+    },
     onSuccess: (result, variables) => {
       setHistory((current) => [
         ...current,
@@ -86,10 +97,34 @@ export function ChatClient() {
       setOperation(null);
       setStreamedText("");
     },
+    onError: (error) => {
+      if (error instanceof ChatJobCanceledError) {
+        setCanceled(true);
+        setStreamedText("");
+      }
+    },
+    onSettled: () => {
+      streamController.current = null;
+    },
+  });
+  const cancelMutation = useMutation({
+    mutationFn: (operationId: string) => api.cancelChatJob(operationId),
+    onSuccess: (response) => {
+      setOperation(response.operation);
+      setCanceled(true);
+      setStreamedText("");
+      streamController.current?.abort();
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.detail === "already_finalizing") {
+        setCancelMessage("The response is already being committed and can no longer be canceled.");
+      }
+    },
   });
 
   const latest = [...history].reverse().find((turn) => turn.result)?.result;
   const canAddAttachment = attachmentUrl.trim().length > 0;
+  const canCancel = operation?.status === "queued" || operation?.status === "running";
 
   function addAttachment() {
     if (!canAddAttachment) return;
@@ -140,9 +175,10 @@ export function ChatClient() {
             <strong>KAGYA</strong>
             <p className="generating-indicator"><span className="spinner" aria-hidden="true" />{operation?.status === "queued" ? `Queued${operation.queue_position ? ` (${operation.queue_position})` : ""}` : operation?.status === "finalizing" ? "Finalizing response..." : "Generating response..."}</p>
             {streamedText ? <p>{streamedText}</p> : null}
-            {operation ? <Button type="button" onClick={() => api.cancelChatJob(operation.operation_id)}>Cancel</Button> : null}
+            {canCancel && operation ? <Button type="button" disabled={cancelMutation.isPending} onClick={() => cancelMutation.mutate(operation.operation_id)}>Cancel</Button> : null}
           </div>
         ) : null}
+        {canceled ? <p className="muted" role="status">Canceled</p> : null}
       </Card>
 
       <form
@@ -176,7 +212,9 @@ export function ChatClient() {
         <Button disabled={mutation.isPending || !message.trim()} type="submit">{mutation.isPending ? "Sending" : "Send"}</Button>
       </form>
 
-      {mutation.error ? <p className="error">{errorMessage(mutation.error)}</p> : null}
+      {cancelMessage ? <p className="error">{cancelMessage}</p> : null}
+      {cancelMutation.error && !cancelMessage ? <p className="error">{errorMessage(cancelMutation.error)}</p> : null}
+      {mutation.error && !canceled ? <p className="error">{errorMessage(mutation.error)}</p> : null}
     </div>
   );
 }

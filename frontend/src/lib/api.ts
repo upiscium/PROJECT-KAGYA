@@ -30,7 +30,7 @@ export type OperationStatus = {
   finalizing_at: string | null;
   completed_at: string | null;
   updated_at: string;
-  error_code: "internal_error" | "interrupted" | "timeout" | "provider_error" | null;
+  error_code: "internal_error" | "interrupted" | "timeout" | "provider_error" | "commit_indeterminate" | "committed_result_unavailable" | null;
   cancel_code: "client_request" | "timeout" | "shutdown" | null;
   cancel_requested: boolean;
   result_available: boolean;
@@ -531,6 +531,20 @@ export class ApiError extends Error {
   }
 }
 
+export class ChatJobCanceledError extends Error {
+  constructor(readonly code: string) {
+    super("Chat was canceled.");
+    this.name = "ChatJobCanceledError";
+  }
+}
+
+export class ChatJobFailedError extends Error {
+  constructor(readonly code: string) {
+    super(`Chat failed: ${code.replaceAll("_", " ")}.`);
+    this.name = "ChatJobFailedError";
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return requestUrl<T>(`${API_PROXY_BASE_URL}${path.replace(/^\/api/, "")}`, init);
 }
@@ -628,13 +642,19 @@ export async function streamChatJob(
           if (!fields.data) continue;
           const data = JSON.parse(fields.data) as Record<string, unknown>;
           if (fields.event === "status") callbacks.status(data as OperationStatus);
-          if (fields.event === "token" && typeof data.text === "string") callbacks.token(data.text);
-          if (fields.event === "final") return data as ChatResponse;
+           if (fields.event === "token" && typeof data.text === "string") callbacks.token(data.text);
+           if (fields.event === "final") return data as ChatResponse;
+           if (fields.event === "canceled") {
+             throw new ChatJobCanceledError(typeof data.code === "string" ? data.code : "client_request");
+           }
+           if (fields.event === "error") {
+             throw new ChatJobFailedError(typeof data.code === "string" ? data.code : "internal_error");
+           }
         }
         if (done) break;
       }
     } catch (error) {
-      if (signal?.aborted) throw error;
+      if (signal?.aborted || error instanceof ChatJobCanceledError || error instanceof ChatJobFailedError) throw error;
     }
   }
   const final = await request<ChatJobResult>(accepted.result_url);

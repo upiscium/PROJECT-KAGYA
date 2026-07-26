@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import hmac
 import json
 import os
@@ -37,7 +38,7 @@ from kagya.runtime import (
 class ChatJobRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     status: OperationStatus
     enqueue_sequence: int = Field(ge=1)
     client_id: str = Field(min_length=1, max_length=128)
@@ -47,6 +48,9 @@ class ChatJobRecord(BaseModel):
     pending_result: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     last_stream_sequence: int = Field(default=0, ge=0)
+    requested_cancel_code: OperationCancelCode | None = None
+    cancel_requested_at: datetime | None = None
+    timeout_deadline: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -231,12 +235,16 @@ class ChatJobRegistry:
             if token is not None:
                 token.cancel(code.value)
             if record.status.status == OperationState.QUEUED:
+                record.requested_cancel_code = code
+                record.cancel_requested_at = operation_now()
                 self._transition(
                     operation_id, OperationState.CANCELED, cancel_code=code
                 )
                 self._refresh_queue_positions()
                 self._emit(operation_id, "canceled", {"code": code.value})
                 return "canceled"
+            record.requested_cancel_code = code
+            record.cancel_requested_at = operation_now()
             self._transition(
                 operation_id,
                 record.status.status,
@@ -338,7 +346,11 @@ class ChatJobRegistry:
                         disposition == "uncommitted" and record.status.cancel_requested
                     )
                     if canceled:
-                        code = record.status.cancel_code or OperationCancelCode.SHUTDOWN
+                        code = (
+                            record.requested_cancel_code
+                            or record.status.cancel_code
+                            or OperationCancelCode.SHUTDOWN
+                        )
                         self._transition(
                             operation_id, OperationState.CANCELED, cancel_code=code
                         )
@@ -420,12 +432,31 @@ class ChatJobRegistry:
         self._tokens[operation_id] = token
         timer: Timer | None = None
         if self.timeout_seconds > 0:
-            timer = Timer(
-                self.timeout_seconds,
-                lambda: self.cancel(operation_id, OperationCancelCode.TIMEOUT),
+            if record.timeout_deadline is None:
+                record.timeout_deadline = operation_now() + timedelta(
+                    seconds=self.timeout_seconds
+                )
+                self._persist()
+            remaining = max(
+                0.0, (record.timeout_deadline - operation_now()).total_seconds()
             )
-            timer.daemon = True
-            self._timers[operation_id] = timer
+            if remaining == 0:
+                record.requested_cancel_code = OperationCancelCode.TIMEOUT
+                record.cancel_requested_at = operation_now()
+                self._transition(
+                    operation_id,
+                    OperationState.QUEUED,
+                    cancel_requested=True,
+                    queue_position=record.status.queue_position,
+                )
+                token.cancel(OperationCancelCode.TIMEOUT.value)
+            else:
+                timer = Timer(
+                    remaining,
+                    lambda: self.cancel(operation_id, OperationCancelCode.TIMEOUT),
+                )
+                timer.daemon = True
+                self._timers[operation_id] = timer
 
         def run() -> dict[str, Any]:
             with self._lock:
@@ -481,11 +512,22 @@ class ChatJobRegistry:
             outcome = future.result()
         except OperationCanceled as exc:
             self._errors[operation_id] = exc
-            cancel_code = (
-                OperationCancelCode.TIMEOUT
-                if exc.code == OperationCancelCode.TIMEOUT.value
-                else OperationCancelCode.CLIENT_REQUEST
-            )
+            try:
+                cancel_code = OperationCancelCode(exc.code)
+            except ValueError:
+                with self._lock:
+                    self._records[operation_id].pending_result = None
+                    self._transition(
+                        operation_id,
+                        OperationState.FAILED,
+                        error_code=OperationErrorCode.INTERNAL_ERROR,
+                    )
+                    self._emit(
+                        operation_id,
+                        "error",
+                        {"code": OperationErrorCode.INTERNAL_ERROR.value},
+                    )
+                return
             with self._lock:
                 if self._records[operation_id].status.status != OperationState.CANCELED:
                     self._records[operation_id].pending_result = None
@@ -558,7 +600,11 @@ class ChatJobRegistry:
                 )
             if record.status.cancel_requested or token.is_canceled:
                 token.raise_if_canceled()
-                raise OperationCanceled(OperationCancelCode.CLIENT_REQUEST.value)
+                raise OperationCanceled(
+                    (
+                        record.requested_cancel_code or OperationCancelCode.SHUTDOWN
+                    ).value
+                )
             self._transition(operation_id, OperationState.FINALIZING)
 
     def _transition(
@@ -654,6 +700,14 @@ class ChatJobRegistry:
         if not self.path.exists():
             return
         values = json.loads(self.path.read_text(encoding="utf-8"))
+        for value in values:
+            if value.get("schema_version", 1) == 1:
+                value.update(
+                    schema_version=2,
+                    requested_cancel_code=None,
+                    cancel_requested_at=None,
+                    timeout_deadline=None,
+                )
         records = [ChatJobRecord.model_validate(value) for value in values]
         self._records = {record.status.operation_id: record for record in records}
         self._enqueue_sequence = max(

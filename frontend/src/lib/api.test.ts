@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { api, streamChatJob } from "./api";
+import { ChatJobCanceledError, ChatJobFailedError, api, streamChatJob } from "./api";
 
 const fetchMock = vi.fn();
 
@@ -139,5 +139,30 @@ describe("api client", () => {
 
     await expect(streamChatJob({ text: "hello" }, { status: vi.fn(), token: vi.fn() })).resolves.toEqual(result);
     expect(fetchMock.mock.calls[2][1].headers).toEqual({ "Last-Event-ID": "1" });
+  });
+
+  it.each([
+    ["canceled", "timeout", ChatJobCanceledError],
+    ["error", "provider_error", ChatJobFailedError],
+  ])("treats %s SSE as terminal without reconnect or result fetch", async (event, code, errorType) => {
+    const operation = {
+      schema_version: 1 as const, operation_id: "operation-1", event_id: "event-1", status: "running" as const,
+      status_sequence: 2, queue_position: null, submitted_at: "2026-01-01T00:00:00Z", started_at: "2026-01-01T00:00:01Z",
+      finalizing_at: null, completed_at: null, updated_at: "2026-01-01T00:00:01Z", error_code: null, cancel_code: null,
+      cancel_requested: false, result_available: false,
+    };
+    const encoder = new TextEncoder();
+    const terminal = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(`id: 1\nevent: ${event}\ndata: ${JSON.stringify({ code })}\n\n`));
+        controller.close();
+      },
+    });
+    fetchMock
+      .mockReturnValueOnce(jsonResponse({ operation, status_url: "/api/chat/jobs/operation-1", result_url: "/api/chat/jobs/operation-1/result", events_url: "/api/chat/jobs/operation-1/events", duplicate: false }))
+      .mockResolvedValueOnce({ ok: true, body: terminal });
+
+    await expect(streamChatJob({ text: "hello" }, { status: vi.fn(), token: vi.fn() })).rejects.toBeInstanceOf(errorType);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

@@ -2,6 +2,7 @@ import re
 from pathlib import Path
 
 from kagya.api.server import create_app
+from kagya.operation_status import OperationErrorCode
 
 
 FRONTEND_API_PATH = Path(__file__).resolve().parents[1] / "frontend" / "src" / "lib" / "api.ts"
@@ -68,6 +69,16 @@ def test_frontend_api_client_exposes_backend_routes() -> None:
     missing = [snippet for snippet in expected_route_snippets if snippet not in frontend_api]
 
     assert missing == []
+
+
+def test_frontend_operation_error_codes_match_backend_enum() -> None:
+    frontend_api = FRONTEND_API_PATH.read_text(encoding="utf-8")
+    operation = _frontend_type_body(frontend_api, "OperationStatus")
+    declaration = re.search(r"error_code:\s*([^;]+);", operation)
+
+    assert declaration is not None
+    frontend_codes = set(re.findall(r'"([a-z_]+)"', declaration.group(1)))
+    assert frontend_codes == {code.value for code in OperationErrorCode}
 
 
 def _frontend_type_body(source: str, type_name: str) -> str:

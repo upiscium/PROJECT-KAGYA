@@ -98,6 +98,9 @@ def test_queued_cancel_never_calls_chat_handler(tmp_path: Path) -> None:
     runtime.shutdown()
 
     assert terminal.status.status == OperationState.CANCELED
+    assert terminal.status.cancel_code == OperationCancelCode.CLIENT_REQUEST
+    assert terminal.requested_cancel_code == OperationCancelCode.CLIENT_REQUEST
+    assert terminal.cancel_requested_at is not None
     assert terminal.result is None
     assert not called.is_set()
 
@@ -209,6 +212,84 @@ def test_cancel_is_rejected_when_paused_after_finalizing(tmp_path: Path) -> None
 
     assert terminal.status.status == OperationState.COMPLETED
     assert terminal.result == {"response": "committed"}
+
+
+def test_timeout_deadline_survives_restart_without_extension(tmp_path: Path) -> None:
+    source_path = tmp_path / "source" / "jobs.json"
+    replay_path = tmp_path / "replay" / "jobs.json"
+    source_runtime = AgentRuntime(queue_capacity=2)
+    source_runtime.start()
+    release = Event()
+    source_runtime.submit(
+        AgentEventType.STATE_SNAPSHOT,
+        source="test.blocker",
+        handler=lambda: release.wait(2),
+    )
+    source_registry = ChatJobRegistry(
+        source_path, source_runtime, _result, timeout_seconds=0.25
+    )
+    job, _ = source_registry.enqueue(
+        {"text": "timeout"},
+        client_id="client",
+        idempotency_key="timeout-restart",
+        correlation_id="context",
+    )
+    original = source_registry.get(job.status.operation_id)
+    assert original is not None and original.timeout_deadline is not None
+    time.sleep(0.15)
+    replay_path.parent.mkdir(parents=True)
+    shutil.copy2(source_path, replay_path)
+    shutil.copy2(
+        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
+    )
+
+    def wait_for_timeout(payload: dict[str, object]) -> dict[str, object]:
+        time.sleep(0.2)
+        cancellation_checkpoint()
+        return _result(payload)
+
+    replay_runtime = AgentRuntime(queue_capacity=2)
+    replay_registry = ChatJobRegistry(
+        replay_path, replay_runtime, wait_for_timeout, timeout_seconds=10.0
+    )
+    started = time.monotonic()
+    replay_runtime.start()
+    replay_registry.activate()
+    terminal = _wait(replay_registry, job.status.operation_id)
+    elapsed = time.monotonic() - started
+    replay_runtime.shutdown()
+    source_registry.cancel(job.status.operation_id, OperationCancelCode.SHUTDOWN)
+    release.set()
+    source_runtime.shutdown()
+
+    assert terminal.status.status == OperationState.CANCELED
+    assert terminal.status.cancel_code == OperationCancelCode.TIMEOUT
+    assert terminal.requested_cancel_code == OperationCancelCode.TIMEOUT
+    assert terminal.timeout_deadline == original.timeout_deadline
+    assert elapsed < 1.0
+
+
+def test_unknown_provider_cancel_code_fails_closed(tmp_path: Path) -> None:
+    from kagya.runtime import OperationCanceled
+
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(
+        tmp_path / "jobs.json",
+        runtime,
+        lambda _payload: (_ for _ in ()).throw(OperationCanceled("unknown-code")),
+    )
+    job, _ = registry.enqueue(
+        {"text": "failure"},
+        client_id="client",
+        idempotency_key="unknown-cancel",
+        correlation_id="context",
+    )
+    terminal = _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+
+    assert terminal.status.status == OperationState.FAILED
+    assert terminal.status.error_code == "internal_error"
 
 
 def test_queue_order_matches_runtime_processing_sequence(tmp_path: Path) -> None:
@@ -585,18 +666,20 @@ def test_completion_journal_failure_preserves_indeterminate_pending_result(
 
 
 @pytest.mark.parametrize(
-    ("disposition", "cancel_requested", "expected"),
+    ("disposition", "cancel_requested", "requested_code", "expected"),
     [
-        ("uncommitted", False, OperationState.FAILED),
-        ("uncommitted", True, OperationState.CANCELED),
-        ("failed", False, OperationState.FAILED),
-        ("canceled", False, OperationState.CANCELED),
+        ("uncommitted", False, None, OperationState.FAILED),
+        ("uncommitted", True, "client_request", OperationState.CANCELED),
+        ("uncommitted", True, "shutdown", OperationState.CANCELED),
+        ("failed", False, None, OperationState.FAILED),
+        ("canceled", False, None, OperationState.CANCELED),
     ],
 )
 def test_fresh_registry_reconciles_uncommitted_and_terminal_journal_outcomes(
     tmp_path: Path,
     disposition: str,
     cancel_requested: bool,
+    requested_code: str | None,
     expected: OperationState,
 ) -> None:
     path = tmp_path / "jobs.json"
@@ -620,6 +703,8 @@ def test_fresh_registry_reconciles_uncommitted_and_terminal_journal_outcomes(
         error_code="commit_indeterminate",
         cancel_requested=cancel_requested,
     )
+    if requested_code is not None:
+        values[0]["requested_cancel_code"] = requested_code
     path.write_text(json.dumps(values))
 
     restarted_runtime = AgentRuntime(queue_capacity=2)
@@ -637,6 +722,43 @@ def test_fresh_registry_reconciles_uncommitted_and_terminal_journal_outcomes(
     assert recovered.status.status == expected
     assert recovered.pending_result is None
     assert recovered.result is None
+    if requested_code is not None:
+        assert recovered.status.cancel_code == OperationCancelCode(requested_code)
+
+
+def test_v1_record_migrates_without_inventing_cancel_authority(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.json"
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    registry = ChatJobRegistry(path, runtime, _result)
+    job, _ = registry.enqueue(
+        {"text": "legacy"},
+        client_id="client",
+        idempotency_key="legacy-v1",
+        correlation_id="context",
+    )
+    _wait(registry, job.status.operation_id)
+    runtime.shutdown()
+    values = json.loads(path.read_text())
+    values[0]["schema_version"] = 1
+    for field in (
+        "requested_cancel_code",
+        "cancel_requested_at",
+        "timeout_deadline",
+    ):
+        values[0].pop(field, None)
+    path.write_text(json.dumps(values))
+
+    restarted_runtime = AgentRuntime(queue_capacity=2)
+    restarted_runtime.start()
+    restarted = ChatJobRegistry(path, restarted_runtime, _result)
+    migrated = restarted.get(job.status.operation_id)
+    restarted_runtime.shutdown()
+
+    assert migrated is not None
+    assert migrated.schema_version == 2
+    assert migrated.requested_cancel_code is None
+    assert migrated.cancel_requested_at is None
 
 
 def test_fresh_registry_fails_closed_on_ambiguous_commit(tmp_path: Path) -> None:

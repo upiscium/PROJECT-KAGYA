@@ -43,13 +43,16 @@ async function proxy(request: NextRequest, context: RouteContext) {
     return NextResponse.json({ detail: `Backend API is not reachable at ${BACKEND_URL}` }, { status: 502 });
   }
 
+  const headers = new Headers({
+    "Content-Type": response.headers.get("Content-Type") ?? "application/json",
+    "Cache-Control": response.headers.get("Cache-Control") ?? "no-cache",
+  });
+  const buffering = response.headers.get("X-Accel-Buffering");
+  if (buffering) headers.set("X-Accel-Buffering", buffering);
   return new NextResponse(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: {
-      "Content-Type": response.headers.get("Content-Type") ?? "application/json",
-      "Cache-Control": response.headers.get("Cache-Control") ?? "no-cache",
-    },
+    headers,
   });
 }
 
