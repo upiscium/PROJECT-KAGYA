@@ -44,6 +44,7 @@ def chat(
     _runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatResponse:
     registry = get_chat_job_registry(http_request)
+    _require_ready_registry(registry)
     context_id = request.context_id or f"ctx-{uuid4()}"
     payload = request.model_dump(mode="json")
     payload["_context_id"] = context_id
@@ -95,6 +96,7 @@ def create_chat_job(
     _runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatJobAccepted:
     registry = get_chat_job_registry(http_request)
+    _require_ready_registry(registry)
     context_id = request.context_id or f"ctx-{uuid4()}"
     payload = request.model_dump(mode="json")
     payload["_context_id"] = context_id
@@ -316,6 +318,7 @@ def get_chat_job_registry(request: Request) -> ChatJobRegistry:
         if registry is None:
             registry = create_chat_job_registry(request.app)
             request.app.state.chat_job_registry = registry
+            registry.activate()
     return registry
 
 
@@ -324,6 +327,11 @@ def _required_job(registry: ChatJobRegistry, operation_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Chat job not found")
     return record
+
+
+def _require_ready_registry(registry: ChatJobRegistry) -> None:
+    if not registry.is_ready:
+        raise HTTPException(status_code=503, detail="Chat job registry is not ready")
 
 
 def _wait_for_terminal(registry: ChatJobRegistry, operation_id: str):

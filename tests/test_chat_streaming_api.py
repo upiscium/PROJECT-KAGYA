@@ -1,12 +1,18 @@
 from pathlib import Path
 import json
 import re
+import shutil
 from threading import Event
 import time
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
-from kagya.operation_status import OperationState
+from kagya.chat_jobs import ChatJobRecord
+from kagya.api.server import _activate_subject_runtime
+from kagya.operation_status import OperationState, OperationStatus, operation_now
+from kagya.runtime import AgentEvent, AgentEventType
 from tests.test_fastapi_backend import ThinkingProvider, _client, _settings
 
 
@@ -22,6 +28,24 @@ class BlockingThinkingProvider(ThinkingProvider):
         if cancellation_token is not None:
             cancellation_token.raise_if_canceled()
         yield self.response_text
+
+
+def test_subject_runtime_replays_chat_before_background_producers() -> None:
+    order: list[str] = []
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            agent_runtime=SimpleNamespace(start=lambda: order.append("runtime")),
+            chat_job_registry=SimpleNamespace(
+                activate=lambda: order.append("chat-replay")
+            ),
+            autonomy_loop=SimpleNamespace(start=lambda: order.append("autonomy")),
+            emotion_timer=SimpleNamespace(start=lambda: order.append("emotion")),
+        )
+    )
+
+    _activate_subject_runtime(app)
+
+    assert order == ["runtime", "chat-replay", "autonomy", "emotion"]
 
 
 def _completed(client, operation_id: str) -> dict[str, object]:
@@ -77,6 +101,99 @@ def test_chat_job_status_result_idempotency_and_sse_reconnect(tmp_path: Path) ->
     ]
     assert reconnect_ids == [event_ids[-1]]
     assert reconnect.text.count("event: final") == 1
+
+
+def test_lifespan_replays_accepted_not_started_chat_job(tmp_path: Path) -> None:
+    source_path = tmp_path / "source"
+    restarted_path = tmp_path / "restarted"
+    source_settings = _settings(source_path)
+    restarted_settings = _settings(restarted_path)
+    with _client(restarted_path, settings=restarted_settings) as baseline:
+        baseline.app.state.agent_state_store.save(
+            baseline.app.state.agent_state_store.last_snapshot
+        )
+    with _client(source_path, settings=source_settings) as source:
+        registry = source.app.state.chat_job_registry
+        operation_id = str(uuid4())
+        event_id = str(uuid4())
+        now = operation_now()
+        payload = {
+            "text": "replayed",
+            "attachments": [],
+            "context_id": None,
+            "client_session_id": None,
+            "interlocutor_key": None,
+            "_context_id": "restart-context",
+            "_create_context": True,
+        }
+        record = ChatJobRecord(
+            status=OperationStatus(
+                operation_id=operation_id,
+                event_id=event_id,
+                status=OperationState.QUEUED,
+                status_sequence=1,
+                queue_position=1,
+                submitted_at=now,
+                updated_at=now,
+            ),
+            enqueue_sequence=1,
+            client_id="restart-client",
+            idempotency_key="accepted-not-started",
+            correlation_id="restart-context",
+            sealed_request=registry._seal(payload),
+        )
+        with registry._lock:
+            registry._records[operation_id] = record
+            registry._enqueue_sequence = 1
+            registry._persist()
+        source.app.state.event_journal.accepted(
+            AgentEvent(
+                event_id=event_id,
+                event_type=AgentEventType.CHAT,
+                source="api.chat.job",
+                observed_at=now,
+                requested_at=now,
+                payload={"operation_id": operation_id},
+                correlation_id="restart-context",
+            )
+        )
+        source_registry = source_settings.agent_state.path.parent / "chat_jobs.json"
+        restarted_registry = (
+            restarted_settings.agent_state.path.parent / "chat_jobs.json"
+        )
+        shutil.copy2(source_registry, restarted_registry)
+        shutil.copy2(
+            source_registry.with_suffix(".json.key"),
+            restarted_registry.with_suffix(".json.key"),
+        )
+        shutil.copy2(
+            source_settings.agent_journal.path,
+            restarted_settings.agent_journal.path,
+        )
+
+    with _client(restarted_path, settings=restarted_settings) as restarted:
+        operation = _completed(restarted, operation_id)
+        result = restarted.get(f"/api/chat/jobs/{operation_id}/result")
+        readiness = restarted.get("/health/ready")
+
+    assert operation["status"] == "completed"
+    assert operation["event_id"] == event_id
+    assert result.status_code == 200
+    assert result.json()["result"]["response"] == "Visible API answer."
+    assert readiness.status_code == 200, readiness.json()
+
+
+def test_not_ready_registry_rejects_new_chat_jobs(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        client.app.state.chat_job_registry._recovery_ambiguous = True
+        response = client.post(
+            "/api/chat/jobs",
+            json={"text": "must not enqueue", "attachments": []},
+            headers={"Idempotency-Key": "not-ready"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Chat job registry is not ready"
 
 
 def test_private_and_think_sentinels_never_reach_job_surfaces_or_store(

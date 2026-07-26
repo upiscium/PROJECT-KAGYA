@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 from threading import Condition, RLock, Timer
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,7 +37,7 @@ from kagya.runtime import (
 class ChatJobRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    schema_version: Literal[1] = 1
     status: OperationStatus
     enqueue_sequence: int = Field(ge=1)
     client_id: str = Field(min_length=1, max_length=128)
@@ -96,6 +96,9 @@ class ChatJobRegistry:
         self._event_sequences: dict[str, int] = {}
         self._errors: dict[str, BaseException] = {}
         self._enqueue_sequence = 0
+        self._activated = False
+        self._replay_complete = False
+        self._queued_for_replay: list[str] = []
         self._key = self._load_key()
         self._load()
         self._missing_required_event_ids = self.required_event_ids - {
@@ -103,7 +106,25 @@ class ChatJobRegistry:
         }
         self._recovery_ambiguous = False
         with self._lock:
-            self._recover()
+            self._recover_without_submission()
+
+    def activate(self) -> None:
+        """Replay durable queued jobs after the AgentRuntime starts accepting work."""
+
+        with self._lock:
+            if self._replay_complete:
+                return
+            if self._activated:
+                return
+            self._activated = True
+        try:
+            self._replay_queued_jobs()
+        except Exception:
+            with self._lock:
+                self._activated = False
+            raise
+        with self._lock:
+            self._replay_complete = True
 
     def enqueue(
         self,
@@ -174,7 +195,12 @@ class ChatJobRegistry:
 
     @property
     def is_ready(self) -> bool:
-        return not self._missing_required_event_ids and not self._recovery_ambiguous
+        return (
+            self._activated
+            and self._replay_complete
+            and not self._missing_required_event_ids
+            and not self._recovery_ambiguous
+        )
 
     def shutdown(self) -> None:
         with self._lock:
@@ -238,7 +264,7 @@ class ChatJobRegistry:
             self._changed.wait(timeout)
             return self.events_after(operation_id, last_event_id)
 
-    def _recover(self) -> None:
+    def _recover_without_submission(self) -> None:
         for record in sorted(
             self._records.values(), key=lambda item: item.enqueue_sequence
         ):
@@ -273,7 +299,12 @@ class ChatJobRegistry:
                 None,
                 "queued",
             }:
-                self._submit(record)
+                if self._has_recovery_evidence and disposition is None:
+                    raise ValueError(
+                        "queued chat job has no matching journal recovery evidence"
+                    )
+                self._open(record.sealed_request)
+                self._queued_for_replay.append(operation_id)
             elif reconcile:
                 if disposition == "committed":
                     result = record.pending_result
@@ -368,6 +399,20 @@ class ChatJobRegistry:
                         {"code": cancel_value},
                     )
         self._refresh_queue_positions()
+
+    def _replay_queued_jobs(self) -> None:
+        while True:
+            with self._changed:
+                if not self._queued_for_replay:
+                    return
+                operation_id = self._queued_for_replay[0]
+                record = self._records[operation_id]
+                try:
+                    self._submit(record)
+                except AgentRuntimeQueueFull:
+                    self._changed.wait(0.01)
+                    continue
+                self._queued_for_replay.pop(0)
 
     def _submit(self, record: ChatJobRecord) -> None:
         operation_id = record.status.operation_id
