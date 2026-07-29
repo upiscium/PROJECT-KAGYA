@@ -740,16 +740,21 @@ def _install_files(settings: Settings, files: dict[str, bytes]) -> None:
                 output.flush()
                 os.fsync(output.fileno())
             temporaries[name] = temporary
+        modified_directories: set[Path] = set()
         for name, target in targets.items():
             if name in temporaries:
                 os.replace(temporaries[name], target)
+                modified_directories.add(target.parent)
             elif name.startswith("journal.") or name in {
                 "chat_jobs",
                 "adapter_registry",
                 "adapter_history",
             }:
+                existed = target.exists()
                 target.unlink(missing_ok=True)
-        for directory in {path.parent for path in targets.values()}:
+                if existed:
+                    modified_directories.add(target.parent)
+        for directory in modified_directories:
             descriptor = os.open(directory, os.O_RDONLY)
             try:
                 os.fsync(descriptor)
