@@ -423,8 +423,25 @@ class ApiSettings(StrictBaseModel):
     chat_job_registry_path: Path = Path(".kagya/chat_jobs.json")
     chat_timeout_seconds: float = Field(default=300.0, gt=0)
     chat_stream_replay_limit: int = Field(default=256, gt=0, le=4096)
+    chat_job_result_retention_seconds: float = Field(default=86400.0, ge=0)
+    chat_job_idempotency_retention_seconds: float = Field(
+        default=604800.0, ge=0
+    )
+    chat_job_max_terminal_records: int = Field(default=10000, gt=0)
+    chat_job_cleanup_interval_seconds: float = Field(default=60.0, ge=0)
     cors_origins: list[str]
     admin_auth: "AdminAuthSettings" = Field(default_factory=lambda: AdminAuthSettings())
+
+    @model_validator(mode="after")
+    def validate_chat_job_retention(self) -> "ApiSettings":
+        if (
+            self.chat_job_idempotency_retention_seconds
+            < self.chat_job_result_retention_seconds
+        ):
+            raise ValueError(
+                "chat job idempotency retention must not be shorter than result retention"
+            )
+        return self
 
 
 class AdminAuthSettings(StrictBaseModel):

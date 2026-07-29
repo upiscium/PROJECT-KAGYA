@@ -208,6 +208,10 @@ api:
   chat_job_registry_path: .kagya/chat_jobs.json
   chat_timeout_seconds: 300
   chat_stream_replay_limit: 256
+  chat_job_result_retention_seconds: 86400
+  chat_job_idempotency_retention_seconds: 604800
+  chat_job_max_terminal_records: 10000
+  chat_job_cleanup_interval_seconds: 60
   # Optional identity/role sessions are disabled for the private token-only default.
   admin_auth:
     enabled: false

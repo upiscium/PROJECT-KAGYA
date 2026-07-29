@@ -13,7 +13,8 @@ import json
 import os
 from pathlib import Path
 from threading import Condition, Event, RLock, Thread, Timer
-from typing import Any, Callable, Literal
+import time
+from typing import Any, Callable, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,6 +62,23 @@ class ChatJobRecord(BaseModel):
     ] = "none"
 
 
+class ChatJobIdempotencyTombstone(BaseModel):
+    """Minimal durable duplicate response after public job data expires."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    record_type: Literal["idempotency_tombstone"] = "idempotency_tombstone"
+    schema_version: Literal[1] = 1
+    status: OperationStatus
+    client_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    expires_at: datetime
+
+
+class ChatJobIdempotencyResultExpired(Exception):
+    """A duplicate key still exists after its public result was removed."""
+
+
 @dataclass(frozen=True)
 class ChatStreamEvent:
     event_id: int
@@ -78,6 +96,14 @@ Executor = Callable[[dict[str, Any]], dict[str, Any]]
 CompletionObserver = Callable[[dict[str, Any]], None]
 ResultReconstructor = Callable[[str], dict[str, Any] | None]
 ReplayCompleteCallback = Callable[[], None]
+
+
+class MetricsSink(Protocol):
+    def counter(self, name: str, amount: float = 1.0, **labels: str) -> None: ...
+
+    def gauge(self, name: str, value: float, **labels: str) -> None: ...
+
+    def observe(self, name: str, value: float, **labels: str) -> None: ...
 
 
 class ReplayState(StrEnum):
@@ -105,7 +131,22 @@ class ChatJobRegistry:
         ] | None = None,
         required_event_ids: set[str] | None = None,
         result_reconstructor: ResultReconstructor | None = None,
+        result_retention_seconds: float = 86400.0,
+        idempotency_retention_seconds: float = 604800.0,
+        max_terminal_records: int = 10000,
+        cleanup_interval_seconds: float = 60.0,
+        metrics: MetricsSink | None = None,
     ) -> None:
+        if result_retention_seconds < 0 or idempotency_retention_seconds < 0:
+            raise ValueError("chat job retention must be non-negative")
+        if idempotency_retention_seconds < result_retention_seconds:
+            raise ValueError(
+                "chat job idempotency retention must not be shorter than result retention"
+            )
+        if max_terminal_records < 1:
+            raise ValueError("chat job max terminal records must be positive")
+        if cleanup_interval_seconds < 0:
+            raise ValueError("chat job cleanup interval must be non-negative")
         self.path = path
         self.runtime = runtime
         self.executor = executor
@@ -123,9 +164,16 @@ class ChatJobRegistry:
         }
         self.required_event_ids = required_event_ids or set()
         self.result_reconstructor = result_reconstructor
+        self.result_retention_seconds = result_retention_seconds
+        self.idempotency_retention_seconds = idempotency_retention_seconds
+        self.max_terminal_records = max_terminal_records
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self.metrics = metrics
+        self._last_cleanup_monotonic: float | None = None
         self._lock = RLock()
         self._changed = Condition(self._lock)
         self._records: dict[str, ChatJobRecord] = {}
+        self._tombstones: dict[str, ChatJobIdempotencyTombstone] = {}
         self._tokens: dict[str, CancellationToken] = {}
         self._timers: dict[str, Timer] = {}
         self._events: dict[str, deque[ChatStreamEvent]] = {}
@@ -140,9 +188,18 @@ class ChatJobRegistry:
         self._projection = ChatProjectionPublisher(self)
         self._key = self._load_key()
         self._load()
-        self._missing_required_event_ids = self.required_event_ids - {
+        with self._lock:
+            self._compact_locked(operation_now())
+            self._last_cleanup_monotonic = time.monotonic()
+        retained_event_ids = {
             record.status.event_id for record in self._records.values()
         }
+        retained_event_ids.update(
+            item.status.event_id for item in self._tombstones.values()
+        )
+        self._missing_required_event_ids = (
+            self.required_event_ids - retained_event_ids
+        )
         self._recovery_ambiguous = False
         with self._lock:
             self._recover_without_submission()
@@ -189,6 +246,7 @@ class ChatJobRegistry:
         client_id = _safe_identity(client_id)
         idempotency_key = _safe_identity(idempotency_key)
         with self._lock:
+            self._maybe_compact_locked()
             duplicate = next(
                 (
                     record
@@ -200,6 +258,17 @@ class ChatJobRegistry:
             )
             if duplicate is not None:
                 return duplicate.model_copy(deep=True), False
+            tombstone = next(
+                (
+                    item
+                    for item in self._tombstones.values()
+                    if item.client_id == client_id
+                    and item.idempotency_key == idempotency_key
+                ),
+                None,
+            )
+            if tombstone is not None:
+                raise ChatJobIdempotencyResultExpired
             operation_id = str(uuid4())
             event_id = str(uuid4())
             now = operation_now()
@@ -235,6 +304,13 @@ class ChatJobRegistry:
                 # Keep the durable spool when journal acceptance may have succeeded.
                 raise
             return record.model_copy(deep=True), True
+
+    def compact(self, now: datetime | None = None) -> None:
+        """Atomically apply age and count retention to safe terminal jobs."""
+
+        with self._lock:
+            self._compact_locked(now or operation_now())
+            self._last_cleanup_monotonic = time.monotonic()
 
     def get(self, operation_id: str) -> ChatJobRecord | None:
         with self._lock:
@@ -316,6 +392,7 @@ class ChatJobRegistry:
                     token.cancel(code.value)
                 self._refresh_queue_positions()
                 self._emit(operation_id, "canceled", {"code": code.value})
+                self._maybe_compact_locked()
                 return "canceled"
             try:
                 record.requested_cancel_code = code
@@ -689,6 +766,7 @@ class ChatJobRegistry:
                 if timer is not None:
                     timer.cancel()
                 self._refresh_queue_positions()
+                self._maybe_compact_locked()
 
     def _complete(self, operation_id: str, result: dict[str, Any]) -> None:
         if self.completion_observer is not None:
@@ -753,6 +831,7 @@ class ChatJobRegistry:
             if record.terminal_projection_state != "published":
                 record.terminal_projection_state = "published"
                 self._persist()
+            self._maybe_compact_locked()
             self._changed.notify_all()
 
     def mark_projection_failed(self, operation_id: str) -> None:
@@ -834,6 +913,12 @@ class ChatJobRegistry:
             ),
         )
         record.status = status
+        if state in {
+            OperationState.COMPLETED,
+            OperationState.FAILED,
+            OperationState.CANCELED,
+        }:
+            record.sealed_request = ""
         self._emit(operation_id, "status", status.model_dump(mode="json"))
 
     def _refresh_queue_positions(self) -> None:
@@ -875,7 +960,12 @@ class ChatJobRegistry:
         if not self.path.exists():
             return
         values = json.loads(self.path.read_text(encoding="utf-8"))
+        full_values = []
+        tombstones = []
         for value in values:
+            if value.get("record_type") == "idempotency_tombstone":
+                tombstones.append(ChatJobIdempotencyTombstone.model_validate(value))
+                continue
             if value.get("schema_version", 1) in {1, 2}:
                 value["schema_version"] = 3
                 value.setdefault("requested_cancel_code", None)
@@ -884,20 +974,36 @@ class ChatJobRegistry:
                 value.setdefault("terminal_projection_start_sequence", None)
                 value.setdefault("terminal_projection_event_count", 0)
                 value.setdefault("terminal_projection_state", "none")
-        records = [ChatJobRecord.model_validate(value) for value in values]
+            full_values.append(value)
+        records = [ChatJobRecord.model_validate(value) for value in full_values]
         self._records = {record.status.operation_id: record for record in records}
+        self._tombstones = {
+            item.status.operation_id: item for item in tombstones
+        }
         self._enqueue_sequence = max(
             (record.enqueue_sequence for record in records), default=0
         )
 
-    def _persist(self) -> None:
+    def _persist(
+        self,
+        records: Mapping[str, ChatJobRecord] | None = None,
+        tombstones: Mapping[str, ChatJobIdempotencyTombstone] | None = None,
+    ) -> None:
+        records = self._records if records is None else records
+        tombstones = self._tombstones if tombstones is None else tombstones
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         payload = json.dumps(
             [
                 record.model_dump(mode="json")
                 for record in sorted(
-                    self._records.values(), key=lambda item: item.enqueue_sequence
+                    records.values(), key=lambda item: item.enqueue_sequence
+                )
+            ]
+            + [
+                item.model_dump(mode="json")
+                for item in sorted(
+                    tombstones.values(), key=lambda value: value.status.submitted_at
                 )
             ],
             separators=(",", ":"),
@@ -912,6 +1018,163 @@ class ChatJobRegistry:
             _fsync_directory(self.path.parent)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _compact_locked(self, now: datetime) -> None:
+        started = time.perf_counter()
+        ambiguous_event_ids = {
+            event_id
+            for event_id, disposition in self.recovery_dispositions.items()
+            if disposition.state == "ambiguous"
+        }
+        records = {
+            operation_id: record.model_copy(deep=True)
+            for operation_id, record in self._records.items()
+        }
+        tombstones = {
+            operation_id: item.model_copy(deep=True)
+            for operation_id, item in self._tombstones.items()
+        }
+        cleared = 0
+        age_compacted = 0
+        capacity_compacted = 0
+        expired = 0
+
+        def protected(record: ChatJobRecord) -> bool:
+            return (
+                record.status.status
+                in {
+                    OperationState.QUEUED,
+                    OperationState.RUNNING,
+                    OperationState.FINALIZING,
+                }
+                or record.status.event_id in ambiguous_event_ids
+                or record.terminal_projection_state
+                in {"pending", "projection_failed"}
+            )
+
+        def terminal_time(record: ChatJobRecord) -> datetime:
+            return record.status.completed_at or record.status.updated_at
+
+        def tombstone(record: ChatJobRecord) -> ChatJobIdempotencyTombstone:
+            completed_at = terminal_time(record)
+            return ChatJobIdempotencyTombstone(
+                status=record.status,
+                client_id=record.client_id,
+                idempotency_key=record.idempotency_key,
+                expires_at=completed_at
+                + timedelta(seconds=self.idempotency_retention_seconds),
+            )
+
+        for record in records.values():
+            if (
+                record.status.status
+                in {
+                    OperationState.COMPLETED,
+                    OperationState.FAILED,
+                    OperationState.CANCELED,
+                }
+                and record.sealed_request
+            ):
+                record.sealed_request = ""
+                cleared += 1
+
+        eligible = sorted(
+            (record for record in records.values() if not protected(record)),
+            key=terminal_time,
+        )
+        for record in eligible:
+            if now < terminal_time(record) + timedelta(
+                seconds=self.result_retention_seconds
+            ):
+                continue
+            operation_id = record.status.operation_id
+            tombstones[operation_id] = tombstone(record)
+            del records[operation_id]
+            age_compacted += 1
+
+        eligible = sorted(
+            (record for record in records.values() if not protected(record)),
+            key=terminal_time,
+        )
+        excess = max(0, len(eligible) - self.max_terminal_records)
+        for record in eligible[:excess]:
+            operation_id = record.status.operation_id
+            tombstones[operation_id] = tombstone(record)
+            del records[operation_id]
+            capacity_compacted += 1
+
+        for operation_id, item in list(tombstones.items()):
+            if now >= item.expires_at:
+                del tombstones[operation_id]
+                expired += 1
+
+        changed = bool(cleared or age_compacted or capacity_compacted or expired)
+        if changed:
+            self._persist(records, tombstones)
+            removed_ids = self._records.keys() - records.keys()
+            self._records = records
+            self._tombstones = tombstones
+            for operation_id in removed_ids:
+                self._events.pop(operation_id, None)
+                self._event_sequences.pop(operation_id, None)
+                self._errors.pop(operation_id, None)
+        self._observe_compaction(
+            age_compacted=age_compacted,
+            capacity_compacted=capacity_compacted,
+            expired=expired,
+            duration_seconds=max(0.0, time.perf_counter() - started),
+        )
+
+    def _maybe_compact_locked(self) -> None:
+        monotonic_now = time.monotonic()
+        if (
+            self._last_cleanup_monotonic is not None
+            and monotonic_now - self._last_cleanup_monotonic
+            < self.cleanup_interval_seconds
+        ):
+            return
+        self._compact_locked(operation_now())
+        self._last_cleanup_monotonic = monotonic_now
+
+    def _observe_compaction(
+        self,
+        *,
+        age_compacted: int,
+        capacity_compacted: int,
+        expired: int,
+        duration_seconds: float,
+    ) -> None:
+        if self.metrics is None:
+            return
+        try:
+            for action, amount in (
+                ("result_expired", age_compacted),
+                ("capacity", capacity_compacted),
+                ("tombstone_expired", expired),
+            ):
+                if amount:
+                    self.metrics.counter(
+                        "kagya_chat_job_compactions_total",
+                        float(amount),
+                        action=action,
+                    )
+            self.metrics.gauge(
+                "kagya_chat_job_registry_entries",
+                float(len(self._records)),
+                kind="full",
+            )
+            self.metrics.gauge(
+                "kagya_chat_job_registry_entries",
+                float(len(self._tombstones)),
+                kind="tombstone",
+            )
+            registry_bytes = float(self.path.stat().st_size) if self.path.exists() else 0.0
+            self.metrics.gauge("kagya_chat_job_registry_bytes", registry_bytes)
+            self.metrics.observe(
+                "kagya_chat_job_cleanup_duration_seconds", duration_seconds
+            )
+        except Exception:
+            pass
 
     def _load_key(self) -> bytes:
         key_path = self.path.with_suffix(self.path.suffix + ".key")
