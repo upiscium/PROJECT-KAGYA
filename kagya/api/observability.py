@@ -149,6 +149,18 @@ _METRICS: dict[str, tuple[str, tuple[str, ...], str]] = {
         "summary", ("component", "operation", "status"),
         "Snapshot, journal, and telemetry persistence duration.",
     ),
+    "kagya_chat_job_compactions_total": (
+        "counter", ("action",), "Chat job retention actions by bounded category.",
+    ),
+    "kagya_chat_job_registry_entries": (
+        "gauge", ("kind",), "Current full chat job and tombstone entries.",
+    ),
+    "kagya_chat_job_registry_bytes": (
+        "gauge", (), "Current durable chat job registry size in bytes.",
+    ),
+    "kagya_chat_job_cleanup_duration_seconds": (
+        "summary", (), "Chat job registry cleanup duration.",
+    ),
     "kagya_process_resident_memory_bytes": (
         "gauge", (), "Process resident memory where supported.",
     ),
@@ -177,6 +189,10 @@ _LABEL_VALUES: dict[tuple[str, str], set[str]] = {
         "processed", "no_action", "budget_exhausted", "stopped",
     },
     ("kagya_autonomy_wakeups_total", "outcome"): {"processed", "deferred"},
+    ("kagya_chat_job_compactions_total", "action"): {
+        "result_expired", "capacity", "tombstone_expired",
+    },
+    ("kagya_chat_job_registry_entries", "kind"): {"full", "tombstone"},
 }
 
 

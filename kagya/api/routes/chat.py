@@ -23,6 +23,7 @@ from kagya.api.schemas.chat import (
     ModelSchema,
 )
 from kagya.chat_jobs import (
+    ChatJobIdempotencyResultExpired,
     ChatJobRegistry,
     ChatRecoveryDisposition,
     ChatStreamEvent,
@@ -115,6 +116,10 @@ def create_chat_job(
             idempotency_key=idempotency_key,
             correlation_id=context_id,
         )
+    except ChatJobIdempotencyResultExpired as exc:
+        raise HTTPException(
+            status_code=409, detail="idempotency_result_expired"
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except AgentRuntimeQueueFull as exc:
@@ -314,6 +319,13 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
         recovery_dispositions=recovery_dispositions,
         required_event_ids=required_event_ids,
         result_reconstructor=reconstruct_result,
+        result_retention_seconds=settings.chat_job_result_retention_seconds,
+        idempotency_retention_seconds=(
+            settings.chat_job_idempotency_retention_seconds
+        ),
+        max_terminal_records=settings.chat_job_max_terminal_records,
+        cleanup_interval_seconds=settings.chat_job_cleanup_interval_seconds,
+        metrics=getattr(app.state, "operational_telemetry", None),
     )
 
 
