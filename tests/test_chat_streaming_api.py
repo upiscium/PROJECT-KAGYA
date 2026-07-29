@@ -165,7 +165,9 @@ def test_lifespan_replays_accepted_not_started_chat_job(tmp_path: Path) -> None:
             client_id="restart-client",
             idempotency_key="accepted-not-started",
             correlation_id="restart-context",
-            sealed_request=registry._seal(payload),
+            sealed_request=registry._seal(
+                payload, operation_id=operation_id, event_id=event_id
+            ),
         )
         with registry._lock:
             registry._records[operation_id] = record
@@ -187,10 +189,6 @@ def test_lifespan_replays_accepted_not_started_chat_job(tmp_path: Path) -> None:
             restarted_settings.agent_state.path.parent / "chat_jobs.json"
         )
         shutil.copy2(source_registry, restarted_registry)
-        shutil.copy2(
-            source_registry.with_suffix(".json.key"),
-            restarted_registry.with_suffix(".json.key"),
-        )
         shutil.copy2(
             source_settings.agent_journal.path,
             restarted_settings.agent_journal.path,

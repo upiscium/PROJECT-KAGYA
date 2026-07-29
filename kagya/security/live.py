@@ -11,6 +11,7 @@ class LiveCodecs:
     snapshot: EncryptedCodec
     wal: EncryptedCodec
     journal: EncryptedCodec
+    chat_request_spool: EncryptedCodec
 
 
 def build_live_codecs(settings: Settings) -> LiveCodecs:
@@ -33,6 +34,12 @@ def build_live_codecs(settings: Settings) -> LiveCodecs:
             enabled=enabled,
             purpose="live-state",
             context="operator-journal",
+            key_ring=ring,
+        ),
+        chat_request_spool=EncryptedCodec(
+            enabled=enabled,
+            purpose="chat-request-spool",
+            context="request-record",
             key_ring=ring,
         ),
     )

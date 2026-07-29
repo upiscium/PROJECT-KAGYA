@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from kagya.chat_jobs import ChatJobRegistry, ChatRecoveryDisposition
+from kagya.chat_jobs import ChatRecoveryDisposition
 from kagya.operation_status import OperationCancelCode, OperationState
 from kagya.runtime import (
     AgentEventType,
@@ -19,6 +19,7 @@ from kagya.runtime import (
     current_agent_event,
     enter_finalization_boundary,
 )
+from tests.chat_job_helpers import ChatJobRegistry
 
 
 def _wait(registry: ChatJobRegistry, operation_id: str, timeout: float = 3.0):
@@ -295,9 +296,6 @@ def test_timeout_deadline_survives_restart_without_extension(tmp_path: Path) -> 
     time.sleep(0.15)
     replay_path.parent.mkdir(parents=True)
     shutil.copy2(source_path, replay_path)
-    shutil.copy2(
-        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
-    )
 
     def wait_for_timeout(payload: dict[str, object]) -> dict[str, object]:
         time.sleep(0.2)
@@ -447,6 +445,7 @@ def test_request_spool_is_durable_before_journal_acceptance(tmp_path: Path) -> N
 
     assert accepted_spool
     assert "PRIVATE_SPOOL_SENTINEL" not in json.dumps(accepted_spool)
+    assert not path.with_suffix(".json.key").exists()
 
 
 def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> None:
@@ -469,9 +468,6 @@ def test_fresh_registry_replays_queued_job_without_plaintext(tmp_path: Path) -> 
     )
     second_path.parent.mkdir(parents=True)
     shutil.copy2(first_path, second_path)
-    shutil.copy2(
-        first_path.with_suffix(".json.key"), second_path.with_suffix(".json.key")
-    )
 
     restarted_runtime = AgentRuntime(queue_capacity=2)
     restarted = ChatJobRegistry(
@@ -515,9 +511,6 @@ def test_activate_replays_queued_jobs_once_in_enqueue_order(tmp_path: Path) -> N
     ]
     replay_path.parent.mkdir(parents=True)
     shutil.copy2(source_path, replay_path)
-    shutil.copy2(
-        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
-    )
 
     executions: list[tuple[str, int | None]] = []
 
@@ -576,9 +569,6 @@ def test_activate_does_not_block_on_capacity_bound_replay(tmp_path: Path) -> Non
     ]
     replay_path.parent.mkdir(parents=True)
     shutil.copy2(source_path, replay_path)
-    shutil.copy2(
-        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
-    )
 
     entered = Event()
     release = Event()
@@ -639,9 +629,6 @@ def test_expired_replay_wait_has_bounded_registry_writes(tmp_path: Path) -> None
     ]
     replay_path.parent.mkdir(parents=True)
     shutil.copy2(source_path, replay_path)
-    shutil.copy2(
-        source_path.with_suffix(".json.key"), replay_path.with_suffix(".json.key")
-    )
     values = json.loads(replay_path.read_text())
     future = datetime.now(UTC) + timedelta(seconds=10)
     past = datetime.now(UTC) - timedelta(seconds=1)

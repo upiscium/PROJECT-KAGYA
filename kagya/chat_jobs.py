@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-import hmac
 import json
 import os
 from pathlib import Path
@@ -19,6 +18,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kagya.config.schema import Settings
 from kagya.operation_status import (
     OperationCancelCode,
     OperationErrorCode,
@@ -26,6 +26,7 @@ from kagya.operation_status import (
     OperationStatus,
     operation_now,
 )
+from kagya.security.crypto import EncryptedCodec, EncryptionError
 from kagya.chat_projection import ChatProjectionPublisher
 from kagya.runtime import (
     AgentEventOutcome,
@@ -123,6 +124,7 @@ class ChatJobRegistry:
         runtime: AgentRuntime,
         executor: Executor,
         *,
+        request_codec: EncryptedCodec,
         replay_limit: int = 256,
         timeout_seconds: float = 300.0,
         completion_observer: CompletionObserver | None = None,
@@ -150,6 +152,7 @@ class ChatJobRegistry:
         self.path = path
         self.runtime = runtime
         self.executor = executor
+        self.request_codec = request_codec
         self.replay_limit = replay_limit
         self.timeout_seconds = timeout_seconds
         self.completion_observer = completion_observer
@@ -186,7 +189,6 @@ class ChatJobRegistry:
         self._replay_thread: Thread | None = None
         self._replay_complete_callback: ReplayCompleteCallback | None = None
         self._projection = ChatProjectionPublisher(self)
-        self._key = self._load_key()
         self._load()
         with self._lock:
             self._compact_locked(operation_now())
@@ -289,7 +291,9 @@ class ChatJobRegistry:
                 client_id=client_id,
                 idempotency_key=idempotency_key,
                 correlation_id=correlation_id,
-                sealed_request=self._seal(request),
+                sealed_request=self._seal(
+                    request, operation_id=operation_id, event_id=event_id
+                ),
             )
             self._records[operation_id] = record
             self._persist()
@@ -470,7 +474,11 @@ class ChatJobRegistry:
                     raise ValueError(
                         "queued chat job has no matching journal recovery evidence"
                     )
-                self._open(record.sealed_request)
+                self._open(
+                    record.sealed_request,
+                    operation_id=operation_id,
+                    event_id=record.status.event_id,
+                )
                 self._queued_for_replay.append(operation_id)
             elif reconcile:
                 if disposition == "committed":
@@ -658,7 +666,13 @@ class ChatJobRegistry:
                 self._refresh_queue_positions()
                 self._changed.notify_all()
             token.raise_if_canceled()
-            result = self.executor(self._open(record.sealed_request))
+            result = self.executor(
+                self._open(
+                    record.sealed_request,
+                    operation_id=operation_id,
+                    event_id=record.status.event_id,
+                )
+            )
             with self._lock:
                 if self._records[operation_id].status.status == OperationState.RUNNING:
                     self._enter_finalizing(operation_id, token)
@@ -959,23 +973,8 @@ class ChatJobRegistry:
     def _load(self) -> None:
         if not self.path.exists():
             return
-        values = json.loads(self.path.read_text(encoding="utf-8"))
-        full_values = []
-        tombstones = []
-        for value in values:
-            if value.get("record_type") == "idempotency_tombstone":
-                tombstones.append(ChatJobIdempotencyTombstone.model_validate(value))
-                continue
-            if value.get("schema_version", 1) in {1, 2}:
-                value["schema_version"] = 3
-                value.setdefault("requested_cancel_code", None)
-                value.setdefault("cancel_requested_at", None)
-                value.setdefault("timeout_deadline", None)
-                value.setdefault("terminal_projection_start_sequence", None)
-                value.setdefault("terminal_projection_event_count", 0)
-                value.setdefault("terminal_projection_state", "none")
-            full_values.append(value)
-        records = [ChatJobRecord.model_validate(value) for value in full_values]
+        records, tombstones = parse_chat_job_registry(self.path.read_bytes())
+        validate_chat_request_records(records, self.request_codec)
         self._records = {record.status.operation_id: record for record in records}
         self._tombstones = {
             item.status.operation_id: item for item in tombstones
@@ -993,24 +992,10 @@ class ChatJobRegistry:
         tombstones = self._tombstones if tombstones is None else tombstones
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
-        payload = json.dumps(
-            [
-                record.model_dump(mode="json")
-                for record in sorted(
-                    records.values(), key=lambda item: item.enqueue_sequence
-                )
-            ]
-            + [
-                item.model_dump(mode="json")
-                for item in sorted(
-                    tombstones.values(), key=lambda value: value.status.submitted_at
-                )
-            ],
-            separators=(",", ":"),
-        )
+        payload = serialize_chat_job_registry(records.values(), tombstones.values())
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            with os.fdopen(descriptor, "wb") as output:
                 output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
@@ -1176,45 +1161,154 @@ class ChatJobRegistry:
         except Exception:
             pass
 
-    def _load_key(self) -> bytes:
-        key_path = self.path.with_suffix(self.path.suffix + ".key")
-        if key_path.exists():
-            return key_path.read_bytes()
-        key_path.parent.mkdir(parents=True, exist_ok=True)
-        key = os.urandom(32)
-        descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(key)
-            output.flush()
-            os.fsync(output.fileno())
-        _fsync_directory(key_path.parent)
-        return key
+    def _seal(
+        self,
+        value: dict[str, Any],
+        *,
+        operation_id: str,
+        event_id: str,
+    ) -> str:
+        return encode_chat_request(
+            value,
+            self.request_codec,
+            operation_id=operation_id,
+            event_id=event_id,
+        )
 
-    def _seal(self, value: dict[str, Any]) -> str:
-        plaintext = json.dumps(value, separators=(",", ":")).encode()
-        nonce = os.urandom(16)
-        ciphertext = _xor_stream(plaintext, self._key, nonce)
-        signature = hmac.digest(self._key, nonce + ciphertext, "sha256")
-        return (nonce + signature + ciphertext).hex()
-
-    def _open(self, value: str) -> dict[str, Any]:
-        sealed = bytes.fromhex(value)
-        nonce, signature, ciphertext = sealed[:16], sealed[16:48], sealed[48:]
-        if not hmac.compare_digest(
-            signature, hmac.digest(self._key, nonce + ciphertext, "sha256")
-        ):
-            raise ValueError("chat request spool authentication failed")
-        opened = json.loads(_xor_stream(ciphertext, self._key, nonce))
-        if not isinstance(opened, dict):
-            raise ValueError("chat request spool is invalid")
-        return opened
+    def _open(
+        self,
+        value: str,
+        *,
+        operation_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        return decode_chat_request(
+            value,
+            self.request_codec,
+            operation_id=operation_id,
+            event_id=event_id,
+        )
 
 
-def _xor_stream(value: bytes, key: bytes, nonce: bytes) -> bytes:
-    output = bytearray()
-    for counter in range((len(value) + 31) // 32):
-        output.extend(hmac.digest(key, nonce + counter.to_bytes(8, "big"), "sha256"))
-    return bytes(left ^ right for left, right in zip(value, output, strict=False))
+def resolve_chat_job_registry_path(settings: Settings) -> Path:
+    configured = settings.api.chat_job_registry_path
+    default = type(settings.api).model_fields["chat_job_registry_path"].default
+    if configured == default:
+        return settings.agent_state.path.parent / "chat_jobs.json"
+    return configured
+
+
+def parse_chat_job_registry(
+    encoded: bytes,
+) -> tuple[list[ChatJobRecord], list[ChatJobIdempotencyTombstone]]:
+    try:
+        values = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("chat job registry is invalid") from exc
+    if not isinstance(values, list):
+        raise ValueError("chat job registry root must be a list")
+    full_values: list[dict[str, Any]] = []
+    tombstones: list[ChatJobIdempotencyTombstone] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("chat job registry entry must be an object")
+        if value.get("record_type") == "idempotency_tombstone":
+            tombstones.append(ChatJobIdempotencyTombstone.model_validate(value))
+            continue
+        if value.get("schema_version", 1) in {1, 2}:
+            value = dict(value)
+            value["schema_version"] = 3
+            value.setdefault("requested_cancel_code", None)
+            value.setdefault("cancel_requested_at", None)
+            value.setdefault("timeout_deadline", None)
+            value.setdefault("terminal_projection_start_sequence", None)
+            value.setdefault("terminal_projection_event_count", 0)
+            value.setdefault("terminal_projection_state", "none")
+        full_values.append(value)
+    return (
+        [ChatJobRecord.model_validate(value) for value in full_values],
+        tombstones,
+    )
+
+
+def serialize_chat_job_registry(
+    records: Iterable[ChatJobRecord],
+    tombstones: Iterable[ChatJobIdempotencyTombstone],
+) -> bytes:
+    values = [
+        record.model_dump(mode="json")
+        for record in sorted(records, key=lambda item: item.enqueue_sequence)
+    ] + [
+        item.model_dump(mode="json")
+        for item in sorted(tombstones, key=lambda value: value.status.submitted_at)
+    ]
+    return json.dumps(values, separators=(",", ":")).encode("utf-8")
+
+
+def validate_chat_job_registry(path: Path, codec: EncryptedCodec) -> None:
+    if not path.exists():
+        return
+    records, _tombstones = parse_chat_job_registry(path.read_bytes())
+    validate_chat_request_records(records, codec)
+
+
+def validate_chat_request_records(
+    records: list[ChatJobRecord], codec: EncryptedCodec
+) -> None:
+    terminal = {
+        OperationState.COMPLETED,
+        OperationState.FAILED,
+        OperationState.CANCELED,
+    }
+    for record in records:
+        if record.status.status in terminal:
+            if record.sealed_request:
+                raise EncryptionError("terminal chat job retains request ciphertext")
+            continue
+        if not record.sealed_request:
+            if record.status.status != OperationState.QUEUED:
+                continue
+            raise EncryptionError("active chat job request ciphertext is missing")
+        decode_chat_request(
+            record.sealed_request,
+            codec,
+            operation_id=record.status.operation_id,
+            event_id=record.status.event_id,
+        )
+
+
+def encode_chat_request(
+    value: dict[str, Any],
+    codec: EncryptedCodec,
+    *,
+    operation_id: str,
+    event_id: str,
+) -> str:
+    encoded = codec.encode(
+        json.dumps(value, separators=(",", ":")).encode("utf-8"),
+        metadata={"operation_id": operation_id, "event_id": event_id},
+    )
+    return encoded.decode("utf-8")
+
+
+def decode_chat_request(
+    value: str,
+    codec: EncryptedCodec,
+    *,
+    operation_id: str,
+    event_id: str,
+) -> dict[str, Any]:
+    plaintext = codec.decode(
+        value.encode("utf-8"),
+        expected_metadata={"operation_id": operation_id, "event_id": event_id},
+    )
+    try:
+        opened = json.loads(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EncryptionError("chat request spool is invalid") from exc
+    if not isinstance(opened, dict):
+        raise EncryptionError("chat request spool is invalid")
+    return opened
 
 
 def _safe_identity(value: str) -> str:

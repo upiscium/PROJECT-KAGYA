@@ -18,6 +18,7 @@ from kagya.security.backup import (
 )
 from kagya.security.crypto import KeyRing
 from kagya.security.migration import reencrypt_live_state
+from kagya.chat_jobs import resolve_chat_job_registry_path
 from kagya.security.generation import (
     initialize_encrypted_state,
     require_encrypted_generation,
@@ -156,6 +157,10 @@ def test_encrypted_backup_round_trip_incremental_and_public_sidecar(
 ) -> None:
     settings = _settings(tmp_path, monkeypatch)
     _authoritative_graph(settings, SENTINEL)
+    chat_jobs = resolve_chat_job_registry_path(settings)
+    chat_jobs.write_bytes(b"[]")
+    adjacent_key = chat_jobs.with_suffix(chat_jobs.suffix + ".key")
+    adjacent_key.write_bytes(b"LEGACY_RAW_KEY_SENTINEL")
     manager = BackupManager(settings)
 
     full = manager.create()
@@ -163,6 +168,9 @@ def test_encrypted_backup_round_trip_incremental_and_public_sidecar(
     sidecar = bundle.with_suffix(".status.json")
     assert SENTINEL not in bundle.read_bytes()
     assert b"agent_state" not in sidecar.read_bytes()
+    inventory = manager._inventory(None)
+    assert any(entry.root == "chat_jobs" for entry in inventory)
+    assert all(entry.relative_path != adjacent_key.name for entry in inventory)
     assert manager.verify(full.backup_id) == full
 
     settings.tools.path.write_bytes(b"changed")
@@ -208,11 +216,14 @@ def test_encrypted_backup_round_trip_incremental_and_public_sidecar(
     assert BackupManager(denied_old_settings).verify(rotated.backup_id) == rotated
 
     settings.tools.path.write_bytes(b"authoritative-newer")
+    chat_jobs.write_bytes(b"[ ]")
     restored = manager.restore(
         full.backup_id, expected_manifest_hash=full.manifest_hash
     )
     assert restored == full
     assert settings.tools.path.read_bytes() == SENTINEL
+    assert chat_jobs.read_bytes() == b"[]"
+    assert adjacent_key.read_bytes() == b"LEGACY_RAW_KEY_SENTINEL"
     assert (settings.at_rest.backup.directory / "previous-generation").exists()
 
 

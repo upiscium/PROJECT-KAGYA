@@ -2,9 +2,9 @@ from pathlib import Path
 from threading import Event
 import time
 
-from kagya.chat_jobs import ChatJobRegistry
 from kagya.operation_status import OperationState
 from kagya.runtime import AgentEventType, AgentRuntime
+from tests.chat_job_helpers import ChatJobRegistry
 
 
 def _wait_for(

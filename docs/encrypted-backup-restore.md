@@ -2,11 +2,17 @@
 
 ## Security Boundary
 
-Live snapshot, private WAL, and operator-safe Journal encryption uses AES-256-GCM
-from `cryptography`. Every record has a random 96-bit nonce and authenticated
+When live encryption is enabled, live snapshot, private WAL, operator-safe Journal,
+and active Chat request spool encryption uses AES-256-GCM from `cryptography`.
+Every record has a random 96-bit nonce and authenticated
 format, version, purpose, context, key ID, and sequence/record metadata. HKDF-SHA256
 derives separate context keys from each 32-byte root key. Live state, backup, and
 adapter artifact key rings are independent.
+
+Chat requests use the live key ring with the separate `chat-request-spool`
+purpose. Operation and event IDs are authenticated metadata. Terminal Chat records
+and idempotency tombstones do not retain request ciphertext, and no adjacent
+`chat_jobs.json.key` is created.
 
 Root keys are strict base64 environment values whose names are configured under
 `at_rest`. Do not put key values in YAML, files, command arguments, logs, manifests,
@@ -49,9 +55,21 @@ one-shot migration. Startup never silently migrates encrypted production state:
 just live-encryption-migrate /path/to/config.yaml
 ```
 
+After upgrading a deployment that has the retired adjacent-key Chat spool, keep
+the API stopped and migrate it atomically before startup:
+
+```bash
+uv run kagya-backup --config /path/to/config.yaml migrate-chat-spool
+```
+
+The migration authenticates every legacy request before replacing the mixed full
+record/tombstone registry, then removes the adjacent key. Runtime startup rejects
+legacy, mixed, tampered, moved, or unavailable-key request ciphertext.
+
 ## Back Up And Verify
 
-The `.kgb` format streams each source file into independently encrypted chunks and
+The `.kgb` format streams each source file, including the Chat registry but never
+its retired adjacent key, into independently encrypted chunks and
 never creates a plaintext tar/archive. Its encrypted internal manifest records
 relative names, sizes, SHA-256 digests, schema/source/model/adapter revisions,
 backup ID/time, and incremental base bindings. Adapter chunks receive an inner,
@@ -141,3 +159,6 @@ just live-encryption-rotate /path/to/config.yaml
 After every required live file and backup has been re-encrypted and verified,
 remove the old allowed ID and retire its secret. A missing or omitted old key fails
 closed; there is no plaintext fallback.
+
+`rotate-live` also rewrites every active Chat request under the current live key
+generation while preserving request-free terminal records and tombstones.

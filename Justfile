@@ -74,6 +74,9 @@ backup-scheduled config="config.yaml":
 live-encryption-migrate config="config.yaml":
     uv run kagya-backup --config {{config}} migrate-live
 
+chat-spool-migrate config="config.yaml":
+    uv run kagya-backup --config {{config}} migrate-chat-spool
+
 live-encryption-rotate config="config.yaml":
     uv run kagya-backup --config {{config}} rotate-live
 

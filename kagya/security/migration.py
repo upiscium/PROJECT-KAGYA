@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import hmac
+import json
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Callable
 from uuid import uuid4
 
+from kagya.chat_jobs import (
+    ChatJobRecord,
+    decode_chat_request,
+    encode_chat_request,
+    parse_chat_job_registry,
+    resolve_chat_job_registry_path,
+    serialize_chat_job_registry,
+    validate_chat_request_records,
+)
 from kagya.config.schema import Settings
 from kagya.runtime.agent_state import AgentStateSnapshot
 from kagya.runtime.event_journal import EventJournal, JournalRecord
@@ -106,9 +117,78 @@ def reencrypt_live_state(settings: Settings) -> int:
     ] + [settings.agent_journal.path]
     for path in journal_paths:
         targets.extend(_reencrypt_lines(path, codecs.journal, JournalRecord))
+    targets.extend(
+        _reencrypt_chat_request_spool(
+            resolve_chat_job_registry_path(settings), codecs.chat_request_spool
+        )
+    )
     return _replace_targets(
         targets, finalize=lambda: seal_encrypted_generation(settings)
     )
+
+
+def migrate_chat_request_spool(settings: Settings) -> int:
+    """Atomically replace the retired adjacent-key request spool format."""
+
+    if not settings.at_rest.live.enabled:
+        raise EncryptionError("live encryption must be enabled for migration")
+    path = resolve_chat_job_registry_path(settings)
+    if not path.exists():
+        return 0
+    key_path = path.with_suffix(path.suffix + ".key")
+    codec = build_live_codecs(settings).chat_request_spool
+    records, tombstones = parse_chat_job_registry(path.read_bytes())
+    undecoded: list[ChatJobRecord] = []
+    for record in records:
+        if not record.sealed_request:
+            continue
+        try:
+            decode_chat_request(
+                record.sealed_request,
+                codec,
+                operation_id=record.status.operation_id,
+                event_id=record.status.event_id,
+            )
+        except EncryptionError:
+            undecoded.append(record)
+    if not undecoded:
+        validate_chat_request_records(records, codec)
+        if key_path.exists():
+            key_path.unlink()
+            _fsync_directory(key_path.parent)
+        return 0
+
+    try:
+        legacy_key = key_path.read_bytes()
+    except FileNotFoundError as exc:
+        raise EncryptionError("legacy chat request spool key is unavailable") from exc
+    if len(legacy_key) != 32:
+        raise EncryptionError("legacy chat request spool key must be exactly 32 bytes")
+    legacy = [
+        (record, _decode_legacy_chat_request(record.sealed_request, legacy_key))
+        for record in undecoded
+    ]
+    encrypted = sum(bool(record.sealed_request) for record in records) - len(legacy)
+    if encrypted:
+        raise EncryptionError("mixed legacy and encrypted chat request spool")
+
+    terminal = {"completed", "failed", "canceled"}
+    for record, request in legacy:
+        if record.status.status.value in terminal:
+            record.sealed_request = ""
+            continue
+        record.sealed_request = encode_chat_request(
+            request,
+            codec,
+            operation_id=record.status.operation_id,
+            event_id=record.status.event_id,
+        )
+    validate_chat_request_records(records, codec)
+    encoded = serialize_chat_job_registry(records, tombstones)
+    replaced = _replace_targets([(path, encoded)])
+    key_path.unlink(missing_ok=True)
+    _fsync_directory(key_path.parent)
+    return replaced
 
 
 def _replace_targets(
@@ -196,6 +276,59 @@ def _reencrypt_lines(
         encoded_lines.append(codec.encode(plaintext, metadata=metadata))
     encoded = b"\n".join(encoded_lines)
     return [(path, encoded + (b"\n" if encoded else b""))]
+
+
+def _reencrypt_chat_request_spool(
+    path: Path, codec: EncryptedCodec
+) -> list[tuple[Path, bytes]]:
+    if not path.exists():
+        return []
+    records, tombstones = parse_chat_job_registry(path.read_bytes())
+    validate_chat_request_records(records, codec)
+    for record in records:
+        if not record.sealed_request:
+            continue
+        request = decode_chat_request(
+            record.sealed_request,
+            codec,
+            operation_id=record.status.operation_id,
+            event_id=record.status.event_id,
+        )
+        record.sealed_request = encode_chat_request(
+            request,
+            codec,
+            operation_id=record.status.operation_id,
+            event_id=record.status.event_id,
+        )
+    return [(path, serialize_chat_job_registry(records, tombstones))]
+
+
+def _decode_legacy_chat_request(value: str, key: bytes) -> dict[str, Any]:
+    try:
+        sealed = bytes.fromhex(value)
+    except ValueError as exc:
+        raise EncryptionError("legacy chat request spool is invalid") from exc
+    if len(sealed) < 48:
+        raise EncryptionError("legacy chat request spool is invalid")
+    nonce, signature, ciphertext = sealed[:16], sealed[16:48], sealed[48:]
+    if not hmac.compare_digest(
+        signature, hmac.digest(key, nonce + ciphertext, "sha256")
+    ):
+        raise EncryptionError("legacy chat request spool authentication failed")
+    try:
+        opened = json.loads(_legacy_xor_stream(ciphertext, key, nonce))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EncryptionError("legacy chat request spool is invalid") from exc
+    if not isinstance(opened, dict):
+        raise EncryptionError("legacy chat request spool is invalid")
+    return opened
+
+
+def _legacy_xor_stream(value: bytes, key: bytes, nonce: bytes) -> bytes:
+    output = bytearray()
+    for counter in range((len(value) + 31) // 32):
+        output.extend(hmac.digest(key, nonce + counter.to_bytes(8, "big"), "sha256"))
+    return bytes(left ^ right for left, right in zip(value, output, strict=False))
 
 
 def _fsync_directory(path: Path) -> None:
