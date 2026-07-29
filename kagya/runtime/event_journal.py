@@ -185,6 +185,23 @@ class EventJournal:
             state_hash_after=state_hash_after,
         )
 
+    def prepared_interrupted(
+        self,
+        event: JournalEvent,
+        *,
+        state_hash_before: str,
+        state_hash_after: str,
+    ) -> JournalRecord:
+        """Record a no-op transition that consumes an interrupted sequence."""
+
+        return self._append_event(
+            event,
+            JournalLifecycle.PREPARED,
+            state_hash_before=state_hash_before,
+            state_hash_after=state_hash_after,
+            failure_category="uncommitted_after_crash",
+        )
+
     def completed(self, event: JournalEvent, snapshot_hash: str) -> JournalRecord:
         if self._failure_injector is not None:
             self._failure_injector("before_journal_completed")
@@ -214,6 +231,26 @@ class EventJournal:
             return []
         with self._lock:
             return self.verify()[-limit:]
+
+    def durable_files(self) -> dict[str, bytes]:
+        """Read a complete rotation set without racing concurrent appends."""
+
+        with self._lock:
+            return self._durable_files_locked()
+
+    def replica_snapshot(self) -> tuple[list[JournalRecord], dict[str, bytes]]:
+        """Capture verified Journal evidence and identical durable bytes."""
+
+        with self._lock:
+            return self.verify(), self._durable_files_locked()
+
+    def _durable_files_locked(self) -> dict[str, bytes]:
+        files = {"journal": self.path.read_bytes() if self.path.exists() else b""}
+        for index in range(1, self.retained_files + 1):
+            path = self.path.with_name(f"{self.path.name}.{index}")
+            if path.exists():
+                files[f"journal.{index}"] = path.read_bytes()
+        return files
 
     def audit_admin_action(
         self,
@@ -258,7 +295,13 @@ class EventJournal:
                 }
                 or (
                     record.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
-                    and record.failure_category == "committed_before_crash"
+                    and (
+                        record.failure_category == "committed_before_crash"
+                        or (
+                            record.failure_category == "uncommitted_after_crash"
+                            and record.processing_sequence == record.snapshot_sequence
+                        )
+                    )
                 )
                 or (
                     record.lifecycle == JournalLifecycle.CHECKPOINT
@@ -527,6 +570,8 @@ class EventJournal:
         sequence = record.processing_sequence
         if sequence is None:
             category = "started_without_sequence"
+        elif record.failure_category == "uncommitted_after_crash":
+            category = "uncommitted_after_crash"
         elif snapshot.last_processed_event_sequence < sequence:
             category = "uncommitted_after_crash"
         elif (

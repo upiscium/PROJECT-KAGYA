@@ -1,9 +1,11 @@
 """FastAPI startup foundation for PROJECT-KAGYA."""
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+import os
+from threading import RLock, Thread
 import time
 
 import uvicorn
@@ -11,6 +13,7 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from kagya.actions import ActionExecutionLayer
 from kagya.artifact_provenance import build_adapter_artifact_manifest
@@ -55,11 +58,15 @@ from kagya.motivation import GoalStatus
 from kagya.outbox import Outbox
 from kagya.runtime import (
     AgentRuntime,
+    AgentRuntimeJournalError,
     AgentEvent,
+    AgentEventType,
     AgentStateStore,
     AgentStateSnapshot,
     EmotionTimer,
     EventJournal,
+    JournalLifecycle,
+    JournalRecord,
     ExternalTransactionCoordinator,
     KagyaMainLoop,
     RemoteTrainingDispatcher,
@@ -74,6 +81,14 @@ from kagya.runtime import (
 from kagya.security import build_live_codecs
 from kagya.security.backup import assert_no_incomplete_restore
 from kagya.security.generation import require_encrypted_generation
+from kagya.failover import (
+    NOT_AUTHORITATIVE,
+    EtcdFencingAuthority,
+    FailoverError,
+    build_manifest,
+    core_files,
+    restore_and_preflight,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -83,6 +98,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title=app_settings.project.name, lifespan=_lifespan(app_settings))
     app.state.settings = app_settings
     app.state.node_role = app_settings.deployment.node.role
+    app.state.subject_role = (
+        app_settings.failover.subject_role.value
+        if app_settings.failover.enabled
+        else "active"
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.api.cors_origins,
@@ -90,6 +110,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def reject_non_authoritative(request: Request, call_next):
+        if (
+            request.url.path.startswith("/api/")
+            and app_settings.failover.enabled
+            and app.state.subject_role == "active"
+        ):
+            try:
+                await run_in_threadpool(app.state.fencing_authority.renew_once)
+            except Exception:
+                _schedule_subject_authority_loss(app)
+        if request.url.path.startswith("/api/") and app.state.subject_role != "active":
+            code = 409 if request.method not in {"GET", "HEAD", "OPTIONS"} else 503
+            return JSONResponse(
+                status_code=code,
+                content={
+                    "detail": {
+                        "code": NOT_AUTHORITATIVE,
+                        "role": app.state.subject_role,
+                    }
+                },
+            )
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_without_input(
@@ -100,6 +144,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for error in exc.errors()
         ]
         return JSONResponse(status_code=422, content={"detail": errors})
+
+    @app.exception_handler(FailoverError)
+    async def failover_error(_request: Request, _exc: FailoverError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": {"code": NOT_AUTHORITATIVE}},
+        )
+
+    @app.exception_handler(AgentRuntimeJournalError)
+    async def indeterminate_commit(
+        _request: Request, _exc: AgentRuntimeJournalError
+    ) -> JSONResponse:
+        code = (
+            NOT_AUTHORITATIVE
+            if app_settings.failover.enabled and app.state.subject_role != "active"
+            else "commit_indeterminate"
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": {"code": code}},
+        )
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -122,6 +187,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if app_settings.deployment.node.role == NodeRole.TRAINING_WORKER:
             ready = getattr(app.state, "worker_runtime", None) is not None
             checks = {"worker_runtime": ready}
+        elif app.state.subject_role != "active":
+            promoting = app.state.subject_role == "promoting"
+            checks = {"authoritative": False, "replica_only": not promoting}
+            ready = False
         else:
             runtime = getattr(app.state, "agent_runtime", None)
             journal = getattr(app.state, "event_journal", None)
@@ -143,19 +212,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     wal_ready = True
                 except Exception:
                     wal_ready = False
+            memory_ready = False
+            memory_system = getattr(app.state, "memory_system", None)
+            reconciliation = getattr(app.state, "external_reconciliation", None)
+            if memory_system is not None and not getattr(
+                reconciliation, "retryable", 0
+            ):
+                try:
+                    memory_system.readiness_probe()
+                    memory_ready = True
+                except Exception:
+                    memory_ready = False
             checks = {
                 "agent_runtime": runtime_ready,
                 "journal": journal_ready,
                 "state_wal": wal_ready,
+                "shared_memory": memory_ready,
                 "chat_job_registry": bool(
                     getattr(app.state, "chat_job_registry", None) is not None
                     and app.state.chat_job_registry.is_ready
+                ),
+                "authority": bool(
+                    not app_settings.failover.enabled
+                    or getattr(app.state, "fencing_authority", None) is not None
+                    and app.state.fencing_authority.is_authoritative
                 ),
             }
             ready = all(checks.values())
         if not ready:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "ready" if ready else "not_ready", "checks": checks}
+        return {
+            "status": "ready" if ready else "not_ready",
+            "subject_role": app.state.subject_role,
+            "fencing_token": getattr(
+                getattr(app.state, "fencing_authority", None), "_fencing_token", None
+            ),
+            "acquisition_conflicts": getattr(
+                getattr(app.state, "fencing_authority", None),
+                "acquisition_conflicts",
+                0,
+            ),
+            "stale_write_rejections": getattr(
+                getattr(app.state, "fencing_authority", None),
+                "stale_write_rejections",
+                0,
+            ),
+            "checks": checks,
+        }
 
     role = app_settings.deployment.node.role
     if role in {NodeRole.ALL, NodeRole.INFERENCE}:
@@ -200,7 +303,7 @@ def _lifespan(settings: Settings):
         if settings.deployment.node.role == NodeRole.TRAINING_WORKER:
             _preload_worker_runtime(app, settings)
         else:
-            _preload_subject_runtime(app, settings)
+            _preload_failover_runtime(app, settings)
         try:
             yield
         finally:
@@ -211,6 +314,11 @@ def _lifespan(settings: Settings):
 
 def teardown_subject_runtime(app: FastAPI) -> None:
     """Stop every subject writer/resource and invalidate the dependency graph."""
+
+    _teardown_subject_runtime(app, close_authority=True)
+
+
+def _teardown_subject_runtime(app: FastAPI, *, close_authority: bool) -> None:
 
     failures: list[Exception] = []
     for name, shutdown_method in (
@@ -276,8 +384,20 @@ def teardown_subject_runtime(app: FastAPI) -> None:
         "chat_job_registry",
         "runtime_event_log",
         "operational_telemetry",
+        "failover_persistence_hook",
+        "failover_commit_lock",
+        "promotion_manifest",
+        "failover_bootstrap",
     ):
         setattr(app.state, name, None)
+    if close_authority:
+        authority = getattr(app.state, "fencing_authority", None)
+        if authority is not None:
+            try:
+                authority.close()
+            except Exception as exc:
+                failures.append(exc)
+        app.state.fencing_authority = None
     if failures:
         raise RuntimeError(
             "one or more subject runtime resources failed to stop"
@@ -287,6 +407,170 @@ def teardown_subject_runtime(app: FastAPI) -> None:
 def _preload_subject_runtime(app: FastAPI, settings: Settings) -> None:
     _build_subject_runtime(app, settings, reconcile=True)
     _activate_subject_runtime(app)
+
+
+def _preload_failover_runtime(app: FastAPI, settings: Settings) -> None:
+    if not settings.failover.enabled:
+        _preload_subject_runtime(app, settings)
+        return
+    authority = EtcdFencingAuthority(
+        settings.deployment.node.id,
+        settings.failover.etcd,
+    )
+    app.state.fencing_authority = authority
+    should_contend = (
+        settings.failover.subject_role.value == "active"
+        or settings.failover.automatic_promotion
+    )
+    if not should_contend or not authority.acquire():
+        app.state.subject_role = "standby"
+        if settings.failover.automatic_promotion:
+            authority.start_campaign(
+                lambda: _automatic_promote_subject(app, settings, authority)
+            )
+        return
+    _promote_subject(app, settings, authority)
+
+
+def _promote_subject(
+    app: FastAPI, settings: Settings, authority: EtcdFencingAuthority
+) -> None:
+    try:
+        app.state.subject_role = "promoting"
+        authority.start_renewal(lambda: _lose_subject_authority(app))
+        bundle = authority.latest_bundle()
+        if bundle is not None:
+            restore_and_preflight(settings, bundle)
+        elif not settings.failover.bootstrap_from_local_state:
+            raise RuntimeError(
+                "failover watermark is missing; explicit bootstrap required"
+            )
+        app.state.promotion_manifest = None if bundle is None else bundle.manifest
+        app.state.failover_bootstrap = bundle is None
+        app.state.failover_persistence_hook = lambda: _publish_subject_generation(
+            app, settings
+        )
+        app.state.failover_commit_lock = RLock()
+        _build_subject_runtime(app, settings, reconcile=True)
+        _publish_subject_generation(app, settings)
+        _activate_subject_runtime(app)
+        authority.assert_authoritative()
+        app.state.subject_role = "active"
+        authority.assert_authoritative()
+    except Exception:
+        # Never retain a lease while graph teardown may wait for worker threads.
+        authority.relinquish()
+        _lose_subject_authority(app)
+        _teardown_subject_runtime(app, close_authority=False)
+        raise
+
+
+def _automatic_promote_subject(
+    app: FastAPI, settings: Settings, authority: EtcdFencingAuthority
+) -> None:
+    _promote_subject(app, settings, authority)
+
+
+def _lose_subject_authority(app: FastAPI) -> None:
+    app.state.subject_role = "standby"
+    app.state.failover_persistence_hook = None
+    for name, method in (
+        ("autonomy_loop", "shutdown"),
+        ("sleep_coordinator", "shutdown"),
+        ("emotion_timer", "stop"),
+        ("agent_runtime", "abort"),
+    ):
+        component = getattr(app.state, name, None)
+        if component is not None:
+            try:
+                getattr(component, method)()
+            except Exception:
+                pass
+
+
+def _schedule_subject_authority_loss(app: FastAPI) -> None:
+    app.state.subject_role = "standby"
+    app.state.failover_persistence_hook = None
+    Thread(
+        target=_lose_subject_authority,
+        args=(app,),
+        name="kagya-authority-loss",
+        daemon=True,
+    ).start()
+
+
+def _publish_subject_generation(
+    app: FastAPI, settings: Settings, terminal_event: AgentEvent | None = None
+) -> None:
+    lock = getattr(app.state, "failover_commit_lock", None)
+    with nullcontext() if lock is None else lock:
+        _publish_subject_generation_locked(app, settings, terminal_event)
+
+
+def _publish_subject_generation_locked(
+    app: FastAPI, settings: Settings, terminal_event: AgentEvent | None
+) -> None:
+    snapshot = app.state.agent_state_store.last_snapshot
+    if snapshot is None:
+        raise RuntimeError("authoritative snapshot is unavailable")
+    if not settings.agent_state.path.exists():
+        app.state.agent_state_store.save(snapshot)
+    if not settings.agent_journal.path.exists():
+        settings.agent_journal.path.parent.mkdir(parents=True, exist_ok=True)
+        with settings.agent_journal.path.open("xb") as journal_file:
+            journal_file.flush()
+            os.fsync(journal_file.fileno())
+    authority = app.state.fencing_authority
+    try:
+        journal_records, journal_files = app.state.event_journal.replica_snapshot()
+        authority.publish(
+            build_manifest(
+                settings,
+                authority,
+                app,
+                journal_records=journal_records,
+            ),
+            core_files(settings, journal_files=journal_files),
+        )
+        if terminal_event is not None:
+            sequence = terminal_event.processing_sequence
+            if sequence is None:
+                raise RuntimeError("completed event has no processing sequence")
+            completed = any(
+                record.event_id == terminal_event.event_id
+                and record.lifecycle == JournalLifecycle.COMPLETED
+                for record in journal_records
+            )
+            failed = any(
+                record.event_id == terminal_event.event_id
+                and record.lifecycle == JournalLifecycle.FAILED
+                for record in journal_records
+            )
+            if (
+                completed
+                and not app.state.external_transaction_coordinator.finalize_event(
+                    terminal_event.event_id, sequence
+                )
+            ):
+                raise RuntimeError("external event could not be finalized")
+            if failed:
+                app.state.external_transaction_coordinator.compensate_event(
+                    terminal_event.event_id, "internal_mutation_failed"
+                )
+            authority.publish(
+                build_manifest(
+                    settings,
+                    authority,
+                    app,
+                    journal_records=journal_records,
+                ),
+                core_files(settings, journal_files=journal_files),
+            )
+    except Exception:
+        # Admission may hold AgentRuntime's state lock. Stop the graph only after
+        # that call unwinds and its own fail-stop transition can complete.
+        _schedule_subject_authority_loss(app)
+        raise
 
 
 def _build_subject_runtime(
@@ -337,7 +621,8 @@ def _build_subject_runtime(
         )
     if reconcile:
         snapshot = _reconcile_state_wal(app, snapshot)
-        app.state.event_journal.reconcile(snapshot)
+        recovery = app.state.event_journal.reconcile(snapshot)
+        snapshot = _consume_interrupted_sequence(app, snapshot, recovery)
     else:
         reconstructed = app.state.state_wal.reconstruct()
         if (
@@ -349,16 +634,44 @@ def _build_subject_runtime(
             )
         app.state.event_journal.verify()
     if getattr(app.state, "memory_system", None) is None:
-        app.state.memory_system = DualMemorySystem(settings)
+        authority = getattr(app.state, "fencing_authority", None)
+        app.state.memory_system = DualMemorySystem(
+            settings,
+            fencing_token=None
+            if authority is None
+            else lambda: authority.fencing_token,
+        )
     if getattr(app.state, "external_transaction_coordinator", None) is None:
         app.state.external_transaction_coordinator = ExternalTransactionCoordinator(
             [app.state.memory_system]
         )
+    promotion_manifest = getattr(app.state, "promotion_manifest", None)
+    if promotion_manifest is not None:
+        app.state.memory_system.validate_shared_memory_state(
+            promotion_manifest.memory_hash,
+            promotion_manifest.memory_transaction_head,
+            snapshot.last_processed_event_sequence,
+        )
+    elif getattr(app.state, "failover_bootstrap", False):
+        app.state.memory_system.verify_bootstrap_memory(
+            settings.failover.bootstrap_memory_hash
+        )
+    app.state.memory_system.assert_external_sequence(
+        snapshot.last_processed_event_sequence
+    )
     app.state.external_reconciliation = (
         app.state.external_transaction_coordinator.reconcile(
             app.state.event_journal.verify()
         )
     )
+    if app.state.external_reconciliation.retryable:
+        raise RuntimeError("shared Chroma reconciliation remains retryable")
+    if promotion_manifest is not None:
+        app.state.memory_system.validate_shared_memory_state(
+            promotion_manifest.memory_hash,
+            promotion_manifest.memory_transaction_head,
+            snapshot.last_processed_event_sequence,
+        )
     embedding_model = getattr(
         app.state.memory_system.embedding_function, "_get_model", None
     )
@@ -371,14 +684,14 @@ def _build_subject_runtime(
     app.state.behavioral_artifact_reconciliation = BehavioralArtifactStore(
         settings.adapter_registry.eval_result_dir
     ).reconcile(app.state.adapter_registry)
-    active_adapter = next(
-        (
-            entry
-            for entry in app.state.adapter_registry.list()
-            if entry.status == AdapterStatus.ACTIVE
-        ),
-        None,
-    )
+    active_adapters = [
+        entry
+        for entry in app.state.adapter_registry.list()
+        if entry.status == AdapterStatus.ACTIVE
+    ]
+    if len(active_adapters) > 1:
+        raise RuntimeError("adapter registry has multiple active adapters")
+    active_adapter = active_adapters[0] if active_adapters else None
     if getattr(app.state, "model_provider", None) is None:
         adapter_path = (
             active_adapter.path
@@ -460,6 +773,25 @@ def _build_subject_runtime(
             initial_sequence=snapshot.last_processed_event_sequence,
             completion_hook=lambda event: _commit_subject_event(app, event),
             failure_hook=lambda event, exc: _fail_subject_event(app, event),
+            admission_hook=(
+                None
+                if not settings.failover.enabled
+                else lambda event: _publish_subject_generation(app, settings)
+            ),
+            started_hook=(
+                None
+                if not settings.failover.enabled
+                else lambda event: _publish_subject_generation(app, settings)
+            ),
+            terminal_hook=(
+                None
+                if not settings.failover.enabled
+                else lambda event, snapshot_hash: _publish_subject_generation(
+                    app, settings, event
+                )
+            ),
+            event_boundary_lock=getattr(app.state, "failover_commit_lock", None),
+            event_boundary_types={AgentEventType.ADAPTER_UPDATE},
             telemetry=app.state.operational_telemetry,
         )
     if getattr(app.state, "chat_job_registry", None) is None:
@@ -539,6 +871,12 @@ def _event_sequence(sequence: int | None) -> int:
 
 
 def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    lock = getattr(app.state, "failover_commit_lock", None)
+    with nullcontext() if lock is None else lock:
+        return _commit_subject_event_locked(app, event)
+
+
+def _commit_subject_event_locked(app: FastAPI, event: AgentEvent) -> str:
     started = time.perf_counter()
     status = "failure"
     store = app.state.agent_state_store
@@ -558,9 +896,10 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
     app.state.state_wal.append_transition(event, previous, candidate)
     try:
         saved = store.save(candidate)
-        app.state.external_transaction_coordinator.finalize_event(
-            event.event_id, _event_sequence(event.processing_sequence)
-        )
+        if not app.state.settings.failover.enabled:
+            app.state.external_transaction_coordinator.finalize_event(
+                event.event_id, _event_sequence(event.processing_sequence)
+            )
         try:
             _observe_subject_state(app)
         except Exception:
@@ -577,10 +916,17 @@ def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
 
 
 def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
+    lock = getattr(app.state, "failover_commit_lock", None)
+    with nullcontext() if lock is None else lock:
+        return _fail_subject_event_locked(app, event)
+
+
+def _fail_subject_event_locked(app: FastAPI, event: AgentEvent) -> str:
     store = app.state.agent_state_store
-    app.state.external_transaction_coordinator.orphan_event(
-        event.event_id, "internal_mutation_failed"
-    )
+    if not app.state.settings.failover.enabled:
+        app.state.external_transaction_coordinator.orphan_event(
+            event.event_id, "internal_mutation_failed"
+        )
     previous = store.last_snapshot
     if previous is None:
         raise RuntimeError("Agent state store has no previous snapshot")
@@ -598,9 +944,10 @@ def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
     )
     app.state.state_wal.append_transition(event, previous, candidate)
     saved = store.save(candidate)
-    app.state.external_transaction_coordinator.compensate_event(
-        event.event_id, "internal_mutation_failed"
-    )
+    if not app.state.settings.failover.enabled:
+        app.state.external_transaction_coordinator.compensate_event(
+            event.event_id, "internal_mutation_failed"
+        )
     return hash_snapshot(saved)
 
 
@@ -620,6 +967,52 @@ def _reconcile_state_wal(
     if latest.sequence == snapshot.last_processed_event_sequence + 1:
         return app.state.agent_state_store.save(latest.snapshot)
     raise StateWalIntegrityError("snapshot and private state WAL sequences diverge")
+
+
+def _consume_interrupted_sequence(
+    app: FastAPI,
+    snapshot: AgentStateSnapshot,
+    recovery: list[JournalRecord],
+) -> AgentStateSnapshot:
+    interrupted = [
+        record
+        for record in recovery
+        if getattr(record, "failure_category", None) == "uncommitted_after_crash"
+    ]
+    if not interrupted:
+        return snapshot
+    if len(interrupted) != 1:
+        raise RuntimeError("multiple interrupted subject events cannot be reconciled")
+    record = interrupted[0]
+    sequence = getattr(record, "processing_sequence", None)
+    if sequence != snapshot.last_processed_event_sequence + 1:
+        raise RuntimeError("interrupted event sequence is not contiguous")
+    now = datetime.now(UTC)
+    event = AgentEvent(
+        event_id=str(getattr(record, "event_id")),
+        event_type=AgentEventType(str(getattr(record, "event_type"))),
+        source=str(getattr(record, "source")),
+        observed_at=now,
+        requested_at=now,
+        processing_sequence=sequence,
+        causation_id=getattr(record, "causation_id", None),
+        correlation_id=getattr(record, "correlation_id", None),
+    )
+    candidate = snapshot.model_copy(
+        update={
+            "saved_at": now,
+            "last_processed_event_sequence": sequence,
+        }
+    )
+    app.state.event_journal.prepared_interrupted(
+        event,
+        state_hash_before=hash_snapshot(snapshot),
+        state_hash_after=hash_snapshot(candidate),
+    )
+    app.state.state_wal.append_transition(event, snapshot, candidate)
+    saved = app.state.agent_state_store.save(candidate)
+    app.state.event_journal.reconcile(saved)
+    return saved
 
 
 def _observe_subject_state(app: FastAPI) -> None:

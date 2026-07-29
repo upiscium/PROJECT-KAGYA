@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import os
 import time
+from types import SimpleNamespace
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -1787,8 +1788,13 @@ def test_restart_reconciliation_finalizes_pending_chat_once(tmp_path: Path) -> N
         )
         assert chat.status_code == 200
         pending = first.app.state.memory_system.get_episodic(chat.json()["episode_id"])
-        assert pending is not None
-        assert pending.external_transaction_status == ExternalTransactionStatus.PENDING
+        assert pending is None
+        transactions = first.app.state.memory_system.list_external_transactions()
+        assert any(
+            record.artifact_id == chat.json()["episode_id"]
+            and record.status == ExternalTransactionStatus.PENDING
+            for record in transactions
+        )
         assert (
             first.app.state.memory_system.retrieve_context(
                 "restart recovery"
@@ -3081,6 +3087,27 @@ def test_readiness_fails_when_subject_runtime_stops(tmp_path: Path) -> None:
         assert response.status_code == 503
         assert response.json()["status"] == "not_ready"
         assert response.json()["checks"]["agent_runtime"] is False
+
+
+def test_readiness_fails_when_memory_probe_or_reconciliation_is_unhealthy(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        memory = client.app.state.memory_system
+        original_probe = memory.readiness_probe
+        memory.readiness_probe = lambda: (_ for _ in ()).throw(
+            RuntimeError("memory unavailable")
+        )
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["shared_memory"] is False
+
+        memory.readiness_probe = original_probe
+        client.app.state.external_reconciliation = SimpleNamespace(retryable=1)
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        assert response.json()["checks"]["shared_memory"] is False
 
 
 def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> None:

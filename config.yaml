@@ -41,11 +41,19 @@ appraisal:
 
 memory:
   persist_directory: .kagya/chroma
+  backend: persistent
+  http_host: 127.0.0.1
+  http_port: 8001
+  http_ssl: false
+  http_tenant: default_tenant
+  http_database: default_database
+  http_auth_token_env: null
   db1_collection: hippocampus
   db2_collection: cortex
   db1_top_k: 5
   db2_top_k: 5
   embedding_model_id: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: null
   default_record_type: episodic
   consolidation_min_arousal: 0.55
   consolidation_min_subjective_salience: 0.55
@@ -253,3 +261,23 @@ deployment:
     enforce_hostname_match: false
   training:
     backend: local
+
+# Disabled preserves the single-node runtime. Enabled nodes coordinate the
+# subject role independently from their deployment workload role.
+failover:
+  enabled: false
+  subject_role: active
+  automatic_promotion: false
+  bootstrap_from_local_state: false
+  bootstrap_memory_hash: null
+  etcd:
+    endpoints:
+      - http://127.0.0.1:2379
+    key_prefix: /kagya/subject
+    lease_ttl_seconds: 15
+    renew_interval_seconds: 5.0
+    request_timeout_seconds: 3.0
+    # Production requires a secret-bearing Authorization header from this env.
+    auth_token_env: null
+    # etcd request limit must exceed this by at least 40% for JSON/base64 overhead.
+    max_bundle_bytes: 1000000

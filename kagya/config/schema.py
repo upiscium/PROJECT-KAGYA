@@ -163,6 +163,55 @@ class DeploymentSettings(StrictBaseModel):
     training: DeploymentTrainingSettings
 
 
+class SubjectRole(StrEnum):
+    ACTIVE = "active"
+    STANDBY = "standby"
+
+
+class EtcdFailoverSettings(StrictBaseModel):
+    endpoints: list[str] = Field(
+        default_factory=lambda: ["http://127.0.0.1:2379"], min_length=1
+    )
+    key_prefix: str = Field(default="/kagya/subject", pattern=r"^/[A-Za-z0-9._/-]+$")
+    lease_ttl_seconds: int = Field(default=15, ge=3, le=300)
+    renew_interval_seconds: float = Field(default=5.0, gt=0.0)
+    request_timeout_seconds: float = Field(default=3.0, gt=0.0)
+    max_bundle_bytes: int = Field(default=1_000_000, gt=0)
+    auth_token_env: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    )
+
+    @model_validator(mode="after")
+    def validate_etcd(self) -> "EtcdFailoverSettings":
+        if self.renew_interval_seconds >= self.lease_ttl_seconds / 2:
+            raise ValueError("etcd renew interval must be less than half the lease TTL")
+        if any(
+            not endpoint.startswith(("http://", "https://"))
+            for endpoint in self.endpoints
+        ):
+            raise ValueError("etcd endpoints must use http or https")
+        return self
+
+
+class FailoverSettings(StrictBaseModel):
+    enabled: bool = False
+    subject_role: SubjectRole = SubjectRole.ACTIVE
+    automatic_promotion: bool = False
+    bootstrap_from_local_state: bool = False
+    bootstrap_memory_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    etcd: EtcdFailoverSettings = Field(default_factory=EtcdFailoverSettings)
+
+    @model_validator(mode="after")
+    def validate_role(self) -> "FailoverSettings":
+        if self.automatic_promotion and self.subject_role != SubjectRole.STANDBY:
+            raise ValueError("automatic promotion is only valid for standby")
+        if self.bootstrap_from_local_state and self.subject_role != SubjectRole.ACTIVE:
+            raise ValueError("failover bootstrap is only valid for an active candidate")
+        if self.bootstrap_from_local_state and self.automatic_promotion:
+            raise ValueError("automatic promotion cannot bootstrap failover state")
+        return self
+
+
 class GenerationSettings(StrictBaseModel):
     max_new_tokens: int = Field(gt=0)
     temperature: float = Field(ge=0.0)
@@ -194,11 +243,21 @@ class AppraisalSettings(StrictBaseModel):
 
 class MemorySettings(StrictBaseModel):
     persist_directory: Path
+    backend: Literal["persistent", "http"] = "persistent"
+    http_host: str = Field(default="127.0.0.1", min_length=1)
+    http_port: int = Field(default=8001, gt=0, le=65535)
+    http_ssl: bool = False
+    http_tenant: str = Field(default="default_tenant", min_length=1)
+    http_database: str = Field(default="default_database", min_length=1)
+    http_auth_token_env: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"
+    )
     db1_collection: str = Field(min_length=1)
     db2_collection: str = Field(min_length=1)
     db1_top_k: int = Field(gt=0)
     db2_top_k: int = Field(gt=0)
     embedding_model_id: str = Field(min_length=1)
+    embedding_revision: str | None = Field(default=None, min_length=1)
     default_record_type: str = Field(min_length=1)
     consolidation_min_arousal: float = Field(default=0.55, gt=0.0, le=1.0)
     consolidation_min_subjective_salience: float = Field(default=0.55, gt=0.0, le=1.0)
@@ -333,9 +392,7 @@ class BackupEncryptionSettings(StrictBaseModel):
     restore_staging_directory: Path = Path(".kagya/restore-staging")
     encrypted_filesystem_attested: bool = False
     keys: KeyRingSettings = Field(
-        default_factory=lambda: KeyRingSettings(
-            current_key_env="KAGYA_BACKUP_KEY"
-        )
+        default_factory=lambda: KeyRingSettings(current_key_env="KAGYA_BACKUP_KEY")
     )
     adapter_keys: KeyRingSettings = Field(
         default_factory=lambda: KeyRingSettings(
@@ -424,9 +481,7 @@ class ApiSettings(StrictBaseModel):
     chat_timeout_seconds: float = Field(default=300.0, gt=0)
     chat_stream_replay_limit: int = Field(default=256, gt=0, le=4096)
     chat_job_result_retention_seconds: float = Field(default=86400.0, ge=0)
-    chat_job_idempotency_retention_seconds: float = Field(
-        default=604800.0, ge=0
-    )
+    chat_job_idempotency_retention_seconds: float = Field(default=604800.0, ge=0)
     chat_job_max_terminal_records: int = Field(default=10000, gt=0)
     chat_job_cleanup_interval_seconds: float = Field(default=60.0, ge=0)
     cors_origins: list[str]
@@ -490,6 +545,7 @@ class Settings(StrictBaseModel):
     api: ApiSettings
     frontend: FrontendSettings
     deployment: DeploymentSettings
+    failover: FailoverSettings = Field(default_factory=FailoverSettings)
 
     @model_validator(mode="after")
     def validate_deployment_topology(self) -> "Settings":
@@ -502,7 +558,10 @@ class Settings(StrictBaseModel):
             raise ValueError(
                 "production requires behavioral_activation_policy=real_model_required"
             )
-        if environment == ProjectEnvironment.PRODUCTION and not self.at_rest.live.enabled:
+        if (
+            environment == ProjectEnvironment.PRODUCTION
+            and not self.at_rest.live.enabled
+        ):
             raise ValueError("production requires live authoritative encryption")
         if (
             environment == ProjectEnvironment.PRODUCTION
@@ -520,7 +579,8 @@ class Settings(StrictBaseModel):
             )
         if (
             policy == BehavioralActivationPolicy.DETERMINISTIC_RUNTIME_ONLY
-            and environment not in {
+            and environment
+            not in {
                 ProjectEnvironment.DEVELOPMENT,
                 ProjectEnvironment.TEST,
                 ProjectEnvironment.CI,
@@ -585,6 +645,69 @@ class Settings(StrictBaseModel):
             raise ValueError(
                 "standalone deployment forbids remote worker and worker settings"
             )
+        if self.failover.enabled and role == NodeRole.TRAINING_WORKER:
+            raise ValueError("subject failover is not valid for a training worker")
+        if self.failover.enabled and not self.at_rest.live.enabled:
+            raise ValueError("subject failover requires live authoritative encryption")
+        if self.failover.enabled and self.memory.backend != "http":
+            raise ValueError("subject failover requires a shared Chroma HTTP service")
+        if self.failover.enabled and any(
+            revision == "main"
+            for revision in (
+                self.model.revision,
+                self.model.processor_revision,
+                self.model.fallback_revision,
+            )
+        ):
+            raise ValueError("subject failover requires exact immutable revisions")
+        if (
+            self.failover.enabled
+            and self.model.provider.lower() == "transformers"
+            and any(
+                re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+                for revision in (
+                    self.model.revision,
+                    self.model.processor_revision,
+                    self.model.fallback_revision,
+                )
+            )
+        ):
+            raise ValueError(
+                "transformers failover requires immutable commit revisions"
+            )
+        if (
+            self.failover.enabled
+            and self.memory.embedding_model_id != "deterministic"
+            and (
+                self.memory.embedding_revision is None
+                or re.fullmatch(r"[0-9a-fA-F]{40}", self.memory.embedding_revision)
+                is None
+            )
+        ):
+            raise ValueError(
+                "subject failover requires an immutable memory embedding revision"
+            )
+        if (
+            self.failover.enabled
+            and self.project.environment == ProjectEnvironment.PRODUCTION
+        ):
+            if any(
+                not endpoint.startswith("https://")
+                for endpoint in self.failover.etcd.endpoints
+            ):
+                raise ValueError(
+                    "production subject failover requires HTTPS etcd endpoints"
+                )
+            if self.failover.etcd.auth_token_env is None:
+                raise ValueError(
+                    "production subject failover requires etcd authentication"
+                )
+            if not self.memory.http_ssl:
+                raise ValueError("production subject failover requires Chroma TLS")
+            if self.memory.http_auth_token_env is None:
+                raise ValueError(
+                    "production subject failover requires Chroma authentication"
+                )
         if self.agent_state.path.resolve() == self.agent_journal.path.resolve():
             raise ValueError("agent state and journal paths must be distinct")
         operational_paths = {

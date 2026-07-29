@@ -138,6 +138,7 @@ class ChatJobRegistry:
         max_terminal_records: int = 10000,
         cleanup_interval_seconds: float = 60.0,
         metrics: MetricsSink | None = None,
+        persistence_hook: Callable[[], None] | None = None,
     ) -> None:
         if result_retention_seconds < 0 or idempotency_retention_seconds < 0:
             raise ValueError("chat job retention must be non-negative")
@@ -172,6 +173,8 @@ class ChatJobRegistry:
         self.max_terminal_records = max_terminal_records
         self.cleanup_interval_seconds = cleanup_interval_seconds
         self.metrics = metrics
+        self._persistence_hook = persistence_hook
+        self._replication_suppressed = False
         self._last_cleanup_monotonic: float | None = None
         self._lock = RLock()
         self._changed = Condition(self._lock)
@@ -182,6 +185,8 @@ class ChatJobRegistry:
         self._events: dict[str, deque[ChatStreamEvent]] = {}
         self._event_sequences: dict[str, int] = {}
         self._errors: dict[str, BaseException] = {}
+        self._submitting: set[str] = set()
+        self._submission_failed: set[str] = set()
         self._enqueue_sequence = 0
         self._replay_state = ReplayState.INACTIVE
         self._queued_for_replay: list[str] = []
@@ -249,16 +254,25 @@ class ChatJobRegistry:
         idempotency_key = _safe_identity(idempotency_key)
         with self._lock:
             self._maybe_compact_locked()
-            duplicate = next(
-                (
-                    record
-                    for record in self._records.values()
-                    if record.client_id == client_id
-                    and record.idempotency_key == idempotency_key
-                ),
-                None,
-            )
+            while True:
+                duplicate = next(
+                    (
+                        record
+                        for record in self._records.values()
+                        if record.client_id == client_id
+                        and record.idempotency_key == idempotency_key
+                    ),
+                    None,
+                )
+                if (
+                    duplicate is None
+                    or duplicate.status.operation_id not in self._submitting
+                ):
+                    break
+                self._changed.wait()
             if duplicate is not None:
+                if duplicate.status.operation_id in self._submission_failed:
+                    raise AgentRuntimeStopped("Chat job admission failed")
                 return duplicate.model_copy(deep=True), False
             tombstone = next(
                 (
@@ -296,18 +310,44 @@ class ChatJobRegistry:
                 ),
             )
             self._records[operation_id] = record
-            self._persist()
-            self._emit(operation_id, "status", status.model_dump(mode="json"))
+            self._submitting.add(operation_id)
+            # AgentRuntime publishes this spool and its accepted Journal record as one cut.
+            self._replication_suppressed = True
             try:
-                self._submit(record)
-            except (AgentRuntimeQueueFull, AgentRuntimeStopped):
-                del self._records[operation_id]
                 self._persist()
-                raise
-            except Exception:
-                # Keep the durable spool when journal acceptance may have succeeded.
-                raise
-            return record.model_copy(deep=True), True
+                self._emit(operation_id, "status", status.model_dump(mode="json"))
+            finally:
+                self._replication_suppressed = False
+            result = record.model_copy(deep=True)
+        try:
+            # Admission publication can wait on the runtime event-boundary lock.
+            # Never retain the registry lock across that wait.
+            self._submit(record)
+        except (AgentRuntimeQueueFull, AgentRuntimeStopped):
+            with self._changed:
+                self._replication_suppressed = True
+                try:
+                    if self._records.get(operation_id) is record:
+                        del self._records[operation_id]
+                        self._persist()
+                    self._submitting.discard(operation_id)
+                    self._changed.notify_all()
+                finally:
+                    self._replication_suppressed = False
+            if self._persistence_hook is not None:
+                self._persistence_hook()
+            raise
+        except Exception:
+            # Keep the durable spool when journal acceptance may have succeeded.
+            with self._changed:
+                self._submitting.discard(operation_id)
+                self._submission_failed.add(operation_id)
+                self._changed.notify_all()
+            raise
+        with self._changed:
+            self._submitting.discard(operation_id)
+            self._changed.notify_all()
+        return result, True
 
     def compact(self, now: datetime | None = None) -> None:
         """Atomically apply age and count retention to safe terminal jobs."""
@@ -366,53 +406,63 @@ class ChatJobRegistry:
 
     def cancel(self, operation_id: str, code: OperationCancelCode) -> str:
         with self._lock:
-            record = self._records.get(operation_id)
-            if record is None:
-                return "not_found"
-            if record.status.status == OperationState.COMPLETED:
-                return "already_completed"
-            if record.status.status in {
-                OperationState.CANCELED,
-                OperationState.FAILED,
-            }:
-                return record.status.status.value
-            if record.status.status == OperationState.FINALIZING:
-                return "already_finalizing"
-            token = self._tokens.get(operation_id)
-            previous = record.model_copy(deep=True)
-            previous_event_sequence = self._event_sequences.get(operation_id, 0)
-            if record.status.status == OperationState.QUEUED:
-                try:
-                    record.requested_cancel_code = code
-                    record.cancel_requested_at = operation_now()
-                    self._transition(
-                        operation_id, OperationState.CANCELED, cancel_code=code
-                    )
-                except Exception:
-                    self._records[operation_id] = previous
-                    self._event_sequences[operation_id] = previous_event_sequence
-                    raise
-                if token is not None:
-                    token.cancel(code.value)
-                self._refresh_queue_positions()
-                self._emit(operation_id, "canceled", {"code": code.value})
-                self._maybe_compact_locked()
-                return "canceled"
+            self._replication_suppressed = True
+            try:
+                result, token = self._cancel_locked(operation_id, code)
+            finally:
+                self._replication_suppressed = False
+        if self._persistence_hook is not None:
+            self._persistence_hook()
+        if token is not None:
+            token.cancel(code.value)
+        return result
+
+    def _cancel_locked(
+        self, operation_id: str, code: OperationCancelCode
+    ) -> tuple[str, CancellationToken | None]:
+        record = self._records.get(operation_id)
+        if record is None:
+            return "not_found", None
+        if record.status.status == OperationState.COMPLETED:
+            return "already_completed", None
+        if record.status.status in {
+            OperationState.CANCELED,
+            OperationState.FAILED,
+        }:
+            return record.status.status.value, None
+        if record.status.status == OperationState.FINALIZING:
+            return "already_finalizing", None
+        token = self._tokens.get(operation_id)
+        previous = record.model_copy(deep=True)
+        previous_event_sequence = self._event_sequences.get(operation_id, 0)
+        if record.status.status == OperationState.QUEUED:
             try:
                 record.requested_cancel_code = code
                 record.cancel_requested_at = operation_now()
                 self._transition(
-                    operation_id,
-                    record.status.status,
-                    cancel_requested=True,
+                    operation_id, OperationState.CANCELED, cancel_code=code
                 )
             except Exception:
                 self._records[operation_id] = previous
                 self._event_sequences[operation_id] = previous_event_sequence
                 raise
-            if token is not None:
-                token.cancel(code.value)
-            return "cancel_requested"
+            self._refresh_queue_positions()
+            self._emit(operation_id, "canceled", {"code": code.value})
+            self._maybe_compact_locked()
+            return "canceled", token
+        try:
+            record.requested_cancel_code = code
+            record.cancel_requested_at = operation_now()
+            self._transition(
+                operation_id,
+                record.status.status,
+                cancel_requested=True,
+            )
+        except Exception:
+            self._records[operation_id] = previous
+            self._event_sequences[operation_id] = previous_event_sequence
+            raise
+        return "cancel_requested", token
 
     def events_after(
         self, operation_id: str, last_event_id: int
@@ -606,12 +656,15 @@ class ChatJobRegistry:
                         break
                     operation_id = self._queued_for_replay[0]
                     record = self._records[operation_id]
-                    try:
-                        self._submit(record)
-                    except AgentRuntimeQueueFull:
+                try:
+                    self._submit(record)
+                except AgentRuntimeQueueFull:
+                    with self._changed:
                         self._changed.wait()
-                        continue
-                    self._queued_for_replay.pop(0)
+                    continue
+                with self._changed:
+                    if self._queued_for_replay[0] == operation_id:
+                        self._queued_for_replay.pop(0)
             else:
                 return
         except Exception:
@@ -625,35 +678,43 @@ class ChatJobRegistry:
     def _submit(self, record: ChatJobRecord) -> None:
         operation_id = record.status.operation_id
         token = CancellationToken()
-        self._tokens[operation_id] = token
         timer: Timer | None = None
-        if self.timeout_seconds > 0:
-            if record.timeout_deadline is None:
-                record.timeout_deadline = operation_now() + timedelta(
-                    seconds=self.timeout_seconds
-                )
-                self._persist()
-            remaining = max(
-                0.0, (record.timeout_deadline - operation_now()).total_seconds()
-            )
-            if remaining == 0:
-                if record.requested_cancel_code is None:
-                    record.requested_cancel_code = OperationCancelCode.TIMEOUT
-                    record.cancel_requested_at = operation_now()
-                    self._transition(
-                        operation_id,
-                        OperationState.QUEUED,
-                        cancel_requested=True,
-                        queue_position=record.status.queue_position,
+        with self._lock:
+            self._replication_suppressed = True
+            try:
+                self._tokens[operation_id] = token
+                if self.timeout_seconds > 0:
+                    if record.timeout_deadline is None:
+                        record.timeout_deadline = operation_now() + timedelta(
+                            seconds=self.timeout_seconds
+                        )
+                        self._persist()
+                    remaining = max(
+                        0.0,
+                        (record.timeout_deadline - operation_now()).total_seconds(),
                     )
-                token.cancel(record.requested_cancel_code.value)
-            else:
-                timer = Timer(
-                    remaining,
-                    lambda: self.cancel(operation_id, OperationCancelCode.TIMEOUT),
-                )
-                timer.daemon = True
-                self._timers[operation_id] = timer
+                    if remaining == 0:
+                        if record.requested_cancel_code is None:
+                            record.requested_cancel_code = OperationCancelCode.TIMEOUT
+                            record.cancel_requested_at = operation_now()
+                            self._transition(
+                                operation_id,
+                                OperationState.QUEUED,
+                                cancel_requested=True,
+                                queue_position=record.status.queue_position,
+                            )
+                        token.cancel(record.requested_cancel_code.value)
+                    else:
+                        timer = Timer(
+                            remaining,
+                            lambda: self.cancel(
+                                operation_id, OperationCancelCode.TIMEOUT
+                            ),
+                        )
+                        timer.daemon = True
+                        self._timers[operation_id] = timer
+            finally:
+                self._replication_suppressed = False
 
         def run() -> dict[str, Any]:
             with self._lock:
@@ -1001,6 +1062,8 @@ class ChatJobRegistry:
                 os.fsync(output.fileno())
             os.replace(temporary, self.path)
             _fsync_directory(self.path.parent)
+            if not self._replication_suppressed and self._persistence_hook is not None:
+                self._persistence_hook()
         finally:
             temporary.unlink(missing_ok=True)
 

@@ -5,12 +5,14 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 import re
 from typing import Any
 from uuid import uuid4
 
 import chromadb
 from chromadb.api.types import Metadata
+import numpy as np
 
 from kagya.config import Settings
 from kagya.memory.consolidation import build_consolidation_prompt
@@ -34,6 +36,7 @@ from kagya.external_transaction import (
     ExternalTransactionRecord,
     ExternalTransactionStatus,
 )
+from kagya.memory.transactional_chroma import ChromaTransactionStore
 
 
 class DeterministicEmbeddingFunction:
@@ -42,8 +45,10 @@ class DeterministicEmbeddingFunction:
     def __call__(self, input: Sequence[str]) -> list[list[float]]:
         return [_embed_text(text) for text in input]
 
-    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
-        return self(input)
+    def embed_query(
+        self, input: Sequence[str]
+    ) -> np.ndarray[Any, np.dtype[np.float32]]:
+        return np.asarray(self(input), dtype=np.float32)
 
     def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
         return self(input)
@@ -60,22 +65,31 @@ class DeterministicEmbeddingFunction:
 class SentenceTransformerEmbeddingFunction:
     """Chroma embedding function backed by a configured sentence-transformers model."""
 
-    def __init__(self, model_id: str, model_loader: Any | None = None) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        revision: str | None = None,
+        model_loader: Any | None = None,
+    ) -> None:
         self.model_id = model_id
+        self.revision = revision
         self._model_loader = model_loader or _load_sentence_transformer
         self._model: Any | None = None
 
     def __call__(self, input: Sequence[str]) -> list[list[float]]:
         return self._encode(input)
 
-    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
-        return self._encode(input)
+    def embed_query(
+        self, input: Sequence[str]
+    ) -> np.ndarray[Any, np.dtype[np.float32]]:
+        return np.asarray(self._encode(input), dtype=np.float32)
 
     def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
         return self._encode(input)
 
     def name(self) -> str:
-        return f"sentence-transformers:{self.model_id}"
+        identity = f"sentence-transformers:{self.model_id}"
+        return identity if self.revision is None else f"{identity}@{self.revision}"
 
     @staticmethod
     def is_legacy() -> bool:
@@ -84,13 +98,16 @@ class SentenceTransformerEmbeddingFunction:
     def _encode(self, input: Sequence[str]) -> list[list[float]]:
         model = self._get_model()
         embeddings = model.encode(list(input), normalize_embeddings=True)
-        if hasattr(embeddings, "tolist"):
-            return embeddings.tolist()
-        return [list(vector) for vector in embeddings]
+        values = embeddings.tolist() if hasattr(embeddings, "tolist") else embeddings
+        return [list(vector) for vector in values]
 
     def _get_model(self) -> Any:
         if self._model is None:
-            self._model = self._model_loader(self.model_id)
+            self._model = (
+                self._model_loader(self.model_id)
+                if self.revision is None
+                else self._model_loader(self.model_id, self.revision)
+            )
         return self._model
 
 
@@ -100,7 +117,21 @@ def create_embedding_function(settings: Settings) -> Any:
     model_id = settings.memory.embedding_model_id
     if model_id == "deterministic":
         return DeterministicEmbeddingFunction()
-    return SentenceTransformerEmbeddingFunction(model_id)
+    return SentenceTransformerEmbeddingFunction(
+        model_id, revision=settings.memory.embedding_revision
+    )
+
+
+def configured_memory_identity(settings: Settings) -> tuple[str, str, str]:
+    """Return the immutable collection and embedding identity used by Chroma."""
+
+    embedding = create_embedding_function(settings)
+    identity = _embedding_name(embedding)
+    return (
+        _collection_name_for_embedding(settings.memory.db1_collection, embedding),
+        _collection_name_for_embedding(settings.memory.db2_collection, embedding),
+        identity,
+    )
 
 
 class DualMemorySystem:
@@ -111,6 +142,7 @@ class DualMemorySystem:
         settings: Settings,
         embedding_function: Any | None = None,
         evaluator: MemoryEvaluator | None = None,
+        fencing_token: Callable[[], int] | None = None,
     ) -> None:
         self.settings = settings
         self.embedding_function = embedding_function or create_embedding_function(
@@ -122,30 +154,73 @@ class DualMemorySystem:
                 settings.memory.consolidation_min_subjective_salience
             ),
         )
-        self.client = chromadb.PersistentClient(
-            path=str(settings.memory.persist_directory)
-        )
+        if settings.memory.backend == "http":
+            token_env = settings.memory.http_auth_token_env
+            token = None if token_env is None else os.environ.get(token_env)
+            if token_env is not None and not token:
+                raise RuntimeError("Chroma authentication token is unavailable")
+            self.client = chromadb.HttpClient(
+                host=settings.memory.http_host,
+                port=settings.memory.http_port,
+                ssl=settings.memory.http_ssl,
+                headers=None if token is None else {"Authorization": token},
+                tenant=settings.memory.http_tenant,
+                database=settings.memory.http_database,
+            )
+        else:
+            self.client = chromadb.PersistentClient(
+                path=str(settings.memory.persist_directory)
+            )
         db1_collection = _collection_name_for_embedding(
             settings.memory.db1_collection, self.embedding_function
         )
         db2_collection = _collection_name_for_embedding(
             settings.memory.db2_collection, self.embedding_function
         )
-        self.db1 = self.client.get_or_create_collection(
+        self.db1_collection_name = db1_collection
+        self.db2_collection_name = db2_collection
+        self.embedding_identity = _embedding_name(self.embedding_function)
+        raw_db1 = self.client.get_or_create_collection(
             name=db1_collection,
             embedding_function=self.embedding_function,
-            metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
+            metadata={"kagya_embedding": self.embedding_identity},
         )
-        self.db2 = self.client.get_or_create_collection(
+        raw_db2 = self.client.get_or_create_collection(
             name=db2_collection,
             embedding_function=self.embedding_function,
-            metadata={"kagya_embedding": _embedding_name(self.embedding_function)},
+            metadata={"kagya_embedding": self.embedding_identity},
         )
+        self._transaction_store: ChromaTransactionStore | None = None
+        self.db1: Any
+        self.db2: Any
+        if settings.failover.enabled:
+            if settings.memory.backend != "http" or fencing_token is None:
+                raise RuntimeError(
+                    "failover shared Chroma transactions are unavailable"
+                )
+            transaction_name = _transaction_collection_name(
+                db1_collection, db2_collection, self.embedding_identity
+            )
+            self._transaction_store = ChromaTransactionStore(
+                self.client,
+                collection_name=transaction_name,
+                node_id=settings.deployment.node.id,
+                fencing_token=fencing_token,
+                embedding_function=self.embedding_function,
+                event_provider=_current_agent_event,
+            )
+            self.db1 = self._transaction_store.wrap(raw_db1, "db1")
+            self.db2 = self._transaction_store.wrap(raw_db2, "db2")
+            self._transaction_store.recover_materialization()
+        else:
+            self.db1 = raw_db1
+            self.db2 = raw_db2
         self._external_failure_injector: Callable[[str, str], None] | None = None
         self._external_boundary_injector: Callable[[str, str], None] | None = None
-        self._scrub_legacy_hidden_thoughts()
-        self._backfill_episodic_transactions()
-        self._backfill_semantic_records()
+        if not settings.failover.enabled:
+            self._scrub_legacy_hidden_thoughts()
+            self._backfill_episodic_transactions()
+            self._backfill_semantic_records()
 
     def save_episodic(
         self,
@@ -189,7 +264,7 @@ class DualMemorySystem:
         created_at = _now_iso()
         transaction_status = (
             ExternalTransactionStatus.PENDING
-            if stage_external
+            if stage_external and self._transaction_store is None
             else ExternalTransactionStatus.COMMITTED
         )
         if stage_external and (source_event_id is None or processing_sequence is None):
@@ -349,20 +424,93 @@ class DualMemorySystem:
                     ],
                 )
             )
+        if self._transaction_store is not None:
+            records.extend(self._transaction_store.records())
         return records
 
     def finalize_external_event(self, event_id: str, processing_sequence: int) -> int:
         if self._external_failure_injector is not None:
             self._external_failure_injector("finalize", event_id)
-        return self._transition_external_event(
+        changed = 0
+        if self._transaction_store is not None:
+            changed += self._transaction_store.finalize_event(
+                event_id, processing_sequence
+            )
+        changed += self._transition_external_event(
             event_id,
             from_statuses={ExternalTransactionStatus.PENDING},
             to_status=ExternalTransactionStatus.COMMITTED,
             reason="snapshot_committed",
             processing_sequence=processing_sequence,
         )
+        if self._transaction_store is not None:
+            changed += self._transaction_store.materialize_event(
+                event_id, processing_sequence
+            )
+        return changed
+
+    def assert_external_sequence(self, processing_sequence: int) -> None:
+        if self._transaction_store is not None:
+            self._transaction_store.assert_not_ahead(processing_sequence)
+
+    def shared_memory_state(self) -> tuple[str, str]:
+        if self._transaction_store is None:
+            raise RuntimeError("shared memory continuity is unavailable")
+        return (
+            self._transaction_store.canonical_memory_hash(),
+            self._transaction_store.transaction_head(),
+        )
+
+    def validate_shared_memory_state(
+        self, memory_hash: str, transaction_head: str, processing_sequence: int
+    ) -> None:
+        if self._transaction_store is None:
+            raise RuntimeError("shared memory continuity is unavailable")
+        current_hash, current_head = self.shared_memory_state()
+        continuity = self._transaction_store.continuity()
+        sealed_sequence = int(continuity.get("sealed_through_sequence", -1))
+        hash_matches = current_hash == memory_hash or (
+            sealed_sequence == processing_sequence
+            and continuity.get("previous_memory_hash") == memory_hash
+        )
+        head_matches = current_head == transaction_head or (
+            sealed_sequence == processing_sequence
+            and continuity.get("previous_head_hash") == transaction_head
+        )
+        if not hash_matches or not head_matches:
+            raise RuntimeError("shared Chroma continuity does not match the replica")
+
+    def readiness_probe(self) -> None:
+        heartbeat = getattr(self.client, "heartbeat", None)
+        if callable(heartbeat):
+            heartbeat()
+        if self._transaction_store is not None:
+            self._transaction_store.readiness_probe()
+
+    def verify_bootstrap_memory(self, expected_hash: str | None) -> None:
+        if self._transaction_store is None:
+            return
+        current_hash = self._transaction_store.canonical_memory_hash()
+        empty_hash = hashlib.sha256(b"[]").hexdigest()
+        continuity = self._transaction_store.continuity()
+        if expected_hash is not None:
+            if current_hash != expected_hash:
+                raise RuntimeError("shared Chroma bootstrap hash mismatch")
+            if continuity:
+                raise RuntimeError(
+                    "shared Chroma transaction continuity requires a replica bundle"
+                )
+            return
+        if current_hash != empty_hash or continuity:
+            raise RuntimeError(
+                "foreign shared Chroma requires failover.bootstrap_memory_hash"
+            )
 
     def orphan_external_event(self, event_id: str, reason: str) -> int:
+        if self._transaction_store is not None:
+            # Pending commands remain immutable and invisible; compensation records
+            # the durable terminal disposition.
+            return self._transaction_store.compensate_event(event_id, reason)
         return self._transition_external_event(
             event_id,
             from_statuses={ExternalTransactionStatus.PENDING},
@@ -371,6 +519,8 @@ class DualMemorySystem:
         )
 
     def compensate_external_event(self, event_id: str, reason: str) -> int:
+        if self._transaction_store is not None:
+            return self._transaction_store.compensate_event(event_id, reason)
         return self._transition_external_event(
             event_id,
             from_statuses={
@@ -751,7 +901,16 @@ class DualMemorySystem:
 
     def get_episodic(self, episode_id: str) -> EpisodicMemoryRecord | None:
         result = self.db1.get(ids=[episode_id], include=["metadatas"])
-        return _first_episode_from_get(result)
+        record = _first_episode_from_get(result)
+        if (
+            record is not None
+            and record.external_transaction_status
+            != ExternalTransactionStatus.COMMITTED
+        ):
+            event = _current_agent_event()
+            if event is None or record.source_event_id != event.event_id:
+                return None
+        return record
 
     def committed_episodic_for_event(
         self, event_id: str
@@ -1304,6 +1463,15 @@ def _collection_name_for_embedding(base_name: str, embedding_function: Any) -> s
     return f"{base_name}-{safe_name}-{digest}"
 
 
+def _transaction_collection_name(db1: str, db2: str, embedding_identity: str) -> str:
+    identity = _canonical_memory_identity(db1, db2, embedding_identity)
+    return f"kagya-transactions-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+
+
+def _canonical_memory_identity(db1: str, db2: str, embedding_identity: str) -> str:
+    return json.dumps([db1, db2, embedding_identity], separators=(",", ":"))
+
+
 def _embedding_name(embedding_function: Any) -> str:
     name = getattr(embedding_function, "name", None)
     if callable(name):
@@ -1316,18 +1484,26 @@ def _is_legacy_embedding(embedding_function: Any) -> bool:
     return bool(callable(is_legacy) and is_legacy())
 
 
-def _load_sentence_transformer(model_id: str) -> Any:
+def _load_sentence_transformer(model_id: str, revision: str | None = None) -> Any:
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
         raise RuntimeError(
             "sentence-transformers is required for configured memory embeddings"
         ) from exc
-    return SentenceTransformer(model_id)
+    kwargs = {} if revision is None else {"revision": revision}
+    return SentenceTransformer(model_id, **kwargs)
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _current_agent_event() -> Any | None:
+    # Lazy import avoids the runtime -> main loop -> memory package cycle.
+    from kagya.runtime.agent_runtime import current_agent_event
+
+    return current_agent_event()
 
 
 def _episodic_document(user_input: str, response: str) -> str:

@@ -430,6 +430,9 @@ def _audit_admin_mutation(request: Request, actor: AdminActor) -> None:
         target=f"{request.method} {request.url.path}",
         reauthenticated=actor.reauthenticated,
     )
+    publish = getattr(request.app.state, "failover_persistence_hook", None)
+    if publish is not None:
+        publish()
 
 
 def get_model_provider(request: Request) -> ModelProvider:

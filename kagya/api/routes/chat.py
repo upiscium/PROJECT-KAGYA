@@ -320,12 +320,11 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
         required_event_ids=required_event_ids,
         result_reconstructor=reconstruct_result,
         result_retention_seconds=settings.chat_job_result_retention_seconds,
-        idempotency_retention_seconds=(
-            settings.chat_job_idempotency_retention_seconds
-        ),
+        idempotency_retention_seconds=(settings.chat_job_idempotency_retention_seconds),
         max_terminal_records=settings.chat_job_max_terminal_records,
         cleanup_interval_seconds=settings.chat_job_cleanup_interval_seconds,
         metrics=getattr(app.state, "operational_telemetry", None),
+        persistence_hook=getattr(app.state, "failover_persistence_hook", None),
     )
 
 
