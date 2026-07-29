@@ -305,6 +305,11 @@ def commit_encrypted_restore(
     runtime: AgentRuntime = Depends(get_agent_runtime),
     settings: Settings = Depends(get_api_settings),
 ) -> RestorePreview:
+    if settings.failover.enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="online backup restore is unavailable while subject failover is enabled",
+        )
     if body.expected_backup_id != backup_id:
         raise HTTPException(status_code=409, detail="expected backup ID does not match")
     manager = BackupManager(settings)

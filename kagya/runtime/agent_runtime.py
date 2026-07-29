@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from queue import Empty, Full, Queue
-from threading import Lock, Thread
+from threading import Lock, Thread, current_thread
 from typing import Any, Callable, cast, Generic, Protocol, TypeVar
 from uuid import uuid4
 
@@ -160,6 +160,24 @@ class EventFailureHook(Protocol):
     def __call__(self, event: AgentEvent, exception: Exception) -> str | None: ...
 
 
+class EventTerminalHook(Protocol):
+    def __call__(self, event: AgentEvent, snapshot_hash: str) -> None: ...
+
+
+class EventAdmissionHook(Protocol):
+    def __call__(self, event: AgentEvent) -> None: ...
+
+
+class EventStartedHook(Protocol):
+    def __call__(self, event: AgentEvent) -> None: ...
+
+
+class EventBoundaryLock(Protocol):
+    def acquire(self) -> bool: ...
+
+    def release(self) -> None: ...
+
+
 class DurableEventJournal(Protocol):
     def accepted(self, event: AgentEvent) -> object: ...
 
@@ -208,6 +226,11 @@ class AgentRuntime:
         initial_sequence: int = 0,
         completion_hook: EventCompletionHook | None = None,
         failure_hook: EventFailureHook | None = None,
+        admission_hook: EventAdmissionHook | None = None,
+        started_hook: EventStartedHook | None = None,
+        terminal_hook: EventTerminalHook | None = None,
+        event_boundary_lock: EventBoundaryLock | None = None,
+        event_boundary_types: set[AgentEventType] | None = None,
         event_journal: DurableEventJournal | None = None,
         telemetry: RuntimeTelemetry | None = None,
     ) -> None:
@@ -219,6 +242,11 @@ class AgentRuntime:
         self._event_recorder = event_recorder
         self._completion_hook = completion_hook
         self._failure_hook = failure_hook
+        self._admission_hook = admission_hook
+        self._started_hook = started_hook
+        self._terminal_hook = terminal_hook
+        self._event_boundary_lock = event_boundary_lock
+        self._event_boundary_types = event_boundary_types
         self._event_journal = event_journal
         self._telemetry = telemetry
         self._state_lock = Lock()
@@ -288,6 +316,15 @@ class AgentRuntime:
                     raise AgentRuntimeJournalError(
                         "Agent event could not be durably accepted"
                     ) from exc
+            if self._admission_hook is not None:
+                try:
+                    self._admission_hook(event)
+                except Exception as exc:
+                    self._state = "failed"
+                    self._queue.put_nowait(_STOP)
+                    raise AgentRuntimeJournalError(
+                        "Agent event acceptance could not be replicated"
+                    ) from exc
             try:
                 self._queue.put_nowait(envelope)
             except Full as exc:
@@ -336,7 +373,7 @@ class AgentRuntime:
             return
         self._queue.join()
         self._queue.put(_STOP)
-        if worker is not None:
+        if worker is not None and worker is not current_thread():
             worker.join()
         with self._state_lock:
             self._state = "stopped"
@@ -365,7 +402,7 @@ class AgentRuntime:
             finally:
                 self._queue.task_done()
         self._queue.put(_STOP)
-        if worker is not None:
+        if worker is not None and worker is not current_thread():
             worker.join()
 
     @property
@@ -399,8 +436,27 @@ class AgentRuntime:
                             can_deliver=can_deliver,
                         )
                         return
+                if self._started_hook is not None:
+                    try:
+                        self._started_hook(event)
+                    except Exception:
+                        self._fail_stop(
+                            envelope,
+                            AgentRuntimeJournalError(
+                                "Agent event start could not be replicated"
+                            ),
+                            can_deliver=can_deliver,
+                        )
+                        return
                 self._record(event, "started")
                 self._observe_telemetry("event_started", event, self._queue.qsize())
+                boundary_locked = self._event_boundary_lock is not None and (
+                    self._event_boundary_types is None
+                    or event.event_type in self._event_boundary_types
+                )
+                if boundary_locked:
+                    assert self._event_boundary_lock is not None
+                    self._event_boundary_lock.acquire()
                 event_token = _current_event.set(event)
                 rollback_token = _rollback_callbacks.set(())
                 cancellation_context = _current_cancellation.set(
@@ -429,6 +485,12 @@ class AgentRuntime:
                             self._event_journal.failed(
                                 event, failure_category, snapshot_hash
                             )
+                        if self._terminal_hook is not None:
+                            if snapshot_hash is None:
+                                raise RuntimeError(
+                                    "terminal publication requires a committed snapshot hash"
+                                )
+                            self._terminal_hook(event, snapshot_hash)
                     except Exception:
                         self._fail_stop(
                             envelope,
@@ -468,6 +530,12 @@ class AgentRuntime:
                                     "durable journal requires a committed snapshot hash"
                                 )
                             self._event_journal.completed(event, snapshot_hash)
+                        if self._terminal_hook is not None:
+                            if snapshot_hash is None:
+                                raise RuntimeError(
+                                    "terminal publication requires a committed snapshot hash"
+                                )
+                            self._terminal_hook(event, snapshot_hash)
                     except Exception as exc:
                         for callback in reversed(_rollback_callbacks.get()):
                             try:
@@ -504,6 +572,9 @@ class AgentRuntime:
                     _current_cancellation.reset(cancellation_context)
                     _rollback_callbacks.reset(rollback_token)
                     _current_event.reset(event_token)
+                    if boundary_locked:
+                        assert self._event_boundary_lock is not None
+                        self._event_boundary_lock.release()
             finally:
                 self._queue.task_done()
 

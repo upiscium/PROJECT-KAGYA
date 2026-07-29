@@ -136,8 +136,9 @@ class ExternalTransactionCoordinator:
     def compensate_event(self, event_id: str, reason: str) -> int:
         changed = 0
         for store in self._stores:
-            store.orphan_external_event(event_id, reason)
-            changed += store.compensate_external_event(event_id, reason)
+            orphaned = store.orphan_external_event(event_id, reason)
+            compensated = store.compensate_external_event(event_id, reason)
+            changed += max(orphaned, compensated)
         return changed
 
     def reconcile(
@@ -162,7 +163,9 @@ class ExternalTransactionCoordinator:
         for event_id in sorted(pending_event_ids):
             outcome = latest.get(event_id)
             if outcome is None:
-                retryable += 1
+                compensated += self.compensate_event(
+                    event_id, "journal_commit_evidence_missing"
+                )
                 continue
             lifecycle = str(outcome.lifecycle)
             committed = lifecycle == "completed" or (
