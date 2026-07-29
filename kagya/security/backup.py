@@ -19,6 +19,10 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.artifact_provenance import build_adapter_artifact_manifest
+from kagya.chat_jobs import (
+    resolve_chat_job_registry_path,
+    validate_chat_job_registry,
+)
 from kagya.config.schema import ProjectEnvironment, Settings
 from kagya.runtime.agent_state import AgentStateStore
 from kagya.runtime.event_journal import EventJournal, hash_snapshot
@@ -540,6 +544,11 @@ class BackupManager:
             retained_files=self.settings.agent_journal.retained_files,
             codec=codecs.journal,
         ).verify()
+        if roots["chat_jobs"]:
+            validate_chat_job_registry(
+                resolve_chat_job_registry_path(self.settings),
+                codecs.chat_request_spool,
+            )
         return snapshot.last_processed_event_sequence, snapshot_hash
 
     def _read_manifest(self, path: Path) -> tuple[BackupManifest, dict[str, Any]]:
@@ -762,6 +771,14 @@ class BackupManager:
                 raise BackupError("isolated restore checksum validation failed")
         by_root = {source.label: source for source in _sources(self.settings)}
         live = build_live_codecs(self.settings)
+        if "chat_jobs" not in manifest.roots:
+            raise BackupError("backup chat job registry root is missing")
+        if manifest.roots["chat_jobs"]:
+            chat_source = by_root["chat_jobs"]
+            validate_chat_job_registry(
+                _staged_file(root, "chat_jobs", chat_source.path.name),
+                live.chat_request_spool,
+            )
         authoritative = {
             "agent_state": manifest.roots["agent_state"],
             "state_wal": manifest.roots["state_wal"],
@@ -1117,6 +1134,9 @@ class BackupManager:
             for record in records
         ):
             raise BackupError("live snapshot and Journal are inconsistent after restore")
+        chat_path = resolve_chat_job_registry_path(self.settings)
+        if chat_path.exists():
+            validate_chat_job_registry(chat_path, codecs.chat_request_spool)
 
     def recovery_status(self) -> dict[str, Any]:
         marker = self.directory / _RESTORE_MARKER
@@ -1397,6 +1417,7 @@ def _sources(settings: Settings) -> list[_Source]:
             allowed_names=journal_names,
         ),
         _Source("state_wal", settings.agent_state_wal.path, False),
+        _Source("chat_jobs", resolve_chat_job_registry_path(settings), False),
         _Source(
             "generation_marker", settings.at_rest.live.generation_marker, False
         ),

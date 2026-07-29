@@ -11,8 +11,8 @@ import pytest
 from kagya.chat_jobs import (
     ChatJobIdempotencyResultExpired,
     ChatJobIdempotencyTombstone,
-    ChatJobRegistry,
 )
+from tests.chat_job_helpers import ChatJobRegistry
 from kagya.operation_status import OperationCancelCode, OperationState
 from kagya.runtime import AgentEventType, AgentRuntime
 

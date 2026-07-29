@@ -27,6 +27,7 @@ from kagya.chat_jobs import (
     ChatJobRegistry,
     ChatRecoveryDisposition,
     ChatStreamEvent,
+    resolve_chat_job_registry_path,
 )
 from kagya.operation_status import OperationCancelCode, OperationState
 from kagya.runtime import JournalLifecycle
@@ -227,9 +228,7 @@ def stream_chat_job(
 
 def create_chat_job_registry(app: Any) -> ChatJobRegistry:
     settings = app.state.settings.api
-    registry_path = settings.chat_job_registry_path
-    if registry_path == type(settings).model_fields["chat_job_registry_path"].default:
-        registry_path = app.state.settings.agent_state.path.parent / "chat_jobs.json"
+    registry_path = resolve_chat_job_registry_path(app.state.settings)
 
     def execute(payload: dict[str, Any]) -> dict[str, Any]:
         context_id = str(payload.pop("_context_id"))
@@ -313,6 +312,7 @@ def create_chat_job_registry(app: Any) -> ChatJobRegistry:
         registry_path,
         app.state.agent_runtime,
         execute,
+        request_codec=app.state.live_codecs.chat_request_spool,
         replay_limit=settings.chat_stream_replay_limit,
         timeout_seconds=settings.chat_timeout_seconds,
         completion_observer=observe_completed,

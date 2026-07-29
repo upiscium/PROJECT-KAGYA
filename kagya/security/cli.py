@@ -12,7 +12,11 @@ from typing import Any
 from kagya.config import load_settings
 from kagya.security.backup import BackupError, BackupManager
 from kagya.security.crypto import EncryptionError
-from kagya.security.migration import migrate_live_state, reencrypt_live_state
+from kagya.security.migration import (
+    migrate_chat_request_spool,
+    migrate_live_state,
+    reencrypt_live_state,
+)
 from kagya.security.generation import initialize_encrypted_state
 
 
@@ -49,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "migrate-live":
             result = {"migrated_files": migrate_live_state(settings)}
+        elif args.command == "migrate-chat-spool":
+            result = {"migrated_files": migrate_chat_request_spool(settings)}
         elif args.command == "rotate-live":
             result = {"reencrypted_files": reencrypt_live_state(settings)}
         elif args.command == "state-encryption-init":
@@ -89,6 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("--manifest-hash", required=True)
     commands.add_parser("scheduled")
     commands.add_parser("migrate-live")
+    commands.add_parser("migrate-chat-spool")
     commands.add_parser("rotate-live")
     commands.add_parser("state-encryption-init")
     commands.add_parser("recovery-status")
