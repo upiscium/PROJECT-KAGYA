@@ -535,7 +535,11 @@ export type CockpitOutboxMessage = {
     commitment_id: string | null;
   };
 };
-export type CockpitOutboxResponse = { messages: CockpitOutboxMessage[] };
+export type CockpitOutboxResponse = {
+  pending_count: number;
+  critical_count: number;
+  messages: CockpitOutboxMessage[];
+};
 
 export type ContextFrame = {
   context_id: string;
@@ -1013,7 +1017,10 @@ function parseWorkingMemory(value: unknown): WorkingMemorySummary {
 
 function parseCockpitOutbox(value: unknown): CockpitOutboxResponse {
   if (!isRecord(value) || !Array.isArray(value.messages)) invalid("cockpit outbox");
-  return { messages: value.messages.map((message) => {
+  return {
+    pending_count: nonnegativeInteger(value.pending_count, "cockpit outbox pending count"),
+    critical_count: nonnegativeInteger(value.critical_count, "cockpit outbox critical count"),
+    messages: value.messages.map((message) => {
     if (!isRecord(message) || !isRecord(message.references)) invalid("cockpit outbox message");
     return {
       message_id: id(message.message_id, "cockpit outbox message"),
@@ -1030,7 +1037,8 @@ function parseCockpitOutbox(value: unknown): CockpitOutboxResponse {
         commitment_id: optionalId(message.references.commitment_id, "cockpit outbox commitment"),
       },
     };
-  }) };
+    }),
+  };
 }
 
 function identityOrigin(value: unknown, label: string): string {

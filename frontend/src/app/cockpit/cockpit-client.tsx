@@ -35,7 +35,7 @@ export function CockpitClient() {
   const currentCommitments = commitments.data?.commitments.filter(isCurrentCommitment) ?? [];
   const activePlans = plans.data?.plans.filter((plan) => plan.status === "active") ?? [];
   const recentDecisions = decisions.data?.decisions.slice(-6).reverse() ?? [];
-  const recentOutbox = outbox.data?.messages.slice(-5).reverse() ?? [];
+  const recentOutbox = outbox.data?.messages.slice(0, 5) ?? [];
   const recentJournal = journal.data?.records.slice(-6).reverse() ?? [];
   const loadedContexts = new Set(contexts.data?.contexts.map((item) => item.context_id));
   const loadedGoals = new Set(currentGoals.map((item) => item.goal_id));
@@ -96,7 +96,7 @@ export function CockpitClient() {
         </Section>
 
         <Section title="Outbox" query={outbox} empty={outbox.data?.messages.length === 0} emptyText="No proactive messages.">
-          {outbox.data ? <OutboxSummary messages={outbox.data.messages} visibleMessages={recentOutbox} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} loadedCommitments={loadedCommitments} /> : null}
+          {outbox.data ? <OutboxSummary pendingCount={outbox.data.pending_count} criticalCount={outbox.data.critical_count} visibleMessages={recentOutbox} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} loadedCommitments={loadedCommitments} /> : null}
         </Section>
 
         <Section title="Recent Journal" query={journal} empty={journal.data?.records.length === 0} emptyText="No Journal records.">
@@ -158,10 +158,8 @@ function DecisionRecord({ decision, outbox, loadedContexts, loadedGoals, loadedP
   return <article className="record" id={anchor("decision", decision.decision_id)}><div className="metadata-row"><Badge>{decision.status}</Badge><Badge>{decision.outcome_status}</Badge><strong>{decision.decision_id}</strong><span>{percent(decision.selection_confidence)} confidence</span></div><p>Selected action: <span className="mono">{candidate.candidate_type}:{candidate.candidate_id}</span> · {candidate.proposed_action}</p><p>Context: <EntityReference kind="context" id={decision.context_id} available={loadedContexts} /> · Plan: <EntityReference kind="plan" id={candidate.plan_id} available={loadedPlans} />{candidate.step_id ? ` / step ${candidate.step_id}` : ""}</p><p>Goals: {decision.active_goal_ids.length ? <ReferenceList kind="goal" ids={decision.active_goal_ids} available={loadedGoals} /> : "unavailable"} · Commitments: {candidate.commitment_refs.length ? <ReferenceList kind="commitment" ids={candidate.commitment_refs} available={loadedCommitments} /> : "unavailable"}</p><p>Outbox: {messages.length ? <ReferenceList kind="outbox" ids={messages} available={loadedOutbox} /> : "unavailable"}</p></article>;
 }
 
-function OutboxSummary({ messages, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { messages: CockpitOutboxMessage[]; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
-  const pending = messages.filter((message) => message.delivery_status === "pending").length;
-  const critical = messages.filter((message) => message.urgency === "critical").length;
-  return <><div className="metric-grid"><Metric label="Pending" value={String(pending)} /><Metric label="Critical" value={String(critical)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <span className="mono">{message.references.action_id ?? "unavailable"}</span></p></article>)}</div></>;
+function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
+  return <><div className="metric-grid"><Metric label="Pending" value={String(pendingCount)} /><Metric label="Critical" value={String(criticalCount)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <span className="mono">{message.references.action_id ?? "unavailable"}</span></p></article>)}</div></>;
 }
 
 function JournalEntry({ record, loadedJournal }: { record: JournalRecord; loadedJournal: Set<string> }) {

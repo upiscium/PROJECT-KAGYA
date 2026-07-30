@@ -30,7 +30,7 @@ from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import BoundaryProbeChoice, DummyProvider
 from kagya.motivation import MotivationSource
 from kagya.identity import KnownLimitation
-from kagya.outbox import OutboxMessageKind, OutboxReferences
+from kagya.outbox import OutboxMessageKind, OutboxReferences, OutboxUrgency
 from kagya.runtime import (
     AgentEventType,
     AgentStateStore,
@@ -692,7 +692,7 @@ def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access
         assert client.get("/api/outbox/summary").status_code == 401
         assert client.get(
             "/api/outbox/summary", headers=admin_headers()
-        ).json() == {"messages": []}
+        ).json() == {"pending_count": 0, "critical_count": 0, "messages": []}
         outbox = client.app.state.outbox
         for index in range(3):
             outbox.enqueue(
@@ -750,6 +750,8 @@ def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
 
         assert response.status_code == 200
         assert response.json() == {
+            "pending_count": 0,
+            "critical_count": 0,
             "messages": [
                 {
                     "message_id": message.message_id,
@@ -786,6 +788,48 @@ def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
         and record.source == "api.outbox.summary"
         for record in records
     )
+
+
+def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        client.get("/api/outbox/summary", headers=admin_headers())
+        outbox = client.app.state.outbox
+        next_tick = 0
+
+        def clock() -> datetime:
+            nonlocal next_tick
+            value = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=next_tick)
+            next_tick += 1
+            return value
+
+        outbox.clock = clock
+        created_ids: list[str] = []
+        for index in range(55):
+            message = outbox.enqueue(
+                OutboxMessageKind.ACTION_RESULT,
+                title=f"Message {index}",
+                body=f"Body {index}",
+                deduplication_key=f"ordered-summary-{index}",
+                urgency=(
+                    OutboxUrgency.CRITICAL if index < 2 else OutboxUrgency.NORMAL
+                ),
+            )
+            created_ids.append(message.message_id)
+
+        response = client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 5}
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pending_count"] == 55
+        assert payload["critical_count"] == 2
+        assert len(payload["messages"]) == 5
+        assert [message["message_id"] for message in payload["messages"]] == list(
+            reversed(created_ids[-5:])
+        )
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,

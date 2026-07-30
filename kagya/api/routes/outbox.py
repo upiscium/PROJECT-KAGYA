@@ -82,6 +82,8 @@ class CockpitOutboxMessageResponse(BaseModel):
 class CockpitOutboxSummaryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    pending_count: int = Field(ge=0)
+    critical_count: int = Field(ge=0)
     messages: list[CockpitOutboxMessageResponse]
 
 
@@ -112,13 +114,24 @@ def cockpit_summary(
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> CockpitOutboxSummaryResponse:
+    def build_summary() -> CockpitOutboxSummaryResponse:
+        messages = outbox.list_messages()
+        return CockpitOutboxSummaryResponse(
+            pending_count=sum(
+                message.delivery_status == DeliveryStatus.PENDING
+                for message in messages
+            ),
+            critical_count=sum(
+                message.urgency == OutboxUrgency.CRITICAL for message in messages
+            ),
+            messages=[_cockpit_message(message) for message in messages[:limit]],
+        )
+
     return execute_agent_event(
         runtime,
         AgentEventType.OUTBOX_READ,
         source="api.outbox.summary",
-        handler=lambda: CockpitOutboxSummaryResponse(
-            messages=[_cockpit_message(item) for item in outbox.list_messages()[:limit]]
-        ),
+        handler=build_summary,
         payload={"limit": limit},
     ).value
 

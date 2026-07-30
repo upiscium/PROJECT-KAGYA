@@ -148,7 +148,7 @@ describe("api client", () => {
     const result = await api.cockpitOutbox();
 
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/outbox/summary", expect.anything());
-    expect(result).toEqual({ messages: [{
+    expect(result).toEqual({ pending_count: 42, critical_count: 9, messages: [{
       message_id: "message-1",
       title: "Release ready",
       urgency: "critical",
@@ -171,12 +171,16 @@ describe("api client", () => {
 
   it.each([
     ["root", null],
-    ["messages collection", { messages: {} }],
-    ["message ID", { messages: [{ ...cockpitOutboxPayload.messages[0], message_id: undefined }] }],
-    ["urgency", { messages: [{ ...cockpitOutboxPayload.messages[0], urgency: "urgent" }] }],
-    ["delivery status", { messages: [{ ...cockpitOutboxPayload.messages[0], delivery_status: "invented" }] }],
-    ["acknowledgment status", { messages: [{ ...cockpitOutboxPayload.messages[0], acknowledgment_status: "invented" }] }],
-    ["reference", { messages: [{ ...cockpitOutboxPayload.messages[0], references: { ...cockpitOutboxPayload.messages[0].references, goal_id: 7 } }] }],
+    ["messages collection", { ...cockpitOutboxPayload, messages: {} }],
+    ["message ID", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], message_id: undefined }] }],
+    ["urgency", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], urgency: "urgent" }] }],
+    ["delivery status", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], delivery_status: "invented" }] }],
+    ["acknowledgment status", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], acknowledgment_status: "invented" }] }],
+    ["reference", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], references: { ...cockpitOutboxPayload.messages[0].references, goal_id: 7 } }] }],
+    ["negative pending count", { ...cockpitOutboxPayload, pending_count: -1 }],
+    ["fractional critical count", { ...cockpitOutboxPayload, critical_count: 1.5 }],
+    ["missing pending count", { critical_count: 9, messages: cockpitOutboxPayload.messages }],
+    ["missing critical count", { pending_count: 42, messages: cockpitOutboxPayload.messages }],
   ])("rejects malformed cockpit outbox %s", async (_label, payload) => {
     fetchMock.mockReturnValue(jsonResponse(payload));
     await expect(api.cockpitOutbox()).rejects.toMatchObject({ name: "ApiError" });
@@ -288,6 +292,8 @@ const decisionPayload = {
 const workingMemoryPayload = { item_count: 3, token_count: 120, item_capacity: 12, token_capacity: 2000, items: [{ hidden_thought: "PRIVATE_SENTINEL" }] };
 
 const cockpitOutboxPayload = {
+  pending_count: 42,
+  critical_count: 9,
   messages: [{
     message_id: "message-1",
     title: "Release ready",
