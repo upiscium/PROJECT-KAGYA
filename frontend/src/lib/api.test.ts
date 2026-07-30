@@ -197,7 +197,10 @@ describe("api client", () => {
     expect(result.retry_pending_count).toBe(1);
     expect(result.failed_count).toBe(3);
     expect(result.traces[0].receipt?.status).toBe("succeeded");
+    expect(result.traces[0].related_receipts).toEqual([{ receipt_id: "receipt-original", status: "succeeded" }]);
     expect(result.traces[0].observation?.result_digest).toBe("a".repeat(64));
+    expect(result.pre_intent_failures.map((failure) => failure.failure_type)).toEqual(["validation", "policy_rejection"]);
+    expect(result.pre_intent_failures[1].candidate_id).toBe("candidate-2");
     expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
     expect(result.traces[0]).not.toHaveProperty("arguments");
     expect(result.traces[0]).not.toHaveProperty("preview");
@@ -219,6 +222,13 @@ describe("api client", () => {
     ["digest", actionTraceWith({ observation: { ...actionTracePayload.traces[0].observation, result_digest: "invalid" } })],
     ["event sequence", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, event_sequence: 0 } })],
     ["validation errors", actionTraceWith({ observation: { ...actionTracePayload.traces[0].observation, validation_errors: {} } })],
+    ["failure type", actionFailureWith({ failure_type: "invented" })],
+    ["failure error code", actionFailureWith({ error_codes: ["not bounded code"] })],
+    ["failure event sequence", actionFailureWith({ event_sequence: 0 })],
+    ["failure decision ID", actionFailureWith({ decision_id: undefined })],
+    ["intent failure code", actionTraceWith({ failure_code: "not bounded code" })],
+    ["receipt error code", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, error_code: "not bounded code" } })],
+    ["verification reason", actionTraceWith({ verification: { ...actionTracePayload.traces[0].verification, reason: "not bounded code" } })],
   ])("rejects malformed action trace %s", async (_label, payload) => {
     fetchMock.mockReturnValue(jsonResponse(payload));
     await expect(api.actionTrace()).rejects.toMatchObject({ name: "ApiError" });
@@ -362,14 +372,23 @@ const actionTracePayload = {
     provenance: { decision_id: "decision-1", candidate_id: "candidate-1", triggering_event_id: "event-0", plan_id: "plan-1", plan_revision: 1, step_id: "step-1" },
     approval: { approval_id: "approval-1", status: "approved", requested_at: "2026-07-30T00:00:00Z", resolved_at: "2026-07-30T00:00:01Z", resolved_by_operator: true, reason: "PRIVATE_SENTINEL" },
     receipt: { receipt_id: "receipt-1", status: "succeeded", attempt: 1, duration_ms: 12.5, event_id: "event-1", event_sequence: 45, error_code: null, compensation_of: null, idempotency_key: "PRIVATE_SENTINEL" },
+    related_receipts: [{ receipt_id: "receipt-original", status: "succeeded", idempotency_key: "PRIVATE_SENTINEL" }],
     observation: { observation_id: "observation-1", valid: true, validation_errors: [], result_digest: "a".repeat(64), data: { result: "PRIVATE_SENTINEL" } },
     verification: { verification_id: "verification-1", success: true, reason: "observation_schema_valid", private_replay: "PRIVATE_SENTINEL" },
     arguments: { query: "PRIVATE_SENTINEL" },
     preview: { arguments: { query: "PRIVATE_SENTINEL" } },
     idempotency_key: "PRIVATE_SENTINEL",
   }],
+  pre_intent_failures: [
+    { failure_id: "validation-1", failure_type: "validation", decision_id: "decision-1", candidate_id: null, tool_name: "document_search", risk_class: "read_only", error_codes: ["arguments_schema_invalid"], event_id: "event-1", event_sequence: 42, occurred_at: "2026-07-30T00:00:00Z", idempotency_key: "PRIVATE_SENTINEL", request_digest: "PRIVATE_SENTINEL", canonical_arguments_digest: "PRIVATE_SENTINEL", arguments: { secret: "PRIVATE_SENTINEL" } },
+    { failure_id: "rejection-1", failure_type: "policy_rejection", decision_id: "decision-2", candidate_id: "candidate-2", tool_name: null, risk_class: "reversible_write", error_codes: ["risk_class_exceeds_budget"], event_id: "event-2", event_sequence: 43, occurred_at: "2026-07-30T00:00:01Z", idempotency_key: "PRIVATE_SENTINEL" },
+  ],
 };
 
 function actionTraceWith(update: Record<string, unknown>) {
   return { ...actionTracePayload, traces: [{ ...actionTracePayload.traces[0], ...update }] };
+}
+
+function actionFailureWith(update: Record<string, unknown>) {
+  return { ...actionTracePayload, pre_intent_failures: [{ ...actionTracePayload.pre_intent_failures[0], ...update }] };
 }

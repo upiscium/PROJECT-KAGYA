@@ -17,9 +17,12 @@ from kagya.actions import (
     ACTION_STATE_KEY,
     ActionBudget,
     ActionIntent,
+    ActionPolicyRejectionRecord,
     ActionPreview,
     ActionProvenance,
     ActionState,
+    ActionValidationErrorCode,
+    ActionValidationRecord,
     ApprovalRecord,
     ExecutionReceipt,
     IntentStatus,
@@ -860,6 +863,7 @@ def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
             "retry_pending_count": 0,
             "failed_count": 0,
             "traces": [],
+            "pre_intent_failures": [],
         }
 
     records = EventJournal(settings.agent_journal.path).verify()
@@ -912,7 +916,8 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
         receipts=(
             _cockpit_receipt(succeeded, "receipt-success", ReceiptStatus.SUCCEEDED, "observation-success", "verification-success", now),
             _cockpit_receipt(failed, "receipt-timeout", ReceiptStatus.TIMED_OUT, "observation-timeout", "verification-timeout", now, error_code="timeout"),
-            _cockpit_receipt(compensated, "receipt-compensated", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-success"),
+            _cockpit_receipt(compensated, "receipt-original", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
+            _cockpit_receipt(compensated, "receipt-compensated", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-original"),
         ),
         observations=(
             _cockpit_observation(succeeded, "receipt-success", "observation-success", True, now),
@@ -946,6 +951,10 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
         assert by_id["intent-success"]["verification"]["success"] is True
         assert by_id["intent-failed"]["receipt"]["status"] == "timed_out"
         assert by_id["intent-compensated"]["receipt"]["status"] == "compensated"
+        assert by_id["intent-compensated"]["receipt"]["compensation_of"] == "receipt-original"
+        assert by_id["intent-compensated"]["related_receipts"] == [
+            {"receipt_id": "receipt-original", "status": "succeeded"}
+        ]
         assert by_id["intent-missing"]["receipt"] is None
         assert by_id["intent-missing"]["observation"] is None
         assert by_id["intent-missing"]["verification"] is None
@@ -987,6 +996,99 @@ def test_admin_cockpit_action_trace_counts_before_limit_and_orders_ties(
         ]
         assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 0}).status_code == 422
         assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 201}).status_code == 422
+
+
+def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    validation_failure = ActionValidationRecord(
+        validation_id="validation-failed",
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="c" * 64,
+        decision_id="decision-validation",
+        tool_name="document_search",
+        risk_class=RiskClass.READ_ONLY,
+        arguments_valid=False,
+        validation_schema_revision="d" * 64,
+        validation_error_codes=(ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+        validated_event_id="event-validation",
+        validated_event_sequence=42,
+        canonical_arguments_digest="e" * 64,
+        validated_at=now,
+    )
+    successful_validation = ActionValidationRecord(
+        validation_id="validation-policy",
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="f" * 64,
+        decision_id="decision-policy",
+        intent_id="uncreated-intent",
+        tool_name="local_notification_enqueue",
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        arguments_valid=True,
+        validation_schema_revision="a" * 64,
+        validated_event_id="event-policy",
+        validated_event_sequence=43,
+        canonical_arguments_digest="b" * 64,
+        validated_at=now + timedelta(seconds=1),
+    )
+    rejection = ActionPolicyRejectionRecord(
+        rejection_id="rejection-policy",
+        idempotency_key="PRIVATE_SENTINEL",
+        decision_id="decision-policy",
+        candidate_id="candidate-policy",
+        validation_id=successful_validation.validation_id,
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        policy_code="risk_budget_denied",
+        reason_code="risk_class_exceeds_budget",
+        event_id="event-policy",
+        event_sequence=43,
+        rejected_at=now + timedelta(seconds=1),
+    )
+    terminal = _cockpit_action_intent(
+        "intent-terminal", IntentStatus.FAILED, now - timedelta(seconds=1), failure_code="timeout"
+    )
+    state = ActionState(
+        intents=(terminal,),
+        validation_records=(validation_failure, successful_validation),
+        policy_rejections=(rejection,),
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get(
+            "/api/actions/trace", headers=admin_headers(), params={"limit": 1}
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["failed_count"] == 3
+        assert len(payload["traces"]) == 1
+        assert payload["traces"][0]["intent_id"] == terminal.intent_id
+        assert len(payload["pre_intent_failures"]) == 1
+        assert payload["pre_intent_failures"][0] == {
+            "failure_id": "rejection-policy",
+            "failure_type": "policy_rejection",
+            "decision_id": "decision-policy",
+            "candidate_id": "candidate-policy",
+            "tool_name": "local_notification_enqueue",
+            "risk_class": "reversible_write",
+            "error_codes": ["risk_class_exceeds_budget"],
+            "event_id": "event-policy",
+            "event_sequence": 43,
+            "occurred_at": "2026-07-30T00:00:01Z",
+        }
+        all_failures = client.get(
+            "/api/actions/trace", headers=admin_headers(), params={"limit": 2}
+        ).json()["pre_intent_failures"]
+        assert [item["failure_id"] for item in all_failures] == [
+            "rejection-policy", "validation-failed"
+        ]
+        assert all_failures[1]["decision_id"] == "decision-validation"
+        assert all_failures[1]["error_codes"] == ["arguments_schema_invalid"]
+        assert "PRIVATE_SENTINEL" not in response.text
+        for field in ("idempotency_key", "request_digest", "canonical_arguments_digest"):
+            assert f'"{field}"' not in response.text
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,

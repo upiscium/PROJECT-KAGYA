@@ -12,6 +12,7 @@ from kagya.actions import (
     ActionExecutionLayer,
     ActionIntent,
     ActionPolicyError,
+    ActionPolicyRejectionRecord,
     ActionValidationRecord,
     ApprovalRecord,
     ExecutionReceipt,
@@ -87,6 +88,13 @@ class CockpitActionReceiptResponse(BaseModel):
     compensation_of: str | None
 
 
+class CockpitActionRelatedReceiptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    receipt_id: str
+    status: ReceiptStatus
+
+
 class CockpitActionObservationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -119,8 +127,24 @@ class CockpitActionTraceResponse(BaseModel):
     provenance: CockpitActionProvenanceResponse
     approval: CockpitActionApprovalResponse
     receipt: CockpitActionReceiptResponse | None
+    related_receipts: list[CockpitActionRelatedReceiptResponse]
     observation: CockpitActionObservationResponse | None
     verification: CockpitActionVerificationResponse | None
+
+
+class CockpitPreIntentFailureResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    failure_id: str
+    failure_type: Literal["validation", "policy_rejection"]
+    decision_id: str | None
+    candidate_id: str | None
+    tool_name: str | None
+    risk_class: RiskClass | None
+    error_codes: list[BoundedCode]
+    event_id: str
+    event_sequence: int = Field(ge=1)
+    occurred_at: datetime
 
 
 class CockpitActionTraceListResponse(BaseModel):
@@ -130,6 +154,7 @@ class CockpitActionTraceListResponse(BaseModel):
     retry_pending_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     traces: list[CockpitActionTraceResponse]
+    pre_intent_failures: list[CockpitPreIntentFailureResponse]
 
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
@@ -193,6 +218,8 @@ def cockpit_action_trace(
 ) -> CockpitActionTraceListResponse:
     def build_trace() -> CockpitActionTraceListResponse:
         intents = execution.list_intents()
+        validations = execution.list_validation_records()
+        policy_rejections = execution.list_policy_rejections()
         approvals = {item.approval_id: item for item in execution.list_approvals()}
         receipts = {item.receipt_id: item for item in execution.list_receipts()}
         observations = {
@@ -206,6 +233,21 @@ def cockpit_action_trace(
             key=lambda item: (item.updated_at, item.created_at, item.intent_id),
             reverse=True,
         )
+        failed_validations = tuple(
+            item for item in validations if not item.arguments_valid
+        )
+        validation_by_id = {item.validation_id: item for item in validations}
+        pre_intent_failures = sorted(
+            [
+                _validation_failure(item) for item in failed_validations
+            ]
+            + [
+                _policy_rejection_failure(item, validation_by_id.get(item.validation_id))
+                for item in policy_rejections
+            ],
+            key=lambda item: (item.occurred_at, item.failure_id),
+            reverse=True,
+        )
         return CockpitActionTraceListResponse(
             pending_approval_count=sum(
                 item.status == IntentStatus.AWAITING_APPROVAL for item in intents
@@ -217,7 +259,7 @@ def cockpit_action_trace(
                 item.status
                 in {IntentStatus.FAILED, IntentStatus.REJECTED, IntentStatus.CANCELLED}
                 for item in intents
-            ),
+            ) + len(failed_validations) + len(policy_rejections),
             traces=[
                 _action_trace(
                     intent,
@@ -229,9 +271,11 @@ def cockpit_action_trace(
                     else receipts.get(intent.receipt_id),
                     observations,
                     verifications,
+                    receipts,
                 )
                 for intent in ordered[:limit]
             ],
+            pre_intent_failures=pre_intent_failures[:limit],
         )
 
     return execute_agent_event(
@@ -376,6 +420,7 @@ def _action_trace(
     receipt: ExecutionReceipt | None,
     observations: dict[str, Observation],
     verifications: dict[str, OutcomeVerification],
+    receipts: dict[str, ExecutionReceipt],
 ) -> CockpitActionTraceResponse:
     if approval is not None and approval.intent_id != intent.intent_id:
         approval = None
@@ -452,6 +497,22 @@ def _action_trace(
             error_code=receipt.error_code,
             compensation_of=receipt.compensation_of,
         ),
+        related_receipts=[
+            CockpitActionRelatedReceiptResponse(
+                receipt_id=item.receipt_id,
+                status=item.status,
+            )
+            for item in sorted(
+                (
+                    item
+                    for item in receipts.values()
+                    if item.intent_id == intent.intent_id
+                    and (receipt is None or item.receipt_id != receipt.receipt_id)
+                ),
+                key=lambda item: (item.finished_at, item.receipt_id),
+                reverse=True,
+            )
+        ],
         observation=None if observation is None else CockpitActionObservationResponse(
             observation_id=observation.observation_id,
             valid=observation.valid,
@@ -463,4 +524,44 @@ def _action_trace(
             success=verification.success,
             reason=verification.reason,
         ),
+    )
+
+
+def _validation_failure(
+    validation: ActionValidationRecord,
+) -> CockpitPreIntentFailureResponse:
+    return CockpitPreIntentFailureResponse(
+        failure_id=validation.validation_id,
+        failure_type="validation",
+        decision_id=validation.decision_id,
+        candidate_id=None,
+        tool_name=validation.tool_name,
+        risk_class=validation.risk_class,
+        error_codes=[code.value for code in validation.validation_error_codes],
+        event_id=validation.validated_event_id,
+        event_sequence=validation.validated_event_sequence,
+        occurred_at=validation.validated_at,
+    )
+
+
+def _policy_rejection_failure(
+    rejection: ActionPolicyRejectionRecord,
+    validation: ActionValidationRecord | None,
+) -> CockpitPreIntentFailureResponse:
+    return CockpitPreIntentFailureResponse(
+        failure_id=rejection.rejection_id,
+        failure_type="policy_rejection",
+        decision_id=rejection.decision_id,
+        candidate_id=rejection.candidate_id,
+        tool_name=(
+            validation.tool_name
+            if validation is not None
+            and validation.validation_id == rejection.validation_id
+            else None
+        ),
+        risk_class=rejection.risk_class,
+        error_codes=[rejection.reason_code],
+        event_id=rejection.event_id,
+        event_sequence=rejection.event_sequence,
+        occurred_at=rejection.rejected_at,
     )
