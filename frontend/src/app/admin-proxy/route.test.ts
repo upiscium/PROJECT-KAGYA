@@ -9,6 +9,53 @@ afterEach(() => {
 });
 
 describe("admin proxy authentication", () => {
+  it.each([
+    "state/working-memory",
+    "contexts",
+    "goals",
+    "commitments",
+    "plans",
+    "decisions",
+    "outbox/messages",
+    "outbox/summary",
+  ])("allows the cockpit GET route %s and injects admin credentials", async (path) => {
+    process.env.KAGYA_ADMIN_TOKEN = "backend-token";
+    const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
+    vi.stubGlobal("fetch", backendFetch);
+    vi.resetModules();
+    const { GET } = await import("./[...path]/route");
+
+    const response = await GET(
+      new NextRequest(`http://localhost/admin-proxy/${path}`),
+      { params: Promise.resolve({ path: path.split("/") }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(backendFetch).toHaveBeenCalledWith(
+      new URL(`http://127.0.0.1:8000/api/${path}`),
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ "X-KAGYA-Admin-Token": "backend-token" }),
+      }),
+    );
+  });
+
+  it.each(["goals", "outbox/summary"])("keeps cockpit route %s read-only", async (path) => {
+    process.env.KAGYA_ADMIN_TOKEN = "backend-token";
+    const backendFetch = vi.fn();
+    vi.stubGlobal("fetch", backendFetch);
+    vi.resetModules();
+    const { POST } = await import("./[...path]/route");
+
+    const response = await POST(
+      new NextRequest(`http://localhost/admin-proxy/${path}`, { method: "POST", body: "{}" }),
+      { params: Promise.resolve({ path: path.split("/") }) },
+    );
+
+    expect(response.status).toBe(404);
+    expect(backendFetch).not.toHaveBeenCalled();
+  });
+
   it("preserves token injection when optional auth is disabled", async () => {
     process.env.KAGYA_ADMIN_TOKEN = "backend-token";
     const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));

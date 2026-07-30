@@ -98,6 +98,94 @@ describe("api client", () => {
     await expect(api.decisionExplanations()).rejects.toThrow("invalid decision explanation renderer");
   });
 
+  it("parses whitelisted cockpit projections through admin proxy paths", async () => {
+    const cases = [
+      [api.contexts, contextPayload, "/admin-proxy/contexts", "contexts"],
+      [api.goals, goalPayload, "/admin-proxy/goals", "goals"],
+      [api.commitments, commitmentPayload, "/admin-proxy/commitments", "commitments"],
+      [api.plans, planPayload, "/admin-proxy/plans", "plans"],
+      [api.decisions, decisionPayload, "/admin-proxy/decisions", "decisions"],
+      [api.workingMemory, workingMemoryPayload, "/admin-proxy/state/working-memory", "item_count"],
+      [api.cockpitOutbox, cockpitOutboxPayload, "/admin-proxy/outbox/summary", "messages"],
+    ] as const;
+
+    for (const [client, payload, path, projectionKey] of cases) {
+      fetchMock.mockReturnValueOnce(jsonResponse(payload));
+      const result = await client();
+      expect(fetchMock).toHaveBeenLastCalledWith(path, expect.anything());
+      expect(result).toHaveProperty(projectionKey);
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+    }
+  });
+
+  it.each([
+    ["contexts", api.contexts, { contexts: [{ ...contextPayload.contexts[0], status: "invented" }] }],
+    ["goals", api.goals, { ...goalPayload, goals: [{ ...goalPayload.goals[0], goal_id: "" }] }],
+    ["goal decisions", api.goals, { ...goalPayload, decisions: [{ ...goalPayload.decisions[0], conflicting_goal_ids: "goal-2" }] }],
+    ["commitments", api.commitments, { commitments: [{ ...commitmentPayload.commitments[0], related_goal_id: 3 }] }],
+    ["plans", api.plans, { plans: [{ ...planPayload.plans[0], step_states: [] }] }],
+    ["plan steps", api.plans, { plans: [{ ...planPayload.plans[0], revisions: [{ revision: 1, steps: [{ ...planPayload.plans[0].revisions[0].steps[0], action_type: "invented" }] }] }] }],
+    ["decisions", api.decisions, { decisions: [{ ...decisionPayload.decisions[0], selected_candidate_id: "missing" }] }],
+    ["decision references", api.decisions, { decisions: [{ ...decisionPayload.decisions[0], considered_candidates: [{ candidate: { ...decisionPayload.decisions[0].considered_candidates[0].candidate, plan_revision: null } }] }] }],
+    ["working memory", api.workingMemory, { ...workingMemoryPayload, token_count: -1 }],
+  ])("rejects malformed %s payloads", async (_label, client, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(client()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it.each([
+    ["root", api.contexts, null],
+    ["collection", api.contexts, { contexts: {} }],
+    ["missing ID", api.contexts, { contexts: [{ ...contextPayload.contexts[0], context_id: undefined }] }],
+  ])("rejects malformed cockpit %s", async (_label, client, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(client()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("parses only public-safe cockpit outbox summary fields", async () => {
+    fetchMock.mockReturnValue(jsonResponse(cockpitOutboxPayload));
+
+    const result = await api.cockpitOutbox();
+
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/outbox/summary", expect.anything());
+    expect(result).toEqual({ pending_count: 42, critical_count: 9, messages: [{
+      message_id: "message-1",
+      title: "Release ready",
+      urgency: "critical",
+      delivery_status: "pending",
+      acknowledgment_status: "unacknowledged",
+      references: {
+        event_id: null,
+        goal_id: "goal-1",
+        plan_id: "plan-1",
+        decision_id: "decision-1",
+        action_id: "action-1",
+        commitment_id: "commitment-1",
+      },
+    }] });
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+    expect(result.messages[0]).not.toHaveProperty("body");
+    expect(result.messages[0]).not.toHaveProperty("responses");
+    expect(result.messages[0]).not.toHaveProperty("attempts");
+  });
+
+  it.each([
+    ["root", null],
+    ["messages collection", { ...cockpitOutboxPayload, messages: {} }],
+    ["message ID", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], message_id: undefined }] }],
+    ["urgency", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], urgency: "urgent" }] }],
+    ["delivery status", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], delivery_status: "invented" }] }],
+    ["acknowledgment status", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], acknowledgment_status: "invented" }] }],
+    ["reference", { ...cockpitOutboxPayload, messages: [{ ...cockpitOutboxPayload.messages[0], references: { ...cockpitOutboxPayload.messages[0].references, goal_id: 7 } }] }],
+    ["negative pending count", { ...cockpitOutboxPayload, pending_count: -1 }],
+    ["fractional critical count", { ...cockpitOutboxPayload, critical_count: 1.5 }],
+    ["missing pending count", { critical_count: 9, messages: cockpitOutboxPayload.messages }],
+    ["missing critical count", { pending_count: 42, messages: cockpitOutboxPayload.messages }],
+  ])("rejects malformed cockpit outbox %s", async (_label, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(api.cockpitOutbox()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
   it("formats backend JSON error details", async () => {
     fetchMock.mockReturnValue(errorResponse(500, "Internal Server Error", { detail: "Fallback model produced an empty visible response" }));
 
@@ -178,3 +266,43 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+const contextPayload = {
+  contexts: [{ context_id: "context-1", context_type: "conversation", source_channel: "chat", source_session_id: "session-1", participant_ids: ["person-1"], active_topic: "Release", active_task: null, status: "active", hidden_thought: "PRIVATE_SENTINEL" }],
+};
+
+const goalPayload = {
+  goals: [{ goal_id: "goal-1", goal_type: "intrinsic", description: "Ship safely", priority: 0.8, urgency: 0.6, confidence: 0.9, identity_origin: { actor: "self", input_kind: "internal_state", endorsement: "endorsed" }, status: "active", dependency_ids: [], conflict_ids: [], deadline: null, needs_information: false, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", raw_prompt: "PRIVATE_SENTINEL" }],
+  decisions: [{ decision_id: "goal-decision-1", action: "activate", goal_id: "goal-1", score: 0.8, reasons: ["ready"], conflicting_goal_ids: [], created_at: "2026-01-01T00:00:00Z", secret: "PRIVATE_SENTINEL" }],
+  intrinsic_deliberations: [{ private_replay: "PRIVATE_SENTINEL" }],
+};
+
+const commitmentPayload = {
+  commitments: [{ commitment_id: "commitment-1", description: "Report results", related_goal_id: "goal-1", status: "active", beneficiary: "operator", scope: "Release report", deadline: null, cost: 0.2, burden: 0.1, fulfillability: "fulfillable", fulfillability_reason: "Resources available", decision_refs: ["decision-1"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", hidden_thought: "PRIVATE_SENTINEL" }],
+};
+
+const planPayload = {
+  plans: [{ plan_id: "plan-1", goal_id: "goal-1", revision: 1, status: "active", revisions: [{ revision: 1, raw_prompt: "PRIVATE_SENTINEL", steps: [{ step_id: "step-1", action_type: "respond", action_code: "report.result", dependency_ids: [], parameters: { private_replay: "PRIVATE_SENTINEL" } }] }], step_states: [{ step_id: "step-1", status: "in_progress", attempt_count: 1, started_at: "2026-01-01T00:00:00Z", retry_at: null, completed_at: null, evidence: [{ secret: "PRIVATE_SENTINEL" }] }], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }],
+};
+
+const decisionPayload = {
+  decisions: [{ decision_id: "decision-1", context_id: "context-1", active_goal_ids: ["goal-1"], selected_candidate_id: "candidate-1", considered_candidates: [{ candidate: { candidate_id: "candidate-1", candidate_type: "respond", proposed_action: "Report result", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", goal_refs: ["goal-1"], commitment_refs: ["commitment-1"], parameters: { raw_prompt: "PRIVATE_SENTINEL" } }, hidden_thought: "PRIVATE_SENTINEL" }], selection_confidence: 0.8, status: "awaiting_outcome", actual_outcome: null, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", private_replay: "PRIVATE_SENTINEL" }],
+};
+
+const workingMemoryPayload = { item_count: 3, token_count: 120, item_capacity: 12, token_capacity: 2000, items: [{ hidden_thought: "PRIVATE_SENTINEL" }] };
+
+const cockpitOutboxPayload = {
+  pending_count: 42,
+  critical_count: 9,
+  messages: [{
+    message_id: "message-1",
+    title: "Release ready",
+    urgency: "critical",
+    delivery_status: "pending",
+    acknowledgment_status: "unacknowledged",
+    references: { event_id: null, goal_id: "goal-1", plan_id: "plan-1", decision_id: "decision-1", action_id: "action-1", commitment_id: "commitment-1" },
+    body: "PRIVATE_SENTINEL",
+    responses: [{ text: "PRIVATE_SENTINEL" }],
+    attempts: [{ failure_code: "PRIVATE_SENTINEL" }],
+  }],
+};

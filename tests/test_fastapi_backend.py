@@ -30,13 +30,16 @@ from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import BoundaryProbeChoice, DummyProvider
 from kagya.motivation import MotivationSource
 from kagya.identity import KnownLimitation
+from kagya.outbox import OutboxMessageKind, OutboxReferences, OutboxUrgency
 from kagya.runtime import (
     AgentEventType,
     AgentStateStore,
     EventJournal,
     JournalLifecycle,
     StateWAL,
+    WorkingMemoryKind,
     hash_snapshot,
+    working_memory_item,
 )
 from kagya.security.generation import initialize_encrypted_state
 from kagya.tools import (
@@ -541,6 +544,292 @@ def test_chat_rejects_closed_context(tmp_path: Path) -> None:
     assert ended.json()["status"] == "closed"
     assert response.status_code == 409
 
+
+def test_admin_context_list_projects_all_statuses_and_records_read_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        registry = client.app.state.main_loop.context_registry
+        registry.create(
+            context_id="ctx-active",
+            source_session_id="session-visible",
+            participant_ids=("participant-visible",),
+            active_topic="topic-visible",
+            parent_context_id="private-parent-sentinel",
+        )
+        registry.create(context_id="ctx-suspended")
+        registry.suspend("ctx-suspended")
+        registry.create(context_id="ctx-closed")
+        registry.end("ctx-closed")
+
+        response = client.get("/api/contexts", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert [item["status"] for item in response.json()["contexts"]] == [
+            "active",
+            "suspended",
+            "ended",
+        ]
+        assert set(response.json()["contexts"][0]) == {
+            "context_id",
+            "context_type",
+            "source_channel",
+            "source_session_id",
+            "participant_ids",
+            "active_topic",
+            "active_task",
+            "status",
+        }
+        assert "private-parent-sentinel" not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.CONTEXT_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in records
+    )
+
+
+def test_admin_context_list_is_empty_bounded_and_rejects_public_access(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        assert client.get("/api/contexts").status_code == 401
+        assert client.get("/api/contexts", headers=admin_headers()).json() == {
+            "contexts": []
+        }
+        registry = client.app.state.main_loop.context_registry
+        for index in range(3):
+            registry.create(context_id=f"ctx-{index}")
+
+        bounded = client.get(
+            "/api/contexts", headers=admin_headers(), params={"limit": 2}
+        )
+
+        assert bounded.status_code == 200
+        assert [item["context_id"] for item in bounded.json()["contexts"]] == [
+            "ctx-1",
+            "ctx-2",
+        ]
+        assert (
+            client.get(
+                "/api/contexts", headers=admin_headers(), params={"limit": 201}
+            ).status_code
+            == 422
+        )
+
+
+def test_admin_working_memory_summary_is_count_only_non_mutating_and_runtime_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        memory = client.app.state.main_loop.working_memory
+        memory.admit(
+            working_memory_item(
+                item_id="private-item-id",
+                kind=WorkingMemoryKind.CONVERSATION,
+                content="raw-private-replay-sentinel",
+                source_event_id="hidden-thought-sentinel",
+                context_id="private-context-sentinel",
+                source="secret-sentinel",
+                source_channel="prompt-sentinel",
+                source_session_id="private-session-sentinel",
+            )
+        )
+        memory.admit(
+            working_memory_item(
+                item_id="private-reference-id",
+                kind=WorkingMemoryKind.EPISODIC,
+                reference="private-reference-sentinel",
+            )
+        )
+        before = memory.items
+        monkeypatch.setattr(
+            memory,
+            "select",
+            lambda **_kwargs: pytest.fail("summary must not call mutating select"),
+        )
+
+        assert client.get("/api/state/working-memory").status_code == 401
+        response = client.get(
+            "/api/state/working-memory", headers=admin_headers()
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "item_count": 2,
+            "token_count": len("raw-private-replay-sentinel".encode("utf-8")),
+            "item_capacity": memory.item_capacity,
+            "token_capacity": memory.token_capacity,
+        }
+        assert memory.items == before
+        for sentinel in (
+            "raw-private-replay-sentinel",
+            "private-reference-sentinel",
+            "hidden-thought-sentinel",
+            "secret-sentinel",
+            "prompt-sentinel",
+            "private-session-sentinel",
+            "private-context-sentinel",
+        ):
+            assert sentinel not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.MEMORY_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        and record.source == "api.state.working_memory"
+        for record in records
+    )
+
+
+def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        assert client.get("/api/outbox/summary").status_code == 401
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers()
+        ).json() == {"pending_count": 0, "critical_count": 0, "messages": []}
+        outbox = client.app.state.outbox
+        for index in range(3):
+            outbox.enqueue(
+                OutboxMessageKind.ACTION_RESULT,
+                title=f"Message {index}",
+                body=f"Body {index}",
+                deduplication_key=f"summary-{index}",
+            )
+
+        bounded = client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 2}
+        )
+
+        assert bounded.status_code == 200
+        assert len(bounded.json()["messages"]) == 2
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 0}
+        ).status_code == 422
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 201}
+        ).status_code == 422
+
+
+def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.get("/api/outbox/summary", headers=admin_headers())
+        outbox = client.app.state.outbox
+        message = outbox.enqueue(
+            OutboxMessageKind.ACTION_RESULT,
+            title="Release ready",
+            body="PRIVATE_SENTINEL",
+            deduplication_key="PRIVATE_SENTINEL",
+            interlocutor_id="PRIVATE_SENTINEL",
+            references=OutboxReferences(
+                event_id="event-1",
+                goal_id="goal-1",
+                plan_id="plan-1",
+                decision_id="decision-1",
+                action_id="action-1",
+                commitment_id="commitment-1",
+            ),
+        )
+        outbox.fail_delivery(message.message_id, "PRIVATE_SENTINEL")
+        outbox.respond(
+            message.message_id,
+            kind="reply",
+            actor_id="operator",
+            text="PRIVATE_SENTINEL",
+        )
+
+        response = client.get("/api/outbox/summary", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "pending_count": 0,
+            "critical_count": 0,
+            "messages": [
+                {
+                    "message_id": message.message_id,
+                    "title": "Release ready",
+                    "urgency": "normal",
+                    "delivery_status": "failed",
+                    "acknowledgment_status": "replied",
+                    "references": {
+                        "event_id": "event-1",
+                        "goal_id": "goal-1",
+                        "plan_id": "plan-1",
+                        "decision_id": "decision-1",
+                        "action_id": "action-1",
+                        "commitment_id": "commitment-1",
+                    },
+                }
+            ]
+        }
+        for field in (
+            "body",
+            "responses",
+            "attempts",
+            "last_failure_code",
+            "deduplication_key",
+            "interlocutor_id",
+            "PRIVATE_SENTINEL",
+        ):
+            assert field not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.OUTBOX_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        and record.source == "api.outbox.summary"
+        for record in records
+    )
+
+
+def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        client.get("/api/outbox/summary", headers=admin_headers())
+        outbox = client.app.state.outbox
+        next_tick = 0
+
+        def clock() -> datetime:
+            nonlocal next_tick
+            value = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=next_tick)
+            next_tick += 1
+            return value
+
+        outbox.clock = clock
+        created_ids: list[str] = []
+        for index in range(55):
+            message = outbox.enqueue(
+                OutboxMessageKind.ACTION_RESULT,
+                title=f"Message {index}",
+                body=f"Body {index}",
+                deduplication_key=f"ordered-summary-{index}",
+                urgency=(
+                    OutboxUrgency.CRITICAL if index < 2 else OutboxUrgency.NORMAL
+                ),
+            )
+            created_ids.append(message.message_id)
+
+        response = client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 5}
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pending_count"] == 55
+        assert payload["critical_count"] == 2
+        assert len(payload["messages"]) == 5
+        assert [message["message_id"] for message in payload["messages"]] == list(
+            reversed(created_ids[-5:])
+        )
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,

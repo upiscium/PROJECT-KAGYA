@@ -1,0 +1,192 @@
+"use client";
+
+import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import Link from "next/link";
+import type { ReactNode } from "react";
+import { EmotionMeter } from "@/components/emotion-meter";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardTitle } from "@/components/ui/card";
+import {
+  api,
+  errorMessage,
+  type Commitment,
+  type ContextFrame,
+  type Decision,
+  type Goal,
+  type JournalRecord,
+  type CockpitOutboxMessage,
+  type Plan,
+} from "@/lib/api";
+
+export function CockpitClient() {
+  const runtime = useQuery({ queryKey: ["cockpit", "runtime"], queryFn: api.systemInfo });
+  const emotion = useQuery({ queryKey: ["cockpit", "emotion"], queryFn: api.emotion });
+  const workingMemory = useQuery({ queryKey: ["cockpit", "working-memory"], queryFn: api.workingMemory });
+  const contexts = useQuery({ queryKey: ["cockpit", "contexts"], queryFn: api.contexts });
+  const goals = useQuery({ queryKey: ["cockpit", "goals"], queryFn: api.goals });
+  const commitments = useQuery({ queryKey: ["cockpit", "commitments"], queryFn: api.commitments });
+  const plans = useQuery({ queryKey: ["cockpit", "plans"], queryFn: api.plans });
+  const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
+  const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
+  const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
+  const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
+
+  const currentGoals = goals.data?.goals.filter(isCurrentGoal) ?? [];
+  const currentCommitments = commitments.data?.commitments.filter(isCurrentCommitment) ?? [];
+  const activePlans = plans.data?.plans.filter((plan) => plan.status === "active") ?? [];
+  const recentDecisions = decisions.data?.decisions.slice(-6).reverse() ?? [];
+  const recentOutbox = outbox.data?.messages.slice(0, 5) ?? [];
+  const recentJournal = journal.data?.records.slice(-6).reverse() ?? [];
+  const loadedContexts = new Set(contexts.data?.contexts.map((item) => item.context_id));
+  const loadedGoals = new Set(currentGoals.map((item) => item.goal_id));
+  const loadedCommitments = new Set(currentCommitments.map((item) => item.commitment_id));
+  const loadedPlans = new Set(activePlans.map((item) => item.plan_id));
+  const loadedDecisions = new Set(recentDecisions.map((item) => item.decision_id));
+  const loadedOutbox = new Set(recentOutbox.map((item) => item.message_id));
+  const loadedJournal = new Set(recentJournal.map((item) => item.event_id));
+  const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
+
+  return (
+    <div className="page cockpit-page">
+      <header className="page-header">
+        <div>
+          <p className="cockpit-kicker">SUBJECT / READ ONLY</p>
+          <h1 className="page-title">Cockpit</h1>
+          <p className="page-subtitle">Current runtime state and traceable Goal → Plan → Decision → Action / Outbox references.</p>
+        </div>
+        <div className="metadata-row"><Link className="entity-link" href="/decisions">Decision explanations</Link><Link className="entity-link" href="/outbox">Open outbox</Link></div>
+      </header>
+
+      <div className="cockpit-grid">
+        <Section title="Runtime" query={runtime} empty={false}>
+          {runtime.data ? <div className="metric-grid"><Metric label="Project" value={runtime.data.project} /><Metric label="Status" value={runtime.data.status} /><Metric label="Version" value={runtime.data.build.version} /><Metric label="Environment" value={runtime.data.runtime.environment} /><Metric label="Provider" value={runtime.data.runtime.provider} /><Metric label="Model" value={runtime.data.runtime.primary_model_id} /></div> : null}
+          {runtime.data?.build.commit ? <p className="mono muted">build {runtime.data.build.commit}</p> : null}
+          <QueryState query={adapters} loading="Loading active adapter..." empty={false} />
+          {adapters.data ? <p>Active adapter: {activeAdapter ? <span className="mono">{activeAdapter.adapter_id} / {activeAdapter.adapter_hash ?? "hash unavailable"}</span> : "none"}</p> : null}
+        </Section>
+
+        <Card aria-labelledby="emotion-memory-title">
+          <CardTitle id="emotion-memory-title">Emotion / Working Memory</CardTitle>
+          <QueryState query={emotion} loading="Loading emotion..." empty={false} />
+          {emotion.data ? <EmotionMeter emotion={emotion.data} /> : null}
+          <QueryState query={workingMemory} loading="Loading working memory..." empty={false} />
+          {workingMemory.data ? <div className="capacity-grid"><Capacity label="Items" value={workingMemory.data.item_count} capacity={workingMemory.data.item_capacity} /><Capacity label="Tokens" value={workingMemory.data.token_count} capacity={workingMemory.data.token_capacity} /></div> : null}
+        </Card>
+
+        <Section title="Contexts" query={contexts} empty={contexts.data?.contexts.length === 0} emptyText="No contexts recorded.">
+          <div className="stack">{contexts.data?.contexts.map((context) => <ContextRecord key={context.context_id} context={context} decisions={decisions.data?.decisions ?? []} loadedDecisions={loadedDecisions} />)}</div>
+        </Section>
+
+        <Card aria-labelledby="goals-commitments-title">
+          <CardTitle id="goals-commitments-title">Goals / Commitments</CardTitle>
+          <h3 className="cockpit-subheading">Active and candidate goals</h3>
+          <QueryState query={goals} loading="Loading goals..." empty={currentGoals.length === 0} emptyText="No active or candidate goals." />
+          <div className="stack">{currentGoals.map((goal) => <GoalRecord key={goal.goal_id} goal={goal} plans={plans.data?.plans ?? []} decisions={decisions.data?.decisions ?? []} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} />)}</div>
+          <h3 className="cockpit-subheading">Current commitments</h3>
+          <QueryState query={commitments} loading="Loading commitments..." empty={currentCommitments.length === 0} emptyText="No current commitments." />
+          <div className="stack">{currentCommitments.map((commitment) => <CommitmentRecord key={commitment.commitment_id} commitment={commitment} loadedGoals={loadedGoals} loadedDecisions={loadedDecisions} />)}</div>
+        </Card>
+
+        <Section title="Plans / Steps" query={plans} empty={activePlans.length === 0} emptyText="No active plans.">
+          <div className="stack">{activePlans.map((plan) => <PlanRecord key={plan.plan_id} plan={plan} decisions={decisions.data?.decisions ?? []} loadedGoals={loadedGoals} loadedDecisions={loadedDecisions} />)}</div>
+        </Section>
+
+        <Section title="Recent Decisions" query={decisions} empty={decisions.data?.decisions.length === 0} emptyText="No decisions recorded.">
+          <div className="stack">{recentDecisions.map((decision) => <DecisionRecord key={decision.decision_id} decision={decision} outbox={outbox.data?.messages ?? []} loadedContexts={loadedContexts} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedCommitments={loadedCommitments} loadedOutbox={loadedOutbox} />)}</div>
+        </Section>
+
+        <Section title="Outbox" query={outbox} empty={outbox.data?.messages.length === 0} emptyText="No proactive messages.">
+          {outbox.data ? <OutboxSummary pendingCount={outbox.data.pending_count} criticalCount={outbox.data.critical_count} visibleMessages={recentOutbox} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} loadedCommitments={loadedCommitments} /> : null}
+        </Section>
+
+        <Section title="Recent Journal" query={journal} empty={journal.data?.records.length === 0} emptyText="No Journal records.">
+          <div className="stack">{recentJournal.map((record) => <JournalEntry key={record.record_id} record={record} loadedJournal={loadedJournal} />)}</div>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+function Section<T>({ title, query, empty, emptyText, children }: { title: string; query: UseQueryResult<T>; empty: boolean; emptyText?: string; children: ReactNode }) {
+  return <Card><CardTitle>{title}</CardTitle><QueryState query={query} loading={`Loading ${title.toLowerCase()}...`} empty={empty} emptyText={emptyText} />{children}</Card>;
+}
+
+function QueryState<T>({ query, loading, empty, emptyText }: { query: UseQueryResult<T>; loading: string; empty: boolean; emptyText?: string }) {
+  if (query.isPending) return <p className="muted">{loading}</p>;
+  if (query.error) return <p className="error">{errorMessage(query.error)}</p>;
+  if (empty) return <p className="muted">{emptyText ?? "No records."}</p>;
+  return null;
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return <div className="metric-cell"><span className="muted">{label}</span><strong>{value}</strong></div>;
+}
+
+function Capacity({ label, value, capacity }: { label: string; value: number; capacity: number }) {
+  const percentage = capacity ? Math.min(100, Math.round(value / capacity * 100)) : 0;
+  return <div><div className="capacity-label"><span>{label}</span><span>{value} / {capacity}</span></div><div className="capacity-track"><span style={{ width: `${percentage}%` }} /></div></div>;
+}
+
+function ContextRecord({ context, decisions, loadedDecisions }: { context: ContextFrame; decisions: Decision[]; loadedDecisions: Set<string> }) {
+  const related = decisions.filter((decision) => decision.context_id === context.context_id);
+  return <article className="record" id={anchor("context", context.context_id)}><div className="metadata-row"><Badge>{context.status}</Badge><strong>{context.context_type}</strong></div><p className="mono muted">{context.context_id} · {context.source_channel}{context.source_session_id ? ` / ${context.source_session_id}` : ""}</p><p>Interlocutors: {context.participant_ids.join(", ") || "none"}</p><p>Topic: {context.active_topic ?? "none"} · Task: {context.active_task ?? "none"}</p><p>Decisions: {related.length ? <ReferenceList kind="decision" ids={related.map((item) => item.decision_id)} available={loadedDecisions} /> : "unavailable"}</p></article>;
+}
+
+function GoalRecord({ goal, plans, decisions, loadedGoals, loadedPlans, loadedDecisions }: { goal: Goal; plans: Plan[]; decisions: Decision[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string> }) {
+  const goalPlans = plans.filter((plan) => plan.goal_id === goal.goal_id).map((plan) => plan.plan_id);
+  const goalDecisions = decisions.filter((decision) => decision.active_goal_ids.includes(goal.goal_id) || decision.selected_candidate.goal_refs.includes(goal.goal_id)).map((decision) => decision.decision_id);
+  return <article className="record" id={anchor("goal", goal.goal_id)}><div className="metadata-row"><Badge>{goal.status}</Badge><Badge>{goal.goal_type}</Badge><strong>{goal.description}</strong></div><p className="muted">Priority {percent(goal.priority)} · urgency {percent(goal.urgency)} · confidence {percent(goal.confidence)} · origin {goal.origin}</p><p>Dependencies: {goal.dependency_ids.length ? <ReferenceList kind="goal" ids={goal.dependency_ids} available={loadedGoals} /> : "none"} · Conflicts: {goal.conflict_ids.length ? <ReferenceList kind="goal" ids={goal.conflict_ids} available={loadedGoals} /> : "none"}</p><p>Plans: {goalPlans.length ? <ReferenceList kind="plan" ids={goalPlans} available={loadedPlans} /> : "unavailable"} · Decisions: {goalDecisions.length ? <ReferenceList kind="decision" ids={goalDecisions} available={loadedDecisions} /> : "unavailable"}</p></article>;
+}
+
+function CommitmentRecord({ commitment, loadedGoals, loadedDecisions }: { commitment: Commitment; loadedGoals: Set<string>; loadedDecisions: Set<string> }) {
+  return <article className="record" id={anchor("commitment", commitment.commitment_id)}><div className="metadata-row"><Badge>{commitment.status}</Badge><Badge data-tone={commitment.fulfillability === "at_risk" || commitment.fulfillability === "impossible" ? "danger" : "neutral"}>{commitment.fulfillability}</Badge><strong>{commitment.description}</strong></div><p>{commitment.scope} · beneficiary {commitment.beneficiary} · deadline {commitment.deadline ?? "none"}</p><p>Goal: <EntityReference kind="goal" id={commitment.related_goal_id} available={loadedGoals} /> · Decisions: {commitment.decision_refs.length ? <ReferenceList kind="decision" ids={commitment.decision_refs} available={loadedDecisions} /> : "unavailable"}</p></article>;
+}
+
+function PlanRecord({ plan, decisions, loadedGoals, loadedDecisions }: { plan: Plan; decisions: Decision[]; loadedGoals: Set<string>; loadedDecisions: Set<string> }) {
+  const currentStepId = plan.steps.find((step) => step.status === "in_progress")?.step_id
+    ?? plan.steps.find((step) => step.status === "ready" || step.status === "waiting_retry")?.step_id
+    ?? plan.steps.find((step) => step.status === "pending")?.step_id;
+  return <article className="record" id={anchor("plan", plan.plan_id)}><div className="metadata-row"><Badge data-tone="accent">{plan.status}</Badge><strong>{plan.plan_id}</strong><span>revision {plan.revision}</span></div><p>Goal: <EntityReference kind="goal" id={plan.goal_id} available={loadedGoals} /></p><div className="step-list">{plan.steps.map((step) => {
+    const related = decisions.filter((decision) => decision.selected_candidate.plan_id === plan.plan_id && decision.selected_candidate.step_id === step.step_id).map((decision) => decision.decision_id);
+    return <div className="step-row" id={anchor("step", `${plan.plan_id}-${step.step_id}`)} key={step.step_id}><span className="metadata-row"><Badge data-tone={step.status === "failed" ? "danger" : step.status === "in_progress" || step.status === "ready" ? "accent" : "neutral"}>{step.status}</Badge>{step.step_id === currentStepId ? <Badge data-tone="accent">current</Badge> : null}</span><span><strong>{step.action_code}</strong><span className="muted"> · {step.action_type} · attempt {step.attempt_count}</span></span><span>Decision: {related.length ? <ReferenceList kind="decision" ids={related} available={loadedDecisions} /> : "unavailable"}</span></div>;
+  })}</div></article>;
+}
+
+function DecisionRecord({ decision, outbox, loadedContexts, loadedGoals, loadedPlans, loadedCommitments, loadedOutbox }: { decision: Decision; outbox: CockpitOutboxMessage[]; loadedContexts: Set<string>; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedCommitments: Set<string>; loadedOutbox: Set<string> }) {
+  const messages = outbox.filter((message) => message.references.decision_id === decision.decision_id).map((message) => message.message_id);
+  const candidate = decision.selected_candidate;
+  return <article className="record" id={anchor("decision", decision.decision_id)}><div className="metadata-row"><Badge>{decision.status}</Badge><Badge>{decision.outcome_status}</Badge><strong>{decision.decision_id}</strong><span>{percent(decision.selection_confidence)} confidence</span></div><p>Selected action: <span className="mono">{candidate.candidate_type}:{candidate.candidate_id}</span> · {candidate.proposed_action}</p><p>Context: <EntityReference kind="context" id={decision.context_id} available={loadedContexts} /> · Plan: <EntityReference kind="plan" id={candidate.plan_id} available={loadedPlans} />{candidate.step_id ? ` / step ${candidate.step_id}` : ""}</p><p>Goals: {decision.active_goal_ids.length ? <ReferenceList kind="goal" ids={decision.active_goal_ids} available={loadedGoals} /> : "unavailable"} · Commitments: {candidate.commitment_refs.length ? <ReferenceList kind="commitment" ids={candidate.commitment_refs} available={loadedCommitments} /> : "unavailable"}</p><p>Outbox: {messages.length ? <ReferenceList kind="outbox" ids={messages} available={loadedOutbox} /> : "unavailable"}</p></article>;
+}
+
+function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
+  return <><div className="metric-grid"><Metric label="Pending" value={String(pendingCount)} /><Metric label="Critical" value={String(criticalCount)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <span className="mono">{message.references.action_id ?? "unavailable"}</span></p></article>)}</div></>;
+}
+
+function JournalEntry({ record, loadedJournal }: { record: JournalRecord; loadedJournal: Set<string> }) {
+  return <article className="record" id={anchor("journal", record.event_id)}><div className="metadata-row"><Badge>{record.lifecycle}</Badge><strong>{record.event_type}</strong></div><p className="mono muted">{record.event_id} · {new Date(record.timestamp).toLocaleString()}</p><p>Target: <span className="mono">{record.target ?? "unavailable"}</span> · Category: {record.failure_category ?? "none"}</p><p>Causation: <EntityReference kind="journal" id={record.causation_id} available={loadedJournal} /> · Correlation: <span className="mono">{record.correlation_id ?? "unavailable"}</span></p></article>;
+}
+
+function EntityReference({ kind, id, available }: { kind: string; id: string | null; available: Set<string> }) {
+  if (id === null) return <>unavailable</>;
+  return available.has(id) ? <Link className="entity-link mono" href={`#${anchor(kind, id)}`}>{id}</Link> : <span className="mono muted">{id}</span>;
+}
+
+function ReferenceList({ kind, ids, available }: { kind: string; ids: string[]; available: Set<string> }) {
+  return <>{ids.map((id, index) => <span key={id}>{index ? ", " : ""}<EntityReference kind={kind} id={id} available={available} /></span>)}</>;
+}
+
+function anchor(kind: string, id: string): string {
+  return `${kind}-${encodeURIComponent(id)}`;
+}
+
+function isCurrentGoal(goal: Goal): boolean {
+  return goal.status === "active" || goal.status === "candidate";
+}
+
+function isCurrentCommitment(commitment: Commitment): boolean {
+  return commitment.status === "active" || commitment.status === "proposed" || commitment.status === "renegotiating";
+}
+
+function percent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}

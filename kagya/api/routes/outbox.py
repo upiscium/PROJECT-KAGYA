@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.actions import ActionExecutionLayer
@@ -16,6 +16,8 @@ from kagya.api.dependencies import (
     require_admin,
 )
 from kagya.outbox import (
+    AcknowledgmentStatus,
+    DeliveryStatus,
     Outbox,
     OutboxMessage,
     OutboxMessageKind,
@@ -55,6 +57,36 @@ class FailureRequest(_Request):
     )
 
 
+class CockpitOutboxReferencesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    event_id: str | None
+    goal_id: str | None
+    plan_id: str | None
+    decision_id: str | None
+    action_id: str | None
+    commitment_id: str | None
+
+
+class CockpitOutboxMessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    message_id: str
+    title: str
+    urgency: OutboxUrgency
+    delivery_status: DeliveryStatus
+    acknowledgment_status: AcknowledgmentStatus
+    references: CockpitOutboxReferencesResponse
+
+
+class CockpitOutboxSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    pending_count: int = Field(ge=0)
+    critical_count: int = Field(ge=0)
+    messages: list[CockpitOutboxMessageResponse]
+
+
 router = APIRouter(prefix="/api/outbox", tags=["outbox"])
 
 
@@ -70,6 +102,38 @@ def list_messages(
         handler=outbox.list_messages,
     ).value
     return {"messages": [item.model_dump(mode="json") for item in messages]}
+
+
+@router.get(
+    "/summary",
+    response_model=CockpitOutboxSummaryResponse,
+    dependencies=[Depends(require_admin)],
+)
+def cockpit_summary(
+    limit: int = Query(default=50, ge=1, le=200),
+    outbox: Outbox = Depends(get_outbox),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> CockpitOutboxSummaryResponse:
+    def build_summary() -> CockpitOutboxSummaryResponse:
+        messages = outbox.list_messages()
+        return CockpitOutboxSummaryResponse(
+            pending_count=sum(
+                message.delivery_status == DeliveryStatus.PENDING
+                for message in messages
+            ),
+            critical_count=sum(
+                message.urgency == OutboxUrgency.CRITICAL for message in messages
+            ),
+            messages=[_cockpit_message(message) for message in messages[:limit]],
+        )
+
+    return execute_agent_event(
+        runtime,
+        AgentEventType.OUTBOX_READ,
+        source="api.outbox.summary",
+        handler=build_summary,
+        payload={"limit": limit},
+    ).value
 
 
 @router.post("/messages", dependencies=[Depends(require_admin)])
@@ -186,3 +250,21 @@ def record_delivery_failure(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return message.model_dump(mode="json")
+
+
+def _cockpit_message(message: OutboxMessage) -> CockpitOutboxMessageResponse:
+    return CockpitOutboxMessageResponse(
+        message_id=message.message_id,
+        title=message.title,
+        urgency=message.urgency,
+        delivery_status=message.delivery_status,
+        acknowledgment_status=message.acknowledgment_status,
+        references=CockpitOutboxReferencesResponse(
+            event_id=message.references.event_id,
+            goal_id=message.references.goal_id,
+            plan_id=message.references.plan_id,
+            decision_id=message.references.decision_id,
+            action_id=message.references.action_id,
+            commitment_id=message.references.commitment_id,
+        ),
+    )

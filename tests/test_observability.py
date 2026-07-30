@@ -5,12 +5,17 @@ from kagya.api.observability import OperationalTelemetry
 from kagya.runtime import AgentEvent, AgentEventType
 
 
-def _event(index: int, *, private_ids: bool = False) -> AgentEvent:
+def _event(
+    index: int,
+    *,
+    private_ids: bool = False,
+    event_type: AgentEventType = AgentEventType.CHAT,
+) -> AgentEvent:
     now = datetime.now(UTC)
     suffix = f"private prompt {index}" if private_ids else f"event-{index}"
     return AgentEvent(
         event_id=suffix,
-        event_type=AgentEventType.CHAT,
+        event_type=event_type,
         source="test",
         observed_at=now,
         requested_at=now,
@@ -73,3 +78,17 @@ def test_corrupt_observability_history_does_not_block_restart(tmp_path: Path) ->
 
     assert "kagya_agent_queue_depth" in telemetry.prometheus_text()
     assert telemetry.recent_traces() == []
+
+
+def test_context_read_has_bounded_observability_taxonomy(tmp_path: Path) -> None:
+    telemetry = OperationalTelemetry(tmp_path / "metrics.json", tmp_path / "traces.json")
+    event = _event(1, event_type=AgentEventType.CONTEXT_READ)
+
+    telemetry.event_accepted(event, 1)
+    telemetry.event_started(event, 0)
+    telemetry.event_finished(event, "success", 0)
+
+    exported = telemetry.prometheus_text()
+    assert 'event_type="context_read"' in exported
+    assert 'subsystem="runtime"' in exported
+    assert 'event_type="other"' not in exported

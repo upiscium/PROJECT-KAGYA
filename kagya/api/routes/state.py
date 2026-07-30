@@ -59,6 +59,34 @@ class BackupRestoreRequest(BaseModel):
     expected_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class WorkingMemorySummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    item_count: int = Field(ge=0)
+    token_count: int = Field(ge=0)
+    item_capacity: int = Field(gt=0)
+    token_capacity: int = Field(gt=0)
+
+
+@router.get("/working-memory", response_model=WorkingMemorySummaryResponse)
+def working_memory_summary(
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> WorkingMemorySummaryResponse:
+    working_memory = get_main_loop(request).working_memory
+    return execute_agent_event(
+        runtime,
+        AgentEventType.MEMORY_READ,
+        source="api.state.working_memory",
+        handler=lambda: WorkingMemorySummaryResponse(
+            item_count=len(working_memory.items),
+            token_count=working_memory.token_count,
+            item_capacity=working_memory.item_capacity,
+            token_capacity=working_memory.token_capacity,
+        ),
+    ).value
+
+
 @router.post("/snapshot", response_model=AgentStateSnapshot)
 def create_snapshot(
     runtime: AgentRuntime = Depends(get_agent_runtime),

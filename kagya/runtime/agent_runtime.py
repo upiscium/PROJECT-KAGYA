@@ -54,6 +54,7 @@ class AgentEventType(StrEnum):
     BACKUP_VERIFY = "backup_verify"
     BACKUP_ROTATE = "backup_rotate"
     BACKUP_RESTORE = "backup_restore"
+    CONTEXT_READ = "context_read"
     CONTEXT_UPDATE = "context_update"
     EMOTION_TICK = "emotion_tick"
     VALUE_READ = "value_read"

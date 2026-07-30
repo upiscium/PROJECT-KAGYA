@@ -525,7 +525,7 @@ def _categorical_label(metric: str, label: str, value: str) -> str:
 _KNOWN_EVENT_TYPES = {
     "chat", "debug_chat", "sleep", "memory_read", "memory_update",
     "adapter_read", "adapter_update", "state_snapshot", "state_export",
-    "state_restore", "state_reset", "context_update", "emotion_tick",
+    "state_restore", "state_reset", "context_read", "context_update", "emotion_tick",
     "value_read", "value_update", "goal_read", "goal_update",
     "goal_reevaluate", "decision_read", "decision_update", "decision_generate",
     "self_model_read", "self_model_update", "experience_read",

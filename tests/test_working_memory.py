@@ -50,6 +50,16 @@ def test_token_capacity_limits_selected_view_with_reason() -> None:
     assert "token_capacity" in rejected.reasons
 
 
+def test_token_count_does_not_mutate_items_or_resolve_references() -> None:
+    memory = WorkingMemory(item_capacity=3, token_capacity=100, token_counter=len)
+    memory.admit(_item("inline", content="12345"))
+    memory.admit(_item("reference", reference="episode:private"))
+    before = memory.items
+
+    assert memory.token_count == 5
+    assert memory.items == before
+
+
 def test_goal_retention_outweighs_newer_low_salience_context() -> None:
     memory = WorkingMemory(item_capacity=1, token_capacity=100)
     memory.admit(
