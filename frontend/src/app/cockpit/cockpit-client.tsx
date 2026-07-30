@@ -9,6 +9,8 @@ import { Card, CardTitle } from "@/components/ui/card";
 import {
   api,
   errorMessage,
+  type CockpitActionTrace,
+  type CockpitPreIntentFailure,
   type Commitment,
   type ContextFrame,
   type Decision,
@@ -28,6 +30,7 @@ export function CockpitClient() {
   const plans = useQuery({ queryKey: ["cockpit", "plans"], queryFn: api.plans });
   const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
   const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
+  const actions = useQuery({ queryKey: ["cockpit", "actions"], queryFn: api.actionTrace });
   const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
   const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
 
@@ -44,6 +47,12 @@ export function CockpitClient() {
   const loadedDecisions = new Set(recentDecisions.map((item) => item.decision_id));
   const loadedOutbox = new Set(recentOutbox.map((item) => item.message_id));
   const loadedJournal = new Set(recentJournal.map((item) => item.event_id));
+  const loadedActions = new Set(actions.data?.traces.map((item) => item.intent_id));
+  const loadedReceipts = new Set(actions.data?.traces.flatMap((item) => [
+    ...(item.receipt ? [item.receipt.receipt_id] : []),
+    ...item.related_receipts.map((receipt) => receipt.receipt_id),
+  ]));
+  const loadedActionFailures = new Set(actions.data?.pre_intent_failures.map((item) => item.failure_id));
   const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
 
   return (
@@ -92,15 +101,21 @@ export function CockpitClient() {
         </Section>
 
         <Section title="Recent Decisions" query={decisions} empty={decisions.data?.decisions.length === 0} emptyText="No decisions recorded.">
-          <div className="stack">{recentDecisions.map((decision) => <DecisionRecord key={decision.decision_id} decision={decision} outbox={outbox.data?.messages ?? []} loadedContexts={loadedContexts} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedCommitments={loadedCommitments} loadedOutbox={loadedOutbox} />)}</div>
+          <div className="stack">{recentDecisions.map((decision) => <DecisionRecord key={decision.decision_id} decision={decision} actions={actions.data?.traces ?? []} actionFailures={actions.data?.pre_intent_failures ?? []} outbox={outbox.data?.messages ?? []} loadedContexts={loadedContexts} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedCommitments={loadedCommitments} loadedOutbox={loadedOutbox} loadedActions={loadedActions} loadedActionFailures={loadedActionFailures} />)}</div>
+        </Section>
+
+        <Section title="Action Execution" query={actions} empty={actions.data ? actions.data.traces.length === 0 && actions.data.pre_intent_failures.length === 0 : false} emptyText="No action execution traces.">
+          {actions.data ? <div className="metric-grid"><Metric label="Pending approvals" value={String(actions.data.pending_approval_count)} /><Metric label="Retry pending" value={String(actions.data.retry_pending_count)} /><Metric label="Failed" value={String(actions.data.failed_count)} /></div> : null}
+          <div className="stack">{actions.data?.pre_intent_failures.map((failure) => <PreIntentFailureRecord key={failure.failure_id} failure={failure} loadedDecisions={loadedDecisions} loadedJournal={loadedJournal} />)}</div>
+          <div className="stack">{actions.data?.traces.map((trace) => <ActionTraceRecord key={trace.intent_id} trace={trace} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}</div>
         </Section>
 
         <Section title="Outbox" query={outbox} empty={outbox.data?.messages.length === 0} emptyText="No proactive messages.">
-          {outbox.data ? <OutboxSummary pendingCount={outbox.data.pending_count} criticalCount={outbox.data.critical_count} visibleMessages={recentOutbox} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} loadedCommitments={loadedCommitments} /> : null}
+          {outbox.data ? <OutboxSummary pendingCount={outbox.data.pending_count} criticalCount={outbox.data.critical_count} visibleMessages={recentOutbox} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedDecisions={loadedDecisions} loadedCommitments={loadedCommitments} loadedActions={loadedActions} /> : null}
         </Section>
 
         <Section title="Recent Journal" query={journal} empty={journal.data?.records.length === 0} emptyText="No Journal records.">
-          <div className="stack">{recentJournal.map((record) => <JournalEntry key={record.record_id} record={record} loadedJournal={loadedJournal} />)}</div>
+          <div className="stack">{recentJournal.map((record) => <JournalEntry key={record.record_id} record={record} actions={actions.data?.traces ?? []} loadedJournal={loadedJournal} loadedActions={loadedActions} loadedReceipts={loadedReceipts} />)}</div>
         </Section>
       </div>
     </div>
@@ -152,18 +167,33 @@ function PlanRecord({ plan, decisions, loadedGoals, loadedDecisions }: { plan: P
   })}</div></article>;
 }
 
-function DecisionRecord({ decision, outbox, loadedContexts, loadedGoals, loadedPlans, loadedCommitments, loadedOutbox }: { decision: Decision; outbox: CockpitOutboxMessage[]; loadedContexts: Set<string>; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedCommitments: Set<string>; loadedOutbox: Set<string> }) {
+function DecisionRecord({ decision, actions, actionFailures, outbox, loadedContexts, loadedGoals, loadedPlans, loadedCommitments, loadedOutbox, loadedActions, loadedActionFailures }: { decision: Decision; actions: CockpitActionTrace[]; actionFailures: CockpitPreIntentFailure[]; outbox: CockpitOutboxMessage[]; loadedContexts: Set<string>; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedCommitments: Set<string>; loadedOutbox: Set<string>; loadedActions: Set<string>; loadedActionFailures: Set<string> }) {
   const messages = outbox.filter((message) => message.references.decision_id === decision.decision_id).map((message) => message.message_id);
   const candidate = decision.selected_candidate;
-  return <article className="record" id={anchor("decision", decision.decision_id)}><div className="metadata-row"><Badge>{decision.status}</Badge><Badge>{decision.outcome_status}</Badge><strong>{decision.decision_id}</strong><span>{percent(decision.selection_confidence)} confidence</span></div><p>Selected action: <span className="mono">{candidate.candidate_type}:{candidate.candidate_id}</span> · {candidate.proposed_action}</p><p>Context: <EntityReference kind="context" id={decision.context_id} available={loadedContexts} /> · Plan: <EntityReference kind="plan" id={candidate.plan_id} available={loadedPlans} />{candidate.step_id ? ` / step ${candidate.step_id}` : ""}</p><p>Goals: {decision.active_goal_ids.length ? <ReferenceList kind="goal" ids={decision.active_goal_ids} available={loadedGoals} /> : "unavailable"} · Commitments: {candidate.commitment_refs.length ? <ReferenceList kind="commitment" ids={candidate.commitment_refs} available={loadedCommitments} /> : "unavailable"}</p><p>Outbox: {messages.length ? <ReferenceList kind="outbox" ids={messages} available={loadedOutbox} /> : "unavailable"}</p></article>;
+  const action = actions.find((trace) => trace.provenance.decision_id === decision.decision_id && trace.provenance.candidate_id === decision.selected_candidate_id);
+  const failure = actionFailures.find((item) => item.decision_id === decision.decision_id && (item.candidate_id === null || item.candidate_id === decision.selected_candidate_id));
+  const actionReference = action
+    ? <EntityReference kind="action" id={action.intent_id} available={loadedActions} />
+    : <EntityReference kind="action-failure" id={failure?.failure_id ?? null} available={loadedActionFailures} />;
+  return <article className="record" id={anchor("decision", decision.decision_id)}><div className="metadata-row"><Badge>{decision.status}</Badge><Badge>{decision.outcome_status}</Badge><strong>{decision.decision_id}</strong><span>{percent(decision.selection_confidence)} confidence</span></div><p>Selected action: <span className="mono">{candidate.candidate_type}:{candidate.candidate_id}</span> · {candidate.proposed_action}</p><p>Context: <EntityReference kind="context" id={decision.context_id} available={loadedContexts} /> · Plan: <EntityReference kind="plan" id={candidate.plan_id} available={loadedPlans} />{candidate.step_id ? ` / step ${candidate.step_id}` : ""}</p><p>Goals: {decision.active_goal_ids.length ? <ReferenceList kind="goal" ids={decision.active_goal_ids} available={loadedGoals} /> : "unavailable"} · Commitments: {candidate.commitment_refs.length ? <ReferenceList kind="commitment" ids={candidate.commitment_refs} available={loadedCommitments} /> : "unavailable"}</p><p>Action: {actionReference} · Outbox: {messages.length ? <ReferenceList kind="outbox" ids={messages} available={loadedOutbox} /> : "unavailable"}</p></article>;
 }
 
-function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
-  return <><div className="metric-grid"><Metric label="Pending" value={String(pendingCount)} /><Metric label="Critical" value={String(criticalCount)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <span className="mono">{message.references.action_id ?? "unavailable"}</span></p></article>)}</div></>;
+function PreIntentFailureRecord({ failure, loadedDecisions, loadedJournal }: { failure: CockpitPreIntentFailure; loadedDecisions: Set<string>; loadedJournal: Set<string> }) {
+  return <article className="record" id={anchor("action-failure", failure.failure_id)}><div className="metadata-row"><Badge data-tone="danger">{failure.failure_type === "validation" ? "Validation rejected" : "Policy rejected"}</Badge><strong>{failure.failure_id}</strong></div><p>Decision: <EntityReference kind="decision" id={failure.decision_id} available={loadedDecisions} /> · Candidate: <span className="mono">{failure.candidate_id ?? "unavailable"}</span></p><p>Tool: {failure.tool_name ?? "unavailable"} · Risk: {failure.risk_class ?? "unavailable"} · Codes: <span className="mono">{failure.error_codes.join(", ")}</span></p><p>Event: <EntityReference kind="journal" id={failure.event_id} available={loadedJournal} /> · {failure.occurred_at}</p></article>;
 }
 
-function JournalEntry({ record, loadedJournal }: { record: JournalRecord; loadedJournal: Set<string> }) {
-  return <article className="record" id={anchor("journal", record.event_id)}><div className="metadata-row"><Badge>{record.lifecycle}</Badge><strong>{record.event_type}</strong></div><p className="mono muted">{record.event_id} · {new Date(record.timestamp).toLocaleString()}</p><p>Target: <span className="mono">{record.target ?? "unavailable"}</span> · Category: {record.failure_category ?? "none"}</p><p>Causation: <EntityReference kind="journal" id={record.causation_id} available={loadedJournal} /> · Correlation: <span className="mono">{record.correlation_id ?? "unavailable"}</span></p></article>;
+function ActionTraceRecord({ trace, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { trace: CockpitActionTrace; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
+  const receipt = trace.receipt;
+  return <article className="record" id={anchor("action", trace.intent_id)}><div className="metadata-row"><Badge data-tone={actionTone(trace.status)}>{trace.status}</Badge><Badge>{trace.risk_class}</Badge><strong>{trace.tool_name}</strong></div><p className="mono muted">{trace.intent_id} · revision {trace.revision} · {trace.dry_run ? "dry-run" : "live"}</p><p>Created: {trace.created_at} · Updated: {trace.updated_at} · Failure: <span className="mono">{trace.failure_code ?? "none"}</span></p><p>Decision: <EntityReference kind="decision" id={trace.provenance.decision_id} available={loadedDecisions} /> · Plan: <EntityReference kind="plan" id={trace.provenance.plan_id} available={loadedPlans} />{trace.provenance.step_id ? ` / step ${trace.provenance.step_id}` : ""}</p><p>Approval: {trace.approval.status ?? "not required"}{trace.approval.resolved_by_operator ? " / operator resolved" : ""}</p>{trace.related_receipts.map((related) => <p id={anchor("receipt", related.receipt_id)} key={related.receipt_id}>Related receipt: <Link className="entity-link mono" href={`#${anchor("receipt", related.receipt_id)}`}>{related.receipt_id}</Link> · {related.status}</p>)}{receipt ? <div className="step-row" id={anchor("receipt", receipt.receipt_id)}><p>Receipt: <Link className="entity-link mono" href={`#${anchor("receipt", receipt.receipt_id)}`}>{receipt.receipt_id}</Link> · <Badge data-tone={receipt.status === "succeeded" ? "success" : receipt.status === "failed" || receipt.status === "timed_out" || receipt.status === "cancelled" ? "danger" : "neutral"}>{receipt.status}</Badge></p>{receipt.compensation_of ? <p>Compensates: <EntityReference kind="receipt" id={receipt.compensation_of} available={loadedReceipts} /></p> : null}<p>Attempt {receipt.attempt} · {receipt.duration_ms} ms · Error {receipt.error_code ?? "none"} · Event <EntityReference kind="journal" id={receipt.event_id} available={loadedJournal} /></p>{trace.observation ? <p id={anchor("observation", trace.observation.observation_id)}>Observation: <Link className="entity-link mono" href={`#${anchor("observation", trace.observation.observation_id)}`}>{trace.observation.observation_id}</Link> · {trace.observation.valid ? "valid" : "invalid"} · errors {trace.observation.validation_errors.join(", ") || "none"} · digest <span className="mono">{trace.observation.result_digest}</span></p> : <p>Observation: unavailable</p>}{trace.verification ? <p id={anchor("verification", trace.verification.verification_id)}>Verification: <Link className="entity-link mono" href={`#${anchor("verification", trace.verification.verification_id)}`}>{trace.verification.verification_id}</Link> · {trace.verification.success ? "succeeded" : "failed"} · {trace.verification.reason}</p> : <p>Verification: unavailable</p>}</div> : <p>Receipt: unavailable · Observation: unavailable · Verification: unavailable</p>}</article>;
+}
+
+function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments, loadedActions }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string>; loadedActions: Set<string> }) {
+  return <><div className="metric-grid"><Metric label="Pending" value={String(pendingCount)} /><Metric label="Critical" value={String(criticalCount)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <EntityReference kind="action" id={message.references.action_id} available={loadedActions} /></p></article>)}</div></>;
+}
+
+function JournalEntry({ record, actions, loadedJournal, loadedActions, loadedReceipts }: { record: JournalRecord; actions: CockpitActionTrace[]; loadedJournal: Set<string>; loadedActions: Set<string>; loadedReceipts: Set<string> }) {
+  const trace = actions.find((item) => item.receipt?.event_id === record.event_id);
+  return <article className="record" id={anchor("journal", record.event_id)}><div className="metadata-row"><Badge>{record.lifecycle}</Badge><strong>{record.event_type}</strong></div><p className="mono muted">{record.event_id} · {new Date(record.timestamp).toLocaleString()}</p><p>Target: <span className="mono">{record.target ?? "unavailable"}</span> · Category: {record.failure_category ?? "none"}</p><p>Causation: <EntityReference kind="journal" id={record.causation_id} available={loadedJournal} /> · Correlation: <span className="mono">{record.correlation_id ?? "unavailable"}</span></p>{trace?.receipt ? <p>Action: <EntityReference kind="action" id={trace.intent_id} available={loadedActions} /> · Receipt: <EntityReference kind="receipt" id={trace.receipt.receipt_id} available={loadedReceipts} /></p> : null}</article>;
 }
 
 function EntityReference({ kind, id, available }: { kind: string; id: string | null; available: Set<string> }) {
@@ -189,4 +219,11 @@ function isCurrentCommitment(commitment: Commitment): boolean {
 
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
+}
+
+function actionTone(status: CockpitActionTrace["status"]): string {
+  if (status === "awaiting_approval" || status === "retry_pending") return "warning";
+  if (status === "failed" || status === "rejected" || status === "cancelled") return "danger";
+  if (status === "succeeded") return "success";
+  return "neutral";
 }

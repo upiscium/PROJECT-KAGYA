@@ -47,6 +47,7 @@
 .ui-badge[data-tone="success"] { border-color: rgba(134, 239, 172, 0.5); color: var(--success); }
 .ui-badge[data-tone="danger"] { border-color: rgba(251, 113, 133, 0.5); color: var(--danger); }
 .ui-badge[data-tone="accent"] { border-color: rgba(125, 211, 252, 0.5); color: var(--accent); }
+.ui-badge[data-tone="warning"] { border-color: rgba(251, 191, 36, 0.5); color: #fbbf24; }
 
 .generating-indicator {
   align-items: center;

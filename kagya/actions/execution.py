@@ -368,6 +368,11 @@ _TOOLS = {
     ),
 }
 
+
+def public_tool_name(value: str) -> str | None:
+    """Return only stable, allowlisted tool identifiers."""
+    return value if value in _TOOLS else None
+
 _VALIDATION_SCHEMA_REVISIONS = {
     "restricted_metadata_read": 1,
     "document_search": 1,

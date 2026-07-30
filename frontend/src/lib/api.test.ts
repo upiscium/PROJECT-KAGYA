@@ -107,6 +107,7 @@ describe("api client", () => {
       [api.decisions, decisionPayload, "/admin-proxy/decisions", "decisions"],
       [api.workingMemory, workingMemoryPayload, "/admin-proxy/state/working-memory", "item_count"],
       [api.cockpitOutbox, cockpitOutboxPayload, "/admin-proxy/outbox/summary", "messages"],
+      [api.actionTrace, actionTracePayload, "/admin-proxy/actions/trace", "traces"],
     ] as const;
 
     for (const [client, payload, path, projectionKey] of cases) {
@@ -184,6 +185,87 @@ describe("api client", () => {
   ])("rejects malformed cockpit outbox %s", async (_label, payload) => {
     fetchMock.mockReturnValue(jsonResponse(payload));
     await expect(api.cockpitOutbox()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("parses only public-safe action trace fields", async () => {
+    fetchMock.mockReturnValue(jsonResponse(actionTracePayload));
+
+    const result = await api.actionTrace();
+
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/actions/trace", expect.anything());
+    expect(result.pending_approval_count).toBe(2);
+    expect(result.retry_pending_count).toBe(1);
+    expect(result.failed_count).toBe(3);
+    expect(result.traces[0].receipt?.status).toBe("succeeded");
+    expect(result.traces[0].related_receipts).toEqual([{ receipt_id: "receipt-original", status: "succeeded" }]);
+    expect(result.traces[0].observation?.result_digest).toBe("a".repeat(64));
+    expect(result.pre_intent_failures.map((failure) => failure.failure_type)).toEqual(["validation", "policy_rejection"]);
+    expect(result.pre_intent_failures[0].tool_name).toBe("document_search");
+    expect(result.pre_intent_failures[1].tool_name).toBeNull();
+    expect(result.pre_intent_failures[1].candidate_id).toBe("candidate-2");
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+    expect(result.traces[0]).not.toHaveProperty("arguments");
+    expect(result.traces[0]).not.toHaveProperty("preview");
+    expect(result.traces[0]).not.toHaveProperty("idempotency_key");
+    expect(result.traces[0].approval).not.toHaveProperty("reason");
+    expect(result.traces[0].observation).not.toHaveProperty("data");
+  });
+
+  it.each([
+    ["root", null],
+    ["traces collection", { ...actionTracePayload, traces: {} }],
+    ["intent ID", actionTraceWith({ intent_id: undefined })],
+    ["intent status", actionTraceWith({ status: "invented" })],
+    ["risk class", actionTraceWith({ risk_class: "invented" })],
+    ["receipt status", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, status: "invented" } })],
+    ["negative count", { ...actionTracePayload, failed_count: -1 }],
+    ["fractional count", { ...actionTracePayload, retry_pending_count: 1.5 }],
+    ["duration", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, duration_ms: -0.1 } })],
+    ["digest", actionTraceWith({ observation: { ...actionTracePayload.traces[0].observation, result_digest: "invalid" } })],
+    ["event sequence", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, event_sequence: 0 } })],
+    ["validation errors", actionTraceWith({ observation: { ...actionTracePayload.traces[0].observation, validation_errors: {} } })],
+    ["failure type", actionFailureWith({ failure_type: "invented" })],
+    ["failure error code", actionFailureWith({ error_codes: ["not bounded code"] })],
+    ["failure event sequence", actionFailureWith({ event_sequence: 0 })],
+    ["failure decision ID", actionFailureWith({ decision_id: undefined })],
+    ["tool whitespace", actionFailureWith({ tool_name: "tool name" })],
+    ["tool newline", actionFailureWith({ tool_name: "tool\nname" })],
+    ["tool HTML", actionFailureWith({ tool_name: "<script>alert(1)</script>" })],
+    ["tool uppercase", actionFailureWith({ tool_name: "Document_Search" })],
+    ["tool hyphen", actionFailureWith({ tool_name: "document-search" })],
+    ["tool private sentinel", actionFailureWith({ tool_name: "PRIVATE_SENTINEL" })],
+    ["intent failure code", actionTraceWith({ failure_code: "not bounded code" })],
+    ["receipt error code", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, error_code: "not bounded code" } })],
+    ["verification reason", actionTraceWith({ verification: { ...actionTracePayload.traces[0].verification, reason: "not bounded code" } })],
+  ])("rejects malformed action trace %s", async (_label, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(api.actionTrace()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("accepts backend fail-closed cross-record projections", async () => {
+    const payload = {
+      ...actionTracePayload,
+      traces: [{
+        ...actionTracePayload.traces[0],
+        receipt: null,
+        related_receipts: [],
+        observation: null,
+        verification: null,
+      }],
+      pre_intent_failures: [{
+        ...actionTracePayload.pre_intent_failures[1],
+        tool_name: null,
+      }],
+    };
+    fetchMock.mockReturnValue(jsonResponse(payload));
+
+    const result = await api.actionTrace();
+
+    expect(result.traces[0].receipt).toBeNull();
+    expect(result.traces[0].related_receipts).toEqual([]);
+    expect(result.traces[0].observation).toBeNull();
+    expect(result.traces[0].verification).toBeNull();
+    expect(result.pre_intent_failures[0].tool_name).toBeNull();
   });
 
   it("formats backend JSON error details", async () => {
@@ -306,3 +388,41 @@ const cockpitOutboxPayload = {
     attempts: [{ failure_code: "PRIVATE_SENTINEL" }],
   }],
 };
+
+const actionTracePayload = {
+  pending_approval_count: 2,
+  retry_pending_count: 1,
+  failed_count: 3,
+  traces: [{
+    intent_id: "action-1",
+    revision: 2,
+    tool_name: "document_search",
+    risk_class: "read_only",
+    status: "succeeded",
+    dry_run: false,
+    created_at: "2026-07-30T00:00:00Z",
+    updated_at: "2026-07-30T00:00:01Z",
+    failure_code: null,
+    provenance: { decision_id: "decision-1", candidate_id: "candidate-1", triggering_event_id: "event-0", plan_id: "plan-1", plan_revision: 1, step_id: "step-1" },
+    approval: { approval_id: "approval-1", status: "approved", requested_at: "2026-07-30T00:00:00Z", resolved_at: "2026-07-30T00:00:01Z", resolved_by_operator: true, reason: "PRIVATE_SENTINEL" },
+    receipt: { receipt_id: "receipt-1", status: "succeeded", attempt: 1, duration_ms: 12.5, event_id: "event-1", event_sequence: 45, error_code: null, compensation_of: null, idempotency_key: "PRIVATE_SENTINEL" },
+    related_receipts: [{ receipt_id: "receipt-original", status: "succeeded", idempotency_key: "PRIVATE_SENTINEL" }],
+    observation: { observation_id: "observation-1", valid: true, validation_errors: [], result_digest: "a".repeat(64), data: { result: "PRIVATE_SENTINEL" } },
+    verification: { verification_id: "verification-1", success: true, reason: "observation_schema_valid", private_replay: "PRIVATE_SENTINEL" },
+    arguments: { query: "PRIVATE_SENTINEL" },
+    preview: { arguments: { query: "PRIVATE_SENTINEL" } },
+    idempotency_key: "PRIVATE_SENTINEL",
+  }],
+  pre_intent_failures: [
+    { failure_id: "validation-1", failure_type: "validation", decision_id: "decision-1", candidate_id: null, tool_name: "document_search", risk_class: "read_only", error_codes: ["arguments_schema_invalid"], event_id: "event-1", event_sequence: 42, occurred_at: "2026-07-30T00:00:00Z", idempotency_key: "PRIVATE_SENTINEL", request_digest: "PRIVATE_SENTINEL", canonical_arguments_digest: "PRIVATE_SENTINEL", arguments: { secret: "PRIVATE_SENTINEL" } },
+    { failure_id: "rejection-1", failure_type: "policy_rejection", decision_id: "decision-2", candidate_id: "candidate-2", tool_name: null, risk_class: "reversible_write", error_codes: ["risk_class_exceeds_budget"], event_id: "event-2", event_sequence: 43, occurred_at: "2026-07-30T00:00:01Z", idempotency_key: "PRIVATE_SENTINEL" },
+  ],
+};
+
+function actionTraceWith(update: Record<string, unknown>) {
+  return { ...actionTracePayload, traces: [{ ...actionTracePayload.traces[0], ...update }] };
+}
+
+function actionFailureWith(update: Record<string, unknown>) {
+  return { ...actionTracePayload, pre_intent_failures: [{ ...actionTracePayload.pre_intent_failures[0], ...update }] };
+}

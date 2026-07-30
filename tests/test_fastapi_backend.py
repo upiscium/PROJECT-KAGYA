@@ -13,6 +13,25 @@ from fastapi.testclient import TestClient
 import pytest
 
 from kagya.api.server import create_app
+from kagya.actions import (
+    ACTION_STATE_KEY,
+    ActionBudget,
+    ActionIntent,
+    ActionPolicyRejectionRecord,
+    ActionPreview,
+    ActionProvenance,
+    ActionState,
+    ActionValidationErrorCode,
+    ActionValidationRecord,
+    ApprovalRecord,
+    ExecutionReceipt,
+    IntentStatus,
+    Observation,
+    OutcomeVerification,
+    PolicyEvaluation,
+    ReceiptStatus,
+    RiskClass,
+)
 from kagya.config import (
     BehavioralActivationPolicy,
     ProjectEnvironment,
@@ -830,6 +849,480 @@ def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
         assert [message["message_id"] for message in payload["messages"]] == list(
             reversed(created_ids[-5:])
         )
+
+
+def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/actions/trace").status_code == 401
+        response = client.get("/api/actions/trace", headers=admin_headers())
+        assert response.json() == {
+            "pending_approval_count": 0,
+            "retry_pending_count": 0,
+            "failed_count": 0,
+            "traces": [],
+            "pre_intent_failures": [],
+        }
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.ACTION_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        and record.source == "api.actions.trace"
+        for record in records
+    )
+
+
+def test_admin_cockpit_action_trace_projects_related_records_without_private_data(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    pending = _cockpit_action_intent(
+        "intent-pending", IntentStatus.AWAITING_APPROVAL, now, approval_id="approval-1"
+    )
+    succeeded = _cockpit_action_intent(
+        "intent-success", IntentStatus.SUCCEEDED, now + timedelta(seconds=1), receipt_id="receipt-success"
+    )
+    failed = _cockpit_action_intent(
+        "intent-failed",
+        IntentStatus.FAILED,
+        now + timedelta(seconds=2),
+        receipt_id="receipt-timeout",
+        failure_code="timeout",
+    )
+    compensated = _cockpit_action_intent(
+        "intent-compensated",
+        IntentStatus.COMPENSATED,
+        now + timedelta(seconds=3),
+        receipt_id="receipt-compensated",
+    )
+    missing = _cockpit_action_intent(
+        "intent-missing",
+        IntentStatus.APPROVED,
+        now + timedelta(seconds=4),
+        receipt_id="missing-receipt",
+    )
+    state = ActionState(
+        intents=(pending, succeeded, failed, compensated, missing),
+        approvals=(ApprovalRecord(
+            approval_id="approval-1",
+            intent_id=pending.intent_id,
+            status="pending",
+            requested_at=now,
+            reason="PRIVATE_SENTINEL",
+        ),),
+        receipts=(
+            _cockpit_receipt(succeeded, "receipt-success", ReceiptStatus.SUCCEEDED, "observation-success", "verification-success", now),
+            _cockpit_receipt(failed, "receipt-timeout", ReceiptStatus.TIMED_OUT, "observation-timeout", "verification-timeout", now, error_code="timeout"),
+            _cockpit_receipt(compensated, "receipt-original", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
+            _cockpit_receipt(compensated, "receipt-compensated", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-original"),
+        ),
+        observations=(
+            _cockpit_observation(succeeded, "receipt-success", "observation-success", True, now),
+            _cockpit_observation(failed, "receipt-timeout", "observation-timeout", False, now, errors=("result_fields_invalid",)),
+        ),
+        verifications=(
+            OutcomeVerification(verification_id="verification-success", intent_id=succeeded.intent_id, observation_id="observation-success", success=True, reason="observation_schema_valid", verified_at=now),
+            OutcomeVerification(verification_id="verification-timeout", intent_id=failed.intent_id, observation_id="observation-timeout", success=False, reason="execution_timeout", verified_at=now),
+        ),
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        before = json.dumps(client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pending_approval_count"] == 1
+        assert payload["retry_pending_count"] == 0
+        assert payload["failed_count"] == 1
+        assert [item["intent_id"] for item in payload["traces"]] == [
+            "intent-missing", "intent-compensated", "intent-failed", "intent-success", "intent-pending"
+        ]
+        by_id = {item["intent_id"]: item for item in payload["traces"]}
+        assert by_id["intent-pending"]["approval"] == {
+            "approval_id": "approval-1", "status": "pending", "requested_at": now.isoformat().replace("+00:00", "Z"), "resolved_at": None, "resolved_by_operator": False
+        }
+        assert by_id["intent-success"]["receipt"]["status"] == "succeeded"
+        assert by_id["intent-success"]["observation"]["valid"] is True
+        assert by_id["intent-success"]["verification"]["success"] is True
+        assert by_id["intent-failed"]["receipt"]["status"] == "timed_out"
+        assert by_id["intent-compensated"]["receipt"]["status"] == "compensated"
+        assert by_id["intent-compensated"]["receipt"]["compensation_of"] == "receipt-original"
+        assert by_id["intent-compensated"]["related_receipts"] == [
+            {"receipt_id": "receipt-original", "status": "succeeded"}
+        ]
+        assert by_id["intent-missing"]["receipt"] is None
+        assert by_id["intent-missing"]["observation"] is None
+        assert by_id["intent-missing"]["verification"] is None
+        assert "PRIVATE_SENTINEL" not in response.text
+        for field in ("arguments", "preview", "idempotency_key", "data"):
+            assert f'"{field}"' not in response.text
+        assert json.dumps(client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True) == before
+
+
+def test_admin_cockpit_action_trace_counts_before_limit_and_orders_ties(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    statuses = {
+        0: IntentStatus.AWAITING_APPROVAL,
+        1: IntentStatus.RETRY_PENDING,
+        2: IntentStatus.FAILED,
+        3: IntentStatus.REJECTED,
+        4: IntentStatus.CANCELLED,
+    }
+    intents = tuple(
+        _cockpit_action_intent(
+            f"intent-{index:03d}", statuses.get(index, IntentStatus.SUCCEEDED), now
+        )
+        for index in range(55)
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = ActionState(intents=intents).model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 5})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["pending_approval_count"] == 1
+        assert payload["retry_pending_count"] == 1
+        assert payload["failed_count"] == 3
+        assert [item["intent_id"] for item in payload["traces"]] == [
+            "intent-054", "intent-053", "intent-052", "intent-051", "intent-050"
+        ]
+        assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 0}).status_code == 422
+        assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 201}).status_code == 422
+
+
+def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    validation_failure = ActionValidationRecord(
+        validation_id="validation-failed",
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="c" * 64,
+        decision_id="decision-validation",
+        tool_name="document_search",
+        risk_class=RiskClass.READ_ONLY,
+        arguments_valid=False,
+        validation_schema_revision="d" * 64,
+        validation_error_codes=(ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+        validated_event_id="event-validation",
+        validated_event_sequence=42,
+        canonical_arguments_digest="e" * 64,
+        validated_at=now,
+    )
+    successful_validation = ActionValidationRecord(
+        validation_id="validation-policy",
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="f" * 64,
+        decision_id="decision-policy",
+        intent_id="uncreated-intent",
+        tool_name="local_notification_enqueue",
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        arguments_valid=True,
+        validation_schema_revision="a" * 64,
+        validated_event_id="event-policy",
+        validated_event_sequence=43,
+        canonical_arguments_digest="b" * 64,
+        validated_at=now + timedelta(seconds=1),
+    )
+    rejection = ActionPolicyRejectionRecord(
+        rejection_id="rejection-policy",
+        idempotency_key="PRIVATE_SENTINEL",
+        decision_id="decision-policy",
+        candidate_id="candidate-policy",
+        validation_id=successful_validation.validation_id,
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        policy_code="risk_budget_denied",
+        reason_code="risk_class_exceeds_budget",
+        event_id="event-policy",
+        event_sequence=43,
+        rejected_at=now + timedelta(seconds=1),
+    )
+    terminal = _cockpit_action_intent(
+        "intent-terminal", IntentStatus.FAILED, now - timedelta(seconds=1), failure_code="timeout"
+    )
+    state = ActionState(
+        intents=(terminal,),
+        validation_records=(validation_failure, successful_validation),
+        policy_rejections=(rejection,),
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get(
+            "/api/actions/trace", headers=admin_headers(), params={"limit": 1}
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["failed_count"] == 3
+        assert len(payload["traces"]) == 1
+        assert payload["traces"][0]["intent_id"] == terminal.intent_id
+        assert len(payload["pre_intent_failures"]) == 1
+        assert payload["pre_intent_failures"][0] == {
+            "failure_id": "rejection-policy",
+            "failure_type": "policy_rejection",
+            "decision_id": "decision-policy",
+            "candidate_id": "candidate-policy",
+            "tool_name": "local_notification_enqueue",
+            "risk_class": "reversible_write",
+            "error_codes": ["risk_class_exceeds_budget"],
+            "event_id": "event-policy",
+            "event_sequence": 43,
+            "occurred_at": "2026-07-30T00:00:01Z",
+        }
+        all_failures = client.get(
+            "/api/actions/trace", headers=admin_headers(), params={"limit": 2}
+        ).json()["pre_intent_failures"]
+        assert [item["failure_id"] for item in all_failures] == [
+            "rejection-policy", "validation-failed"
+        ]
+        assert all_failures[1]["decision_id"] == "decision-validation"
+        assert all_failures[1]["error_codes"] == ["arguments_schema_invalid"]
+        assert "PRIVATE_SENTINEL" not in response.text
+        for field in ("idempotency_key", "request_digest", "canonical_arguments_digest"):
+            assert f'"{field}"' not in response.text
+
+
+def test_admin_cockpit_action_trace_only_projects_allowlisted_tool_names(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    unsafe_names = (
+        "PRIVATE_SENTINEL",
+        "<script>alert(1)</script>",
+        "tool name with spaces",
+        "tool\nname",
+    )
+    failed_validations = tuple(
+        _cockpit_validation_record(
+            f"validation-unsafe-{index}",
+            tool_name,
+            now + timedelta(seconds=index),
+            arguments_valid=False,
+        )
+        for index, tool_name in enumerate(unsafe_names)
+    )
+    allowlisted = _cockpit_validation_record(
+        "validation-allowlisted",
+        "document_search",
+        now + timedelta(seconds=4),
+        arguments_valid=False,
+    )
+    policy_validation = _cockpit_validation_record(
+        "validation-policy-unsafe",
+        "<script>alert(1)</script>",
+        now + timedelta(seconds=5),
+        arguments_valid=True,
+    )
+    rejection = ActionPolicyRejectionRecord(
+        rejection_id="rejection-unsafe-tool",
+        idempotency_key="PRIVATE_SENTINEL",
+        decision_id="decision-policy-tool",
+        candidate_id="candidate-policy-tool",
+        validation_id=policy_validation.validation_id,
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        policy_code="risk_budget_denied",
+        reason_code="risk_class_exceeds_budget",
+        event_id="event-policy-tool",
+        event_sequence=50,
+        rejected_at=now + timedelta(seconds=5),
+    )
+    state = ActionState(
+        validation_records=(*failed_validations, allowlisted, policy_validation),
+        policy_rejections=(rejection,),
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        failures = {
+            item["failure_id"]: item for item in response.json()["pre_intent_failures"]
+        }
+        for index in range(len(unsafe_names)):
+            assert failures[f"validation-unsafe-{index}"]["tool_name"] is None
+        assert failures["validation-allowlisted"]["tool_name"] == "document_search"
+        assert failures["rejection-unsafe-tool"]["tool_name"] is None
+        for value in unsafe_names:
+            assert value not in response.text
+        assert "<script>" not in response.text
+
+
+def test_admin_cockpit_action_trace_fails_closed_on_cross_record_bindings(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    cross_decision = _cockpit_action_intent("intent-cross-decision", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-decision")
+    cross_idempotency = _cockpit_action_intent("intent-cross-idempotency", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-idempotency")
+    cross_plan = _cockpit_action_intent("intent-cross-plan", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-plan")
+    duplicate_current = _cockpit_action_intent("intent-duplicate-current", IntentStatus.SUCCEEDED, now, receipt_id="receipt-duplicate-current")
+    ambiguous = _cockpit_action_intent("intent-ambiguous-related", IntentStatus.SUCCEEDED, now, approval_id="approval-duplicate", receipt_id="receipt-ambiguous")
+    receipts = (
+        _cockpit_receipt(cross_decision, "receipt-cross-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "decision-other"}),
+        _cockpit_receipt(cross_idempotency, "receipt-cross-idempotency", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"idempotency_key": "different-key"}),
+        _cockpit_receipt(cross_plan, "receipt-cross-plan", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"plan_revision": 2}),
+        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.SUCCEEDED, None, None, now),
+        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.FAILED, None, None, now),
+        _cockpit_receipt(ambiguous, "receipt-ambiguous", ReceiptStatus.SUCCEEDED, "observation-duplicate", "verification-duplicate", now),
+    )
+    approvals = (
+        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="pending", requested_at=now),
+        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="approved", requested_at=now, resolved_at=now, actor_id="operator"),
+    )
+    observations = (
+        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", True, now),
+        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", False, now, errors=("result_fields_invalid",)),
+    )
+    verifications = (
+        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=True, reason="observation_schema_valid", verified_at=now),
+        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=False, reason="observation_schema_invalid", verified_at=now),
+    )
+    state = ActionState(
+        intents=(cross_decision, cross_idempotency, cross_plan, duplicate_current, ambiguous),
+        approvals=approvals,
+        receipts=receipts,
+        observations=observations,
+        verifications=verifications,
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        by_id = {item["intent_id"]: item for item in response.json()["traces"]}
+        for intent_id in (
+            "intent-cross-decision",
+            "intent-cross-idempotency",
+            "intent-cross-plan",
+            "intent-duplicate-current",
+        ):
+            assert by_id[intent_id]["receipt"] is None
+            assert by_id[intent_id]["related_receipts"] == []
+        assert by_id["intent-ambiguous-related"]["receipt"] is not None
+        assert by_id["intent-ambiguous-related"]["approval"] == {
+            "approval_id": None,
+            "status": None,
+            "requested_at": None,
+            "resolved_at": None,
+            "resolved_by_operator": False,
+        }
+        assert by_id["intent-ambiguous-related"]["observation"] is None
+        assert by_id["intent-ambiguous-related"]["verification"] is None
+
+
+def test_admin_cockpit_action_trace_validates_compensation_bindings(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    scenario_names = ("missing", "other-intent", "other-decision", "self", "duplicate")
+    intents = tuple(
+        _cockpit_action_intent(
+            f"intent-comp-{name}",
+            IntentStatus.COMPENSATED,
+            now,
+            receipt_id=f"receipt-comp-{name}",
+        )
+        for name in scenario_names
+    )
+    valid = _cockpit_action_intent("intent-comp-valid", IntentStatus.COMPENSATED, now, receipt_id="receipt-comp-valid")
+    by_name = {name: intent for name, intent in zip(scenario_names, intents, strict=True)}
+    receipts = [
+        _cockpit_receipt(by_name["missing"], "receipt-comp-missing", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-not-found"),
+        _cockpit_receipt(by_name["other-intent"], "receipt-comp-other-intent", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-intent"),
+        _cockpit_receipt(by_name["other-decision"], "receipt-comp-other-decision", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-decision"),
+        _cockpit_receipt(by_name["self"], "receipt-comp-self", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-comp-self"),
+        _cockpit_receipt(by_name["duplicate"], "receipt-comp-duplicate", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-duplicate"),
+        _cockpit_receipt(valid, "receipt-comp-valid", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-valid"),
+        _cockpit_receipt(by_name["other-intent"], "receipt-target-other-intent", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"intent_id": "different-intent"}),
+        _cockpit_receipt(by_name["other-decision"], "receipt-target-other-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "different-decision"}),
+        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.SUCCEEDED, None, None, now),
+        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.FAILED, None, None, now),
+        _cockpit_receipt(valid, "receipt-target-valid", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
+    ]
+    state = ActionState(intents=(*intents, valid), receipts=tuple(receipts))
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        by_id = {item["intent_id"]: item for item in response.json()["traces"]}
+        for name in scenario_names:
+            assert by_id[f"intent-comp-{name}"]["receipt"]["compensation_of"] is None
+        assert by_id["intent-comp-valid"]["receipt"]["compensation_of"] == "receipt-target-valid"
+        assert by_id["intent-comp-valid"]["related_receipts"] == [
+            {"receipt_id": "receipt-target-valid", "status": "succeeded"}
+        ]
+
+
+def test_admin_cockpit_action_trace_requires_semantic_policy_binding(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    valid = _cockpit_validation_record("validation-binding-valid", "local_notification_enqueue", now, arguments_valid=True)
+    decision_mismatch = _cockpit_validation_record("validation-binding-decision", "local_notification_enqueue", now, arguments_valid=True)
+    risk_mismatch = _cockpit_validation_record("validation-binding-risk", "local_notification_enqueue", now, arguments_valid=True)
+    invalid = _cockpit_validation_record("validation-binding-invalid", "document_search", now, arguments_valid=False)
+    duplicate_one = _cockpit_validation_record("validation-binding-duplicate", "local_notification_enqueue", now, arguments_valid=True)
+    duplicate_two = duplicate_one.model_copy(update={"tool_name": "document_search"})
+
+    def rejection(
+        rejection_id: str,
+        validation: ActionValidationRecord,
+        *,
+        decision_id: str | None = None,
+        risk_class: RiskClass | None = None,
+    ) -> ActionPolicyRejectionRecord:
+        return ActionPolicyRejectionRecord(
+            rejection_id=rejection_id,
+            idempotency_key="PRIVATE_SENTINEL",
+            decision_id=decision_id or validation.decision_id or "decision-missing",
+            candidate_id=f"candidate-{rejection_id}",
+            validation_id=validation.validation_id,
+            risk_class=risk_class or validation.risk_class or RiskClass.READ_ONLY,
+            policy_code="risk_budget_denied",
+            reason_code="risk_class_exceeds_budget",
+            event_id=f"event-{rejection_id}",
+            event_sequence=51,
+            rejected_at=now,
+        )
+
+    rejections = (
+        rejection("rejection-binding-valid", valid),
+        rejection("rejection-binding-decision", decision_mismatch, decision_id="different-decision"),
+        rejection("rejection-binding-risk", risk_mismatch, risk_class=RiskClass.READ_ONLY),
+        rejection("rejection-binding-invalid", invalid),
+        rejection("rejection-binding-duplicate", duplicate_one),
+    )
+    state = ActionState(
+        validation_records=(valid, decision_mismatch, risk_mismatch, invalid, duplicate_one, duplicate_two),
+        policy_rejections=rejections,
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        failures = {item["failure_id"]: item for item in response.json()["pre_intent_failures"]}
+        assert failures["rejection-binding-valid"]["tool_name"] == "local_notification_enqueue"
+        for rejection_id in (
+            "rejection-binding-decision",
+            "rejection-binding-risk",
+            "rejection-binding-invalid",
+            "rejection-binding-duplicate",
+        ):
+            assert failures[rejection_id]["tool_name"] is None
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,
@@ -4834,6 +5327,144 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             and item["acknowledgment_status"] == "approved"
             for item in outbox_messages
         )
+
+
+def _cockpit_action_intent(
+    intent_id: str,
+    status: IntentStatus,
+    timestamp: datetime,
+    *,
+    approval_id: str | None = None,
+    receipt_id: str | None = None,
+    failure_code: str | None = None,
+) -> ActionIntent:
+    budget = ActionBudget()
+    return ActionIntent(
+        intent_id=intent_id,
+        revision=2,
+        idempotency_key="PRIVATE_SENTINEL",
+        tool_name="document_search",
+        arguments={"query": "PRIVATE_SENTINEL"},
+        risk_class=RiskClass.READ_ONLY,
+        status=status,
+        dry_run=status == IntentStatus.DRY_RUN,
+        policy=PolicyEvaluation(
+            evaluation_id=f"policy-{intent_id}",
+            tool_name="document_search",
+            risk_class=RiskClass.READ_ONLY,
+            allowed=True,
+            approval_required=approval_id is not None,
+            reasons=("allowlisted_tool",),
+            argument_digest="a" * 64,
+            evaluated_at=timestamp,
+        ),
+        preview=ActionPreview(
+            tool_name="document_search",
+            risk_class=RiskClass.READ_ONLY,
+            arguments={"query": "PRIVATE_SENTINEL"},
+            effect="PRIVATE_SENTINEL",
+            bounded_by=budget,
+            compensation_available=False,
+        ),
+        provenance=ActionProvenance(
+            decision_id="decision-1",
+            candidate_id="candidate-1",
+            triggering_event_id="event-1",
+            plan_id="plan-1",
+            plan_revision=1,
+            step_id="step-1",
+        ),
+        budget=budget,
+        attempts=1,
+        cost_units_used=0,
+        created_at=timestamp,
+        updated_at=timestamp,
+        deadline_at=timestamp + timedelta(minutes=1),
+        approval_id=approval_id,
+        receipt_id=receipt_id,
+        failure_code=failure_code,
+    )
+
+
+def _cockpit_validation_record(
+    validation_id: str,
+    tool_name: str,
+    timestamp: datetime,
+    *,
+    arguments_valid: bool,
+) -> ActionValidationRecord:
+    return ActionValidationRecord(
+        validation_id=validation_id,
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="c" * 64,
+        decision_id=f"decision-{validation_id}",
+        intent_id=f"intent-{validation_id}" if arguments_valid else None,
+        tool_name=tool_name,
+        risk_class=RiskClass.REVERSIBLE_WRITE if arguments_valid else None,
+        arguments_valid=arguments_valid,
+        validation_schema_revision="d" * 64,
+        validation_error_codes=()
+        if arguments_valid
+        else (ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+        validated_event_id=f"event-{validation_id}",
+        validated_event_sequence=45,
+        canonical_arguments_digest="e" * 64,
+        validated_at=timestamp,
+    )
+
+
+def _cockpit_receipt(
+    intent: ActionIntent,
+    receipt_id: str,
+    status: ReceiptStatus,
+    observation_id: str | None,
+    verification_id: str | None,
+    timestamp: datetime,
+    *,
+    error_code: str | None = None,
+    compensation_of: str | None = None,
+) -> ExecutionReceipt:
+    return ExecutionReceipt(
+        receipt_id=receipt_id,
+        intent_id=intent.intent_id,
+        idempotency_key="PRIVATE_SENTINEL",
+        attempt=1,
+        status=status,
+        started_at=timestamp,
+        finished_at=timestamp,
+        duration_ms=12.5,
+        observation_id=observation_id,
+        verification_id=verification_id,
+        event_id="event-2",
+        event_sequence=45,
+        decision_id="decision-1",
+        plan_id="plan-1",
+        plan_revision=1,
+        step_id="step-1",
+        compensation_of=compensation_of,
+        error_code=error_code,
+    )
+
+
+def _cockpit_observation(
+    intent: ActionIntent,
+    receipt_id: str,
+    observation_id: str,
+    valid: bool,
+    timestamp: datetime,
+    *,
+    errors: tuple[str, ...] = (),
+) -> Observation:
+    return Observation(
+        observation_id=observation_id,
+        intent_id=intent.intent_id,
+        receipt_id=receipt_id,
+        observed_at=timestamp,
+        data={"result": "PRIVATE_SENTINEL"},
+        result_digest="b" * 64,
+        valid=valid,
+        validation_errors=errors,
+    )
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

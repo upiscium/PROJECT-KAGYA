@@ -540,6 +540,82 @@ export type CockpitOutboxResponse = {
   critical_count: number;
   messages: CockpitOutboxMessage[];
 };
+export type CockpitActionProvenance = {
+  decision_id: string;
+  candidate_id: string;
+  triggering_event_id: string | null;
+  plan_id: string | null;
+  plan_revision: number | null;
+  step_id: string | null;
+};
+export type CockpitActionApproval = {
+  approval_id: string | null;
+  status: "pending" | "approved" | "rejected" | null;
+  requested_at: string | null;
+  resolved_at: string | null;
+  resolved_by_operator: boolean;
+};
+export type CockpitActionReceipt = {
+  receipt_id: string;
+  status: "succeeded" | "failed" | "timed_out" | "cancelled" | "compensated";
+  attempt: number;
+  duration_ms: number;
+  event_id: string | null;
+  event_sequence: number | null;
+  error_code: string | null;
+  compensation_of: string | null;
+};
+export type CockpitActionRelatedReceipt = {
+  receipt_id: string;
+  status: CockpitActionReceipt["status"];
+};
+export type CockpitActionObservation = {
+  observation_id: string;
+  valid: boolean;
+  validation_errors: string[];
+  result_digest: string;
+};
+export type CockpitActionVerification = {
+  verification_id: string;
+  success: boolean;
+  reason: string;
+};
+export type CockpitActionTrace = {
+  intent_id: string;
+  revision: number;
+  tool_name: string;
+  risk_class: "read_only" | "reversible_write" | "external_write" | "destructive" | "high_impact";
+  status: "awaiting_approval" | "approved" | "dry_run" | "executing" | "retry_pending" | "succeeded" | "failed" | "cancelled" | "rejected" | "compensated";
+  dry_run: boolean;
+  created_at: string;
+  updated_at: string;
+  failure_code: string | null;
+  provenance: CockpitActionProvenance;
+  approval: CockpitActionApproval;
+  receipt: CockpitActionReceipt | null;
+  related_receipts: CockpitActionRelatedReceipt[];
+  observation: CockpitActionObservation | null;
+  verification: CockpitActionVerification | null;
+};
+export type CockpitPreIntentFailure = {
+  failure_id: string;
+  failure_type: "validation" | "policy_rejection";
+  decision_id: string | null;
+  candidate_id: string | null;
+  tool_name: string | null;
+  risk_class: CockpitActionTrace["risk_class"] | null;
+  error_codes: string[];
+  event_id: string;
+  event_sequence: number;
+  occurred_at: string;
+};
+export type CockpitActionTraceResponse = {
+  pending_approval_count: number;
+  retry_pending_count: number;
+  failed_count: number;
+  traces: CockpitActionTrace[];
+  pre_intent_failures: CockpitPreIntentFailure[];
+};
 
 export type ContextFrame = {
   context_id: string;
@@ -964,6 +1040,7 @@ function parsePlans(value: unknown): PlanListResponse {
 }
 
 const ACTION_TYPES = ["respond", "internal", "no_op", "defer", "observe", "request_information", "delegate", "refuse", "unable", "replan"] as const;
+const ACTION_TOOL_NAMES = ["restricted_metadata_read", "document_search", "calendar_read", "local_notification_enqueue"] as const;
 
 function parseDecisions(value: unknown): DecisionListResponse {
   const items = responseArray(value, "decisions", "decision");
@@ -1041,6 +1118,103 @@ function parseCockpitOutbox(value: unknown): CockpitOutboxResponse {
   };
 }
 
+function parseActionTrace(value: unknown): CockpitActionTraceResponse {
+  if (!isRecord(value) || !Array.isArray(value.traces)) invalid("action trace");
+  return {
+    pending_approval_count: nonnegativeInteger(value.pending_approval_count, "action trace pending approval count"),
+    retry_pending_count: nonnegativeInteger(value.retry_pending_count, "action trace retry count"),
+    failed_count: nonnegativeInteger(value.failed_count, "action trace failed count"),
+    traces: value.traces.map((trace): CockpitActionTrace => {
+      if (!isRecord(trace) || !isRecord(trace.provenance) || !isRecord(trace.approval)) invalid("action trace");
+      const provenance = trace.provenance;
+      const approval = trace.approval;
+      return {
+        intent_id: id(trace.intent_id, "action intent"),
+        revision: positiveInteger(trace.revision, "action intent revision"),
+        tool_name: text(trace.tool_name, "action tool"),
+        risk_class: enumValue(trace.risk_class, ["read_only", "reversible_write", "external_write", "destructive", "high_impact"] as const, "action risk class"),
+        status: enumValue(trace.status, ["awaiting_approval", "approved", "dry_run", "executing", "retry_pending", "succeeded", "failed", "cancelled", "rejected", "compensated"] as const, "action intent"),
+        dry_run: booleanValue(trace.dry_run, "action dry-run"),
+        created_at: text(trace.created_at, "action created timestamp"),
+        updated_at: text(trace.updated_at, "action updated timestamp"),
+        failure_code: optionalBoundedCode(trace.failure_code, "action failure code"),
+        provenance: {
+          decision_id: id(provenance.decision_id, "action decision"),
+          candidate_id: id(provenance.candidate_id, "action candidate"),
+          triggering_event_id: optionalId(provenance.triggering_event_id, "action triggering event"),
+          plan_id: optionalId(provenance.plan_id, "action plan"),
+          plan_revision: optionalPositiveInteger(provenance.plan_revision, "action plan revision"),
+          step_id: optionalId(provenance.step_id, "action step"),
+        },
+        approval: {
+          approval_id: optionalId(approval.approval_id, "action approval"),
+          status: approval.status === null ? null : enumValue(approval.status, ["pending", "approved", "rejected"] as const, "action approval"),
+          requested_at: optionalText(approval.requested_at, "action approval requested timestamp"),
+          resolved_at: optionalText(approval.resolved_at, "action approval resolved timestamp"),
+          resolved_by_operator: booleanValue(approval.resolved_by_operator, "action approval operator resolution"),
+        },
+        receipt: parseActionReceipt(trace.receipt),
+        related_receipts: recordArray(trace.related_receipts, "action related receipt").map((receipt) => ({
+          receipt_id: id(receipt.receipt_id, "action related receipt"),
+          status: enumValue(receipt.status, ["succeeded", "failed", "timed_out", "cancelled", "compensated"] as const, "action related receipt"),
+        })),
+        observation: parseActionObservation(trace.observation),
+        verification: parseActionVerification(trace.verification),
+      };
+    }),
+    pre_intent_failures: recordArray(value.pre_intent_failures, "pre-intent failure").map((failure) => ({
+      failure_id: id(failure.failure_id, "pre-intent failure"),
+      failure_type: enumValue(failure.failure_type, ["validation", "policy_rejection"] as const, "pre-intent failure"),
+      decision_id: optionalId(failure.decision_id, "pre-intent failure decision"),
+      candidate_id: optionalId(failure.candidate_id, "pre-intent failure candidate"),
+      tool_name: optionalToolName(failure.tool_name, "pre-intent failure tool"),
+      risk_class: failure.risk_class === null ? null : enumValue(failure.risk_class, ["read_only", "reversible_write", "external_write", "destructive", "high_impact"] as const, "pre-intent failure risk class"),
+      error_codes: stringArray(failure.error_codes, "pre-intent failure error codes").map((code) => boundedCode(code, "pre-intent failure error code")),
+      event_id: id(failure.event_id, "pre-intent failure event"),
+      event_sequence: positiveInteger(failure.event_sequence, "pre-intent failure event sequence"),
+      occurred_at: text(failure.occurred_at, "pre-intent failure timestamp"),
+    })),
+  };
+}
+
+function parseActionReceipt(value: unknown): CockpitActionReceipt | null {
+  if (value === null) return null;
+  if (!isRecord(value)) invalid("action receipt");
+  return {
+    receipt_id: id(value.receipt_id, "action receipt"),
+    status: enumValue(value.status, ["succeeded", "failed", "timed_out", "cancelled", "compensated"] as const, "action receipt"),
+    attempt: nonnegativeInteger(value.attempt, "action receipt attempt"),
+    duration_ms: nonnegativeNumber(value.duration_ms, "action receipt duration"),
+    event_id: optionalId(value.event_id, "action receipt event"),
+    event_sequence: optionalPositiveInteger(value.event_sequence, "action receipt event sequence"),
+    error_code: optionalBoundedCode(value.error_code, "action receipt error code"),
+    compensation_of: optionalId(value.compensation_of, "action compensation receipt"),
+  };
+}
+
+function parseActionObservation(value: unknown): CockpitActionObservation | null {
+  if (value === null) return null;
+  if (!isRecord(value)) invalid("action observation");
+  const digest = text(value.result_digest, "action observation digest");
+  if (!/^[0-9a-f]{64}$/.test(digest)) invalid("action observation digest");
+  return {
+    observation_id: id(value.observation_id, "action observation"),
+    valid: booleanValue(value.valid, "action observation validity"),
+    validation_errors: stringArray(value.validation_errors, "action observation validation errors").map((code) => boundedCode(code, "action observation validation error")),
+    result_digest: digest,
+  };
+}
+
+function parseActionVerification(value: unknown): CockpitActionVerification | null {
+  if (value === null) return null;
+  if (!isRecord(value)) invalid("action verification");
+  return {
+    verification_id: id(value.verification_id, "action verification"),
+    success: booleanValue(value.success, "action verification result"),
+    reason: boundedCode(value.reason, "action verification reason"),
+  };
+}
+
 function identityOrigin(value: unknown, label: string): string {
   if (!isRecord(value)) invalid(`${label} origin`);
   const actor = text(value.actor, `${label} origin`);
@@ -1080,8 +1254,24 @@ function text(value: unknown, label: string): string {
   return value;
 }
 
+function boundedCode(value: unknown, label: string): string {
+  const result = text(value, label);
+  if (result.length > 128 || !/^[A-Za-z0-9_.-]+$/.test(result)) invalid(label);
+  return result;
+}
+
+function optionalBoundedCode(value: unknown, label: string): string | null {
+  return value === null ? null : boundedCode(value, label);
+}
+
 function optionalText(value: unknown, label: string): string | null {
   return value === null ? null : text(value, label);
+}
+
+function optionalToolName(value: unknown, label: string): typeof ACTION_TOOL_NAMES[number] | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !ACTION_TOOL_NAMES.includes(value as typeof ACTION_TOOL_NAMES[number])) invalid(label);
+  return value as typeof ACTION_TOOL_NAMES[number];
 }
 
 function stringArray(value: unknown, label: string): string[] {
@@ -1098,6 +1288,12 @@ function idArray(value: unknown, label: string): string[] {
 function finiteNumber(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) invalid(label);
   return value;
+}
+
+function nonnegativeNumber(value: unknown, label: string): number {
+  const result = finiteNumber(value, label);
+  if (result < 0) invalid(label);
+  return result;
 }
 
 function optionalNumber(value: unknown, label: string): number | null {
@@ -1160,6 +1356,7 @@ export const api = {
   plans: async () => parsePlans(await adminRequest<unknown>("/plans")),
   decisions: async () => parseDecisions(await adminRequest<unknown>("/decisions")),
   cockpitOutbox: async () => parseCockpitOutbox(await adminRequest<unknown>("/outbox/summary")),
+  actionTrace: async () => parseActionTrace(await adminRequest<unknown>("/actions/trace")),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
   updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
