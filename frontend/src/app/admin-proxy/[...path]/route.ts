@@ -23,6 +23,13 @@ type AdminSession = { actor: string; role: AdminRole; issuedAt: number; reauthen
 
 const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^state\/emotion$/ },
+  { method: "GET", pattern: /^state\/working-memory$/ },
+  { method: "GET", pattern: /^contexts$/ },
+  { method: "GET", pattern: /^goals$/ },
+  { method: "GET", pattern: /^commitments$/ },
+  { method: "GET", pattern: /^plans$/ },
+  { method: "GET", pattern: /^decisions$/ },
+  { method: "GET", pattern: /^outbox\/messages$/ },
   { method: "GET", pattern: /^memory\/search$/ },
   { method: "GET", pattern: /^memory\/episodes\/[^/]+$/ },
   { method: "GET", pattern: /^memory\/semantic\/[^/]+(?:\/graph)?$/ },

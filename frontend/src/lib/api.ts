@@ -521,6 +521,116 @@ export type OutboxMessage = {
 };
 export type OutboxMessageListResponse = { messages: OutboxMessage[] };
 
+export type ContextFrame = {
+  context_id: string;
+  context_type: string;
+  source_channel: string;
+  source_session_id: string | null;
+  participant_ids: string[];
+  active_topic: string | null;
+  active_task: string | null;
+  status: "active" | "suspended" | "ended";
+};
+export type ContextListResponse = { contexts: ContextFrame[] };
+
+export type Goal = {
+  goal_id: string;
+  goal_type: "intrinsic" | "external_request" | "commitment";
+  description: string;
+  priority: number;
+  urgency: number;
+  confidence: number;
+  origin: string;
+  status: "candidate" | "active" | "suspended" | "completed" | "abandoned" | "failed";
+  dependency_ids: string[];
+  conflict_ids: string[];
+  deadline: string | null;
+  needs_information: boolean;
+  created_at: string;
+  updated_at: string;
+};
+export type GoalDecision = {
+  decision_id: string;
+  action: "activate" | "suspend" | "resume" | "defer" | "request_information" | "no_action";
+  goal_id: string | null;
+  score: number | null;
+  reasons: string[];
+  conflicting_goal_ids: string[];
+  created_at: string;
+};
+export type GoalListResponse = { goals: Goal[]; decisions: GoalDecision[] };
+
+export type Commitment = {
+  commitment_id: string;
+  description: string;
+  related_goal_id: string | null;
+  status: "proposed" | "active" | "renegotiating" | "fulfilled" | "released" | "breached";
+  beneficiary: string;
+  scope: string;
+  deadline: string | null;
+  cost: number;
+  burden: number;
+  fulfillability: "unknown" | "fulfillable" | "at_risk" | "impossible";
+  fulfillability_reason: string | null;
+  decision_refs: string[];
+  created_at: string;
+  updated_at: string;
+};
+export type CommitmentListResponse = { commitments: Commitment[] };
+
+export type PlanStep = {
+  step_id: string;
+  action_type: "respond" | "internal" | "no_op" | "defer" | "observe" | "request_information" | "delegate" | "refuse" | "unable" | "replan";
+  action_code: string;
+  dependency_ids: string[];
+  status: "pending" | "ready" | "in_progress" | "waiting_retry" | "completed" | "failed" | "cancelled";
+  attempt_count: number;
+  started_at: string | null;
+  retry_at: string | null;
+  completed_at: string | null;
+};
+export type Plan = {
+  plan_id: string;
+  goal_id: string;
+  revision: number;
+  status: "draft" | "active" | "paused" | "completed" | "failed" | "abandoned";
+  steps: PlanStep[];
+  created_at: string;
+  updated_at: string;
+};
+export type PlanListResponse = { plans: Plan[] };
+
+export type DecisionCandidate = {
+  candidate_id: string;
+  candidate_type: PlanStep["action_type"];
+  proposed_action: string;
+  plan_id: string | null;
+  plan_revision: number | null;
+  step_id: string | null;
+  goal_refs: string[];
+  commitment_refs: string[];
+};
+export type Decision = {
+  decision_id: string;
+  context_id: string | null;
+  active_goal_ids: string[];
+  selected_candidate_id: string;
+  selected_candidate: DecisionCandidate;
+  selection_confidence: number;
+  status: "awaiting_outcome" | "resolved";
+  outcome_status: "pending" | "succeeded" | "failed" | "compensated";
+  created_at: string;
+  updated_at: string;
+};
+export type DecisionListResponse = { decisions: Decision[] };
+
+export type WorkingMemorySummary = {
+  item_count: number;
+  token_count: number;
+  item_capacity: number;
+  token_capacity: number;
+};
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -729,6 +839,255 @@ function parseDecisionExplanationResponse(value: unknown): { explanations: Decis
   return value as { explanations: DecisionExplanation[] };
 }
 
+function parseContexts(value: unknown): ContextListResponse {
+  const items = responseArray(value, "contexts", "context");
+  return { contexts: items.map((item) => ({
+    context_id: id(item.context_id, "context"),
+    context_type: text(item.context_type, "context"),
+    source_channel: text(item.source_channel, "context"),
+    source_session_id: optionalId(item.source_session_id, "context"),
+    participant_ids: idArray(item.participant_ids, "context"),
+    active_topic: optionalText(item.active_topic, "context"),
+    active_task: optionalText(item.active_task, "context"),
+    status: enumValue(item.status, ["active", "suspended", "ended"] as const, "context"),
+  })) };
+}
+
+function parseGoals(value: unknown): GoalListResponse {
+  if (!isRecord(value)) invalid("goal");
+  const goals = recordArray(value.goals, "goal").map((item) => ({
+    goal_id: id(item.goal_id, "goal"),
+    goal_type: enumValue(item.goal_type, ["intrinsic", "external_request", "commitment"] as const, "goal"),
+    description: text(item.description, "goal"),
+    priority: finiteNumber(item.priority, "goal"),
+    urgency: finiteNumber(item.urgency, "goal"),
+    confidence: finiteNumber(item.confidence, "goal"),
+    origin: identityOrigin(item.identity_origin, "goal"),
+    status: enumValue(item.status, ["candidate", "active", "suspended", "completed", "abandoned", "failed"] as const, "goal"),
+    dependency_ids: idArray(item.dependency_ids, "goal"),
+    conflict_ids: idArray(item.conflict_ids, "goal"),
+    deadline: optionalText(item.deadline, "goal"),
+    needs_information: booleanValue(item.needs_information, "goal"),
+    created_at: text(item.created_at, "goal"),
+    updated_at: text(item.updated_at, "goal"),
+  }));
+  const decisions = recordArray(value.decisions, "goal decision").map((item) => ({
+    decision_id: id(item.decision_id, "goal decision"),
+    action: enumValue(item.action, ["activate", "suspend", "resume", "defer", "request_information", "no_action"] as const, "goal decision"),
+    goal_id: optionalId(item.goal_id, "goal decision"),
+    score: optionalNumber(item.score, "goal decision"),
+    reasons: stringArray(item.reasons, "goal decision"),
+    conflicting_goal_ids: idArray(item.conflicting_goal_ids, "goal decision"),
+    created_at: text(item.created_at, "goal decision"),
+  }));
+  return { goals, decisions };
+}
+
+function parseCommitments(value: unknown): CommitmentListResponse {
+  const items = responseArray(value, "commitments", "commitment");
+  return { commitments: items.map((item) => ({
+    commitment_id: id(item.commitment_id, "commitment"),
+    description: text(item.description, "commitment"),
+    related_goal_id: optionalId(item.related_goal_id, "commitment"),
+    status: enumValue(item.status, ["proposed", "active", "renegotiating", "fulfilled", "released", "breached"] as const, "commitment"),
+    beneficiary: text(item.beneficiary, "commitment"),
+    scope: text(item.scope, "commitment"),
+    deadline: optionalText(item.deadline, "commitment"),
+    cost: finiteNumber(item.cost, "commitment"),
+    burden: finiteNumber(item.burden, "commitment"),
+    fulfillability: enumValue(item.fulfillability, ["unknown", "fulfillable", "at_risk", "impossible"] as const, "commitment"),
+    fulfillability_reason: optionalText(item.fulfillability_reason, "commitment"),
+    decision_refs: idArray(item.decision_refs, "commitment"),
+    created_at: text(item.created_at, "commitment"),
+    updated_at: text(item.updated_at, "commitment"),
+  })) };
+}
+
+function parsePlans(value: unknown): PlanListResponse {
+  const items = responseArray(value, "plans", "plan");
+  return { plans: items.map((item) => {
+    const planId = id(item.plan_id, "plan");
+    const revision = positiveInteger(item.revision, "plan");
+    const revisions = recordArray(item.revisions, "plan revision");
+    const current = revisions.at(-1);
+    if (!current || positiveInteger(current.revision, "plan revision") !== revision) invalid("plan revision");
+    const definitions = recordArray(current.steps, "plan step");
+    const states = recordArray(item.step_states, "plan step state");
+    const stateById = new Map(states.map((state) => [id(state.step_id, "plan step state"), state]));
+    const steps = definitions.map((step): PlanStep => {
+      const stepId = id(step.step_id, "plan step");
+      const state = stateById.get(stepId);
+      if (!state) invalid("plan step state");
+      return {
+        step_id: stepId,
+        action_type: enumValue(step.action_type, ACTION_TYPES, "plan step"),
+        action_code: text(step.action_code, "plan step"),
+        dependency_ids: idArray(step.dependency_ids, "plan step"),
+        status: enumValue(state.status, ["pending", "ready", "in_progress", "waiting_retry", "completed", "failed", "cancelled"] as const, "plan step state"),
+        attempt_count: nonnegativeInteger(state.attempt_count, "plan step state"),
+        started_at: optionalText(state.started_at, "plan step state"),
+        retry_at: optionalText(state.retry_at, "plan step state"),
+        completed_at: optionalText(state.completed_at, "plan step state"),
+      };
+    });
+    if (steps.length !== states.length) invalid("plan step state");
+    return {
+      plan_id: planId,
+      goal_id: id(item.goal_id, "plan"),
+      revision,
+      status: enumValue(item.status, ["draft", "active", "paused", "completed", "failed", "abandoned"] as const, "plan"),
+      steps,
+      created_at: text(item.created_at, "plan"),
+      updated_at: text(item.updated_at, "plan"),
+    };
+  }) };
+}
+
+const ACTION_TYPES = ["respond", "internal", "no_op", "defer", "observe", "request_information", "delegate", "refuse", "unable", "replan"] as const;
+
+function parseDecisions(value: unknown): DecisionListResponse {
+  const items = responseArray(value, "decisions", "decision");
+  return { decisions: items.map((item) => {
+    const candidates = recordArray(item.considered_candidates, "decision candidate").map((evaluation): DecisionCandidate => {
+      if (!isRecord(evaluation.candidate)) invalid("decision candidate");
+      const candidate = evaluation.candidate;
+      const planId = optionalId(candidate.plan_id, "decision candidate");
+      const planRevision = optionalPositiveInteger(candidate.plan_revision, "decision candidate");
+      const stepId = optionalId(candidate.step_id, "decision candidate");
+      if ([planId, planRevision, stepId].some((part) => part === null) && [planId, planRevision, stepId].some((part) => part !== null)) invalid("decision candidate reference");
+      return {
+        candidate_id: id(candidate.candidate_id, "decision candidate"),
+        candidate_type: enumValue(candidate.candidate_type, ACTION_TYPES, "decision candidate"),
+        proposed_action: text(candidate.proposed_action, "decision candidate"),
+        plan_id: planId,
+        plan_revision: planRevision,
+        step_id: stepId,
+        goal_refs: idArray(candidate.goal_refs, "decision candidate"),
+        commitment_refs: idArray(candidate.commitment_refs, "decision candidate"),
+      };
+    });
+    const selectedId = id(item.selected_candidate_id, "decision");
+    const selected = candidates.find((candidate) => candidate.candidate_id === selectedId);
+    if (!selected) invalid("decision selected candidate");
+    const outcomeStatus = decisionOutcomeStatus(item.actual_outcome);
+    return {
+      decision_id: id(item.decision_id, "decision"),
+      context_id: optionalId(item.context_id, "decision"),
+      active_goal_ids: idArray(item.active_goal_ids, "decision"),
+      selected_candidate_id: selectedId,
+      selected_candidate: selected,
+      selection_confidence: finiteNumber(item.selection_confidence, "decision"),
+      status: enumValue(item.status, ["awaiting_outcome", "resolved"] as const, "decision"),
+      outcome_status: outcomeStatus,
+      created_at: text(item.created_at, "decision"),
+      updated_at: text(item.updated_at, "decision"),
+    };
+  }) };
+}
+
+function parseWorkingMemory(value: unknown): WorkingMemorySummary {
+  if (!isRecord(value)) invalid("working-memory summary");
+  return {
+    item_count: nonnegativeInteger(value.item_count, "working-memory summary"),
+    token_count: nonnegativeInteger(value.token_count, "working-memory summary"),
+    item_capacity: nonnegativeInteger(value.item_capacity, "working-memory summary"),
+    token_capacity: nonnegativeInteger(value.token_capacity, "working-memory summary"),
+  };
+}
+
+function identityOrigin(value: unknown, label: string): string {
+  if (!isRecord(value)) invalid(`${label} origin`);
+  const actor = text(value.actor, `${label} origin`);
+  const inputKind = text(value.input_kind, `${label} origin`);
+  const endorsement = text(value.endorsement, `${label} origin`);
+  return `${actor} / ${inputKind} / ${endorsement}`;
+}
+
+function decisionOutcomeStatus(value: unknown): Decision["outcome_status"] {
+  if (value === null) return "pending";
+  if (!isRecord(value) || typeof value.success !== "boolean" || typeof value.compensated !== "boolean") invalid("decision outcome");
+  if (value.compensated) return "compensated";
+  return value.success ? "succeeded" : "failed";
+}
+
+function responseArray(value: unknown, key: string, label: string): Record<string, unknown>[] {
+  if (!isRecord(value)) invalid(label);
+  return recordArray(value[key], label);
+}
+
+function recordArray(value: unknown, label: string): Record<string, unknown>[] {
+  if (!Array.isArray(value) || !value.every(isRecord)) invalid(label);
+  return value;
+}
+
+function id(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value.trim() || /\s/.test(value)) invalid(`${label} ID`);
+  return value;
+}
+
+function optionalId(value: unknown, label: string): string | null {
+  return value === null ? null : id(value, label);
+}
+
+function text(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value.trim()) invalid(label);
+  return value;
+}
+
+function optionalText(value: unknown, label: string): string | null {
+  return value === null ? null : text(value, label);
+}
+
+function stringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.length > 0)) invalid(label);
+  return value;
+}
+
+function idArray(value: unknown, label: string): string[] {
+  const values = stringArray(value, label);
+  values.forEach((item) => id(item, label));
+  return values;
+}
+
+function finiteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) invalid(label);
+  return value;
+}
+
+function optionalNumber(value: unknown, label: string): number | null {
+  return value === null ? null : finiteNumber(value, label);
+}
+
+function nonnegativeInteger(value: unknown, label: string): number {
+  const result = finiteNumber(value, label);
+  if (!Number.isInteger(result) || result < 0) invalid(label);
+  return result;
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  const result = nonnegativeInteger(value, label);
+  if (result < 1) invalid(label);
+  return result;
+}
+
+function optionalPositiveInteger(value: unknown, label: string): number | null {
+  return value === null ? null : positiveInteger(value, label);
+}
+
+function booleanValue(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") invalid(label);
+  return value;
+}
+
+function enumValue<const T extends readonly string[]>(value: unknown, values: T, label: string): T[number] {
+  if (typeof value !== "string" || !values.includes(value)) invalid(`${label} status`);
+  return value as T[number];
+}
+
+function invalid(label: string): never {
+  throw new ApiError(`Backend returned an invalid ${label} response.`);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -748,6 +1107,12 @@ export const api = {
   feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),
+  workingMemory: async () => parseWorkingMemory(await adminRequest<unknown>("/state/working-memory")),
+  contexts: async () => parseContexts(await adminRequest<unknown>("/contexts")),
+  goals: async () => parseGoals(await adminRequest<unknown>("/goals")),
+  commitments: async () => parseCommitments(await adminRequest<unknown>("/commitments")),
+  plans: async () => parsePlans(await adminRequest<unknown>("/plans")),
+  decisions: async () => parseDecisions(await adminRequest<unknown>("/decisions")),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
   updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),

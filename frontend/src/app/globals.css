@@ -92,6 +92,20 @@ pre { background: rgba(2, 6, 23, 0.8); border: 1px solid var(--border); border-r
 .wide { grid-column: 1 / -1; }
 .dimension-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.55rem; }
 .dimension-cell { display: flex; justify-content: space-between; gap: 0.75rem; border-bottom: 1px solid var(--border); padding: 0.45rem 0; text-transform: capitalize; }
+.cockpit-page { max-width: 88rem; }
+.cockpit-kicker { color: var(--accent); font-size: 0.75rem; font-weight: 800; letter-spacing: 0.16em; margin: 0 0 0.6rem; }
+.cockpit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: start; }
+.cockpit-subheading { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.08em; margin: 1.2rem 0 0.7rem; text-transform: uppercase; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: 0.65rem; }
+.metric-cell { background: rgba(2, 6, 23, 0.42); border: 1px solid var(--border); border-radius: 0.75rem; display: grid; gap: 0.25rem; padding: 0.7rem; }
+.metric-cell strong { overflow-wrap: anywhere; }
+.capacity-grid { display: grid; gap: 0.8rem; margin-top: 1rem; }
+.capacity-label { display: flex; justify-content: space-between; margin-bottom: 0.35rem; }
+.capacity-track { background: rgba(2, 6, 23, 0.75); border-radius: 999px; height: 0.45rem; overflow: hidden; }
+.capacity-track span { background: linear-gradient(90deg, var(--accent-strong), var(--success)); display: block; height: 100%; }
+.entity-link { color: var(--accent); text-decoration: underline; text-decoration-color: rgba(125, 211, 252, 0.4); text-underline-offset: 0.18rem; }
+.step-list { display: grid; gap: 0.45rem; }
+.step-row { align-items: center; border-left: 2px solid var(--border); display: grid; gap: 0.7rem; grid-template-columns: auto minmax(8rem, 1fr) minmax(8rem, auto); padding: 0.35rem 0 0.35rem 0.7rem; }
 
 @media (max-width: 760px) {
   .app-shell { grid-template-columns: 1fr; }
@@ -100,4 +114,7 @@ pre { background: rgba(2, 6, 23, 0.8); border: 1px solid var(--border); border-r
   .main { padding: 1rem; }
   .page-header { display: block; }
   .attachment-panel { grid-template-columns: 1fr; }
+  .cockpit-grid { grid-template-columns: 1fr; }
+  .step-row { align-items: start; grid-template-columns: auto 1fr; }
+  .step-row > :last-child { grid-column: 1 / -1; }
 }

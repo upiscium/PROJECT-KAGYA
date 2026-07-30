@@ -126,6 +126,14 @@ class WorkingMemory:
     def items(self) -> tuple[WorkingMemoryItem, ...]:
         return tuple(self._items.values())
 
+    @property
+    def token_count(self) -> int:
+        return sum(
+            self._token_counter(item.content)
+            for item in self._items.values()
+            if item.content is not None
+        )
+
     def admit(self, item: WorkingMemoryItem) -> None:
         now = _now()
         protected = {

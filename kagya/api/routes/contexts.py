@@ -1,7 +1,9 @@
 """Context lifecycle administration routes."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict
 
 from kagya.api.dependencies import (
     execute_agent_event,
@@ -9,10 +11,12 @@ from kagya.api.dependencies import (
     get_main_loop,
     require_admin,
 )
-from kagya.runtime import AgentEventType, AgentRuntime, ContextFrame
+from kagya.runtime import AgentEventType, AgentRuntime, ContextFrame, ContextStatus
 
 
 class ContextFrameResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     context_id: str
     context_type: str
     source_channel: str
@@ -20,7 +24,26 @@ class ContextFrameResponse(BaseModel):
     participant_ids: list[str]
     active_topic: str | None
     active_task: str | None
-    status: str
+    status: ContextStatus
+
+
+class ContextListFrameResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    context_id: str
+    context_type: str
+    source_channel: str
+    source_session_id: str | None
+    participant_ids: list[str]
+    active_topic: str | None
+    active_task: str | None
+    status: Literal["active", "suspended", "ended"]
+
+
+class ContextListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    contexts: list[ContextListFrameResponse]
 
 
 router = APIRouter(
@@ -28,6 +51,24 @@ router = APIRouter(
     tags=["contexts"],
     dependencies=[Depends(require_admin)],
 )
+
+
+@router.get("", response_model=ContextListResponse)
+def list_contexts(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> ContextListResponse:
+    registry = get_main_loop(request).context_registry
+    return execute_agent_event(
+        runtime,
+        AgentEventType.CONTEXT_READ,
+        source="api.contexts.list",
+        handler=lambda: ContextListResponse(
+            contexts=[_list_response(frame) for frame in registry.frames[-limit:]]
+        ),
+        payload={"limit": limit},
+    ).value
 
 
 @router.post("/{context_id}/suspend", response_model=ContextFrameResponse)
@@ -94,5 +135,25 @@ def _response(frame: ContextFrame) -> ContextFrameResponse:
         participant_ids=list(frame.participant_ids),
         active_topic=frame.active_topic,
         active_task=frame.active_task,
-        status=frame.status.value,
+        status=frame.status,
+    )
+
+
+def _list_response(frame: ContextFrame) -> ContextListFrameResponse:
+    status: Literal["active", "suspended", "ended"]
+    if frame.status == ContextStatus.ACTIVE:
+        status = "active"
+    elif frame.status == ContextStatus.SUSPENDED:
+        status = "suspended"
+    else:
+        status = "ended"
+    return ContextListFrameResponse(
+        context_id=frame.context_id,
+        context_type=frame.context_type,
+        source_channel=frame.source_channel,
+        source_session_id=frame.source_session_id,
+        participant_ids=list(frame.participant_ids),
+        active_topic=frame.active_topic,
+        active_task=frame.active_task,
+        status=status,
     )

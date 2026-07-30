@@ -36,7 +36,9 @@ from kagya.runtime import (
     EventJournal,
     JournalLifecycle,
     StateWAL,
+    WorkingMemoryKind,
     hash_snapshot,
+    working_memory_item,
 )
 from kagya.security.generation import initialize_encrypted_state
 from kagya.tools import (
@@ -540,6 +542,146 @@ def test_chat_rejects_closed_context(tmp_path: Path) -> None:
     assert resumed.json()["status"] == "active"
     assert ended.json()["status"] == "closed"
     assert response.status_code == 409
+
+
+def test_admin_context_list_projects_all_statuses_and_records_read_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        registry = client.app.state.main_loop.context_registry
+        registry.create(
+            context_id="ctx-active",
+            source_session_id="session-visible",
+            participant_ids=("participant-visible",),
+            active_topic="topic-visible",
+            parent_context_id="private-parent-sentinel",
+        )
+        registry.create(context_id="ctx-suspended")
+        registry.suspend("ctx-suspended")
+        registry.create(context_id="ctx-closed")
+        registry.end("ctx-closed")
+
+        response = client.get("/api/contexts", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert [item["status"] for item in response.json()["contexts"]] == [
+            "active",
+            "suspended",
+            "ended",
+        ]
+        assert set(response.json()["contexts"][0]) == {
+            "context_id",
+            "context_type",
+            "source_channel",
+            "source_session_id",
+            "participant_ids",
+            "active_topic",
+            "active_task",
+            "status",
+        }
+        assert "private-parent-sentinel" not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.CONTEXT_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        for record in records
+    )
+
+
+def test_admin_context_list_is_empty_bounded_and_rejects_public_access(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        assert client.get("/api/contexts").status_code == 401
+        assert client.get("/api/contexts", headers=admin_headers()).json() == {
+            "contexts": []
+        }
+        registry = client.app.state.main_loop.context_registry
+        for index in range(3):
+            registry.create(context_id=f"ctx-{index}")
+
+        bounded = client.get(
+            "/api/contexts", headers=admin_headers(), params={"limit": 2}
+        )
+
+        assert bounded.status_code == 200
+        assert [item["context_id"] for item in bounded.json()["contexts"]] == [
+            "ctx-1",
+            "ctx-2",
+        ]
+        assert (
+            client.get(
+                "/api/contexts", headers=admin_headers(), params={"limit": 201}
+            ).status_code
+            == 422
+        )
+
+
+def test_admin_working_memory_summary_is_count_only_non_mutating_and_runtime_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        memory = client.app.state.main_loop.working_memory
+        memory.admit(
+            working_memory_item(
+                item_id="private-item-id",
+                kind=WorkingMemoryKind.CONVERSATION,
+                content="raw-private-replay-sentinel",
+                source_event_id="hidden-thought-sentinel",
+                context_id="private-context-sentinel",
+                source="secret-sentinel",
+                source_channel="prompt-sentinel",
+                source_session_id="private-session-sentinel",
+            )
+        )
+        memory.admit(
+            working_memory_item(
+                item_id="private-reference-id",
+                kind=WorkingMemoryKind.EPISODIC,
+                reference="private-reference-sentinel",
+            )
+        )
+        before = memory.items
+        monkeypatch.setattr(
+            memory,
+            "select",
+            lambda **_kwargs: pytest.fail("summary must not call mutating select"),
+        )
+
+        assert client.get("/api/state/working-memory").status_code == 401
+        response = client.get(
+            "/api/state/working-memory", headers=admin_headers()
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "item_count": 2,
+            "token_count": len("raw-private-replay-sentinel".encode("utf-8")),
+            "item_capacity": memory.item_capacity,
+            "token_capacity": memory.token_capacity,
+        }
+        assert memory.items == before
+        for sentinel in (
+            "raw-private-replay-sentinel",
+            "private-reference-sentinel",
+            "hidden-thought-sentinel",
+            "secret-sentinel",
+            "prompt-sentinel",
+            "private-session-sentinel",
+            "private-context-sentinel",
+        ):
+            assert sentinel not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.MEMORY_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        and record.source == "api.state.working_memory"
+        for record in records
+    )
 
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
