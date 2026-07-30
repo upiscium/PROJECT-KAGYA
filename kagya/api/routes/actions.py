@@ -21,6 +21,7 @@ from kagya.actions import (
     OutcomeVerification,
     ReceiptStatus,
     RiskClass,
+    public_tool_name,
 )
 from kagya.api.dependencies import (
     AdminActor,
@@ -51,6 +52,9 @@ class ApprovalRequest(_RequestModel):
 
 BoundedCode = Annotated[
     str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+]
+PublicToolName = Annotated[
+    str, Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
 ]
 
 
@@ -139,7 +143,7 @@ class CockpitPreIntentFailureResponse(BaseModel):
     failure_type: Literal["validation", "policy_rejection"]
     decision_id: str | None
     candidate_id: str | None
-    tool_name: str | None
+    tool_name: PublicToolName | None
     risk_class: RiskClass | None
     error_codes: list[BoundedCode]
     event_id: str
@@ -535,7 +539,7 @@ def _validation_failure(
         failure_type="validation",
         decision_id=validation.decision_id,
         candidate_id=None,
-        tool_name=validation.tool_name,
+        tool_name=public_tool_name(validation.tool_name),
         risk_class=validation.risk_class,
         error_codes=[code.value for code in validation.validation_error_codes],
         event_id=validation.validated_event_id,
@@ -554,7 +558,7 @@ def _policy_rejection_failure(
         decision_id=rejection.decision_id,
         candidate_id=rejection.candidate_id,
         tool_name=(
-            validation.tool_name
+            public_tool_name(validation.tool_name)
             if validation is not None
             and validation.validation_id == rejection.validation_id
             else None

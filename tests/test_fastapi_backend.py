@@ -1090,6 +1090,72 @@ def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplica
         for field in ("idempotency_key", "request_digest", "canonical_arguments_digest"):
             assert f'"{field}"' not in response.text
 
+
+def test_admin_cockpit_action_trace_only_projects_allowlisted_tool_names(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    unsafe_names = (
+        "PRIVATE_SENTINEL",
+        "<script>alert(1)</script>",
+        "tool name with spaces",
+        "tool\nname",
+    )
+    failed_validations = tuple(
+        _cockpit_validation_record(
+            f"validation-unsafe-{index}",
+            tool_name,
+            now + timedelta(seconds=index),
+            arguments_valid=False,
+        )
+        for index, tool_name in enumerate(unsafe_names)
+    )
+    allowlisted = _cockpit_validation_record(
+        "validation-allowlisted",
+        "document_search",
+        now + timedelta(seconds=4),
+        arguments_valid=False,
+    )
+    policy_validation = _cockpit_validation_record(
+        "validation-policy-unsafe",
+        "<script>alert(1)</script>",
+        now + timedelta(seconds=5),
+        arguments_valid=True,
+    )
+    rejection = ActionPolicyRejectionRecord(
+        rejection_id="rejection-unsafe-tool",
+        idempotency_key="PRIVATE_SENTINEL",
+        decision_id="decision-policy-tool",
+        candidate_id="candidate-policy-tool",
+        validation_id=policy_validation.validation_id,
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        policy_code="risk_budget_denied",
+        reason_code="risk_class_exceeds_budget",
+        event_id="event-policy-tool",
+        event_sequence=50,
+        rejected_at=now + timedelta(seconds=5),
+    )
+    state = ActionState(
+        validation_records=(*failed_validations, allowlisted, policy_validation),
+        policy_rejections=(rejection,),
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        failures = {
+            item["failure_id"]: item for item in response.json()["pre_intent_failures"]
+        }
+        for index in range(len(unsafe_names)):
+            assert failures[f"validation-unsafe-{index}"]["tool_name"] is None
+        assert failures["validation-allowlisted"]["tool_name"] == "document_search"
+        assert failures["rejection-unsafe-tool"]["tool_name"] is None
+        for value in unsafe_names:
+            assert value not in response.text
+        assert "<script>" not in response.text
+
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,
 ) -> None:
@@ -5149,6 +5215,33 @@ def _cockpit_action_intent(
         approval_id=approval_id,
         receipt_id=receipt_id,
         failure_code=failure_code,
+    )
+
+
+def _cockpit_validation_record(
+    validation_id: str,
+    tool_name: str,
+    timestamp: datetime,
+    *,
+    arguments_valid: bool,
+) -> ActionValidationRecord:
+    return ActionValidationRecord(
+        validation_id=validation_id,
+        idempotency_key="PRIVATE_SENTINEL",
+        request_digest="c" * 64,
+        decision_id=f"decision-{validation_id}",
+        intent_id=f"intent-{validation_id}" if arguments_valid else None,
+        tool_name=tool_name,
+        risk_class=RiskClass.REVERSIBLE_WRITE if arguments_valid else None,
+        arguments_valid=arguments_valid,
+        validation_schema_revision="d" * 64,
+        validation_error_codes=()
+        if arguments_valid
+        else (ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+        validated_event_id=f"event-{validation_id}",
+        validated_event_sequence=45,
+        canonical_arguments_digest="e" * 64,
+        validated_at=timestamp,
     )
 
 

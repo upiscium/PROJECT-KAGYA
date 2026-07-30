@@ -1040,6 +1040,7 @@ function parsePlans(value: unknown): PlanListResponse {
 }
 
 const ACTION_TYPES = ["respond", "internal", "no_op", "defer", "observe", "request_information", "delegate", "refuse", "unable", "replan"] as const;
+const ACTION_TOOL_NAMES = ["restricted_metadata_read", "document_search", "calendar_read", "local_notification_enqueue"] as const;
 
 function parseDecisions(value: unknown): DecisionListResponse {
   const items = responseArray(value, "decisions", "decision");
@@ -1166,7 +1167,7 @@ function parseActionTrace(value: unknown): CockpitActionTraceResponse {
       failure_type: enumValue(failure.failure_type, ["validation", "policy_rejection"] as const, "pre-intent failure"),
       decision_id: optionalId(failure.decision_id, "pre-intent failure decision"),
       candidate_id: optionalId(failure.candidate_id, "pre-intent failure candidate"),
-      tool_name: optionalText(failure.tool_name, "pre-intent failure tool"),
+      tool_name: optionalToolName(failure.tool_name, "pre-intent failure tool"),
       risk_class: failure.risk_class === null ? null : enumValue(failure.risk_class, ["read_only", "reversible_write", "external_write", "destructive", "high_impact"] as const, "pre-intent failure risk class"),
       error_codes: stringArray(failure.error_codes, "pre-intent failure error codes").map((code) => boundedCode(code, "pre-intent failure error code")),
       event_id: id(failure.event_id, "pre-intent failure event"),
@@ -1265,6 +1266,12 @@ function optionalBoundedCode(value: unknown, label: string): string | null {
 
 function optionalText(value: unknown, label: string): string | null {
   return value === null ? null : text(value, label);
+}
+
+function optionalToolName(value: unknown, label: string): typeof ACTION_TOOL_NAMES[number] | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !ACTION_TOOL_NAMES.includes(value as typeof ACTION_TOOL_NAMES[number])) invalid(label);
+  return value as typeof ACTION_TOOL_NAMES[number];
 }
 
 function stringArray(value: unknown, label: string): string[] {

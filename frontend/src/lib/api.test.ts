@@ -200,6 +200,8 @@ describe("api client", () => {
     expect(result.traces[0].related_receipts).toEqual([{ receipt_id: "receipt-original", status: "succeeded" }]);
     expect(result.traces[0].observation?.result_digest).toBe("a".repeat(64));
     expect(result.pre_intent_failures.map((failure) => failure.failure_type)).toEqual(["validation", "policy_rejection"]);
+    expect(result.pre_intent_failures[0].tool_name).toBe("document_search");
+    expect(result.pre_intent_failures[1].tool_name).toBeNull();
     expect(result.pre_intent_failures[1].candidate_id).toBe("candidate-2");
     expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
     expect(result.traces[0]).not.toHaveProperty("arguments");
@@ -226,6 +228,12 @@ describe("api client", () => {
     ["failure error code", actionFailureWith({ error_codes: ["not bounded code"] })],
     ["failure event sequence", actionFailureWith({ event_sequence: 0 })],
     ["failure decision ID", actionFailureWith({ decision_id: undefined })],
+    ["tool whitespace", actionFailureWith({ tool_name: "tool name" })],
+    ["tool newline", actionFailureWith({ tool_name: "tool\nname" })],
+    ["tool HTML", actionFailureWith({ tool_name: "<script>alert(1)</script>" })],
+    ["tool uppercase", actionFailureWith({ tool_name: "Document_Search" })],
+    ["tool hyphen", actionFailureWith({ tool_name: "document-search" })],
+    ["tool private sentinel", actionFailureWith({ tool_name: "PRIVATE_SENTINEL" })],
     ["intent failure code", actionTraceWith({ failure_code: "not bounded code" })],
     ["receipt error code", actionTraceWith({ receipt: { ...actionTracePayload.traces[0].receipt, error_code: "not bounded code" } })],
     ["verification reason", actionTraceWith({ verification: { ...actionTracePayload.traces[0].verification, reason: "not bounded code" } })],

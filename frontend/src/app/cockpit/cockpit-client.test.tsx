@@ -63,6 +63,7 @@ describe("CockpitClient", () => {
     const compensation = screen.getByText((_, element) => element?.tagName === "P" && element.textContent === "Compensates: receipt-original");
     expect(within(compensation).getByRole("link", { name: "receipt-original" })).toHaveAttribute("href", "#receipt-receipt-original");
     expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
+    expect(document.body.textContent).not.toContain("<script>");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "outbox"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "actions"]))).not.toContain("PRIVATE_SENTINEL");
   });
@@ -253,7 +254,7 @@ function cockpitActionProjection(action: ReturnType<typeof rawActionFixture>) {
 
 const rawActionFailures = [
   { failure_id: "validation-1", failure_type: "validation", decision_id: "decision-1", candidate_id: null, tool_name: "document_search", risk_class: "read_only", error_codes: ["arguments_schema_invalid"], event_id: "event-1", event_sequence: 42, occurred_at: "2026-07-30T00:00:02Z", idempotency_key: "PRIVATE_SENTINEL", request_digest: "PRIVATE_SENTINEL", canonical_arguments_digest: "PRIVATE_SENTINEL", arguments: { secret: "PRIVATE_SENTINEL" } },
-  { failure_id: "rejection-1", failure_type: "policy_rejection", decision_id: "decision-2", candidate_id: "candidate-2", tool_name: null, risk_class: "reversible_write", error_codes: ["risk_class_exceeds_budget"], event_id: "event-2", event_sequence: 43, occurred_at: "2026-07-30T00:00:01Z", idempotency_key: "PRIVATE_SENTINEL" },
+  { failure_id: "rejection-1", failure_type: "policy_rejection", decision_id: "decision-2", candidate_id: "candidate-2", tool_name: "PRIVATE_SENTINEL<script>", risk_class: "reversible_write", error_codes: ["risk_class_exceeds_budget"], event_id: "event-2", event_sequence: 43, occurred_at: "2026-07-30T00:00:01Z", idempotency_key: "PRIVATE_SENTINEL" },
 ];
 
 function cockpitFailureProjection(failure: typeof rawActionFailures[number]) {
@@ -262,7 +263,7 @@ function cockpitFailureProjection(failure: typeof rawActionFailures[number]) {
     failure_type: failure.failure_type,
     decision_id: failure.decision_id,
     candidate_id: failure.candidate_id,
-    tool_name: failure.tool_name,
+    tool_name: failure.tool_name === "document_search" ? failure.tool_name : null,
     risk_class: failure.risk_class,
     error_codes: failure.error_codes,
     event_id: failure.event_id,
