@@ -14,7 +14,7 @@ import {
   type Decision,
   type Goal,
   type JournalRecord,
-  type OutboxMessage,
+  type CockpitOutboxMessage,
   type Plan,
 } from "@/lib/api";
 
@@ -27,7 +27,7 @@ export function CockpitClient() {
   const commitments = useQuery({ queryKey: ["cockpit", "commitments"], queryFn: api.commitments });
   const plans = useQuery({ queryKey: ["cockpit", "plans"], queryFn: api.plans });
   const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
-  const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.outboxMessages });
+  const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
   const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
   const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
 
@@ -152,13 +152,13 @@ function PlanRecord({ plan, decisions, loadedGoals, loadedDecisions }: { plan: P
   })}</div></article>;
 }
 
-function DecisionRecord({ decision, outbox, loadedContexts, loadedGoals, loadedPlans, loadedCommitments, loadedOutbox }: { decision: Decision; outbox: OutboxMessage[]; loadedContexts: Set<string>; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedCommitments: Set<string>; loadedOutbox: Set<string> }) {
+function DecisionRecord({ decision, outbox, loadedContexts, loadedGoals, loadedPlans, loadedCommitments, loadedOutbox }: { decision: Decision; outbox: CockpitOutboxMessage[]; loadedContexts: Set<string>; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedCommitments: Set<string>; loadedOutbox: Set<string> }) {
   const messages = outbox.filter((message) => message.references.decision_id === decision.decision_id).map((message) => message.message_id);
   const candidate = decision.selected_candidate;
   return <article className="record" id={anchor("decision", decision.decision_id)}><div className="metadata-row"><Badge>{decision.status}</Badge><Badge>{decision.outcome_status}</Badge><strong>{decision.decision_id}</strong><span>{percent(decision.selection_confidence)} confidence</span></div><p>Selected action: <span className="mono">{candidate.candidate_type}:{candidate.candidate_id}</span> · {candidate.proposed_action}</p><p>Context: <EntityReference kind="context" id={decision.context_id} available={loadedContexts} /> · Plan: <EntityReference kind="plan" id={candidate.plan_id} available={loadedPlans} />{candidate.step_id ? ` / step ${candidate.step_id}` : ""}</p><p>Goals: {decision.active_goal_ids.length ? <ReferenceList kind="goal" ids={decision.active_goal_ids} available={loadedGoals} /> : "unavailable"} · Commitments: {candidate.commitment_refs.length ? <ReferenceList kind="commitment" ids={candidate.commitment_refs} available={loadedCommitments} /> : "unavailable"}</p><p>Outbox: {messages.length ? <ReferenceList kind="outbox" ids={messages} available={loadedOutbox} /> : "unavailable"}</p></article>;
 }
 
-function OutboxSummary({ messages, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { messages: OutboxMessage[]; visibleMessages: OutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
+function OutboxSummary({ messages, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments }: { messages: CockpitOutboxMessage[]; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string> }) {
   const pending = messages.filter((message) => message.delivery_status === "pending").length;
   const critical = messages.filter((message) => message.urgency === "critical").length;
   return <><div className="metric-grid"><Metric label="Pending" value={String(pending)} /><Metric label="Critical" value={String(critical)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <span className="mono">{message.references.action_id ?? "unavailable"}</span></p></article>)}</div></>;

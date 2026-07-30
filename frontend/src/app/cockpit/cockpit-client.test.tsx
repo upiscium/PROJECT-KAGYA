@@ -9,7 +9,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...original,
     api: {
-      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), outboxMessages: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
+      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
     },
   };
 });
@@ -23,7 +23,7 @@ beforeEach(() => {
 
 describe("CockpitClient", () => {
   it("renders representative safe sections and causal entity links", async () => {
-    renderCockpit();
+    const { queryClient } = renderCockpit();
 
     expect(await screen.findByText("Ship safely")).toBeInTheDocument();
     expect(screen.getByText("report.result")).toBeInTheDocument();
@@ -34,6 +34,7 @@ describe("CockpitClient", () => {
     expect(screen.getAllByRole("link", { name: "decision-1" })[0]).toHaveAttribute("href", "#decision-decision-1");
     expect(screen.getByRole("link", { name: "message-1" })).toHaveAttribute("href", "#outbox-message-1");
     expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getQueryData(["cockpit", "outbox"]))).not.toContain("PRIVATE_SENTINEL");
   });
 
   it("shows section loading without hiding loaded sections", async () => {
@@ -51,7 +52,7 @@ describe("CockpitClient", () => {
     mockedApi.commitments.mockResolvedValue({ commitments: [] });
     mockedApi.plans.mockResolvedValue({ plans: [] });
     mockedApi.decisions.mockResolvedValue({ decisions: [] });
-    mockedApi.outboxMessages.mockResolvedValue({ messages: [] });
+    mockedApi.cockpitOutbox.mockResolvedValue({ messages: [] });
     mockedApi.eventJournal.mockResolvedValue({ records: [] });
     renderCockpit();
 
@@ -76,8 +77,8 @@ describe("CockpitClient", () => {
 });
 
 function renderCockpit() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><CockpitClient /></QueryClientProvider>);
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return { ...render(<QueryClientProvider client={queryClient}><CockpitClient /></QueryClientProvider>), queryClient };
 }
 
 function resolveRepresentativeData() {
@@ -90,6 +91,29 @@ function resolveRepresentativeData() {
   mockedApi.commitments.mockResolvedValue({ commitments: [{ commitment_id: "commitment-1", description: "Report results", related_goal_id: "goal-1", status: "active", beneficiary: "operator", scope: "Release report", deadline: null, cost: 0.1, burden: 0.1, fulfillability: "fulfillable", fulfillability_reason: "ready", decision_refs: ["decision-1"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", secret: "PRIVATE_SENTINEL" } as never] });
   mockedApi.plans.mockResolvedValue({ plans: [{ plan_id: "plan-1", goal_id: "goal-1", revision: 1, status: "active", steps: [{ step_id: "step-1", action_type: "respond", action_code: "report.result", dependency_ids: [], status: "in_progress", attempt_count: 1, started_at: "2026-01-01T00:00:00Z", retry_at: null, completed_at: null }], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
   mockedApi.decisions.mockResolvedValue({ decisions: [{ decision_id: "decision-1", context_id: "context-1", active_goal_ids: ["goal-1"], selected_candidate_id: "candidate-1", selected_candidate: { candidate_id: "candidate-1", candidate_type: "respond", proposed_action: "Report result", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", goal_refs: ["goal-1"], commitment_refs: ["commitment-1"] }, selection_confidence: 0.8, status: "awaiting_outcome", outcome_status: "pending", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
-  mockedApi.outboxMessages.mockResolvedValue({ messages: [{ message_id: "message-1", urgency: "critical", delivery_status: "pending", title: "Release ready", references: { decision_id: "decision-1", action_id: "action-1", event_id: null, goal_id: "goal-1", plan_id: "plan-1", commitment_id: "commitment-1" }, body: "PRIVATE_SENTINEL" } as never] });
+  mockedApi.cockpitOutbox.mockResolvedValue({ messages: [cockpitOutboxProjection(rawOutboxFixture)] });
   mockedApi.eventJournal.mockResolvedValue({ records: [{ record_id: "record-1", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-1", event_type: "goal_update", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: "goal:goal-1", reauthenticated: null, previous_record_hash: null, record_hash: "hash", private_replay: "PRIVATE_SENTINEL" } as never] });
+}
+
+const rawOutboxFixture = {
+  message_id: "message-1",
+  urgency: "critical" as const,
+  delivery_status: "pending" as const,
+  acknowledgment_status: "unacknowledged" as const,
+  title: "Release ready",
+  references: { decision_id: "decision-1", action_id: "action-1", event_id: null, goal_id: "goal-1", plan_id: "plan-1", commitment_id: "commitment-1" },
+  body: "PRIVATE_SENTINEL",
+  responses: [{ text: "PRIVATE_SENTINEL" }],
+  attempts: [{ failure_code: "PRIVATE_SENTINEL" }],
+};
+
+function cockpitOutboxProjection(message: typeof rawOutboxFixture) {
+  return {
+    message_id: message.message_id,
+    urgency: message.urgency,
+    delivery_status: message.delivery_status,
+    acknowledgment_status: message.acknowledgment_status,
+    title: message.title,
+    references: message.references,
+  };
 }

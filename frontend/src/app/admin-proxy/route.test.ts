@@ -17,6 +17,7 @@ describe("admin proxy authentication", () => {
     "plans",
     "decisions",
     "outbox/messages",
+    "outbox/summary",
   ])("allows the cockpit GET route %s and injects admin credentials", async (path) => {
     process.env.KAGYA_ADMIN_TOKEN = "backend-token";
     const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
@@ -39,7 +40,7 @@ describe("admin proxy authentication", () => {
     );
   });
 
-  it("keeps cockpit routes read-only", async () => {
+  it.each(["goals", "outbox/summary"])("keeps cockpit route %s read-only", async (path) => {
     process.env.KAGYA_ADMIN_TOKEN = "backend-token";
     const backendFetch = vi.fn();
     vi.stubGlobal("fetch", backendFetch);
@@ -47,8 +48,8 @@ describe("admin proxy authentication", () => {
     const { POST } = await import("./[...path]/route");
 
     const response = await POST(
-      new NextRequest("http://localhost/admin-proxy/goals", { method: "POST", body: "{}" }),
-      { params: Promise.resolve({ path: ["goals"] }) },
+      new NextRequest(`http://localhost/admin-proxy/${path}`, { method: "POST", body: "{}" }),
+      { params: Promise.resolve({ path: path.split("/") }) },
     );
 
     expect(response.status).toBe(404);

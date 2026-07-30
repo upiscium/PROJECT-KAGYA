@@ -30,6 +30,7 @@ from kagya.external_transaction import ExternalTransactionStatus
 from kagya.models import BoundaryProbeChoice, DummyProvider
 from kagya.motivation import MotivationSource
 from kagya.identity import KnownLimitation
+from kagya.outbox import OutboxMessageKind, OutboxReferences
 from kagya.runtime import (
     AgentEventType,
     AgentStateStore,
@@ -683,6 +684,108 @@ def test_admin_working_memory_summary_is_count_only_non_mutating_and_runtime_rea
         for record in records
     )
 
+
+def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        assert client.get("/api/outbox/summary").status_code == 401
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers()
+        ).json() == {"messages": []}
+        outbox = client.app.state.outbox
+        for index in range(3):
+            outbox.enqueue(
+                OutboxMessageKind.ACTION_RESULT,
+                title=f"Message {index}",
+                body=f"Body {index}",
+                deduplication_key=f"summary-{index}",
+            )
+
+        bounded = client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 2}
+        )
+
+        assert bounded.status_code == 200
+        assert len(bounded.json()["messages"]) == 2
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 0}
+        ).status_code == 422
+        assert client.get(
+            "/api/outbox/summary", headers=admin_headers(), params={"limit": 201}
+        ).status_code == 422
+
+
+def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.get("/api/outbox/summary", headers=admin_headers())
+        outbox = client.app.state.outbox
+        message = outbox.enqueue(
+            OutboxMessageKind.ACTION_RESULT,
+            title="Release ready",
+            body="PRIVATE_SENTINEL",
+            deduplication_key="PRIVATE_SENTINEL",
+            interlocutor_id="PRIVATE_SENTINEL",
+            references=OutboxReferences(
+                event_id="event-1",
+                goal_id="goal-1",
+                plan_id="plan-1",
+                decision_id="decision-1",
+                action_id="action-1",
+                commitment_id="commitment-1",
+            ),
+        )
+        outbox.fail_delivery(message.message_id, "PRIVATE_SENTINEL")
+        outbox.respond(
+            message.message_id,
+            kind="reply",
+            actor_id="operator",
+            text="PRIVATE_SENTINEL",
+        )
+
+        response = client.get("/api/outbox/summary", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "messages": [
+                {
+                    "message_id": message.message_id,
+                    "title": "Release ready",
+                    "urgency": "normal",
+                    "delivery_status": "failed",
+                    "acknowledgment_status": "replied",
+                    "references": {
+                        "event_id": "event-1",
+                        "goal_id": "goal-1",
+                        "plan_id": "plan-1",
+                        "decision_id": "decision-1",
+                        "action_id": "action-1",
+                        "commitment_id": "commitment-1",
+                    },
+                }
+            ]
+        }
+        for field in (
+            "body",
+            "responses",
+            "attempts",
+            "last_failure_code",
+            "deduplication_key",
+            "interlocutor_id",
+            "PRIVATE_SENTINEL",
+        ):
+            assert field not in response.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.OUTBOX_READ.value
+        and record.lifecycle == JournalLifecycle.COMPLETED
+        and record.source == "api.outbox.summary"
+        for record in records
+    )
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,

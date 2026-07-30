@@ -520,6 +520,22 @@ export type OutboxMessage = {
   last_failure_code: string | null;
 };
 export type OutboxMessageListResponse = { messages: OutboxMessage[] };
+export type CockpitOutboxMessage = {
+  message_id: string;
+  title: string;
+  urgency: "low" | "normal" | "high" | "critical";
+  delivery_status: "pending" | "delivered" | "failed" | "expired" | "cancelled";
+  acknowledgment_status: "unacknowledged" | "read" | "replied" | "approved" | "rejected";
+  references: {
+    event_id: string | null;
+    goal_id: string | null;
+    plan_id: string | null;
+    decision_id: string | null;
+    action_id: string | null;
+    commitment_id: string | null;
+  };
+};
+export type CockpitOutboxResponse = { messages: CockpitOutboxMessage[] };
 
 export type ContextFrame = {
   context_id: string;
@@ -995,6 +1011,28 @@ function parseWorkingMemory(value: unknown): WorkingMemorySummary {
   };
 }
 
+function parseCockpitOutbox(value: unknown): CockpitOutboxResponse {
+  if (!isRecord(value) || !Array.isArray(value.messages)) invalid("cockpit outbox");
+  return { messages: value.messages.map((message) => {
+    if (!isRecord(message) || !isRecord(message.references)) invalid("cockpit outbox message");
+    return {
+      message_id: id(message.message_id, "cockpit outbox message"),
+      title: text(message.title, "cockpit outbox message title"),
+      urgency: enumValue(message.urgency, ["low", "normal", "high", "critical"] as const, "cockpit outbox urgency"),
+      delivery_status: enumValue(message.delivery_status, ["pending", "delivered", "failed", "expired", "cancelled"] as const, "cockpit outbox delivery"),
+      acknowledgment_status: enumValue(message.acknowledgment_status, ["unacknowledged", "read", "replied", "approved", "rejected"] as const, "cockpit outbox acknowledgment"),
+      references: {
+        event_id: optionalId(message.references.event_id, "cockpit outbox event"),
+        goal_id: optionalId(message.references.goal_id, "cockpit outbox goal"),
+        plan_id: optionalId(message.references.plan_id, "cockpit outbox plan"),
+        decision_id: optionalId(message.references.decision_id, "cockpit outbox decision"),
+        action_id: optionalId(message.references.action_id, "cockpit outbox action"),
+        commitment_id: optionalId(message.references.commitment_id, "cockpit outbox commitment"),
+      },
+    };
+  }) };
+}
+
 function identityOrigin(value: unknown, label: string): string {
   if (!isRecord(value)) invalid(`${label} origin`);
   const actor = text(value.actor, `${label} origin`);
@@ -1113,6 +1151,7 @@ export const api = {
   commitments: async () => parseCommitments(await adminRequest<unknown>("/commitments")),
   plans: async () => parsePlans(await adminRequest<unknown>("/plans")),
   decisions: async () => parseDecisions(await adminRequest<unknown>("/decisions")),
+  cockpitOutbox: async () => parseCockpitOutbox(await adminRequest<unknown>("/outbox/summary")),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
   updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
