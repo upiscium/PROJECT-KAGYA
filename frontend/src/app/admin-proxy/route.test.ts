@@ -18,6 +18,7 @@ describe("admin proxy authentication", () => {
     "decisions",
     "outbox/messages",
     "outbox/summary",
+    "actions/trace",
   ])("allows the cockpit GET route %s and injects admin credentials", async (path) => {
     process.env.KAGYA_ADMIN_TOKEN = "backend-token";
     const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
@@ -40,7 +41,7 @@ describe("admin proxy authentication", () => {
     );
   });
 
-  it.each(["goals", "outbox/summary"])("keeps cockpit route %s read-only", async (path) => {
+  it.each(["goals", "outbox/summary", "actions/trace"])("keeps cockpit route %s read-only", async (path) => {
     process.env.KAGYA_ADMIN_TOKEN = "backend-token";
     const backendFetch = vi.fn();
     vi.stubGlobal("fetch", backendFetch);

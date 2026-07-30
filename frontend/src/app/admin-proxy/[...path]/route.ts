@@ -31,6 +31,7 @@ const ALLOWED_ROUTES = [
   { method: "GET", pattern: /^decisions$/ },
   { method: "GET", pattern: /^outbox\/messages$/ },
   { method: "GET", pattern: /^outbox\/summary$/ },
+  { method: "GET", pattern: /^actions\/trace$/ },
   { method: "GET", pattern: /^memory\/search$/ },
   { method: "GET", pattern: /^memory\/episodes\/[^/]+$/ },
   { method: "GET", pattern: /^memory\/semantic\/[^/]+(?:\/graph)?$/ },
