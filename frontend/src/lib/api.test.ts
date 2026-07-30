@@ -242,6 +242,32 @@ describe("api client", () => {
     await expect(api.actionTrace()).rejects.toMatchObject({ name: "ApiError" });
   });
 
+  it("accepts backend fail-closed cross-record projections", async () => {
+    const payload = {
+      ...actionTracePayload,
+      traces: [{
+        ...actionTracePayload.traces[0],
+        receipt: null,
+        related_receipts: [],
+        observation: null,
+        verification: null,
+      }],
+      pre_intent_failures: [{
+        ...actionTracePayload.pre_intent_failures[1],
+        tool_name: null,
+      }],
+    };
+    fetchMock.mockReturnValue(jsonResponse(payload));
+
+    const result = await api.actionTrace();
+
+    expect(result.traces[0].receipt).toBeNull();
+    expect(result.traces[0].related_receipts).toEqual([]);
+    expect(result.traces[0].observation).toBeNull();
+    expect(result.traces[0].verification).toBeNull();
+    expect(result.pre_intent_failures[0].tool_name).toBeNull();
+  });
+
   it("formats backend JSON error details", async () => {
     fetchMock.mockReturnValue(errorResponse(500, "Internal Server Error", { detail: "Fallback model produced an empty visible response" }));
 

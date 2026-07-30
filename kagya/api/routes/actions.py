@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,6 +56,7 @@ BoundedCode = Annotated[
 PublicToolName = Annotated[
     str, Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
 ]
+RecordT = TypeVar("RecordT")
 
 
 class CockpitActionProvenanceResponse(BaseModel):
@@ -224,23 +225,29 @@ def cockpit_action_trace(
         intents = execution.list_intents()
         validations = execution.list_validation_records()
         policy_rejections = execution.list_policy_rejections()
-        approvals = {item.approval_id: item for item in execution.list_approvals()}
-        receipts = {item.receipt_id: item for item in execution.list_receipts()}
-        observations = {
-            item.observation_id: item for item in execution.list_observations()
-        }
-        verifications = {
-            item.verification_id: item for item in execution.list_verifications()
-        }
+        approvals = _unique_by_id(
+            execution.list_approvals(), lambda item: item.approval_id
+        )
+        receipts = _unique_by_id(
+            execution.list_receipts(), lambda item: item.receipt_id
+        )
+        observations = _unique_by_id(
+            execution.list_observations(), lambda item: item.observation_id
+        )
+        verifications = _unique_by_id(
+            execution.list_verifications(), lambda item: item.verification_id
+        )
         ordered = sorted(
             intents,
             key=lambda item: (item.updated_at, item.created_at, item.intent_id),
             reverse=True,
         )
-        failed_validations = tuple(
-            item for item in validations if not item.arguments_valid
+        validation_by_id = _unique_by_id(
+            validations, lambda item: item.validation_id
         )
-        validation_by_id = {item.validation_id: item for item in validations}
+        failed_validations = tuple(
+            item for item in validation_by_id.values() if not item.arguments_valid
+        )
         pre_intent_failures = sorted(
             [
                 _validation_failure(item) for item in failed_validations
@@ -428,7 +435,7 @@ def _action_trace(
 ) -> CockpitActionTraceResponse:
     if approval is not None and approval.intent_id != intent.intent_id:
         approval = None
-    if receipt is not None and receipt.intent_id != intent.intent_id:
+    if receipt is not None and not _receipt_matches_intent(receipt, intent):
         receipt = None
     observation = None
     verification = None
@@ -499,7 +506,7 @@ def _action_trace(
             event_id=receipt.event_id,
             event_sequence=receipt.event_sequence,
             error_code=receipt.error_code,
-            compensation_of=receipt.compensation_of,
+            compensation_of=_safe_compensation_of(receipt, intent, receipts),
         ),
         related_receipts=[
             CockpitActionRelatedReceiptResponse(
@@ -510,7 +517,7 @@ def _action_trace(
                 (
                     item
                     for item in receipts.values()
-                    if item.intent_id == intent.intent_id
+                    if _receipt_matches_intent(item, intent)
                     and (receipt is None or item.receipt_id != receipt.receipt_id)
                 ),
                 key=lambda item: (item.finished_at, item.receipt_id),
@@ -560,7 +567,7 @@ def _policy_rejection_failure(
         tool_name=(
             public_tool_name(validation.tool_name)
             if validation is not None
-            and validation.validation_id == rejection.validation_id
+            and _validation_matches_rejection(validation, rejection)
             else None
         ),
         risk_class=rejection.risk_class,
@@ -569,3 +576,61 @@ def _policy_rejection_failure(
         event_sequence=rejection.event_sequence,
         occurred_at=rejection.rejected_at,
     )
+
+
+def _receipt_matches_intent(
+    receipt: ExecutionReceipt,
+    intent: ActionIntent,
+) -> bool:
+    return (
+        receipt.intent_id == intent.intent_id
+        and receipt.idempotency_key == intent.idempotency_key
+        and receipt.decision_id == intent.provenance.decision_id
+        and receipt.plan_id == intent.provenance.plan_id
+        and receipt.plan_revision == intent.provenance.plan_revision
+        and receipt.step_id == intent.provenance.step_id
+    )
+
+
+def _safe_compensation_of(
+    receipt: ExecutionReceipt,
+    intent: ActionIntent,
+    receipts: dict[str, ExecutionReceipt],
+) -> str | None:
+    if receipt.compensation_of is None:
+        return None
+    target = receipts.get(receipt.compensation_of)
+    if (
+        target is None
+        or target.receipt_id == receipt.receipt_id
+        or not _receipt_matches_intent(target, intent)
+    ):
+        return None
+    return target.receipt_id
+
+
+def _validation_matches_rejection(
+    validation: ActionValidationRecord,
+    rejection: ActionPolicyRejectionRecord,
+) -> bool:
+    return (
+        validation.validation_id == rejection.validation_id
+        and validation.arguments_valid is True
+        and validation.intent_id is not None
+        and validation.decision_id == rejection.decision_id
+        and validation.risk_class == rejection.risk_class
+    )
+
+
+def _unique_by_id(
+    values: tuple[RecordT, ...],
+    identifier: Callable[[RecordT], str],
+) -> dict[str, RecordT]:
+    grouped: dict[str, list[RecordT]] = {}
+    for item in values:
+        grouped.setdefault(identifier(item), []).append(item)
+    return {
+        record_id: items[0]
+        for record_id, items in grouped.items()
+        if len(items) == 1
+    }

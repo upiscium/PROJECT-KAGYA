@@ -1156,6 +1156,174 @@ def test_admin_cockpit_action_trace_only_projects_allowlisted_tool_names(
             assert value not in response.text
         assert "<script>" not in response.text
 
+
+def test_admin_cockpit_action_trace_fails_closed_on_cross_record_bindings(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    cross_decision = _cockpit_action_intent("intent-cross-decision", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-decision")
+    cross_idempotency = _cockpit_action_intent("intent-cross-idempotency", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-idempotency")
+    cross_plan = _cockpit_action_intent("intent-cross-plan", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-plan")
+    duplicate_current = _cockpit_action_intent("intent-duplicate-current", IntentStatus.SUCCEEDED, now, receipt_id="receipt-duplicate-current")
+    ambiguous = _cockpit_action_intent("intent-ambiguous-related", IntentStatus.SUCCEEDED, now, approval_id="approval-duplicate", receipt_id="receipt-ambiguous")
+    receipts = (
+        _cockpit_receipt(cross_decision, "receipt-cross-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "decision-other"}),
+        _cockpit_receipt(cross_idempotency, "receipt-cross-idempotency", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"idempotency_key": "different-key"}),
+        _cockpit_receipt(cross_plan, "receipt-cross-plan", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"plan_revision": 2}),
+        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.SUCCEEDED, None, None, now),
+        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.FAILED, None, None, now),
+        _cockpit_receipt(ambiguous, "receipt-ambiguous", ReceiptStatus.SUCCEEDED, "observation-duplicate", "verification-duplicate", now),
+    )
+    approvals = (
+        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="pending", requested_at=now),
+        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="approved", requested_at=now, resolved_at=now, actor_id="operator"),
+    )
+    observations = (
+        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", True, now),
+        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", False, now, errors=("result_fields_invalid",)),
+    )
+    verifications = (
+        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=True, reason="observation_schema_valid", verified_at=now),
+        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=False, reason="observation_schema_invalid", verified_at=now),
+    )
+    state = ActionState(
+        intents=(cross_decision, cross_idempotency, cross_plan, duplicate_current, ambiguous),
+        approvals=approvals,
+        receipts=receipts,
+        observations=observations,
+        verifications=verifications,
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        by_id = {item["intent_id"]: item for item in response.json()["traces"]}
+        for intent_id in (
+            "intent-cross-decision",
+            "intent-cross-idempotency",
+            "intent-cross-plan",
+            "intent-duplicate-current",
+        ):
+            assert by_id[intent_id]["receipt"] is None
+            assert by_id[intent_id]["related_receipts"] == []
+        assert by_id["intent-ambiguous-related"]["receipt"] is not None
+        assert by_id["intent-ambiguous-related"]["approval"] == {
+            "approval_id": None,
+            "status": None,
+            "requested_at": None,
+            "resolved_at": None,
+            "resolved_by_operator": False,
+        }
+        assert by_id["intent-ambiguous-related"]["observation"] is None
+        assert by_id["intent-ambiguous-related"]["verification"] is None
+
+
+def test_admin_cockpit_action_trace_validates_compensation_bindings(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    scenario_names = ("missing", "other-intent", "other-decision", "self", "duplicate")
+    intents = tuple(
+        _cockpit_action_intent(
+            f"intent-comp-{name}",
+            IntentStatus.COMPENSATED,
+            now,
+            receipt_id=f"receipt-comp-{name}",
+        )
+        for name in scenario_names
+    )
+    valid = _cockpit_action_intent("intent-comp-valid", IntentStatus.COMPENSATED, now, receipt_id="receipt-comp-valid")
+    by_name = {name: intent for name, intent in zip(scenario_names, intents, strict=True)}
+    receipts = [
+        _cockpit_receipt(by_name["missing"], "receipt-comp-missing", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-not-found"),
+        _cockpit_receipt(by_name["other-intent"], "receipt-comp-other-intent", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-intent"),
+        _cockpit_receipt(by_name["other-decision"], "receipt-comp-other-decision", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-decision"),
+        _cockpit_receipt(by_name["self"], "receipt-comp-self", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-comp-self"),
+        _cockpit_receipt(by_name["duplicate"], "receipt-comp-duplicate", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-duplicate"),
+        _cockpit_receipt(valid, "receipt-comp-valid", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-valid"),
+        _cockpit_receipt(by_name["other-intent"], "receipt-target-other-intent", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"intent_id": "different-intent"}),
+        _cockpit_receipt(by_name["other-decision"], "receipt-target-other-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "different-decision"}),
+        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.SUCCEEDED, None, None, now),
+        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.FAILED, None, None, now),
+        _cockpit_receipt(valid, "receipt-target-valid", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
+    ]
+    state = ActionState(intents=(*intents, valid), receipts=tuple(receipts))
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        by_id = {item["intent_id"]: item for item in response.json()["traces"]}
+        for name in scenario_names:
+            assert by_id[f"intent-comp-{name}"]["receipt"]["compensation_of"] is None
+        assert by_id["intent-comp-valid"]["receipt"]["compensation_of"] == "receipt-target-valid"
+        assert by_id["intent-comp-valid"]["related_receipts"] == [
+            {"receipt_id": "receipt-target-valid", "status": "succeeded"}
+        ]
+
+
+def test_admin_cockpit_action_trace_requires_semantic_policy_binding(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=UTC)
+    valid = _cockpit_validation_record("validation-binding-valid", "local_notification_enqueue", now, arguments_valid=True)
+    decision_mismatch = _cockpit_validation_record("validation-binding-decision", "local_notification_enqueue", now, arguments_valid=True)
+    risk_mismatch = _cockpit_validation_record("validation-binding-risk", "local_notification_enqueue", now, arguments_valid=True)
+    invalid = _cockpit_validation_record("validation-binding-invalid", "document_search", now, arguments_valid=False)
+    duplicate_one = _cockpit_validation_record("validation-binding-duplicate", "local_notification_enqueue", now, arguments_valid=True)
+    duplicate_two = duplicate_one.model_copy(update={"tool_name": "document_search"})
+
+    def rejection(
+        rejection_id: str,
+        validation: ActionValidationRecord,
+        *,
+        decision_id: str | None = None,
+        risk_class: RiskClass | None = None,
+    ) -> ActionPolicyRejectionRecord:
+        return ActionPolicyRejectionRecord(
+            rejection_id=rejection_id,
+            idempotency_key="PRIVATE_SENTINEL",
+            decision_id=decision_id or validation.decision_id or "decision-missing",
+            candidate_id=f"candidate-{rejection_id}",
+            validation_id=validation.validation_id,
+            risk_class=risk_class or validation.risk_class or RiskClass.READ_ONLY,
+            policy_code="risk_budget_denied",
+            reason_code="risk_class_exceeds_budget",
+            event_id=f"event-{rejection_id}",
+            event_sequence=51,
+            rejected_at=now,
+        )
+
+    rejections = (
+        rejection("rejection-binding-valid", valid),
+        rejection("rejection-binding-decision", decision_mismatch, decision_id="different-decision"),
+        rejection("rejection-binding-risk", risk_mismatch, risk_class=RiskClass.READ_ONLY),
+        rejection("rejection-binding-invalid", invalid),
+        rejection("rejection-binding-duplicate", duplicate_one),
+    )
+    state = ActionState(
+        validation_records=(valid, decision_mismatch, risk_mismatch, invalid, duplicate_one, duplicate_two),
+        policy_rejections=rejections,
+    )
+    with _client(tmp_path) as client:
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+
+        response = client.get("/api/actions/trace", headers=admin_headers())
+
+        assert response.status_code == 200
+        failures = {item["failure_id"]: item for item in response.json()["pre_intent_failures"]}
+        assert failures["rejection-binding-valid"]["tool_name"] == "local_notification_enqueue"
+        for rejection_id in (
+            "rejection-binding-decision",
+            "rejection-binding-risk",
+            "rejection-binding-invalid",
+            "rejection-binding-duplicate",
+        ):
+            assert failures[rejection_id]["tool_name"] is None
+
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,
 ) -> None:
