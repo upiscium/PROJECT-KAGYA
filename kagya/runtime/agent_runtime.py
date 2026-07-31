@@ -40,6 +40,7 @@ class AgentEventType(StrEnum):
     CHAT = "chat"
     DEBUG_CHAT = "debug_chat"
     SLEEP = "sleep"
+    TRAINING_READ = "training_read"
     MEMORY_READ = "memory_read"
     MEMORY_UPDATE = "memory_update"
     ADAPTER_READ = "adapter_read"

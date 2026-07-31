@@ -10,7 +10,10 @@ import {
   api,
   errorMessage,
   type CockpitActionTrace,
+  type CockpitAdapterLineage,
   type CockpitPreIntentFailure,
+  type CockpitTrainingJob,
+  type CockpitTrainingNode,
   type Commitment,
   type ContextFrame,
   type Decision,
@@ -31,6 +34,7 @@ export function CockpitClient() {
   const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
   const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
   const actions = useQuery({ queryKey: ["cockpit", "actions"], queryFn: api.actionTrace });
+  const training = useQuery({ queryKey: ["cockpit", "training"], queryFn: api.cockpitTraining });
   const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
   const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
 
@@ -53,6 +57,9 @@ export function CockpitClient() {
     ...item.related_receipts.map((receipt) => receipt.receipt_id),
   ]));
   const loadedActionFailures = new Set(actions.data?.pre_intent_failures.map((item) => item.failure_id));
+  const loadedTrainingNodes = new Set(training.data?.nodes.map((item) => item.node_id));
+  const loadedTrainingJobs = new Set(training.data?.jobs.map((item) => item.job_id));
+  const loadedCockpitAdapters = new Set(training.data?.adapters.map((item) => item.adapter_id));
   const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
 
   return (
@@ -108,6 +115,13 @@ export function CockpitClient() {
           {actions.data ? <div className="metric-grid"><Metric label="Pending approvals" value={String(actions.data.pending_approval_count)} /><Metric label="Retry pending" value={String(actions.data.retry_pending_count)} /><Metric label="Failed" value={String(actions.data.failed_count)} /></div> : null}
           <div className="stack">{actions.data?.pre_intent_failures.map((failure) => <PreIntentFailureRecord key={failure.failure_id} failure={failure} loadedDecisions={loadedDecisions} loadedJournal={loadedJournal} />)}</div>
           <div className="stack">{actions.data?.traces.map((trace) => <ActionTraceRecord key={trace.intent_id} trace={trace} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}</div>
+        </Section>
+
+        <Section title="Training / Adapters" query={training} empty={training.data ? training.data.nodes.length === 0 && training.data.jobs.length === 0 && training.data.adapters.length === 0 : false} emptyText="No training nodes, jobs, or adapter lineage records.">
+          {training.data ? <TrainingAdaptersSummary nodes={training.data.node_count} online={training.data.online_node_count} running={training.data.running_job_count} failed={training.data.failed_job_count} importing={training.data.importing_job_count} activeAdapters={training.data.active_adapter_count} candidateAdapters={training.data.candidate_adapter_count} /> : null}
+          <div className="stack">{training.data?.nodes.map((node) => <TrainingNodeRecord key={node.node_id} node={node} jobs={training.data?.jobs ?? []} loadedJobs={loadedTrainingJobs} />)}</div>
+          <div className="stack">{training.data?.jobs.map((job) => <TrainingJobRecord key={job.job_id} job={job} loadedNodes={loadedTrainingNodes} loadedAdapters={loadedCockpitAdapters} />)}</div>
+          <div className="stack">{training.data?.adapters.map((adapter) => <AdapterLineageRecord key={adapter.adapter_id} adapter={adapter} loadedJobs={loadedTrainingJobs} loadedNodes={loadedTrainingNodes} loadedJournal={loadedJournal} />)}</div>
         </Section>
 
         <Section title="Outbox" query={outbox} empty={outbox.data?.messages.length === 0} emptyText="No proactive messages.">
@@ -187,6 +201,23 @@ function ActionTraceRecord({ trace, loadedDecisions, loadedPlans, loadedJournal,
   return <article className="record" id={anchor("action", trace.intent_id)}><div className="metadata-row"><Badge data-tone={actionTone(trace.status)}>{trace.status}</Badge><Badge>{trace.risk_class}</Badge><strong>{trace.tool_name}</strong></div><p className="mono muted">{trace.intent_id} · revision {trace.revision} · {trace.dry_run ? "dry-run" : "live"}</p><p>Created: {trace.created_at} · Updated: {trace.updated_at} · Failure: <span className="mono">{trace.failure_code ?? "none"}</span></p><p>Decision: <EntityReference kind="decision" id={trace.provenance.decision_id} available={loadedDecisions} /> · Plan: <EntityReference kind="plan" id={trace.provenance.plan_id} available={loadedPlans} />{trace.provenance.step_id ? ` / step ${trace.provenance.step_id}` : ""}</p><p>Approval: {trace.approval.status ?? "not required"}{trace.approval.resolved_by_operator ? " / operator resolved" : ""}</p>{trace.related_receipts.map((related) => <p id={anchor("receipt", related.receipt_id)} key={related.receipt_id}>Related receipt: <Link className="entity-link mono" href={`#${anchor("receipt", related.receipt_id)}`}>{related.receipt_id}</Link> · {related.status}</p>)}{receipt ? <div className="step-row" id={anchor("receipt", receipt.receipt_id)}><p>Receipt: <Link className="entity-link mono" href={`#${anchor("receipt", receipt.receipt_id)}`}>{receipt.receipt_id}</Link> · <Badge data-tone={receipt.status === "succeeded" ? "success" : receipt.status === "failed" || receipt.status === "timed_out" || receipt.status === "cancelled" ? "danger" : "neutral"}>{receipt.status}</Badge></p>{receipt.compensation_of ? <p>Compensates: <EntityReference kind="receipt" id={receipt.compensation_of} available={loadedReceipts} /></p> : null}<p>Attempt {receipt.attempt} · {receipt.duration_ms} ms · Error {receipt.error_code ?? "none"} · Event <EntityReference kind="journal" id={receipt.event_id} available={loadedJournal} /></p>{trace.observation ? <p id={anchor("observation", trace.observation.observation_id)}>Observation: <Link className="entity-link mono" href={`#${anchor("observation", trace.observation.observation_id)}`}>{trace.observation.observation_id}</Link> · {trace.observation.valid ? "valid" : "invalid"} · errors {trace.observation.validation_errors.join(", ") || "none"} · digest <span className="mono">{trace.observation.result_digest}</span></p> : <p>Observation: unavailable</p>}{trace.verification ? <p id={anchor("verification", trace.verification.verification_id)}>Verification: <Link className="entity-link mono" href={`#${anchor("verification", trace.verification.verification_id)}`}>{trace.verification.verification_id}</Link> · {trace.verification.success ? "succeeded" : "failed"} · {trace.verification.reason}</p> : <p>Verification: unavailable</p>}</div> : <p>Receipt: unavailable · Observation: unavailable · Verification: unavailable</p>}</article>;
 }
 
+function TrainingAdaptersSummary({ nodes, online, running, failed, importing, activeAdapters, candidateAdapters }: { nodes: number; online: number; running: number; failed: number; importing: number; activeAdapters: number; candidateAdapters: number }) {
+  return <div className="metric-grid"><Metric label="Nodes" value={String(nodes)} /><Metric label="Online" value={String(online)} /><Metric label="Running" value={String(running)} /><Metric label="Failed" value={String(failed)} /><Metric label="Importing" value={String(importing)} /><Metric label="Active adapters" value={String(activeAdapters)} /><Metric label="Candidate adapters" value={String(candidateAdapters)} /></div>;
+}
+
+function TrainingNodeRecord({ node, jobs, loadedJobs }: { node: CockpitTrainingNode; jobs: CockpitTrainingJob[]; loadedJobs: Set<string> }) {
+  const nodeJobs = jobs.filter((job) => job.worker_node_id === node.node_id).map((job) => job.job_id);
+  return <article className="record" id={anchor("training-node", node.node_id)}><div className="metadata-row"><Badge data-tone={node.status === "online" ? "success" : "danger"}>{node.status}</Badge><Badge>{node.role}</Badge><strong>{node.node_id}</strong></div><p>Backend: <span className="mono">{node.backend}</span> · Last contact: {node.last_contact_at ?? "unavailable"}</p><p>GPU: <span className="mono">{node.gpu_name ?? "unavailable"}</span> · CUDA {node.cuda_version ?? "unavailable"} · Driver {node.driver_version ?? "unavailable"}</p><p>Expected: <span className="mono">{node.expected_model_id ?? "unavailable"} / {node.expected_model_revision ?? "unavailable"}</span> · Observed: <span className="mono">{node.observed_model_id ?? "unavailable"} / {node.observed_model_revision ?? "unavailable"}</span> · Match: {node.model_matches_expected === null ? "unavailable" : node.model_matches_expected ? "yes" : "no"}</p><p>Jobs: {nodeJobs.length ? <ReferenceList kind="training-job" ids={nodeJobs} available={loadedJobs} /> : "unavailable"}</p></article>;
+}
+
+function TrainingJobRecord({ job, loadedNodes, loadedAdapters }: { job: CockpitTrainingJob; loadedNodes: Set<string>; loadedAdapters: Set<string> }) {
+  return <article className="record" id={anchor("training-job", job.job_id)}><div className="metadata-row"><Badge data-tone={job.status === "failed" ? "danger" : job.status === "running" || job.status === "importing" ? "accent" : "neutral"}>{job.status}</Badge><strong>{job.job_id}</strong><span className="mono muted">attempt {job.attempt_id}</span></div><p>Backend: {job.backend ?? "unavailable"} · Worker: <EntityReference kind="training-node" id={job.worker_node_id} available={loadedNodes} /> · Remote: <span className="mono">{job.remote_job_id ?? "unavailable"}</span></p><p>Created: {job.created_at ?? "unavailable"} · Started: {job.started_at ?? "unavailable"} · Completed: {job.completed_at ?? "unavailable"}</p><p>Source events: {job.source_event_start ?? "unavailable"} → {job.source_event_end ?? "unavailable"} · Episodes: {job.selected_episode_count ?? "unavailable"} · Retry: {job.retry_count ?? "unavailable"}</p><p>Transferred: {formatBytes(job.transferred_bytes)} · Failure: <span className="mono">{job.failure_code ?? "none"}</span> · Import: {job.import_status}</p><p>Candidate adapter: <EntityReference kind="adapter-lineage" id={job.candidate_adapter_id} available={loadedAdapters} /> · Bundle: <span className="mono">{shortDigest(job.bundle_digest)}</span> · Result: <span className="mono">{shortDigest(job.result_digest)}</span></p></article>;
+}
+
+function AdapterLineageRecord({ adapter, loadedJobs, loadedNodes, loadedJournal }: { adapter: CockpitAdapterLineage; loadedJobs: Set<string>; loadedNodes: Set<string>; loadedJournal: Set<string> }) {
+  return <article className="record" id={anchor("adapter-lineage", adapter.adapter_id)}><div className="metadata-row"><Badge data-tone={adapter.active ? "success" : adapter.rollback_candidate ? "warning" : "neutral"}>{adapter.status}</Badge><strong>{adapter.adapter_id}</strong><span className="mono muted">{shortDigest(adapter.adapter_hash)}</span></div><p>Base revision: <span className="mono">{adapter.base_model_id ?? "unavailable"} / {adapter.base_model_revision ?? "unavailable"}</span> · Parent: <span className="mono muted">{adapter.parent_adapter_id ?? "none"}</span></p><p>Training job: <EntityReference kind="training-job" id={adapter.training_job_id} available={loadedJobs} /> · Training node: <EntityReference kind="training-node" id={adapter.training_node_id} available={loadedNodes} /></p><p>Submitter: <span className="mono">{adapter.submitted_by_node_id ?? "unavailable"}</span> · Importer: <span className="mono">{adapter.imported_by_node_id ?? "unavailable"}</span></p><p>Evaluation: <EntityReference kind="evaluation" id={adapter.evaluation_id} available={new Set()} /> · {adapter.evaluation_status} · Approval: {adapter.approved ? "approved" : "not approved"} · Active: {adapter.active ? "yes" : "no"} · Rollback candidate: {adapter.rollback_candidate ? "yes" : "no"}</p><p>Activation event: <EntityReference kind="journal" id={adapter.activation_event_id} available={loadedJournal} />{adapter.activation_event_sequence ? ` @${adapter.activation_event_sequence}` : ""} · Rollback event: <EntityReference kind="journal" id={adapter.rollback_event_id} available={loadedJournal} />{adapter.rollback_event_sequence ? ` @${adapter.rollback_event_sequence}` : ""}</p></article>;
+}
+
 function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments, loadedActions }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string>; loadedActions: Set<string> }) {
   return <><div className="metric-grid"><Metric label="Pending" value={String(pendingCount)} /><Metric label="Critical" value={String(criticalCount)} /></div><div className="stack">{visibleMessages.map((message) => <article className="record" id={anchor("outbox", message.message_id)} key={message.message_id}><div className="metadata-row"><Badge data-tone={message.urgency === "critical" ? "danger" : "neutral"}>{message.urgency}</Badge><Badge>{message.delivery_status}</Badge><strong>{message.title}</strong></div><p>Goal: <EntityReference kind="goal" id={message.references.goal_id} available={loadedGoals} /> · Plan: <EntityReference kind="plan" id={message.references.plan_id} available={loadedPlans} /></p><p>Decision: <EntityReference kind="decision" id={message.references.decision_id} available={loadedDecisions} /> · Commitment: <EntityReference kind="commitment" id={message.references.commitment_id} available={loadedCommitments} /> · Action: <EntityReference kind="action" id={message.references.action_id} available={loadedActions} /></p></article>)}</div></>;
 }
@@ -219,6 +250,17 @@ function isCurrentCommitment(commitment: Commitment): boolean {
 
 function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
+}
+
+function shortDigest(value: string | null): string {
+  return value === null ? "unavailable" : `${value.slice(0, 12)}...`;
+}
+
+function formatBytes(value: number | null): string {
+  if (value === null) return "unavailable";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KiB`;
+  return `${Math.round(value / (1024 * 1024))} MiB`;
 }
 
 function actionTone(status: CockpitActionTrace["status"]): string {

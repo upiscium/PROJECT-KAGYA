@@ -9,7 +9,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...original,
     api: {
-      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
+      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), cockpitTraining: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
     },
   };
 });
@@ -35,9 +35,10 @@ describe("CockpitClient", () => {
     expect(screen.queryByText("Oldest message")).not.toBeInTheDocument();
     expect(screen.getByText("goal_update")).toBeInTheDocument();
     expect(screen.getByText("Action Execution")).toBeInTheDocument();
-    expect(screen.getByText("Pending approvals").parentElement).toHaveTextContent("2");
-    expect(screen.getByText("Retry pending").parentElement).toHaveTextContent("1");
-    expect(screen.getByText("Failed").parentElement).toHaveTextContent("5");
+    const actionMetricsSection = screen.getByText("Action Execution").closest(".ui-card") as HTMLElement;
+    expect(within(actionMetricsSection).getByText("Pending approvals").parentElement).toHaveTextContent("2");
+    expect(within(actionMetricsSection).getByText("Retry pending").parentElement).toHaveTextContent("1");
+    expect(within(actionMetricsSection).getByText("Failed").parentElement).toHaveTextContent("5");
     expect(screen.getByText("Validation rejected")).toBeInTheDocument();
     expect(screen.getByText("Policy rejected")).toBeInTheDocument();
     expect(screen.getByText("awaiting_approval")).toBeInTheDocument();
@@ -48,6 +49,11 @@ describe("CockpitClient", () => {
     expect(screen.getAllByRole("link", { name: "decision-1" })[0]).toHaveAttribute("href", "#decision-decision-1");
     expect(screen.getByRole("link", { name: "message-1" })).toHaveAttribute("href", "#outbox-message-1");
     expect(screen.getAllByRole("link", { name: "action-1" })[0]).toHaveAttribute("href", "#action-action-1");
+    expect(screen.getByText("Training / Adapters")).toBeInTheDocument();
+    expect(screen.getByText("gpu-1")).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "job-1" })[0]).toHaveAttribute("href", "#training-job-job-1");
+    expect(screen.getAllByRole("link", { name: "adapter-1" })[0]).toHaveAttribute("href", "#adapter-lineage-adapter-1");
+    expect(screen.getAllByRole("link", { name: "event-1" })[0]).toHaveAttribute("href", "#journal-event-1");
     const decisionSection = screen.getByText("Recent Decisions").closest(".ui-card") as HTMLElement;
     expect(within(decisionSection).getByRole("link", { name: "action-1" })).toHaveAttribute("href", "#action-action-1");
     expect(within(decisionSection).queryByRole("link", { name: "action-old" })).not.toBeInTheDocument();
@@ -66,6 +72,7 @@ describe("CockpitClient", () => {
     expect(document.body.textContent).not.toContain("<script>");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "outbox"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "actions"]))).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getQueryData(["cockpit", "training"]))).not.toContain("PRIVATE_SENTINEL");
   });
 
   it("shows action loading without hiding loaded sections", async () => {
@@ -85,6 +92,7 @@ describe("CockpitClient", () => {
     mockedApi.decisions.mockResolvedValue({ decisions: [] });
     mockedApi.cockpitOutbox.mockResolvedValue({ pending_count: 0, critical_count: 0, messages: [] });
     mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 0, retry_pending_count: 0, failed_count: 0, traces: [], pre_intent_failures: [] });
+    mockedApi.cockpitTraining.mockResolvedValue({ node_count: 0, online_node_count: 0, running_job_count: 0, failed_job_count: 0, importing_job_count: 0, active_adapter_count: 0, candidate_adapter_count: 0, nodes: [], jobs: [], adapters: [] });
     mockedApi.eventJournal.mockResolvedValue({ records: [] });
     renderCockpit();
 
@@ -95,6 +103,7 @@ describe("CockpitClient", () => {
     expect(screen.getByText("No decisions recorded.")).toBeInTheDocument();
     expect(screen.getByText("No proactive messages.")).toBeInTheDocument();
     expect(screen.getByText("No action execution traces.")).toBeInTheDocument();
+    expect(screen.getByText("No training nodes, jobs, or adapter lineage records.")).toBeInTheDocument();
     expect(screen.getByText("No Journal records.")).toBeInTheDocument();
   });
 
@@ -107,6 +116,15 @@ describe("CockpitClient", () => {
     expect(screen.getByText("Report results")).toBeInTheDocument();
     expect(screen.getByText("conversation")).toBeInTheDocument();
     expect(screen.getByText("ok")).toBeInTheDocument();
+  });
+
+  it("keeps successful sections visible after a training-only failure", async () => {
+    mockedApi.cockpitTraining.mockRejectedValue(new Error("training unavailable"));
+    renderCockpit();
+
+    expect(await screen.findByText("training unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Ship safely")).toBeInTheDocument();
+    expect(screen.getByText("Action Execution")).toBeInTheDocument();
   });
 
   it("links a decision to its pre-intent failure when no intent exists", async () => {
@@ -139,7 +157,23 @@ function resolveRepresentativeData() {
   mockedApi.decisions.mockResolvedValue({ decisions: [{ decision_id: "decision-1", context_id: "context-1", active_goal_ids: ["goal-1"], selected_candidate_id: "candidate-1", selected_candidate: { candidate_id: "candidate-1", candidate_type: "respond", proposed_action: "Report result", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", goal_refs: ["goal-1"], commitment_refs: ["commitment-1"] }, selection_confidence: 0.8, status: "awaiting_outcome", outcome_status: "pending", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
   mockedApi.cockpitOutbox.mockResolvedValue({ pending_count: 42, critical_count: 9, messages: rawOutboxFixtures.map(cockpitOutboxProjection) });
   mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 2, retry_pending_count: 1, failed_count: 5, traces: rawActionFixtures.map(cockpitActionProjection) as never, pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never });
+  mockedApi.cockpitTraining.mockResolvedValue(cockpitTrainingProjection());
   mockedApi.eventJournal.mockResolvedValue({ records: [{ record_id: "record-1", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-1", event_type: "goal_update", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: "goal:goal-1", reauthenticated: null, previous_record_hash: null, record_hash: "hash", private_replay: "PRIVATE_SENTINEL" } as never] });
+}
+
+function cockpitTrainingProjection() {
+  return {
+    node_count: 1,
+    online_node_count: 1,
+    running_job_count: 1,
+    failed_job_count: 0,
+    importing_job_count: 0,
+    active_adapter_count: 1,
+    candidate_adapter_count: 0,
+    nodes: [{ node_id: "node-1", role: "worker", backend: "ssh", status: "online", last_contact_at: "2026-01-01T00:00:00Z", expected_model_id: "model-1", expected_model_revision: "rev-1", expected_processor_revision: "proc-1", observed_model_id: "model-1", observed_model_revision: "rev-1", model_matches_expected: true, gpu_name: "gpu-1", cuda_version: "12.1", driver_version: "550" }],
+    jobs: [{ job_id: "job-1", attempt_id: "attempt-1", status: "running", backend: "ssh", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z", started_at: "2026-01-01T00:00:01Z", completed_at: null, source_event_start: 1, source_event_end: 5, selected_episode_count: 3, remote_job_id: "job-1", worker_node_id: "node-1", retry_count: 0, transferred_bytes: 2048, failure_code: null, candidate_adapter_id: "adapter-1", import_status: "not_started", bundle_digest: "a".repeat(64), result_digest: "b".repeat(64) }],
+    adapters: [{ adapter_id: "adapter-1", status: "active", adapter_hash: "b".repeat(64), base_model_id: "model-1", base_model_revision: "rev-1", parent_adapter_id: null, training_job_id: "job-1", training_node_id: "node-1", submitted_by_node_id: "submitter-1", imported_by_node_id: "node-1", evaluation_id: "eval-1", evaluation_status: "passed", approved: true, active: true, rollback_candidate: false, activation_event_id: "event-1", activation_event_sequence: 1, rollback_event_id: null, rollback_event_sequence: null }],
+  } as never;
 }
 
 const rawOutboxFixtures = [
