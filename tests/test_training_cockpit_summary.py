@@ -28,16 +28,14 @@ from kagya.training.jobs import TrainingJob, TrainingJobStatus
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-ADMIN_TOKEN = "test-admin-token"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
 
 
-def test_cockpit_training_requires_admin(tmp_path: Path, monkeypatch) -> None:
+def test_cockpit_training_is_available_without_auth(tmp_path: Path, monkeypatch) -> None:
     client, _runtime, _coordinator = _client(tmp_path, monkeypatch)
 
-    assert client.get("/api/training/cockpit-summary").status_code == 401
-    assert _authed_get(client).status_code == 200
+    assert _get(client).status_code == 200
 
 
 def test_cockpit_training_standalone_node_and_read_boundary(
@@ -46,7 +44,7 @@ def test_cockpit_training_standalone_node_and_read_boundary(
     client, runtime, coordinator = _client(tmp_path, monkeypatch)
     before = dict(client.app.state._state)
 
-    response = _authed_get(client)
+    response = _get(client)
 
     assert response.status_code == 200
     payload = response.json()
@@ -69,7 +67,7 @@ def test_cockpit_training_split_uses_configured_inventory_and_cached_health(
     ]
     client, _runtime, _coordinator = _client(tmp_path, monkeypatch, split=True, health=health)
 
-    payload = _authed_get(client).json()
+    payload = _get(client).json()
 
     assert payload["node_count"] == 2
     assert payload["online_node_count"] == 1
@@ -94,7 +92,7 @@ def test_cockpit_training_counts_limit_duplicates_and_strict_bindings(
     ]
     client, _runtime, _coordinator = _client(tmp_path, monkeypatch, jobs=jobs, adapters=adapters)
 
-    payload = _authed_get(client, "?limit=1").json()
+    payload = _get(client, "?limit=1").json()
 
     assert payload["running_job_count"] == 5
     assert payload["failed_job_count"] == 0
@@ -130,7 +128,7 @@ def test_cockpit_training_activation_rollback_and_evaluation_binding(
         journal=journal,
     )
 
-    adapters = {item["adapter_id"]: item for item in _authed_get(client).json()["adapters"]}
+    adapters = {item["adapter_id"]: item for item in _get(client).json()["adapters"]}
 
     assert adapters["adapter-a"]["activation_event_id"] == "event-activate"
     assert adapters["adapter-a"]["activation_event_sequence"] == 3
@@ -155,17 +153,14 @@ def test_cockpit_training_cross_record_mismatches_fail_closed(
     ]
     client, _runtime, _coordinator = _client(tmp_path, monkeypatch, jobs=jobs, adapters=mismatches)
 
-    payload = _authed_get(client).json()
+    payload = _get(client).json()
 
     assert payload["jobs"][0]["candidate_adapter_id"] is None
     assert all(item["training_job_id"] is None for item in payload["adapters"])
 
 
-def _authed_get(client: TestClient, suffix: str = ""):
-    return client.get(
-        f"/api/training/cockpit-summary{suffix}",
-        headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
-    )
+def _get(client: TestClient, suffix: str = ""):
+    return client.get(f"/api/training/cockpit-summary{suffix}")
 
 
 def _client(
@@ -179,7 +174,6 @@ def _client(
     history: list[AdapterActivationRecord] | None = None,
     journal=None,
 ) -> tuple[TestClient, "_Runtime", "_Coordinator"]:
-    monkeypatch.setenv("KAGYA_TEST_ADMIN_TOKEN", ADMIN_TOKEN)
     settings = _settings(tmp_path, split=split)
     app = create_app(settings)
     runtime = _Runtime()
@@ -273,7 +267,6 @@ def _settings(tmp_path: Path, *, split: bool) -> Settings:
             "agent_state": settings.agent_state.model_copy(update={"path": tmp_path / "agent_state.json"}),
             "agent_journal": settings.agent_journal.model_copy(update={"path": tmp_path / "journal.jsonl"}),
             "agent_state_wal": settings.agent_state_wal.model_copy(update={"path": tmp_path / "wal.jsonl"}),
-            "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
         }
     )
 
