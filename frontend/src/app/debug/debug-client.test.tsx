@@ -109,19 +109,19 @@ describe("DebugClient", () => {
     expect(screen.getByText("No DB2 semantic memories retrieved.")).toBeInTheDocument();
   });
 
-  it("shows a clear admin configuration error", async () => {
+  it("shows a clear backend error", async () => {
     fetchMock.mockResolvedValue({
       ok: false,
       status: 503,
       statusText: "Service Unavailable",
-      text: async () => JSON.stringify({ detail: "KAGYA_ADMIN_TOKEN is not configured" }),
+      text: async () => JSON.stringify({ detail: "debug service unavailable" }),
     });
     renderWithQuery();
 
     await userEvent.type(screen.getByPlaceholderText("Debug a message"), "hello");
     await userEvent.click(screen.getByRole("button", { name: "Run Debug Chat" }));
 
-    expect(await screen.findByText("Admin backend is not configured: KAGYA_ADMIN_TOKEN is not configured")).toBeInTheDocument();
+    expect(await screen.findByText("Chat service is temporarily unavailable: debug service unavailable")).toBeInTheDocument();
   });
 
   it("shows fallback model status explicitly", async () => {

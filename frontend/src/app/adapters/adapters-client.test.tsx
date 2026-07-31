@@ -35,15 +35,15 @@ describe("AdaptersClient", () => {
     expect(await screen.findAllByText("No adapters.")).toHaveLength(6);
   });
 
-  it("shows a clear admin access error", async () => {
+  it("shows a clear API error", async () => {
     fetchMock.mockResolvedValue({
       ok: false,
       status: 401,
       statusText: "Unauthorized",
-      text: async () => JSON.stringify({ detail: "Invalid admin token" }),
+      text: async () => JSON.stringify({ detail: "request rejected" }),
     });
     renderWithQuery();
-    expect(await screen.findByText("Admin access denied: Invalid admin token")).toBeInTheDocument();
+    expect(await screen.findByText("401 Unauthorized: request rejected")).toBeInTheDocument();
   });
 
   it.each([

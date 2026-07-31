@@ -211,7 +211,6 @@ observability:
 api:
   host: 127.0.0.1
   port: 8000
-  admin_token_env: KAGYA_ADMIN_TOKEN
   agent_queue_capacity: 32
   chat_job_registry_path: .kagya/chat_jobs.json
   chat_timeout_seconds: 300
@@ -220,30 +219,6 @@ api:
   chat_job_idempotency_retention_seconds: 604800
   chat_job_max_terminal_records: 10000
   chat_job_cleanup_interval_seconds: 60
-  # Optional identity/role sessions are disabled for the private token-only default.
-  admin_auth:
-    enabled: false
-    actor_header: X-KAGYA-Actor
-    role_header: X-KAGYA-Role
-    reauthenticated_at_header: X-KAGYA-Reauthenticated-At
-    session_cookie_name: kagya_admin_session
-    csrf_cookie_name: kagya_admin_csrf
-    csrf_header: X-KAGYA-CSRF-Token
-    reauthentication_max_age_seconds: 300
-    reauthentication_paths:
-      - /api/state/restore
-      - /api/state/reset
-      - /api/state/restore/*
-      - /api/state/backups/*/restore
-      - /api/state/backups/*/rotate
-      - /api/sleep/jobs
-      - /api/sleep/jobs/*
-      - /api/sleep/cleanup
-      - /api/adapters/rollback
-      - /api/adapters/*/activate
-      - /api/values/reset
-      - /api/self-model/rollback
-    allow_loopback_recovery: true
   cors_origins:
     - http://localhost:3000
     - http://127.0.0.1:3000

@@ -1,8 +1,5 @@
 const API_PROXY_BASE_URL = "/api-proxy";
 const ADMIN_PROXY_BASE_URL = "/admin-proxy";
-const ADMIN_AUTH_ENABLED = process.env.NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED === "true";
-let adminSessionPromise: Promise<void> | null = null;
-let adminCsrfToken: string | null = null;
 
 export type Emotion = { valence: number; arousal: number; optimal_loss: number };
 export type ModelInfo = { model_id: string; adapter_id: string | null; adapter_hash: string | null; activation_sequence: number | null; fallback_used: boolean };
@@ -408,7 +405,6 @@ export type RuntimeInfo = {
   fallback_configured: boolean;
   transformers_4bit: boolean;
   qlora_dry_run: boolean;
-  admin_token_configured: boolean;
 };
 export type SystemInfoResponse = { project: string; status: string; build: BuildInfo; runtime: RuntimeInfo };
 export type RuntimeEvent = {
@@ -757,33 +753,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return requestUrl<T>(`${API_PROXY_BASE_URL}${path.replace(/^\/api/, "")}`, init);
 }
 
-async function adminRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  if (ADMIN_AUTH_ENABLED) await initializeAdminSession();
-  const headers = new Headers(init?.headers);
-  if (adminCsrfToken && (init?.method ?? "GET") !== "GET") {
-    headers.set("X-KAGYA-CSRF-Token", adminCsrfToken);
-  }
-  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, { ...init, headers }, true);
+async function privateApiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  return requestUrl<T>(`${ADMIN_PROXY_BASE_URL}${path}`, init);
 }
 
-export function initializeAdminSession(): Promise<void> {
-  adminSessionPromise ??= fetch(`${ADMIN_PROXY_BASE_URL}/auth/session`, {
-    headers: { "Content-Type": "application/json" },
-  }).then(async (response) => {
-    if (!response.ok) {
-      const detail = await readErrorDetail(response);
-      throw new ApiError(formatAdminHttpError(response.status, response.statusText, detail), response.status, response.statusText, detail);
-    }
-    const body = await response.json() as { csrfToken: string };
-    adminCsrfToken = body.csrfToken;
-  }).catch((error) => {
-    adminSessionPromise = null;
-    throw error;
-  });
-  return adminSessionPromise;
-}
-
-async function requestUrl<T>(url: string, init?: RequestInit, admin = false): Promise<T> {
+async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(url, {
@@ -795,9 +769,7 @@ async function requestUrl<T>(url: string, init?: RequestInit, admin = false): Pr
   }
   if (!response.ok) {
     const detail = await readErrorDetail(response);
-    const message = admin
-      ? formatAdminHttpError(response.status, response.statusText, detail)
-      : formatPublicHttpError(response.status, response.statusText, detail);
+    const message = formatPublicHttpError(response.status, response.statusText, detail);
     throw new ApiError(message, response.status, response.statusText, detail);
   }
   return response.json() as Promise<T>;
@@ -901,19 +873,6 @@ async function readErrorDetail(response: Response): Promise<string> {
 function formatPublicHttpError(status: number, statusText: string, detail: string): string {
   if (status === 503) {
     return detail ? `Chat service is temporarily unavailable: ${detail}` : "Chat service is temporarily unavailable.";
-  }
-  if (status >= 500) {
-    return detail ? `Backend failed: ${detail}` : `Backend failed with ${status} ${statusText}.`;
-  }
-  return detail ? `${status} ${statusText}: ${detail}` : `${status} ${statusText}`;
-}
-
-function formatAdminHttpError(status: number, statusText: string, detail: string): string {
-  if (status === 401 || status === 403) {
-    return detail ? `Admin access denied: ${detail}` : "Admin access denied. Check the admin token or private access boundary.";
-  }
-  if (status === 503) {
-    return detail ? `Admin backend is not configured: ${detail}` : "Admin backend is not configured. Check KAGYA_ADMIN_TOKEN.";
   }
   if (status >= 500) {
     return detail ? `Backend failed: ${detail}` : `Backend failed with ${status} ${statusText}.`;
@@ -1347,62 +1306,62 @@ export const api = {
   chatJobResult: (operationId: string) => request<ChatJobResult>(`/api/chat/jobs/${encodeURIComponent(operationId)}/result`),
   cancelChatJob,
   feedback: (body: FeedbackRequest) => request<FeedbackResponse>("/api/feedback", { method: "POST", body: JSON.stringify(body) }),
-  debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
-  emotion: () => adminRequest<Emotion>("/state/emotion"),
-  workingMemory: async () => parseWorkingMemory(await adminRequest<unknown>("/state/working-memory")),
-  contexts: async () => parseContexts(await adminRequest<unknown>("/contexts")),
-  goals: async () => parseGoals(await adminRequest<unknown>("/goals")),
-  commitments: async () => parseCommitments(await adminRequest<unknown>("/commitments")),
-  plans: async () => parsePlans(await adminRequest<unknown>("/plans")),
-  decisions: async () => parseDecisions(await adminRequest<unknown>("/decisions")),
-  cockpitOutbox: async () => parseCockpitOutbox(await adminRequest<unknown>("/outbox/summary")),
-  actionTrace: async () => parseActionTrace(await adminRequest<unknown>("/actions/trace")),
-  memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
-  archiveEpisodeMemory: (episodeId: string) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
-  updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
-  reviewEpisodeMemory: (episodeId: string, body: MemoryReviewUpdate) => adminRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/review`, { method: "POST", body: JSON.stringify(body) }),
-  archiveSemanticMemory: (memoryId: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
-  updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
-  updateSemanticLifecycle: (memoryId: string, action: "archive" | "restore" | "forget", idempotencyKey: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/lifecycle`, { method: "POST", body: JSON.stringify({ action, idempotency_key: idempotencyKey }) }),
-  semanticGraph: (memoryId: string) => adminRequest<{ records: SemanticMemory[] }>(`/memory/semantic/${encodeURIComponent(memoryId)}/graph`),
-  relateSemanticMemory: (memoryId: string, targetId: string, relationship: "merge" | "contradiction" | "supersession" | "correction", idempotencyKey: string) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/relationships`, { method: "POST", body: JSON.stringify({ target_id: targetId, relationship, idempotency_key: idempotencyKey }) }),
-  updateSemanticPolicy: (memoryId: string, body: { confidence: number; validity: "valid" | "disputed" | "invalid"; valid_from?: string | null; valid_until?: string | null; expires_at?: string | null; decay_rate: number; idempotency_key: string }) => adminRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/policy`, { method: "POST", body: JSON.stringify(body) }),
-  createSleepJob: (idempotency_key?: string) => adminRequest<TrainingJob>("/sleep/jobs", { method: "POST", body: JSON.stringify({ idempotency_key }) }),
-  sleepJobs: () => adminRequest<TrainingJobListResponse>("/sleep/jobs"),
-  datasetRevisions: () => adminRequest<{ datasets: DatasetRevisionSummary[] }>("/training/datasets"),
-  datasetRevision: (revision: string) => adminRequest<DatasetRevisionDetail>(`/training/datasets/${encodeURIComponent(revision)}`),
-  datasetRevisionDiff: (fromRevision: string, toRevision: string) => adminRequest<DatasetRevisionDiff>(`/training/datasets/diff?from=${encodeURIComponent(fromRevision)}&to=${encodeURIComponent(toRevision)}`),
-  cancelSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
-  retrySleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
-  reconcileSleepJob: (jobId: string) => adminRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/reconcile`, { method: "POST" }),
-  reconcileSleepJobs: () => adminRequest<{ jobs: TrainingJob[]; orphan_result_job_ids: string[]; orphan_remote_job_ids: string[] }>("/sleep/reconcile", { method: "POST" }),
-  cleanupSleepArtifacts: () => adminRequest<{ removed: string[]; remote_removed: string[]; retention_days: number }>("/sleep/cleanup", { method: "POST" }),
-  adapters: () => adminRequest<AdapterListResponse>("/adapters"),
-  adapterProvenance: (adapterId: string) => adminRequest<AdapterProvenance>(`/adapters/${encodeURIComponent(adapterId)}/provenance`),
-  adapterRuntime: () => adminRequest<AdapterRuntimeState>("/adapters/runtime"),
-  evaluateAdapter: (adapterId: string) => adminRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({}) }),
-  adapterBehavioralStatus: (adapterId: string) => adminRequest<AdapterBehavioralStatus>(`/adapters/${encodeURIComponent(adapterId)}/behavioral-evaluation-status`),
-  trialAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),
-  approveAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
-  activateAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
-  rollbackAdapter: () => adminRequest<AdapterActivationResponse>("/adapters/rollback", { method: "POST" }),
-  rejectAdapter: (adapterId: string) => adminRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
-  evaluations: () => adminRequest<EvaluationResultListResponse>("/evaluations"),
-  adapterEvaluationHistory: (adapterId: string) => adminRequest<AdapterEvaluationHistoryResponse>(`/evaluations/adapters/${encodeURIComponent(adapterId)}/history`),
-  evaluationResult: (filename: string) => adminRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
-  behavioralEvaluations: () => adminRequest<BehavioralEvaluationHistoryResponse>("/evaluations/behavioral"),
-  behavioralEvaluation: (evaluationId: string) => adminRequest<BehavioralEvaluationDetail>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}`),
-  behavioralFailure: (evaluationId: string, scenarioId: string) => adminRequest<BehavioralFailureArtifact>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/failures/${encodeURIComponent(scenarioId)}.json`),
-  rerunBehavioralEvaluation: (evaluationId: string, rerunId: string) => adminRequest<BehavioralRerunResponse>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/rerun`, { method: "POST", body: JSON.stringify({ rerun_id: rerunId }) }),
+  debugChat: (body: ChatRequest) => privateApiRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
+  emotion: () => privateApiRequest<Emotion>("/state/emotion"),
+  workingMemory: async () => parseWorkingMemory(await privateApiRequest<unknown>("/state/working-memory")),
+  contexts: async () => parseContexts(await privateApiRequest<unknown>("/contexts")),
+  goals: async () => parseGoals(await privateApiRequest<unknown>("/goals")),
+  commitments: async () => parseCommitments(await privateApiRequest<unknown>("/commitments")),
+  plans: async () => parsePlans(await privateApiRequest<unknown>("/plans")),
+  decisions: async () => parseDecisions(await privateApiRequest<unknown>("/decisions")),
+  cockpitOutbox: async () => parseCockpitOutbox(await privateApiRequest<unknown>("/outbox/summary")),
+  actionTrace: async () => parseActionTrace(await privateApiRequest<unknown>("/actions/trace")),
+  memorySearch: (query: string) => privateApiRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
+  archiveEpisodeMemory: (episodeId: string) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
+  updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
+  reviewEpisodeMemory: (episodeId: string, body: MemoryReviewUpdate) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/review`, { method: "POST", body: JSON.stringify(body) }),
+  archiveSemanticMemory: (memoryId: string) => privateApiRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/archive`, { method: "POST" }),
+  updateSemanticMemoryMetadata: (memoryId: string, body: MemoryMetadataUpdate) => privateApiRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),
+  updateSemanticLifecycle: (memoryId: string, action: "archive" | "restore" | "forget", idempotencyKey: string) => privateApiRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/lifecycle`, { method: "POST", body: JSON.stringify({ action, idempotency_key: idempotencyKey }) }),
+  semanticGraph: (memoryId: string) => privateApiRequest<{ records: SemanticMemory[] }>(`/memory/semantic/${encodeURIComponent(memoryId)}/graph`),
+  relateSemanticMemory: (memoryId: string, targetId: string, relationship: "merge" | "contradiction" | "supersession" | "correction", idempotencyKey: string) => privateApiRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/relationships`, { method: "POST", body: JSON.stringify({ target_id: targetId, relationship, idempotency_key: idempotencyKey }) }),
+  updateSemanticPolicy: (memoryId: string, body: { confidence: number; validity: "valid" | "disputed" | "invalid"; valid_from?: string | null; valid_until?: string | null; expires_at?: string | null; decay_rate: number; idempotency_key: string }) => privateApiRequest<SemanticMemory>(`/memory/semantic/${encodeURIComponent(memoryId)}/policy`, { method: "POST", body: JSON.stringify(body) }),
+  createSleepJob: (idempotency_key?: string) => privateApiRequest<TrainingJob>("/sleep/jobs", { method: "POST", body: JSON.stringify({ idempotency_key }) }),
+  sleepJobs: () => privateApiRequest<TrainingJobListResponse>("/sleep/jobs"),
+  datasetRevisions: () => privateApiRequest<{ datasets: DatasetRevisionSummary[] }>("/training/datasets"),
+  datasetRevision: (revision: string) => privateApiRequest<DatasetRevisionDetail>(`/training/datasets/${encodeURIComponent(revision)}`),
+  datasetRevisionDiff: (fromRevision: string, toRevision: string) => privateApiRequest<DatasetRevisionDiff>(`/training/datasets/diff?from=${encodeURIComponent(fromRevision)}&to=${encodeURIComponent(toRevision)}`),
+  cancelSleepJob: (jobId: string) => privateApiRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }),
+  retrySleepJob: (jobId: string) => privateApiRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
+  reconcileSleepJob: (jobId: string) => privateApiRequest<TrainingJob>(`/sleep/jobs/${encodeURIComponent(jobId)}/reconcile`, { method: "POST" }),
+  reconcileSleepJobs: () => privateApiRequest<{ jobs: TrainingJob[]; orphan_result_job_ids: string[]; orphan_remote_job_ids: string[] }>("/sleep/reconcile", { method: "POST" }),
+  cleanupSleepArtifacts: () => privateApiRequest<{ removed: string[]; remote_removed: string[]; retention_days: number }>("/sleep/cleanup", { method: "POST" }),
+  adapters: () => privateApiRequest<AdapterListResponse>("/adapters"),
+  adapterProvenance: (adapterId: string) => privateApiRequest<AdapterProvenance>(`/adapters/${encodeURIComponent(adapterId)}/provenance`),
+  adapterRuntime: () => privateApiRequest<AdapterRuntimeState>("/adapters/runtime"),
+  evaluateAdapter: (adapterId: string) => privateApiRequest<AdapterEvaluateResponse>(`/adapters/${adapterId}/evaluate`, { method: "POST", body: JSON.stringify({}) }),
+  adapterBehavioralStatus: (adapterId: string) => privateApiRequest<AdapterBehavioralStatus>(`/adapters/${encodeURIComponent(adapterId)}/behavioral-evaluation-status`),
+  trialAdapter: (adapterId: string) => privateApiRequest<Adapter>(`/adapters/${adapterId}/trial`, { method: "POST" }),
+  approveAdapter: (adapterId: string) => privateApiRequest<Adapter>(`/adapters/${adapterId}/approve`, { method: "POST" }),
+  activateAdapter: (adapterId: string) => privateApiRequest<Adapter>(`/adapters/${adapterId}/activate`, { method: "POST" }),
+  rollbackAdapter: () => privateApiRequest<AdapterActivationResponse>("/adapters/rollback", { method: "POST" }),
+  rejectAdapter: (adapterId: string) => privateApiRequest<Adapter>(`/adapters/${adapterId}/reject`, { method: "POST" }),
+  evaluations: () => privateApiRequest<EvaluationResultListResponse>("/evaluations"),
+  adapterEvaluationHistory: (adapterId: string) => privateApiRequest<AdapterEvaluationHistoryResponse>(`/evaluations/adapters/${encodeURIComponent(adapterId)}/history`),
+  evaluationResult: (filename: string) => privateApiRequest<EvaluationResultDetail>(`/evaluations/${encodeURIComponent(filename)}`),
+  behavioralEvaluations: () => privateApiRequest<BehavioralEvaluationHistoryResponse>("/evaluations/behavioral"),
+  behavioralEvaluation: (evaluationId: string) => privateApiRequest<BehavioralEvaluationDetail>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}`),
+  behavioralFailure: (evaluationId: string, scenarioId: string) => privateApiRequest<BehavioralFailureArtifact>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/failures/${encodeURIComponent(scenarioId)}.json`),
+  rerunBehavioralEvaluation: (evaluationId: string, rerunId: string) => privateApiRequest<BehavioralRerunResponse>(`/evaluations/behavioral/${encodeURIComponent(evaluationId)}/rerun`, { method: "POST", body: JSON.stringify({ rerun_id: rerunId }) }),
   systemInfo: () => requestUrl<SystemInfoResponse>("/api-proxy/system/info"),
-  runtimeEvents: () => adminRequest<RuntimeEventListResponse>("/system/events"),
-  eventJournal: () => adminRequest<JournalRecordListResponse>("/system/journal"),
-  experiences: () => adminRequest<ExperienceListResponse>("/experiences"),
-  experience: (experienceId: string) => adminRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
-  beliefs: (activeOnly = false) => adminRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
-  decisionExplanations: async () => parseDecisionExplanationResponse(await adminRequest<unknown>("/decisions/explanations")),
-  motivation: () => adminRequest<MotivationState>("/motivation"),
-  outboxMessages: () => adminRequest<OutboxMessageListResponse>("/outbox/messages"),
-  deliverOutbox: () => adminRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),
-  respondToOutbox: (messageId: string, kind: "read" | "reply" | "approval" | "reject", text?: string) => adminRequest<OutboxMessage>(`/outbox/messages/${encodeURIComponent(messageId)}/responses`, { method: "POST", body: JSON.stringify({ kind, text }) }),
+  runtimeEvents: () => privateApiRequest<RuntimeEventListResponse>("/system/events"),
+  eventJournal: () => privateApiRequest<JournalRecordListResponse>("/system/journal"),
+  experiences: () => privateApiRequest<ExperienceListResponse>("/experiences"),
+  experience: (experienceId: string) => privateApiRequest<Experience>(`/experiences/${encodeURIComponent(experienceId)}`),
+  beliefs: (activeOnly = false) => privateApiRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
+  decisionExplanations: async () => parseDecisionExplanationResponse(await privateApiRequest<unknown>("/decisions/explanations")),
+  motivation: () => privateApiRequest<MotivationState>("/motivation"),
+  outboxMessages: () => privateApiRequest<OutboxMessageListResponse>("/outbox/messages"),
+  deliverOutbox: () => privateApiRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),
+  respondToOutbox: (messageId: string, kind: "read" | "reply" | "approval" | "reject", text?: string) => privateApiRequest<OutboxMessage>(`/outbox/messages/${encodeURIComponent(messageId)}/responses`, { method: "POST", body: JSON.stringify({ kind, text }) }),
 };

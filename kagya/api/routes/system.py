@@ -11,7 +11,6 @@ from kagya.api.dependencies import (
     get_api_settings,
     get_operational_telemetry,
     get_runtime_event_log,
-    require_admin,
 )
 from kagya.api.observability import OperationalTelemetry, RuntimeEvent, RuntimeEventLog
 from kagya.api.schemas.system import (
@@ -49,7 +48,6 @@ def system_info(settings: Settings = Depends(get_api_settings)) -> SystemInfoRes
             fallback_configured=bool(settings.model.fallback_id),
             transformers_4bit=settings.model.load_in_4bit,
             qlora_dry_run=settings.qlora.dry_run,
-            admin_token_configured=bool(os.getenv(settings.api.admin_token_env)),
         ),
     )
 
@@ -57,7 +55,6 @@ def system_info(settings: Settings = Depends(get_api_settings)) -> SystemInfoRes
 @router.get(
     "/events",
     response_model=RuntimeEventListResponse,
-    dependencies=[Depends(require_admin)],
 )
 def runtime_events(
     request: Request,
@@ -75,7 +72,6 @@ def runtime_events(
 @router.get(
     "/journal",
     response_model=JournalRecordListResponse,
-    dependencies=[Depends(require_admin)],
 )
 def event_journal(
     request: Request,
@@ -89,7 +85,7 @@ def event_journal(
     )
 
 
-@router.get("/metrics", dependencies=[Depends(require_admin)])
+@router.get("/metrics")
 def operational_metrics(
     telemetry: OperationalTelemetry = Depends(get_operational_telemetry),
 ) -> Response:
@@ -102,7 +98,7 @@ def operational_metrics(
     )
 
 
-@router.get("/telemetry", dependencies=[Depends(require_admin)])
+@router.get("/telemetry")
 def otlp_telemetry(
     telemetry: OperationalTelemetry = Depends(get_operational_telemetry),
 ) -> dict:
@@ -112,7 +108,7 @@ def otlp_telemetry(
     return telemetry.otlp_json()
 
 
-@router.get("/traces", dependencies=[Depends(require_admin)])
+@router.get("/traces")
 def operational_traces(
     limit: int = Query(default=100, ge=1, le=1000),
     event_id: str | None = Query(default=None, max_length=128),

@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from kagya.api.dependencies import (
     get_runtime_event_log,
     get_sleep_coordinator,
-    require_admin,
 )
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.sleep import (
@@ -19,9 +18,7 @@ from kagya.api.schemas.sleep import (
 from kagya.training import SleepCoordinator
 
 
-router = APIRouter(
-    prefix="/api/sleep", tags=["sleep"], dependencies=[Depends(require_admin)]
-)
+router = APIRouter(prefix="/api/sleep", tags=["sleep"])
 
 
 @router.post("/jobs", response_model=TrainingJobResponse)

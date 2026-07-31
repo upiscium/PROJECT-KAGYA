@@ -300,10 +300,22 @@ def test_api_settings_come_from_config() -> None:
 
     assert settings.api.host == raw_config["api"]["host"]
     assert settings.api.port == raw_config["api"]["port"]
-    assert settings.api.admin_token_env == raw_config["api"]["admin_token_env"]
-    assert settings.api.admin_auth.enabled is False
-    assert settings.api.admin_auth.session_cookie_name == "kagya_admin_session"
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
+
+
+def test_legacy_api_auth_config_is_migrated(tmp_path: Path) -> None:
+    raw_config = read_raw_config()
+    raw_config["api"]["admin_token_env"] = "KAGYA_ADMIN_TOKEN"
+    raw_config["api"]["admin_auth"] = {"enabled": False}
+    config_path = tmp_path / "legacy.yaml"
+    config_path.write_text(yaml.safe_dump(raw_config), encoding="utf-8")
+
+    settings, notes = load_settings_with_notes(config_path)
+
+    assert "removed deprecated api.admin_token_env" in notes
+    assert "removed deprecated api.admin_auth" in notes
+    assert not hasattr(settings.api, "admin_token_env")
+    assert not hasattr(settings.api, "admin_auth")
 
 
 def test_working_memory_capacities_come_from_config() -> None:

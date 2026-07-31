@@ -8,12 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.actions import ActionExecutionLayer
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_action_execution,
     get_agent_runtime,
     get_outbox,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.outbox import (
     AcknowledgmentStatus,
@@ -90,7 +90,7 @@ class CockpitOutboxSummaryResponse(BaseModel):
 router = APIRouter(prefix="/api/outbox", tags=["outbox"])
 
 
-@router.get("/messages", dependencies=[Depends(require_admin)])
+@router.get("/messages")
 def list_messages(
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -107,7 +107,6 @@ def list_messages(
 @router.get(
     "/summary",
     response_model=CockpitOutboxSummaryResponse,
-    dependencies=[Depends(require_admin)],
 )
 def cockpit_summary(
     limit: int = Query(default=50, ge=1, le=200),
@@ -136,7 +135,7 @@ def cockpit_summary(
     ).value
 
 
-@router.post("/messages", dependencies=[Depends(require_admin)])
+@router.post("/messages")
 def enqueue_message(
     body: EnqueueRequest,
     outbox: Outbox = Depends(get_outbox),
@@ -168,7 +167,7 @@ def enqueue_message(
     return message.model_dump(mode="json")
 
 
-@router.post("/deliveries", dependencies=[Depends(require_admin)])
+@router.post("/deliveries")
 def deliver_messages(
     limit: int = 20,
     outbox: Outbox = Depends(get_outbox),
@@ -190,7 +189,7 @@ def deliver_messages(
 def respond_to_message(
     message_id: str,
     body: ResponseRequest,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     outbox: Outbox = Depends(get_outbox),
     execution: ActionExecutionLayer = Depends(get_action_execution),
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -204,14 +203,14 @@ def respond_to_message(
             execution.resolve_approval(
                 action_id,
                 approved=body.kind == "approval",
-                actor_id=actor.actor_id,
+                actor_id=operator.actor_id,
                 reason=body.text,
             )
         event = current_agent_event()
         return outbox.respond(
             message_id,
             kind=body.kind,
-            actor_id=actor.actor_id,
+            actor_id=operator.actor_id,
             text=body.text,
             event_id=None if event is None else event.event_id,
             event_sequence=None if event is None else event.processing_sequence,
@@ -231,7 +230,7 @@ def respond_to_message(
     return message.model_dump(mode="json")
 
 
-@router.post("/messages/{message_id}/delivery-failures", dependencies=[Depends(require_admin)])
+@router.post("/messages/{message_id}/delivery-failures")
 def record_delivery_failure(
     message_id: str,
     body: FailureRequest,

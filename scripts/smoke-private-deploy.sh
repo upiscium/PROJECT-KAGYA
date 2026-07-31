@@ -2,13 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${1:-http://127.0.0.1:8080}"
-ADMIN_TOKEN="${KAGYA_ADMIN_TOKEN:-}"
 CHECK_ADMIN_PROXY="${CHECK_ADMIN_PROXY:-1}"
-
-if [[ -z "${ADMIN_TOKEN}" ]]; then
-  printf 'KAGYA_ADMIN_TOKEN must be set for private deployment smoke checks.\n' >&2
-  exit 2
-fi
 
 status_code() {
   local method="$1"
@@ -35,9 +29,7 @@ expect_status 200 GET "${BASE_URL}/health"
 expect_status 200 POST "${BASE_URL}/api/chat" \
   -H 'Content-Type: application/json' \
   --data '{"message":"deployment smoke","attachments":[],"debug":false}'
-expect_status 401 GET "${BASE_URL}/api/state/emotion"
-expect_status 200 GET "${BASE_URL}/api/state/emotion" \
-  -H "X-KAGYA-Admin-Token: ${ADMIN_TOKEN}"
+expect_status 200 GET "${BASE_URL}/api/state/emotion"
 
 if [[ "${CHECK_ADMIN_PROXY}" != "0" ]]; then
   expect_status 200 GET "${BASE_URL}/admin-proxy/state/emotion"

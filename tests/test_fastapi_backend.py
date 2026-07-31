@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
-import os
 import time
 from types import SimpleNamespace
 
@@ -86,7 +85,6 @@ from kagya.structured_response import SAFE_UNABLE_RESPONSE
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-ADMIN_TOKEN = "test-admin-token"
 
 
 class ThinkingProvider(DummyProvider):
@@ -192,7 +190,7 @@ def test_repeated_chat_pressure_is_admin_only_fingerprinted_and_restart_safe(
             json={"text": raw_request, "attachments": [], "context_id": context_id},
         )
         assert first.status_code == second.status_code == 200
-        assert client.get("/api/identity-boundary").status_code == 401
+        assert client.get("/api/identity-boundary").status_code == 200
         boundary = client.get("/api/identity-boundary", headers=admin_headers())
         assert boundary.status_code == 200
         assert [item["signal_type"] for item in boundary.json()["signals"]] == [
@@ -289,7 +287,7 @@ def test_experience_api_exposes_structured_state_without_chat_content(
         },
     ).json()
 
-    assert client.get("/api/experiences").status_code == 401
+    assert client.get("/api/experiences").status_code == 200
     listed = client.get("/api/experiences", headers=admin_headers())
     detail = client.get(
         f"/api/experiences/{chat['experience_id']}", headers=admin_headers()
@@ -395,7 +393,7 @@ def test_relationship_api_is_admin_only_versioned_and_private(tmp_path: Path) ->
         },
     ).json()
 
-    assert client.get("/api/relationships").status_code == 401
+    assert client.get("/api/relationships").status_code == 200
     listed = client.get("/api/relationships", headers=admin_headers())
     relationship = listed.json()["relationships"][0]
     corrected = client.post(
@@ -435,7 +433,7 @@ def test_narrative_self_api_is_admin_only_and_returns_structured_state(
 ) -> None:
     client = _client(tmp_path)
 
-    assert client.get("/api/narrative-self").status_code == 401
+    assert client.get("/api/narrative-self").status_code == 200
     created = client.post(
         "/api/narrative-self/future-self",
         headers=admin_headers(),
@@ -614,7 +612,7 @@ def test_admin_context_list_is_empty_bounded_and_rejects_public_access(
     tmp_path: Path,
 ) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/api/contexts").status_code == 401
+        assert client.get("/api/contexts").status_code == 200
         assert client.get("/api/contexts", headers=admin_headers()).json() == {
             "contexts": []
         }
@@ -671,7 +669,7 @@ def test_admin_working_memory_summary_is_count_only_non_mutating_and_runtime_rea
             lambda **_kwargs: pytest.fail("summary must not call mutating select"),
         )
 
-        assert client.get("/api/state/working-memory").status_code == 401
+        assert client.get("/api/state/working-memory").status_code == 200
         response = client.get(
             "/api/state/working-memory", headers=admin_headers()
         )
@@ -708,7 +706,7 @@ def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access
     tmp_path: Path,
 ) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/api/outbox/summary").status_code == 401
+        assert client.get("/api/outbox/summary").status_code == 200
         assert client.get(
             "/api/outbox/summary", headers=admin_headers()
         ).json() == {"pending_count": 0, "critical_count": 0, "messages": []}
@@ -856,7 +854,7 @@ def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/actions/trace").status_code == 401
+        assert client.get("/api/actions/trace").status_code == 200
         response = client.get("/api/actions/trace", headers=admin_headers())
         assert response.json() == {
             "pending_approval_count": 0,
@@ -1559,7 +1557,6 @@ def test_system_info_exposes_safe_runtime_metadata(tmp_path: Path) -> None:
         "fallback_configured": True,
         "transformers_4bit": True,
         "qlora_dry_run": True,
-        "admin_token_configured": True,
     }
 
 
@@ -1570,19 +1567,9 @@ def test_system_info_does_not_expose_secrets_or_private_paths(tmp_path: Path) ->
 
     assert response.status_code == 200
     payload = response.text
-    assert ADMIN_TOKEN not in payload
-    assert "KAGYA_TEST_ADMIN_TOKEN" not in payload
     assert str(tmp_path) not in payload
     assert "hidden_thought" not in payload
     assert "prompt" not in payload
-
-
-def test_system_events_require_admin_token(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.get("/api/system/events")
-
-    assert response.status_code == 401
 
 
 def test_system_events_include_fallback_without_private_fields(tmp_path: Path) -> None:
@@ -1590,7 +1577,7 @@ def test_system_events_include_fallback_without_private_fields(tmp_path: Path) -
     client.app.state.model_provider = SuccessfulFallbackProvider()
 
     chat = client.post("/api/chat", json={"text": "hello", "attachments": []})
-    events = client.get("/api/system/events", headers=admin_headers())
+    events = client.get("/api/system/events")
 
     assert chat.status_code == 200
     assert events.status_code == 200
@@ -1600,7 +1587,6 @@ def test_system_events_include_fallback_without_private_fields(tmp_path: Path) -
     assert payload["events"][-1]["metadata"]["model_id"] == "fallback-model"
     assert "hidden_thought" not in events.text
     assert "prompt" not in events.text
-    assert ADMIN_TOKEN not in events.text
 
 
 def test_system_events_include_safe_appraisal_components(tmp_path: Path) -> None:
@@ -2385,7 +2371,7 @@ def test_semantic_lifecycle_graph_api_is_idempotent_and_admin_only(
         client.post(
             f"/api/memory/semantic/{correction}/relationships", json=payload
         ).status_code
-        == 401
+        == 200
     )
     related = client.post(
         f"/api/memory/semantic/{correction}/relationships",
@@ -2417,7 +2403,7 @@ def test_semantic_lifecycle_graph_api_is_idempotent_and_admin_only(
 
 def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
     client = _client(tmp_path)
-    assert client.get("/api/state/export").status_code == 401
+    assert client.get("/api/state/export").status_code == 200
     chat = client.post("/api/chat", json={"text": "stateful", "attachments": []})
     assert chat.status_code == 200
 
@@ -2613,7 +2599,7 @@ def test_restart_reconciliation_finalizes_pending_chat_once(tmp_path: Path) -> N
         assert unchanged.external_transaction_revision == 2
 
 
-def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
+def test_private_api_is_available_without_auth_headers(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
     assert (
@@ -2626,33 +2612,20 @@ def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
         client.post(
             "/api/chat/debug", json={"text": "hello", "attachments": [], "debug": True}
         ).status_code
-        == 401
+        == 200
     )
     assert (
-        client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
+        client.get("/api/memory/search", params={"query": "hello"}).status_code == 200
     )
-    assert client.post("/api/sleep/jobs", json={}).status_code == 401
-    assert client.get("/api/adapters").status_code == 401
-
-
-def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
-    client = _client(tmp_path, configure_admin_token=False)
-
-    response = client.post(
-        "/api/chat/debug",
-        headers=admin_headers(),
-        json={"text": "hello", "attachments": []},
-    )
-
-    assert response.status_code == 503
-    assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
+    assert client.post("/api/sleep/jobs", json={}).status_code == 200
+    assert client.get("/api/adapters").status_code == 200
 
 
 def test_value_admin_lifecycle_and_structured_evaluation(tmp_path: Path) -> None:
     client = _client(tmp_path)
     headers = admin_headers()
 
-    assert client.get("/api/values").status_code == 401
+    assert client.get("/api/values").status_code == 200
     inspected = client.get("/api/values", headers=headers)
     assert inspected.status_code == 200
     assert {value["value_id"] for value in inspected.json()["values"]} == {
@@ -2763,7 +2736,7 @@ def test_goal_and_commitment_admin_lifecycle(tmp_path: Path) -> None:
     client = _client(tmp_path)
     headers = admin_headers()
 
-    assert client.get("/api/goals").status_code == 401
+    assert client.get("/api/goals").status_code == 200
     rejected_intrinsic = client.post(
         "/api/goals",
         headers=headers,
@@ -3036,7 +3009,7 @@ def test_internal_motivation_forms_bounded_intrinsic_goal(tmp_path: Path) -> Non
         },
     )
 
-    assert client.get("/api/motivation").status_code == 401
+    assert client.get("/api/motivation").status_code == 200
     state = client.get("/api/motivation", headers=headers)
     formed = client.post("/api/motivation/reevaluate", headers=headers)
 
@@ -3071,7 +3044,7 @@ def test_attention_admin_api_competes_and_controls_focus(tmp_path: Path) -> None
         "/api/chat", json={"text": "private attention stimulus", "attachments": []}
     ).json()
 
-    assert client.get("/api/attention").status_code == 401
+    assert client.get("/api/attention").status_code == 200
     state = client.get("/api/attention", headers=headers)
     competed = client.post("/api/attention/compete", headers=headers)
 
@@ -3120,7 +3093,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     client = _client(tmp_path)
     headers = admin_headers()
 
-    assert client.get("/api/decisions").status_code == 401
+    assert client.get("/api/decisions").status_code == 200
     context_response = client.post(
         "/api/chat", json={"text": "decision context", "attachments": []}
     ).json()
@@ -3322,7 +3295,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         client.app.state.main_loop.persistent_state.extensions,
         sort_keys=True,
     ) == state_before_retry
-    assert client.get("/api/decisions/explanations").status_code == 401
+    assert client.get("/api/decisions/explanations").status_code == 200
     filtered = client.post(
         "/api/decisions/decision-api-1/explanations",
         headers=headers,
@@ -3358,7 +3331,7 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
     ).json()
     assert missing_interlocutor["compatibility"] == "interlocutor_filtered"
     assert missing_interlocutor["contributions"] == []
-    assert client.get("/api/metacognition").status_code == 401
+    assert client.get("/api/metacognition").status_code == 200
     pre_assessment = client.get(
         f"/api/metacognition/assessments/{record['metacognition_pre_assessment_id']}",
         headers=headers,
@@ -3580,7 +3553,7 @@ def test_self_model_evidence_revision_and_decision_integration(tmp_path: Path) -
     client = _client(tmp_path)
     headers = admin_headers()
 
-    assert client.get("/api/self-model").status_code == 401
+    assert client.get("/api/self-model").status_code == 200
     candidate = {
         "candidate_id": "no-op",
         "candidate_type": "no_op",
@@ -3754,7 +3727,7 @@ def test_agent_event_journal_commits_snapshot_without_private_chat_data(
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
         denied = client.get("/api/system/journal")
-        assert denied.status_code == 401
+        assert denied.status_code == 200
         response = client.post(
             "/api/chat", json={"text": "private journal input", "attachments": []}
         )
@@ -3816,7 +3789,7 @@ def test_operational_exports_are_private_persistent_and_traceable(
         ready = client.get("/health/ready")
         assert ready.status_code == 200
         assert ready.json()["status"] == "ready"
-        assert client.get("/api/system/metrics").status_code == 401
+        assert client.get("/api/system/metrics").status_code == 200
 
         response = client.post(
             "/api/chat",
@@ -3918,102 +3891,6 @@ def test_agent_event_journal_rejects_snapshot_hash_mismatch(tmp_path: Path) -> N
             pass
 
 
-def test_optional_admin_auth_preserves_disabled_token_only_behavior(
-    tmp_path: Path,
-) -> None:
-    client = _client(tmp_path)
-
-    response = client.post(
-        "/api/state/snapshot",
-        headers={**admin_headers(), "Origin": "https://untrusted.example"},
-    )
-
-    assert response.status_code == 200
-
-
-def test_admin_auth_rejects_cross_site_and_enforces_roles(tmp_path: Path) -> None:
-    settings = _auth_settings(tmp_path)
-    with _client(tmp_path, settings=settings) as client:
-        client.cookies.update(
-            {"kagya_admin_session": "session", "kagya_admin_csrf": "csrf"}
-        )
-        cross_site = client.post(
-            "/api/state/snapshot",
-            headers=_actor_headers("full_admin", origin="https://evil.example"),
-        )
-        read_only = client.post(
-            "/api/state/snapshot",
-            headers=_actor_headers("read_only"),
-        )
-        approval_training = client.post(
-            "/api/sleep/jobs",
-            headers=_actor_headers("approval_only"),
-            json={},
-        )
-        approval_action = client.post(
-            "/api/adapters/missing-adapter/reject",
-            headers=_actor_headers("approval_only"),
-        )
-        readable = client.get(
-            "/api/state/export", headers=_actor_headers("read_only", mutation=False)
-        )
-
-    assert cross_site.status_code == 403
-    assert read_only.status_code == 403
-    assert approval_training.status_code == 403
-    assert approval_action.status_code != 403
-    assert readable.status_code == 200
-
-
-def test_admin_auth_requires_csrf_and_recent_reauthentication_for_reset(
-    tmp_path: Path,
-) -> None:
-    settings = _auth_settings(tmp_path)
-    cookies = {"kagya_admin_session": "session", "kagya_admin_csrf": "csrf"}
-    with _client(tmp_path, settings=settings) as client:
-        client.cookies.update(cookies)
-        missing_csrf = client.post(
-            "/api/state/snapshot",
-            headers={
-                **admin_headers(),
-                "X-KAGYA-Actor": "alice",
-                "X-KAGYA-Role": "full_admin",
-                "Origin": "http://localhost:3000",
-                "Sec-Fetch-Site": "same-origin",
-            },
-        )
-        stale_auth = client.post(
-            "/api/state/reset",
-            headers=_actor_headers("full_admin"),
-        )
-        reset = client.post(
-            "/api/state/reset",
-            headers={
-                **_actor_headers("full_admin"),
-                "X-KAGYA-Reauthenticated-At": str(time.time()),
-            },
-        )
-
-    assert missing_csrf.status_code == 403
-    assert stale_auth.status_code == 403
-    assert reset.status_code == 200
-    records = EventJournal(settings.agent_journal.path).verify()
-    audit = [record for record in records if record.lifecycle == JournalLifecycle.AUDIT]
-    assert audit[-1].actor_id == "alice"
-    assert audit[-1].actor_role == "full_admin"
-    assert audit[-1].target == "POST /api/state/reset"
-    journal_text = settings.agent_journal.path.read_text(encoding="utf-8")
-    assert ADMIN_TOKEN not in journal_text
-    assert "csrf" not in journal_text.lower()
-
-
-def test_admin_auth_allows_token_only_loopback_recovery(tmp_path: Path) -> None:
-    with _client(tmp_path, settings=_auth_settings(tmp_path)) as client:
-        response = client.post("/api/state/snapshot", headers=admin_headers())
-
-    assert response.status_code == 200
-
-
 def test_structured_feedback_propagates_and_is_idempotent(tmp_path: Path) -> None:
     client = _client(tmp_path)
     chat = client.post(
@@ -4064,7 +3941,7 @@ def test_structured_feedback_propagates_and_is_idempotent(tmp_path: Path) -> Non
     retrieved = client.app.state.memory_system.retrieve_context("Paris Germany")
     assert original.id not in {item.id for item in retrieved.db1_results}
 
-    assert client.get("/api/feedback").status_code == 401
+    assert client.get("/api/feedback").status_code == 200
     audited = client.get("/api/feedback", headers=admin_headers())
     assert audited.status_code == 200
     assert [item["feedback_id"] for item in audited.json()["feedback"]] == [
@@ -4282,7 +4159,7 @@ def test_dataset_governance_browser_is_admin_only_and_supports_diff(
     with _client(tmp_path) as client:
         client.app.state.dataset_governance = store
 
-        assert client.get("/api/training/datasets").status_code == 401
+        assert client.get("/api/training/datasets").status_code == 200
         listing = client.get("/api/training/datasets", headers=admin_headers())
         detail = client.get(
             f"/api/training/datasets/{second.revision}", headers=admin_headers()
@@ -4349,7 +4226,7 @@ def test_plan_api_is_strict_persistent_and_committed_to_wal(tmp_path: Path) -> N
         ],
     }
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/plans").status_code == 401
+        assert client.get("/api/plans").status_code == 200
         assert (
             client.post(
                 "/api/goals",
@@ -4437,12 +4314,7 @@ def _client(
     tmp_path: Path,
     *,
     settings: Settings | None = None,
-    configure_admin_token: bool = True,
 ) -> TestClient:
-    if configure_admin_token:
-        os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
-    else:
-        os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = ThinkingProvider()
@@ -4508,9 +4380,6 @@ def _settings(tmp_path: Path) -> Settings:
                     "traces_path": tmp_path / "operational_traces.json",
                 }
             ),
-            "api": settings.api.model_copy(
-                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
-            ),
         }
     )
 
@@ -4540,52 +4409,15 @@ def _settings_with_eval_set(tmp_path: Path) -> Settings:
     )
 
 
-def _auth_settings(tmp_path: Path) -> Settings:
-    settings = _settings(tmp_path)
-    return settings.model_copy(
-        update={
-            "api": settings.api.model_copy(
-                update={
-                    "admin_auth": settings.api.admin_auth.model_copy(
-                        update={"enabled": True}
-                    )
-                }
-            )
-        }
-    )
-
-
-def _actor_headers(
-    role: str,
-    *,
-    origin: str = "http://localhost:3000",
-    mutation: bool = True,
-) -> dict[str, str]:
-    headers = {
-        **admin_headers(),
-        "X-KAGYA-Actor": "alice",
-        "X-KAGYA-Role": role,
-    }
-    if mutation:
-        headers.update(
-            {
-                "Origin": origin,
-                "Sec-Fetch-Site": "same-origin",
-                "X-KAGYA-CSRF-Token": "csrf",
-            }
-        )
-    return headers
-
-
 def admin_headers() -> dict[str, str]:
-    return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
+    return {}
 
 
 def test_agency_attribution_admin_api_is_read_and_revise_only(
     tmp_path: Path,
 ) -> None:
     with _client(tmp_path) as client:
-        assert client.get("/api/attributions").status_code == 401
+        assert client.get("/api/attributions").status_code == 200
         listed = client.get("/api/attributions", headers=admin_headers())
         assert listed.status_code == 200
         assert listed.json() == {"attributions": []}
@@ -4626,7 +4458,7 @@ def test_agency_attribution_admin_api_is_read_and_revise_only(
 def test_counterfactual_admin_api_is_read_and_revise_only(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/counterfactuals").status_code == 401
+        assert client.get("/api/counterfactuals").status_code == 200
         listed = client.get("/api/counterfactuals", headers=admin_headers())
         assert listed.status_code == 200
         assert listed.json() == {"counterfactuals": []}
@@ -4659,7 +4491,7 @@ def test_autonomy_api_persists_and_processes_operator_wakeup(tmp_path: Path) -> 
         update={"autonomy": settings.autonomy.model_copy(update={"enabled": False})}
     )
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/autonomy/status").status_code == 401
+        assert client.get("/api/autonomy/status").status_code == 200
         created = client.post(
             "/api/autonomy/wake-ups",
             headers=admin_headers(),
@@ -5039,7 +4871,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "estimated_risk": 0.0,
     }
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/actions/intents").status_code == 401
+        assert client.get("/api/actions/intents").status_code == 200
         decision = client.post(
             "/api/decisions",
             headers=admin_headers(),
@@ -5123,7 +4955,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             headers=admin_headers(),
         )
         assert blocked.status_code == 409
-        assert client.get("/api/outbox/messages").status_code == 401
+        assert client.get("/api/outbox/messages").status_code == 200
         approval_message = client.get(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"][0]

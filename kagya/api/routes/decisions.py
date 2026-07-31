@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.decision import ActionCandidate, ActionType, DecisionStatus, PredictedOutcome
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -112,7 +111,6 @@ class ExplanationRenderRequest(_RequestModel):
 router = APIRouter(
     prefix="/api/decisions",
     tags=["decisions"],
-    dependencies=[Depends(require_admin)],
 )
 
 

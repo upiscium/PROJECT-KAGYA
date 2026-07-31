@@ -10,7 +10,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.motivation import (
     CommitmentFulfillability,
@@ -102,12 +101,10 @@ class CommitmentTransitionRequest(BaseModel):
 router = APIRouter(
     prefix="/api/goals",
     tags=["goals"],
-    dependencies=[Depends(require_admin)],
 )
 commitment_router = APIRouter(
     prefix="/api/commitments",
     tags=["commitments"],
-    dependencies=[Depends(require_admin)],
 )
 
 

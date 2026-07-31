@@ -40,7 +40,7 @@ Define the verification gates that must pass before PROJECT-KAGYA v1.0 is consid
 - `uv run python -m kagya.api.server`
 - `npm test -- --run` from `frontend/`.
 - `npm run build` from `frontend/`; this includes Next.js type checking.
-- Private deployment smoke: `KAGYA_ADMIN_TOKEN=... scripts/smoke-private-deploy.sh http://127.0.0.1:8080`.
+- Private deployment smoke: `scripts/smoke-private-deploy.sh http://127.0.0.1:8080`.
 
 ## Regression Checks
 

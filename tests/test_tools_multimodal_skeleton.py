@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 
 from fastapi.testclient import TestClient
 
@@ -21,7 +20,6 @@ from kagya.tools import (
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-ADMIN_TOKEN = "test-admin-token"
 
 
 def test_chat_request_accepts_empty_attachments(tmp_path: Path) -> None:
@@ -49,7 +47,6 @@ def test_chat_request_accepts_non_empty_attachments(tmp_path: Path) -> None:
 def test_debug_chat_accepts_non_empty_attachments(tmp_path: Path) -> None:
     response = _client(tmp_path).post(
         "/api/chat/debug",
-        headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
         json={
             "text": "hello",
             "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
@@ -63,7 +60,6 @@ def test_debug_chat_accepts_non_empty_attachments(tmp_path: Path) -> None:
 def test_debug_chat_response_includes_received_attachments(tmp_path: Path) -> None:
     response = _client(tmp_path).post(
         "/api/chat/debug",
-        headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
         json={
             "text": "hello",
             "attachments": [
@@ -467,7 +463,6 @@ def test_tool_executor_blocks_generated_metadata_lookup_even_after_approval() ->
 
 def _client(tmp_path: Path) -> TestClient:
     settings = _settings(tmp_path)
-    os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
     app.state.memory_system = DualMemorySystem(
@@ -515,9 +510,6 @@ def _settings(tmp_path: Path) -> Settings:
                     "metrics_path": tmp_path / "metrics.json",
                     "traces_path": tmp_path / "traces.json",
                 }
-            ),
-            "api": settings.api.model_copy(
-                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
             ),
         }
     )

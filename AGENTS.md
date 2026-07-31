@@ -26,14 +26,13 @@
 - `kagya.api.dependencies` lazily caches the model provider, memory system, adapter registry, and main loop on `app.state`.
 - `config.yaml` defaults `model.provider` to `dummy`; supported providers in code are only `dummy` and `transformers`.
 - External provider implementations such as Ollama, OpenAI, Gemini API, or Claude API are intentionally unsupported.
-- Frontend public chat calls Next route `/api-proxy/*`; admin UI calls Next route `/admin-proxy/*`, which injects `KAGYA_ADMIN_TOKEN` server-side.
+- Frontend public chat calls Next route `/api-proxy/*`; management UI calls Next route `/admin-proxy/*`, which forwards to the private backend.
 
 ## Security And Env Gotchas
-- Admin/debug/memory/sleep/adapter backend endpoints require `X-KAGYA-Admin-Token`; public `POST /api/chat` must not expose debug internals.
-- The admin token env var name comes from `api.admin_token_env` in `config.yaml`, defaulting to `KAGYA_ADMIN_TOKEN`.
+- Debug/memory/sleep/adapter backend endpoints are unauthenticated for trusted LAN/VPN deployment; public `POST /api/chat` must not expose debug internals.
 - `KAGYA_BACKEND_URL` is server-side only for the frontend API/admin proxies; do not expose backend-only settings via `NEXT_PUBLIC_*`.
 - Keep private/debug fields out of normal responses: `hidden_thought`, raw prompts, retrieved memory internals, and `<think>` tags are guarded by tests.
 
 ## Deployment Notes
 - Intended deployment is private/local, not public internet: FastAPI on `127.0.0.1:8000`, Next.js on `127.0.0.1:3000`, reverse proxy on loopback or behind private access.
-- Private deployment smoke test is `KAGYA_ADMIN_TOKEN=... scripts/smoke-private-deploy.sh http://127.0.0.1:8080`.
+- Private deployment smoke test is `scripts/smoke-private-deploy.sh http://127.0.0.1:8080`.

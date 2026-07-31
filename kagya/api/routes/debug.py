@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     get_agent_runtime,
     get_main_loop,
     get_runtime_event_log,
-    require_admin,
 )
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.routes.chat import (
@@ -36,7 +35,7 @@ from kagya.runtime import AgentEventType, AgentRuntime
 from kagya.identity import OriginActor
 
 
-router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/api", tags=["debug"])
 
 
 @router.post("/chat/debug", response_model=DebugChatResponse)
@@ -47,7 +46,7 @@ def debug_chat(
     settings: Settings = Depends(get_api_settings),
     event_log: RuntimeEventLog = Depends(get_runtime_event_log),
 ) -> DebugChatResponse:
-    """Development-only debug chat gated by admin auth and explicit opt-in."""
+    """Development-only debug chat gated by explicit opt-in."""
 
     if not request.debug:
         raise HTTPException(status_code=400, detail="Debug access requires debug=true")

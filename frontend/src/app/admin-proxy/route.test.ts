@@ -3,162 +3,85 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 afterEach(() => {
   vi.restoreAllMocks();
-  delete process.env.KAGYA_ADMIN_AUTH_ENABLED;
-  delete process.env.KAGYA_ADMIN_TOKEN;
-  delete process.env.KAGYA_SSO_TRUST_TOKEN;
 });
 
-describe("admin proxy authentication", () => {
-  it.each([
-    "state/working-memory",
-    "contexts",
-    "goals",
-    "commitments",
-    "plans",
-    "decisions",
-    "outbox/messages",
-    "outbox/summary",
-    "actions/trace",
-  ])("allows the cockpit GET route %s and injects admin credentials", async (path) => {
-    process.env.KAGYA_ADMIN_TOKEN = "backend-token";
+describe("private backend proxy", () => {
+  it("forwards GET requests with query strings", async () => {
     const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
     vi.stubGlobal("fetch", backendFetch);
     vi.resetModules();
     const { GET } = await import("./[...path]/route");
 
     const response = await GET(
-      new NextRequest(`http://localhost/admin-proxy/${path}`),
-      { params: Promise.resolve({ path: path.split("/") }) },
+      new NextRequest("http://localhost/admin-proxy/system/events?limit=5"),
+      { params: Promise.resolve({ path: ["system", "events"] }) },
     );
 
     expect(response.status).toBe(200);
     expect(backendFetch).toHaveBeenCalledWith(
-      new URL(`http://127.0.0.1:8000/api/${path}`),
-      expect.objectContaining({
-        method: "GET",
-        headers: expect.objectContaining({ "X-KAGYA-Admin-Token": "backend-token" }),
-      }),
+      new URL("http://127.0.0.1:8000/api/system/events?limit=5"),
+      expect.objectContaining({ method: "GET", body: undefined }),
     );
   });
 
-  it.each(["goals", "outbox/summary", "actions/trace"])("keeps cockpit route %s read-only", async (path) => {
-    process.env.KAGYA_ADMIN_TOKEN = "backend-token";
-    const backendFetch = vi.fn();
+  it.each(["POST", "PUT", "PATCH", "DELETE"])("forwards %s request bodies", async (method) => {
+    const backendFetch = vi.fn().mockResolvedValue(new Response("accepted", { status: 202, headers: { "Content-Type": "text/plain" } }));
     vi.stubGlobal("fetch", backendFetch);
     vi.resetModules();
-    const { POST } = await import("./[...path]/route");
+    const route = await import("./[...path]/route");
 
-    const response = await POST(
-      new NextRequest(`http://localhost/admin-proxy/${path}`, { method: "POST", body: "{}" }),
-      { params: Promise.resolve({ path: path.split("/") }) },
-    );
-
-    expect(response.status).toBe(404);
-    expect(backendFetch).not.toHaveBeenCalled();
-  });
-
-  it("preserves token injection when optional auth is disabled", async () => {
-    process.env.KAGYA_ADMIN_TOKEN = "backend-token";
-    const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
-    vi.stubGlobal("fetch", backendFetch);
-    vi.resetModules();
-    const { POST } = await import("./[...path]/route");
-
-    const response = await POST(
+    const response = await route[method as "POST"](
       new NextRequest("http://localhost/admin-proxy/motivation/reevaluate", {
-        method: "POST",
-        body: "{}",
+        method,
+        body: JSON.stringify({ ok: true }),
+        headers: { "Content-Type": "application/vnd.kagya+json" },
       }),
       { params: Promise.resolve({ path: ["motivation", "reevaluate"] }) },
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Content-Type")).toBe("text/plain");
     expect(backendFetch).toHaveBeenCalledWith(
       expect.any(URL),
       expect.objectContaining({
-        headers: expect.objectContaining({ "X-KAGYA-Admin-Token": "backend-token" }),
+        method,
+        body: JSON.stringify({ ok: true }),
+        headers: { "Content-Type": "application/vnd.kagya+json" },
       }),
     );
   });
 
-  it("requires a trusted SSO assertion before issuing strict session cookies", async () => {
-    configureAuth();
+  it("defaults missing backend content-type to JSON", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
     vi.resetModules();
     const { GET } = await import("./[...path]/route");
-    const context = { params: Promise.resolve({ path: ["auth", "session"] }) };
 
-    const rejected = await GET(
-      new NextRequest("https://kagya.example/admin-proxy/auth/session"),
-      context,
-    );
-    const accepted = await GET(sessionRequest("approval_only"), context);
+    const response = await GET(new NextRequest("http://localhost/admin-proxy/goals"), { params: Promise.resolve({ path: ["goals"] }) });
 
-    expect(rejected.status).toBe(401);
-    expect(accepted.status).toBe(200);
-    expect(accepted.cookies.get("kagya_admin_session")?.httpOnly).toBe(true);
-    expect(accepted.cookies.get("kagya_admin_session")?.sameSite).toBe("strict");
-    expect(accepted.cookies.get("kagya_admin_csrf")?.sameSite).toBe("strict");
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Content-Type")).toBe("application/json");
   });
 
-  it("rejects cross-site and role-forbidden mutations before backend fetch", async () => {
-    configureAuth();
-    const backendFetch = vi.fn().mockResolvedValue(Response.json({ ok: true }));
+  it.each([
+    [[]],
+    [["."]],
+    [[".."]],
+    [["state", "..", "system"]],
+    [["state%2F..%2Fsystem"]],
+    [["state%252F..%252Fsystem"]],
+    [["http:", "evil.test"]],
+    [["//evil.test"]],
+    [["state\\system"]],
+    [["state\u0000system"]],
+  ])("rejects unsafe path %j", async (path) => {
+    const backendFetch = vi.fn();
     vi.stubGlobal("fetch", backendFetch);
     vi.resetModules();
-    const { GET, POST } = await import("./[...path]/route");
-    const sessionResponse = await GET(sessionRequest("approval_only"), {
-      params: Promise.resolve({ path: ["auth", "session"] }),
-    });
-    const body = await sessionResponse.json() as { csrfToken: string };
-    const cookie = sessionResponse.cookies.get("kagya_admin_session")?.value;
-    const csrfCookie = sessionResponse.cookies.get("kagya_admin_csrf")?.value;
-    const context = { params: Promise.resolve({ path: ["motivation", "reevaluate"] }) };
+    const { GET } = await import("./[...path]/route");
 
-    const forbidden = await POST(
-      mutationRequest(cookie, csrfCookie, body.csrfToken, "same-origin"),
-      context,
-    );
-    const crossSite = await POST(
-      mutationRequest(cookie, csrfCookie, body.csrfToken, "cross-site"),
-      context,
-    );
+    const response = await GET(new NextRequest(`http://localhost/admin-proxy/${path.join("/")}`), { params: Promise.resolve({ path }) });
 
-    expect(forbidden.status).toBe(403);
-    expect(crossSite.status).toBe(403);
+    expect(response.status).toBe(400);
     expect(backendFetch).not.toHaveBeenCalled();
   });
 });
-
-function configureAuth(): void {
-  process.env.KAGYA_ADMIN_TOKEN = "backend-token";
-  process.env.KAGYA_ADMIN_AUTH_ENABLED = "true";
-  process.env.KAGYA_SSO_TRUST_TOKEN = "proxy-secret";
-}
-
-function sessionRequest(role: string): NextRequest {
-  return new NextRequest("https://kagya.example/admin-proxy/auth/session", {
-    headers: {
-      "x-kagya-sso-secret": "proxy-secret",
-      "x-forwarded-user": "alice@example.test",
-      "x-kagya-role": role,
-    },
-  });
-}
-
-function mutationRequest(
-  session: string | undefined,
-  csrfCookie: string | undefined,
-  csrfHeader: string,
-  fetchSite: string,
-): NextRequest {
-  return new NextRequest("https://kagya.example/admin-proxy/motivation/reevaluate", {
-    method: "POST",
-    body: "{}",
-    headers: {
-      origin: "https://kagya.example",
-      "sec-fetch-site": fetchSite,
-      "x-kagya-csrf-token": csrfHeader,
-      cookie: `kagya_admin_session=${session}; kagya_admin_csrf=${csrfCookie}`,
-    },
-  });
-}

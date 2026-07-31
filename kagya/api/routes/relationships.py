@@ -7,7 +7,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.relationship import PerceivedAttribute
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -55,7 +54,6 @@ class SplitRequest(_RequestModel):
 router = APIRouter(
     prefix="/api/relationships",
     tags=["relationships"],
-    dependencies=[Depends(require_admin)],
 )
 
 

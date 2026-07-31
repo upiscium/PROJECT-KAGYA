@@ -5,11 +5,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from collections.abc import Callable
 
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.planning import EvidenceReference, Plan, PlanCandidate
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -45,7 +45,6 @@ router = APIRouter(prefix="/api/plans", tags=["plans"])
 def inspect_plans(
     request: Request,
     goal_id: str | None = None,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     store = get_main_loop(request).plan_store
@@ -61,7 +60,6 @@ def inspect_plans(
 @router.get("/candidates")
 def current_candidates(
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     main_loop = get_main_loop(request)
@@ -80,7 +78,7 @@ def current_candidates(
 def create_plan(
     body: PlanCandidate,
     request: Request,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     main_loop = get_main_loop(request)
@@ -89,7 +87,7 @@ def create_plan(
             runtime,
             AgentEventType.PLAN_UPDATE,
             source="api.plans.create",
-            handler=lambda: main_loop.create_plan(body, actor_id=actor.actor_id),
+            handler=lambda: main_loop.create_plan(body, actor_id=operator.actor_id),
             payload={"plan_id": body.plan_id, "goal_id": body.goal_id},
             correlation_id=body.plan_id,
         ).value
@@ -102,7 +100,6 @@ def create_plan(
 def activate_plan(
     plan_id: str,
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(
@@ -119,7 +116,7 @@ def revise_plan(
     plan_id: str,
     body: RevisionRequest,
     request: Request,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(
@@ -132,7 +129,7 @@ def revise_plan(
             body.candidate,
             expected_revision=body.expected_revision,
             reason_code=body.reason_code,
-            actor_id=actor.actor_id,
+            actor_id=operator.actor_id,
         ),
     )
 
@@ -142,7 +139,6 @@ def start_step(
     plan_id: str,
     step_id: str,
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(
@@ -161,7 +157,6 @@ def complete_step(
     step_id: str,
     body: EvidenceRequest,
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(
@@ -182,7 +177,6 @@ def fail_step(
     step_id: str,
     body: StepFailureRequest,
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(
@@ -205,7 +199,6 @@ def abandon_plan(
     plan_id: str,
     body: EvidenceRequest,
     request: Request,
-    _actor: AdminActor = Depends(require_admin),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     return _execute_plan_update(

@@ -12,8 +12,6 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
-    env:
-      KAGYA_ADMIN_TOKEN: test-admin-token
     steps:
       - uses: actions/checkout@v4
       - name: Export immutable build provenance

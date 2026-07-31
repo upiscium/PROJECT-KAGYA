@@ -71,6 +71,12 @@ def migrate_config(raw_config: dict[str, Any]) -> tuple[dict[str, Any], list[str
             "behavioral_activation_policy"
         )
     migrated["adapter_registry"] = adapter_registry
+    api = dict(migrated.get("api", {}))
+    if api.pop("admin_token_env", None) is not None:
+        notes.append("removed deprecated api.admin_token_env")
+    if api.pop("admin_auth", None) is not None:
+        notes.append("removed deprecated api.admin_auth")
+    migrated["api"] = api
     if "deployment" not in migrated:
         migrated["deployment"] = {
             "mode": "standalone",

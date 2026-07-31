@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.runtime import AgentEventType, AgentRuntime, ContextFrame, ContextStatus
 
@@ -49,7 +48,6 @@ class ContextListResponse(BaseModel):
 router = APIRouter(
     prefix="/api/contexts",
     tags=["contexts"],
-    dependencies=[Depends(require_admin)],
 )
 
 

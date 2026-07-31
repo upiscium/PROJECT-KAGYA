@@ -14,7 +14,6 @@ from kagya.api.dependencies import (
     get_adapter_runtime_manager,
     get_api_settings,
     get_runtime_event_log,
-    require_admin,
 )
 from kagya.api.observability import RuntimeEventLog
 from kagya.api.schemas.adapter import (
@@ -49,9 +48,7 @@ from kagya.models import load_model_provider
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
-router = APIRouter(
-    prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)]
-)
+router = APIRouter(prefix="/api/adapters", tags=["adapters"])
 
 ArtifactStatusValue = Literal[
     "not_run", "prepared", "valid", "hash_mismatch", "corrupt", "orphan"
