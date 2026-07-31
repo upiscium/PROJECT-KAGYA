@@ -6,7 +6,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_memory_system,
-    require_admin,
 )
 from kagya.api.schemas.memory import (
     EpisodeMemoryResponse,
@@ -24,9 +23,7 @@ from kagya.memory import MemoryLifecycleStatus, ValidationStatus
 from kagya.runtime import AgentEventType, AgentRuntime
 
 
-router = APIRouter(
-    prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)]
-)
+router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 
 @router.get("/search", response_model=MemorySearchResponse)

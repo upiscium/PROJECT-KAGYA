@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.counterfactual import (
     AlternativeOutcome,
@@ -58,7 +57,6 @@ class CounterfactualRevisionRequest(BaseModel):
 router = APIRouter(
     prefix="/api/counterfactuals",
     tags=["counterfactual-simulation"],
-    dependencies=[Depends(require_admin)],
 )
 
 

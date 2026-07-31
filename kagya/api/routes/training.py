@@ -5,14 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from kagya.api.dependencies import (
     get_dataset_governance,
     get_sleep_coordinator,
-    require_admin,
 )
 from kagya.training import DatasetGovernanceStore, SleepCoordinator
 
 
-router = APIRouter(
-    prefix="/api/training", tags=["training"], dependencies=[Depends(require_admin)]
-)
+router = APIRouter(prefix="/api/training", tags=["training"])
 
 
 @router.get("/nodes")

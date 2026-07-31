@@ -475,7 +475,6 @@ class ValueSystemSettings(StrictBaseModel):
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
-    admin_token_env: str = Field(min_length=1)
     agent_queue_capacity: int = Field(default=32, gt=0)
     chat_job_registry_path: Path = Path(".kagya/chat_jobs.json")
     chat_timeout_seconds: float = Field(default=300.0, gt=0)
@@ -485,7 +484,6 @@ class ApiSettings(StrictBaseModel):
     chat_job_max_terminal_records: int = Field(default=10000, gt=0)
     chat_job_cleanup_interval_seconds: float = Field(default=60.0, ge=0)
     cors_origins: list[str]
-    admin_auth: "AdminAuthSettings" = Field(default_factory=lambda: AdminAuthSettings())
 
     @model_validator(mode="after")
     def validate_chat_job_retention(self) -> "ApiSettings":
@@ -497,21 +495,6 @@ class ApiSettings(StrictBaseModel):
                 "chat job idempotency retention must not be shorter than result retention"
             )
         return self
-
-
-class AdminAuthSettings(StrictBaseModel):
-    enabled: bool = False
-    actor_header: str = Field(default="X-KAGYA-Actor", min_length=1)
-    role_header: str = Field(default="X-KAGYA-Role", min_length=1)
-    reauthenticated_at_header: str = Field(
-        default="X-KAGYA-Reauthenticated-At", min_length=1
-    )
-    session_cookie_name: str = Field(default="kagya_admin_session", min_length=1)
-    csrf_cookie_name: str = Field(default="kagya_admin_csrf", min_length=1)
-    csrf_header: str = Field(default="X-KAGYA-CSRF-Token", min_length=1)
-    reauthentication_max_age_seconds: int = Field(default=300, gt=0)
-    reauthentication_paths: list[str] = Field(default_factory=list)
-    allow_loopback_recovery: bool = True
 
 
 class FrontendSettings(StrictBaseModel):

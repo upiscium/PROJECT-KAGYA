@@ -16,7 +16,6 @@ from kagya.api.dependencies import (
     get_state_wal,
     get_tool_executor,
     get_tool_registry,
-    require_admin,
 )
 from kagya.config import Settings
 from kagya.runtime import (
@@ -43,9 +42,7 @@ from kagya.security.backup import (
 from kagya.security.crypto import EncryptionError
 
 
-router = APIRouter(
-    prefix="/api/state", tags=["state"], dependencies=[Depends(require_admin)]
-)
+router = APIRouter(prefix="/api/state", tags=["state"])
 
 
 class BackupCreateRequest(BaseModel):

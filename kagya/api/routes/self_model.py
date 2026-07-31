@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.identity import (
     EpistemicUncertainty,
@@ -81,7 +80,6 @@ class SelfModelRollbackRequest(_RequestModel):
 router = APIRouter(
     prefix="/api/self-model",
     tags=["self-model"],
-    dependencies=[Depends(require_admin)],
 )
 
 

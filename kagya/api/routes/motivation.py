@@ -9,7 +9,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.runtime import AgentEventType, AgentRuntime
 
@@ -21,7 +20,6 @@ class MotivationDecayRequest(BaseModel):
 router = APIRouter(
     prefix="/api/motivation",
     tags=["motivation"],
-    dependencies=[Depends(require_admin)],
 )
 
 

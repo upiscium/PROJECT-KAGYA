@@ -41,14 +41,11 @@ just transformers-smoke-fallback /path/to/transformers-config.yaml
 5. Create local env files. The backend does not auto-load `.env`, so source it before `just api`. Next.js auto-loads `frontend/.env.local` for `npm run dev`.
 
 ```bash
-ADMIN_TOKEN="$(openssl rand -hex 32)"
 cat > .env <<EOF
-KAGYA_ADMIN_TOKEN=${ADMIN_TOKEN}
 KAGYA_CONFIG_PATH=/path/to/transformers-config.yaml
 EOF
 
 cat > frontend/.env.local <<EOF
-KAGYA_ADMIN_TOKEN=${ADMIN_TOKEN}
 KAGYA_BACKEND_URL=http://127.0.0.1:8000
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:3000
 EOF
@@ -66,7 +63,7 @@ cd frontend
 npm run dev
 ```
 
-7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. Optional browser authentication is disabled by default, so keep this token-only mode on loopback, a private LAN/VPN, or an SSH tunnel and off the public internet.
+7. Open the frontend on the private origin, use `/chat` first, then inspect `/debug`, `/memory`, `/sleep`, `/adapters`, and `/evaluations` as needed. PROJECT-KAGYA currently has no built-in WebUI or admin API authentication; keep it on loopback, a trusted LAN/VPN, or an SSH tunnel and off the public internet.
 
 8. After the first useful session, create a streaming encrypted backup because `.kagya/` contains private runtime state. Set the independent backup and adapter-artifact key env vars named by `at_rest.backup` first:
 
@@ -74,49 +71,18 @@ npm run dev
 scripts/private-backup.sh
 ```
 
-## Admin Access
+## Private Access
 
-- Normal chat remains public at `POST /api/chat`.
-- Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
-- The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
-- Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
+- PROJECT-KAGYA is currently for trusted LAN/VPN/private tunnel use only.
+- Built-in WebUI, Cockpit, management UI, and backend API authentication is intentionally not implemented.
+- Do not publish the FastAPI or Next.js listeners to the WAN.
+- Reachability control is the responsibility of firewall, VPN, reverse proxy binding, or SSH tunnel configuration.
+- Frontend management pages call the Next.js `/admin-proxy/*` route, which only forwards requests to the configured private FastAPI backend.
 - Chat responses accept typed feedback at `POST /api/feedback`. Public submissions must identify the response's episode, experience, and context; arbitrary memory, decision, and context targets are admin-only.
 - Operators can audit `GET /api/feedback`, create broader target feedback at `POST /api/feedback/admin`, append revisions at `POST /api/feedback/{id}/revisions`, and withdraw effects at `POST /api/feedback/{id}/withdraw`.
 - Every mutation requires an idempotency key. Feedback remains categorical and versioned: correction and expected-answer text becomes provenance-linked memory, never a free-form reward or hidden-thought update.
 - `do_not_remember`, negative quality/safety signals, and explicit training exclusion remove the target episode from retrieval/consolidation/training while preserving it for audit. Corrections supersede rather than delete the original memory. Withdrawal restores the prior lifecycle and training policy when the feedback owns those effects.
 - Operators can inspect evidence-backed pre/post Decision self-assessments at `GET /api/metacognition` and `GET /api/metacognition/assessments/{id}`. Confidence combines structured capability evidence with observed past accuracy; operator feedback is retained as explicit calibration provenance.
-- `api.admin_auth.enabled` defaults to `false`. In that mode the existing admin-token behavior is unchanged; Origin, session, role, CSRF, and re-authentication checks are not applied. This mode is private/loopback only and must not be exposed directly to the public internet.
-
-### Optional Admin Identity
-
-Enable identity only behind a reverse proxy that has already authenticated the operator through SSO or WebAuthn. The reverse proxy must remove browser-supplied copies of its assertion headers before adding trusted values. Do not expose the Next.js port around that proxy.
-
-1. Set `api.admin_auth.enabled: true` in the backend config. Roles are `read_only`, `approval_only`, and `full_admin`. Read-only actors may use safe methods only. Approval-only actors may perform explicit approval/rejection/review workflows, but cannot edit general state or start training. Full admins retain all admin operations.
-2. Set matching frontend environment values:
-
-```bash
-KAGYA_ADMIN_AUTH_ENABLED=true
-NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED=true
-KAGYA_SSO_TRUST_TOKEN=<random reverse-proxy-to-Next secret>
-KAGYA_SSO_TRUST_HEADER=x-kagya-sso-secret
-KAGYA_SSO_ACTOR_HEADER=x-forwarded-user
-KAGYA_SSO_ROLE_HEADER=x-kagya-role
-KAGYA_SSO_REAUTH_HEADER=x-kagya-reauthenticated-at
-KAGYA_ADMIN_ALLOWED_ORIGINS=https://kagya.private.example
-# Set these only when the matching api.admin_auth header names are customized:
-KAGYA_BACKEND_ACTOR_HEADER=X-KAGYA-Actor
-KAGYA_BACKEND_ROLE_HEADER=X-KAGYA-Role
-KAGYA_BACKEND_REAUTH_HEADER=X-KAGYA-Reauthenticated-At
-KAGYA_ADMIN_CSRF_HEADER=X-KAGYA-CSRF-Token
-```
-
-3. After SSO/WebAuthn succeeds, the reverse proxy injects the trust token, stable actor ID, role, and optional Unix re-authentication timestamp. `GET /admin-proxy/auth/session` exchanges that assertion for a signed, `HttpOnly`, `SameSite=Strict` session cookie and a separate `SameSite=Strict` double-submit CSRF token. The frontend initializes this session automatically when `NEXT_PUBLIC_KAGYA_ADMIN_AUTH_ENABLED=true`.
-4. Browser mutations require an allowed `Origin`, non-cross-site Fetch Metadata, the signed session, and matching CSRF cookie/header. FastAPI repeats Origin, Fetch Metadata, CSRF, role, and configured re-authentication checks behind the proxy.
-5. `api.admin_auth.reauthentication_paths` uses shell-style path patterns. Matching mutations require the re-authentication timestamp to be no older than `reauthentication_max_age_seconds`. Configure expensive or destructive paths explicitly; the committed defaults include state restore/reset, training job operations, cleanup, adapter activation/rollback, and identity/value rollbacks.
-
-The backend token remains the emergency local recovery path when `allow_loopback_recovery` is enabled: a token-authenticated, non-browser request from loopback with no asserted actor is attributed as `local-recovery` and receives full-admin access. Keep this path local, rotate the token after emergency use, and disable it if operational recovery is provided another way.
-
-Authorized mutations append a hash-chained Journal audit record containing only a sanitized actor ID, role, re-authentication status, and method/path target. Admin tokens, SSO trust tokens, session signatures, CSRF values, WebAuthn material, and other credentials are never written to agent state, traces, Journal records, or backup manifests. All secrets remain environment values or transient cookies/headers.
 
 ## Model Provider
 
@@ -357,7 +323,7 @@ Most `config.yaml` fields are active runtime settings. The fields below are inte
 - `npm test -- --run` from `frontend/`
 - `npm run build` from `frontend/`
 - `timeout 5s just api || test $? -eq 124 -o $? -eq 143`
-- `KAGYA_ADMIN_TOKEN=... scripts/smoke-private-deploy.sh http://127.0.0.1:8080` for private deployments.
+- `scripts/smoke-private-deploy.sh http://127.0.0.1:8080` for private deployments.
 - Search for forbidden provider implementation paths.
 - Verify normal API/UI responses do not expose `hidden_thought`, raw prompts, retrieved memory, or `<think>` tags.
 - Verify public chat responses do not expose local attachment paths.
@@ -440,11 +406,11 @@ sudo chmod 600 /etc/project-kagya/*.env
 sudo chown kagya:kagya /etc/project-kagya/*.env
 ```
 
-Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
+Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
 
 For SSH-tunnel access, run `ssh -L 18080:127.0.0.1:8080 user@host`, set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:18080`, rebuild the frontend, and open `http://127.0.0.1:18080` locally.
 
-Admin warning: the frontend does not expose the admin token to browser bundles, but admin pages do not have browser login/session handling. This is acceptable for the intended private LAN/VPN/SSH-tunnel deployment model. Keep this listener bound to loopback or behind private network access; if you expose it outside that boundary, add SSO, basic auth, or another access-control layer first.
+Private deployment warning: PROJECT-KAGYA intentionally does not implement WebUI or admin API authentication. Keep this listener bound to loopback or behind trusted LAN/VPN/SSH-tunnel access.
 
 Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BASE_URL` is embedded at build time:
 
@@ -478,12 +444,12 @@ For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path. The provid
 ### 6. Verify Deployment
 
 ```bash
-KAGYA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```
 
-The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-KAGYA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
+The smoke script verifies `/health`, `/api/chat`, direct private API access, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
 
-Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
+Normal chat and management APIs are unauthenticated on the private listener. Frontend management pages use `/admin-proxy/*` and must remain behind your private access boundary.
 
 ### 7. Back Up Runtime Data
 
@@ -540,7 +506,7 @@ sudo systemctl start kagya-api kagya-frontend
 Run the private deployment smoke test after restore:
 
 ```bash
-KAGYA_ADMIN_TOKEN=replace-with-restored-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```
 
 If restore changes model provider settings, verify model cache availability before switching away from `dummy`. If restore changes adapter artifacts or registry state, inspect `/adapters` in the admin UI before activating any adapter.
@@ -575,5 +541,5 @@ sudo -u kagya KAGYA_RETENTION_DAYS=30 scripts/private-prune.sh --apply --confirm
 Run the private smoke test after pruning if adapter artifacts or dream/eval files were removed:
 
 ```bash
-KAGYA_ADMIN_TOKEN=replace-with-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```

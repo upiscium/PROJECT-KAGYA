@@ -6,7 +6,6 @@ from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
 )
 from kagya.identity import BoundaryAssessmentInput, SocialPressureMetadata
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -15,7 +14,6 @@ from kagya.runtime import AgentEventType, AgentRuntime
 router = APIRouter(
     prefix="/api/identity-boundary",
     tags=["identity-boundary"],
-    dependencies=[Depends(require_admin)],
 )
 
 

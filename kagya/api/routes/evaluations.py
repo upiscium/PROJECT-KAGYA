@@ -12,7 +12,6 @@ from kagya.api.dependencies import (
     get_adapter_registry,
     get_agent_runtime,
     get_api_settings,
-    require_admin,
 )
 from kagya.api.redaction import redact_private_fields
 from kagya.api.schemas.evaluation import (
@@ -49,7 +48,6 @@ from kagya.runtime import AgentEventType, AgentRuntime
 router = APIRouter(
     prefix="/api/evaluations",
     tags=["evaluations"],
-    dependencies=[Depends(require_admin)],
 )
 
 

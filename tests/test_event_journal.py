@@ -226,27 +226,6 @@ def test_real_journal_fsync_failure_rejects_event_before_handler(
     assert ran.is_set() is False
 
 
-def test_admin_audit_record_contains_actor_and_target_without_credentials(
-    tmp_path: Path,
-) -> None:
-    journal = EventJournal(tmp_path / "journal.jsonl")
-
-    record = journal.audit_admin_action(
-        event_id="request-1",
-        actor_id="operator@example.test",
-        actor_role="full_admin",
-        target="POST /api/state/reset",
-        reauthenticated=True,
-    )
-
-    assert record.lifecycle == JournalLifecycle.AUDIT
-    assert record.actor_id == "operator@example.test"
-    assert record.target == "POST /api/state/reset"
-    serialized = journal.path.read_text(encoding="utf-8")
-    assert "admin-token" not in serialized
-    assert "csrf" not in serialized.lower()
-
-
 def _event(*, payload: dict[str, object] | None = None) -> AgentEvent:
     now = datetime.now(UTC)
     return AgentEvent(

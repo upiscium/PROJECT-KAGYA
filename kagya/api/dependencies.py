@@ -1,18 +1,11 @@
 """FastAPI dependency wiring."""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from enum import StrEnum
-from fnmatch import fnmatchcase
-from hmac import compare_digest
-from ipaddress import ip_address
-import os
 from pathlib import Path
 from threading import RLock
 from typing import Callable, TypeVar
-from uuid import uuid4
 
-from fastapi import Header, HTTPException, Request, status
+from fastapi import HTTPException, Request, status
 
 from kagya.api.observability import OperationalTelemetry, RuntimeEventLog
 from kagya.actions import ActionExecutionLayer
@@ -77,30 +70,15 @@ T = TypeVar("T")
 _dependency_lock = RLock()
 
 
-class AdminRole(StrEnum):
-    READ_ONLY = "read_only"
-    APPROVAL_ONLY = "approval_only"
-    FULL_ADMIN = "full_admin"
-
-
 @dataclass(frozen=True)
-class AdminActor:
-    actor_id: str
-    role: AdminRole
-    reauthenticated: bool = False
+class PrivateOperator:
+    """Fixed provenance for private LAN/VPN operation; not an authentication result."""
+
+    actor_id: str = "private-operator"
 
 
-_APPROVAL_PATHS = (
-    "/api/adapters/*/approve",
-    "/api/adapters/*/reject",
-    "/api/memory/episodes/*/review",
-    "/api/beliefs/*/resolve",
-    "/api/beliefs/*/retract",
-    "/api/beliefs/*/supersede",
-    "/api/self-model/identity/proposals/*/resolve",
-    "/api/actions/intents/*/approval",
-    "/api/outbox/messages/*/responses",
-)
+def get_private_operator() -> PrivateOperator:
+    return PrivateOperator()
 
 
 def get_api_settings(request: Request) -> Settings:
@@ -306,133 +284,6 @@ def execute_agent_event(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
-
-
-def require_admin(
-    request: Request,
-    x_kagya_admin_token: str | None = Header(default=None, alias="X-KAGYA-Admin-Token"),
-) -> AdminActor:
-    settings = get_api_settings(request)
-    expected = os.getenv(settings.api.admin_token_env)
-    if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Admin token env var {settings.api.admin_token_env} is not configured",
-        )
-    if x_kagya_admin_token is None or not compare_digest(x_kagya_admin_token, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token"
-        )
-    auth = settings.api.admin_auth
-    if not auth.enabled:
-        actor = AdminActor("admin-token", AdminRole.FULL_ADMIN, True)
-        _audit_admin_mutation(request, actor)
-        return actor
-
-    origin = request.headers.get("origin")
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site == "cross-site" or (fetch_site is not None and origin is None):
-        raise HTTPException(status_code=403, detail="Cross-site admin request rejected")
-    if origin is not None:
-        if origin not in settings.api.cors_origins:
-            raise HTTPException(
-                status_code=403, detail="Admin request origin is not allowed"
-            )
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            csrf_cookie = request.cookies.get(auth.csrf_cookie_name)
-            csrf_header = request.headers.get(auth.csrf_header)
-            if (
-                request.cookies.get(auth.session_cookie_name) is None
-                or csrf_cookie is None
-                or csrf_header is None
-                or not compare_digest(csrf_cookie, csrf_header)
-            ):
-                raise HTTPException(status_code=403, detail="Invalid admin CSRF token")
-
-    actor_id = request.headers.get(auth.actor_header)
-    role_value = request.headers.get(auth.role_header)
-    if actor_id is None or role_value is None:
-        if auth.allow_loopback_recovery and origin is None and _is_loopback(request):
-            actor = AdminActor("local-recovery", AdminRole.FULL_ADMIN, True)
-            _audit_admin_mutation(request, actor)
-            return actor
-        raise HTTPException(status_code=401, detail="Admin identity is required")
-    try:
-        role = AdminRole(role_value.strip().lower().replace("-", "_"))
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="Invalid admin role") from exc
-    actor_id = actor_id.strip()
-    if not actor_id or len(actor_id) > 128:
-        raise HTTPException(status_code=403, detail="Invalid admin actor")
-    _enforce_role(request, role)
-
-    reauthenticated = _recently_reauthenticated(request, settings)
-    if _requires_reauthentication(request, settings) and not reauthenticated:
-        raise HTTPException(
-            status_code=403, detail="Recent re-authentication is required"
-        )
-    actor = AdminActor(actor_id, role, reauthenticated)
-    _audit_admin_mutation(request, actor)
-    return actor
-
-
-def _enforce_role(request: Request, role: AdminRole) -> None:
-    if role == AdminRole.FULL_ADMIN or request.method in {"GET", "HEAD", "OPTIONS"}:
-        return
-    if role == AdminRole.APPROVAL_ONLY and any(
-        fnmatchcase(request.url.path, pattern) for pattern in _APPROVAL_PATHS
-    ):
-        return
-    raise HTTPException(
-        status_code=403, detail="Admin role does not permit this operation"
-    )
-
-
-def _requires_reauthentication(request: Request, settings: Settings) -> bool:
-    if request.method in {"GET", "HEAD", "OPTIONS"}:
-        return False
-    return any(
-        fnmatchcase(request.url.path, pattern)
-        for pattern in settings.api.admin_auth.reauthentication_paths
-    )
-
-
-def _recently_reauthenticated(request: Request, settings: Settings) -> bool:
-    value = request.headers.get(settings.api.admin_auth.reauthenticated_at_header)
-    if value is None:
-        return False
-    try:
-        timestamp = float(value)
-    except ValueError:
-        return False
-    age = datetime.now(UTC).timestamp() - timestamp
-    return -30 <= age <= settings.api.admin_auth.reauthentication_max_age_seconds
-
-
-def _is_loopback(request: Request) -> bool:
-    host = request.client.host if request.client is not None else ""
-    try:
-        return ip_address(host).is_loopback
-    except ValueError:
-        return host == "testclient"
-
-
-def _audit_admin_mutation(request: Request, actor: AdminActor) -> None:
-    if request.method in {"GET", "HEAD", "OPTIONS"}:
-        return
-    journal = getattr(request.app.state, "event_journal", None)
-    if journal is None:
-        return
-    journal.audit_admin_action(
-        event_id=str(uuid4()),
-        actor_id=actor.actor_id,
-        actor_role=actor.role.value,
-        target=f"{request.method} {request.url.path}",
-        reauthenticated=actor.reauthenticated,
-    )
-    publish = getattr(request.app.state, "failover_persistence_hook", None)
-    if publish is not None:
-        publish()
 
 
 def get_model_provider(request: Request) -> ModelProvider:

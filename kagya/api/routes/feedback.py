@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.feedback import FeedbackSignal, FeedbackTarget, FeedbackTargetType
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -121,7 +121,7 @@ def submit_feedback(
 def submit_admin_feedback(
     body: AdminFeedbackCreateRequest,
     request: Request,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     main_loop = get_main_loop(request)
@@ -137,7 +137,7 @@ def submit_admin_feedback(
                     signals=tuple(body.signals),
                     idempotency_key=body.idempotency_key,
                     actor_type="operator",
-                    actor_id=actor.actor_id,
+                    actor_id=operator.actor_id,
                     source="api.feedback.operator",
                     correction=body.correction,
                     expected_answer=body.expected_answer,
@@ -158,7 +158,7 @@ def submit_admin_feedback(
     return asdict(record)
 
 
-@router.get("", dependencies=[Depends(require_admin)])
+@router.get("")
 def inspect_feedback(
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -172,7 +172,7 @@ def inspect_feedback(
     return {"feedback": [asdict(record) for record in records]}
 
 
-@router.get("/{feedback_id}", dependencies=[Depends(require_admin)])
+@router.get("/{feedback_id}")
 def inspect_feedback_record(
     feedback_id: str,
     request: Request,
@@ -196,7 +196,7 @@ def revise_feedback(
     feedback_id: str,
     body: FeedbackRevisionRequest,
     request: Request,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     try:
@@ -210,7 +210,7 @@ def revise_feedback(
                 signals=tuple(body.signals),
                 idempotency_key=body.idempotency_key,
                 actor_type="operator",
-                actor_id=actor.actor_id,
+                actor_id=operator.actor_id,
                 source="api.feedback.revise",
                 correction=body.correction,
                 expected_answer=body.expected_answer,
@@ -232,7 +232,7 @@ def withdraw_feedback(
     feedback_id: str,
     body: FeedbackWithdrawalRequest,
     request: Request,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
     try:
@@ -245,7 +245,7 @@ def withdraw_feedback(
                 expected_revision=body.expected_revision,
                 idempotency_key=body.idempotency_key,
                 actor_type="operator",
-                actor_id=actor.actor_id,
+                actor_id=operator.actor_id,
                 source="api.feedback.withdraw",
             ),
             payload={

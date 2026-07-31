@@ -15,7 +15,6 @@ class RuntimeInfoSchema(BaseModel):
     fallback_configured: bool
     transformers_4bit: bool
     qlora_dry_run: bool
-    admin_token_configured: bool
 
 
 class SystemInfoResponse(BaseModel):

@@ -128,7 +128,7 @@ function renderCockpit() {
 }
 
 function resolveRepresentativeData() {
-  mockedApi.systemInfo.mockResolvedValue({ project: "KAGYA", status: "ok", build: { version: "1.0", commit: "abc123" }, runtime: { environment: "test", provider: "dummy", primary_model_id: "model-1", fallback_configured: false, transformers_4bit: false, qlora_dry_run: true, admin_token_configured: true } });
+  mockedApi.systemInfo.mockResolvedValue({ project: "KAGYA", status: "ok", build: { version: "1.0", commit: "abc123" }, runtime: { environment: "test", provider: "dummy", primary_model_id: "model-1", fallback_configured: false, transformers_4bit: false, qlora_dry_run: true } });
   mockedApi.emotion.mockResolvedValue({ valence: 0.4, arousal: 0.3, optimal_loss: 1 });
   mockedApi.workingMemory.mockResolvedValue({ item_count: 2, token_count: 80, item_capacity: 10, token_capacity: 1000 });
   mockedApi.adapters.mockResolvedValue({ adapters: [{ adapter_id: "adapter-1", adapter_hash: "adapter-hash", status: "active" } as never] });

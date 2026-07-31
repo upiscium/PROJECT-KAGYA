@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.cognition import AppraisalResult, ValueUpdateKind
 from kagya.identity import OriginActor, OriginInputKind
@@ -66,7 +66,6 @@ class ValueOriginReviewRequest(BaseModel):
 router = APIRouter(
     prefix="/api/values",
     tags=["values"],
-    dependencies=[Depends(require_admin)],
 )
 
 
@@ -188,7 +187,7 @@ def review_value_origin(
     body: ValueOriginReviewRequest,
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
 ) -> dict[str, object]:
     main_loop = get_main_loop(request)
 
@@ -201,7 +200,7 @@ def review_value_origin(
         value = main_loop.value_system.review_origin(
             value_id,
             accept=body.accept,
-            reviewer_id=actor.actor_id,
+            reviewer_id=operator.actor_id,
             reviewer_authority="operator",
             evidence_refs=tuple(body.evidence_refs),
             reason_code=body.reason_code,

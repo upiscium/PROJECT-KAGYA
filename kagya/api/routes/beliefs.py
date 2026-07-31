@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.belief import EpistemicStatus, Proposition
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -56,7 +56,6 @@ class BeliefSupersessionRequest(_RequestModel):
 router = APIRouter(
     prefix="/api/beliefs",
     tags=["beliefs"],
-    dependencies=[Depends(require_admin)],
 )
 
 
@@ -120,7 +119,7 @@ def resolve_belief(
     body: BeliefResolutionRequest,
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
 ) -> dict[str, object]:
     try:
         record = execute_agent_event(
@@ -134,7 +133,7 @@ def resolve_belief(
                 epistemic_status=body.epistemic_status,
                 reason_code=body.reason_code,
                 evidence_refs=tuple(body.evidence_refs),
-                reviewer_id=actor.actor_id,
+                reviewer_id=operator.actor_id,
                 reviewer_authority="operator",
             ),
             correlation_id=belief_id,

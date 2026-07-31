@@ -252,26 +252,6 @@ class EventJournal:
                 files[f"journal.{index}"] = path.read_bytes()
         return files
 
-    def audit_admin_action(
-        self,
-        *,
-        event_id: str,
-        actor_id: str,
-        actor_role: str,
-        target: str,
-        reauthenticated: bool,
-    ) -> JournalRecord:
-        return self._append(
-            lifecycle=JournalLifecycle.AUDIT,
-            event_id=_safe_label(event_id),
-            event_type="admin_action",
-            source="api.admin",
-            actor_id=_safe_label(actor_id),
-            actor_role=_safe_label(actor_role),
-            target=_safe_target(target),
-            reauthenticated=reauthenticated,
-        )
-
     def reconcile(self, snapshot: AgentStateSnapshot) -> list[JournalRecord]:
         snapshot_hash = hash_snapshot(snapshot)
         records = self.verify()
@@ -688,14 +668,6 @@ def _safe_optional_label(value: str | None) -> str | None:
 
 def _safe_label(value: str) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", value) else "redacted"
-
-
-def _safe_target(value: str) -> str:
-    return (
-        value
-        if re.fullmatch(r"[A-Z]+ /[A-Za-z0-9._:@/*-]{1,240}", value)
-        else "redacted"
-    )
 
 
 def _fsync_directory(path: Path) -> None:

@@ -24,12 +24,12 @@ from kagya.actions import (
     public_tool_name,
 )
 from kagya.api.dependencies import (
-    AdminActor,
     execute_agent_event,
     get_action_execution,
     get_agent_runtime,
     get_main_loop,
-    require_admin,
+    get_private_operator,
+    PrivateOperator,
 )
 from kagya.runtime import AgentEventType, AgentRuntime
 
@@ -165,7 +165,7 @@ class CockpitActionTraceListResponse(BaseModel):
 router = APIRouter(prefix="/api/actions", tags=["actions"])
 
 
-@router.get("/intents", dependencies=[Depends(require_admin)])
+@router.get("/intents")
 def list_intents(
     execution: ActionExecutionLayer = Depends(get_action_execution),
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -179,7 +179,7 @@ def list_intents(
     return {"intents": [item.model_dump(mode="json") for item in values]}
 
 
-@router.get("/approvals", dependencies=[Depends(require_admin)])
+@router.get("/approvals")
 def approval_inbox(
     pending_only: bool = True,
     execution: ActionExecutionLayer = Depends(get_action_execution),
@@ -194,7 +194,7 @@ def approval_inbox(
     return {"approvals": [item.model_dump(mode="json") for item in values]}
 
 
-@router.get("/receipts", dependencies=[Depends(require_admin)])
+@router.get("/receipts")
 def list_receipts(
     execution: ActionExecutionLayer = Depends(get_action_execution),
     runtime: AgentRuntime = Depends(get_agent_runtime),
@@ -214,7 +214,6 @@ def list_receipts(
 @router.get(
     "/trace",
     response_model=CockpitActionTraceListResponse,
-    dependencies=[Depends(require_admin)],
 )
 def cockpit_action_trace(
     limit: int = Query(default=50, ge=1, le=200),
@@ -298,7 +297,7 @@ def cockpit_action_trace(
     ).value
 
 
-@router.post("/intents", dependencies=[Depends(require_admin)])
+@router.post("/intents")
 def create_intent(
     body: IntentRequest,
     request: Request,
@@ -323,7 +322,7 @@ def create_intent(
 def resolve_approval(
     intent_id: str,
     body: ApprovalRequest,
-    actor: AdminActor = Depends(require_admin),
+    operator: PrivateOperator = Depends(get_private_operator),
     execution: ActionExecutionLayer = Depends(get_action_execution),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict[str, object]:
@@ -334,7 +333,7 @@ def resolve_approval(
         lambda: execution.resolve_approval(
             intent_id,
             approved=body.approved,
-            actor_id=actor.actor_id,
+            actor_id=operator.actor_id,
             reason=body.reason,
         ),
         intent_id,
@@ -342,7 +341,7 @@ def resolve_approval(
     )
 
 
-@router.post("/intents/{intent_id}/execute", dependencies=[Depends(require_admin)])
+@router.post("/intents/{intent_id}/execute")
 def execute_intent(
     intent_id: str,
     execution: ActionExecutionLayer = Depends(get_action_execution),
@@ -358,7 +357,7 @@ def execute_intent(
     )
 
 
-@router.post("/intents/{intent_id}/cancel", dependencies=[Depends(require_admin)])
+@router.post("/intents/{intent_id}/cancel")
 def cancel_intent(
     intent_id: str,
     execution: ActionExecutionLayer = Depends(get_action_execution),
@@ -374,7 +373,7 @@ def cancel_intent(
     )
 
 
-@router.post("/intents/{intent_id}/compensate", dependencies=[Depends(require_admin)])
+@router.post("/intents/{intent_id}/compensate")
 def compensate_intent(
     intent_id: str,
     execution: ActionExecutionLayer = Depends(get_action_execution),

@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from kagya.api.dependencies import get_subject_scheduler, require_admin
+from kagya.api.dependencies import get_subject_scheduler
 from kagya.runtime import SubjectScheduler, WakeUpKind
 
 
@@ -21,7 +21,6 @@ class WakeUpRequest(BaseModel):
 router = APIRouter(
     prefix="/api/autonomy",
     tags=["autonomy"],
-    dependencies=[Depends(require_admin)],
 )
 
 
