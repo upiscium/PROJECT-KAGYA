@@ -303,6 +303,9 @@ class LocalTrainingBackend:
             "backend": "local",
         }
 
+    def cached_node_status(self) -> dict[str, Any]:
+        return self.node_status()
+
     def job_metadata(self, job_id: str) -> dict[str, Any]:
         return {"remote_last_contact": _now()}
 
@@ -620,6 +623,21 @@ class SleepCoordinator:
         return [
             status() if status is not None else {"reachable": True, "backend": "test"}
         ]
+
+    def cached_node_status(self) -> list[dict[str, Any]]:
+        status = getattr(self.backend, "cached_node_status", None)
+        if status is None:
+            if self.settings.deployment.training.remote_worker is not None:
+                return [
+                    {
+                        "node_id": self.settings.deployment.training.remote_worker.node_id,
+                        "reachable": False,
+                        "last_contact": None,
+                        "backend": self.settings.deployment.training.backend.value,
+                    }
+                ]
+            return self.node_status()
+        return [status()]
 
     def reconcile(self, job_id: str) -> TrainingJob:
         job = self.registry.get(job_id)

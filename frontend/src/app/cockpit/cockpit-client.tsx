@@ -35,6 +35,7 @@ export function CockpitClient() {
   const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
   const actions = useQuery({ queryKey: ["cockpit", "actions"], queryFn: api.actionTrace });
   const training = useQuery({ queryKey: ["cockpit", "training"], queryFn: api.cockpitTraining });
+  const evaluations = useQuery({ queryKey: ["cockpit", "evaluations"], queryFn: api.behavioralEvaluations });
   const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
   const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
 
@@ -60,6 +61,7 @@ export function CockpitClient() {
   const loadedTrainingNodes = new Set(training.data?.nodes.map((item) => item.node_id));
   const loadedTrainingJobs = new Set(training.data?.jobs.map((item) => item.job_id));
   const loadedCockpitAdapters = new Set(training.data?.adapters.map((item) => item.adapter_id));
+  const loadedEvaluations = new Set(evaluations.data?.results.map((item) => item.evaluation_id));
   const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
 
   return (
@@ -121,7 +123,7 @@ export function CockpitClient() {
           {training.data ? <TrainingAdaptersSummary nodes={training.data.node_count} online={training.data.online_node_count} running={training.data.running_job_count} failed={training.data.failed_job_count} importing={training.data.importing_job_count} activeAdapters={training.data.active_adapter_count} candidateAdapters={training.data.candidate_adapter_count} /> : null}
           <div className="stack">{training.data?.nodes.map((node) => <TrainingNodeRecord key={node.node_id} node={node} jobs={training.data?.jobs ?? []} loadedJobs={loadedTrainingJobs} />)}</div>
           <div className="stack">{training.data?.jobs.map((job) => <TrainingJobRecord key={job.job_id} job={job} loadedNodes={loadedTrainingNodes} loadedAdapters={loadedCockpitAdapters} />)}</div>
-          <div className="stack">{training.data?.adapters.map((adapter) => <AdapterLineageRecord key={adapter.adapter_id} adapter={adapter} loadedJobs={loadedTrainingJobs} loadedNodes={loadedTrainingNodes} loadedJournal={loadedJournal} />)}</div>
+          <div className="stack">{training.data?.adapters.map((adapter) => <AdapterLineageRecord key={adapter.adapter_id} adapter={adapter} loadedJobs={loadedTrainingJobs} loadedNodes={loadedTrainingNodes} loadedEvaluations={loadedEvaluations} loadedJournal={loadedJournal} />)}</div>
         </Section>
 
         <Section title="Outbox" query={outbox} empty={outbox.data?.messages.length === 0} emptyText="No proactive messages.">
@@ -214,8 +216,8 @@ function TrainingJobRecord({ job, loadedNodes, loadedAdapters }: { job: CockpitT
   return <article className="record" id={anchor("training-job", job.job_id)}><div className="metadata-row"><Badge data-tone={job.status === "failed" ? "danger" : job.status === "running" || job.status === "importing" ? "accent" : "neutral"}>{job.status}</Badge><strong>{job.job_id}</strong><span className="mono muted">attempt {job.attempt_id}</span></div><p>Backend: {job.backend ?? "unavailable"} · Worker: <EntityReference kind="training-node" id={job.worker_node_id} available={loadedNodes} /> · Remote: <span className="mono">{job.remote_job_id ?? "unavailable"}</span></p><p>Created: {job.created_at ?? "unavailable"} · Started: {job.started_at ?? "unavailable"} · Completed: {job.completed_at ?? "unavailable"}</p><p>Source events: {job.source_event_start ?? "unavailable"} → {job.source_event_end ?? "unavailable"} · Episodes: {job.selected_episode_count ?? "unavailable"} · Retry: {job.retry_count ?? "unavailable"}</p><p>Transferred: {formatBytes(job.transferred_bytes)} · Failure: <span className="mono">{job.failure_code ?? "none"}</span> · Import: {job.import_status}</p><p>Candidate adapter: <EntityReference kind="adapter-lineage" id={job.candidate_adapter_id} available={loadedAdapters} /> · Bundle: <span className="mono">{shortDigest(job.bundle_digest)}</span> · Result: <span className="mono">{shortDigest(job.result_digest)}</span></p></article>;
 }
 
-function AdapterLineageRecord({ adapter, loadedJobs, loadedNodes, loadedJournal }: { adapter: CockpitAdapterLineage; loadedJobs: Set<string>; loadedNodes: Set<string>; loadedJournal: Set<string> }) {
-  return <article className="record" id={anchor("adapter-lineage", adapter.adapter_id)}><div className="metadata-row"><Badge data-tone={adapter.active ? "success" : adapter.rollback_candidate ? "warning" : "neutral"}>{adapter.status}</Badge><strong>{adapter.adapter_id}</strong><span className="mono muted">{shortDigest(adapter.adapter_hash)}</span></div><p>Base revision: <span className="mono">{adapter.base_model_id ?? "unavailable"} / {adapter.base_model_revision ?? "unavailable"}</span> · Parent: <span className="mono muted">{adapter.parent_adapter_id ?? "none"}</span></p><p>Training job: <EntityReference kind="training-job" id={adapter.training_job_id} available={loadedJobs} /> · Training node: <EntityReference kind="training-node" id={adapter.training_node_id} available={loadedNodes} /></p><p>Submitter: <span className="mono">{adapter.submitted_by_node_id ?? "unavailable"}</span> · Importer: <span className="mono">{adapter.imported_by_node_id ?? "unavailable"}</span></p><p>Evaluation: <EntityReference kind="evaluation" id={adapter.evaluation_id} available={new Set()} /> · {adapter.evaluation_status} · Approval: {adapter.approved ? "approved" : "not approved"} · Active: {adapter.active ? "yes" : "no"} · Rollback candidate: {adapter.rollback_candidate ? "yes" : "no"}</p><p>Activation event: <EntityReference kind="journal" id={adapter.activation_event_id} available={loadedJournal} />{adapter.activation_event_sequence ? ` @${adapter.activation_event_sequence}` : ""} · Rollback event: <EntityReference kind="journal" id={adapter.rollback_event_id} available={loadedJournal} />{adapter.rollback_event_sequence ? ` @${adapter.rollback_event_sequence}` : ""}</p></article>;
+function AdapterLineageRecord({ adapter, loadedJobs, loadedNodes, loadedEvaluations, loadedJournal }: { adapter: CockpitAdapterLineage; loadedJobs: Set<string>; loadedNodes: Set<string>; loadedEvaluations: Set<string>; loadedJournal: Set<string> }) {
+  return <article className="record" id={anchor("adapter-lineage", adapter.adapter_id)}><div className="metadata-row"><Badge data-tone={adapter.active ? "success" : adapter.rollback_candidate ? "warning" : "neutral"}>{adapter.status}</Badge><strong>{adapter.adapter_id}</strong><span className="mono muted">{shortDigest(adapter.adapter_hash)}</span></div><p>Base revision: <span className="mono">{adapter.base_model_id ?? "unavailable"} / {adapter.base_model_revision ?? "unavailable"}</span> · Parent: <span className="mono muted">{adapter.parent_adapter_id ?? "none"}</span></p><p>Training job: <EntityReference kind="training-job" id={adapter.training_job_id} available={loadedJobs} /> · Training node: <EntityReference kind="training-node" id={adapter.training_node_id} available={loadedNodes} /></p><p>Submitter: <span className="mono">{adapter.submitted_by_node_id ?? "unavailable"}</span> · Importer: <span className="mono">{adapter.imported_by_node_id ?? "unavailable"}</span></p><p>Evaluation: <EvaluationReference id={adapter.evaluation_id} available={loadedEvaluations} /> · {adapter.evaluation_status} · Approval: {adapter.approved ? "approved" : "not approved"} · Active: {adapter.active ? "yes" : "no"} · Rollback candidate: {adapter.rollback_candidate ? "yes" : "no"}</p><p>Activation event: <EntityReference kind="journal" id={adapter.activation_event_id} available={loadedJournal} />{adapter.activation_event_sequence ? ` @${adapter.activation_event_sequence}` : ""} · Rollback event: <EntityReference kind="journal" id={adapter.rollback_event_id} available={loadedJournal} />{adapter.rollback_event_sequence ? ` @${adapter.rollback_event_sequence}` : ""}</p></article>;
 }
 
 function OutboxSummary({ pendingCount, criticalCount, visibleMessages, loadedGoals, loadedPlans, loadedDecisions, loadedCommitments, loadedActions }: { pendingCount: number; criticalCount: number; visibleMessages: CockpitOutboxMessage[]; loadedGoals: Set<string>; loadedPlans: Set<string>; loadedDecisions: Set<string>; loadedCommitments: Set<string>; loadedActions: Set<string> }) {
@@ -230,6 +232,11 @@ function JournalEntry({ record, actions, loadedJournal, loadedActions, loadedRec
 function EntityReference({ kind, id, available }: { kind: string; id: string | null; available: Set<string> }) {
   if (id === null) return <>unavailable</>;
   return available.has(id) ? <Link className="entity-link mono" href={`#${anchor(kind, id)}`}>{id}</Link> : <span className="mono muted">{id}</span>;
+}
+
+function EvaluationReference({ id, available }: { id: string | null; available: Set<string> }) {
+  if (id === null) return <>unavailable</>;
+  return available.has(id) ? <Link className="entity-link mono" href={`/evaluations#${anchor("evaluation", id)}`}>{id}</Link> : <span className="mono muted">{id}</span>;
 }
 
 function ReferenceList({ kind, ids, available }: { kind: string; ids: string[]; available: Set<string> }) {

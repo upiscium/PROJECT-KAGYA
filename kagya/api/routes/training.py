@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Annotated, Any, Literal, TypeVar, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -16,11 +17,11 @@ from kagya.api.dependencies import (
     get_dataset_governance,
     get_sleep_coordinator,
 )
-from kagya.config import Settings
+from kagya.config import DeploymentMode, Settings
 from kagya.learning import AdapterRegistry, AdapterRuntimeManager
 from kagya.learning.adapter_registry import AdapterEntry
 from kagya.learning.adapter_runtime import AdapterActivationRecord
-from kagya.runtime import AgentEventType, AgentRuntime, EventJournal
+from kagya.runtime import AgentEventType, AgentRuntime, EventJournal, JournalRecord
 from kagya.training import DatasetGovernanceStore, SleepCoordinator
 from kagya.training.jobs import TrainingJob, TrainingJobStatus
 
@@ -41,7 +42,7 @@ class CockpitTrainingNodeResponse(_ResponseModel):
     role: Literal["inference", "worker"]
     backend: SafeText
     status: Literal["online", "unavailable"]
-    last_contact_at: str | None
+    last_contact_at: datetime | None
     expected_model_id: SafeText | None
     expected_model_revision: SafeText | None
     expected_processor_revision: SafeText | None
@@ -69,10 +70,10 @@ class CockpitTrainingJobResponse(_ResponseModel):
         "unavailable",
     ]
     backend: SafeText | None
-    created_at: str | None
-    updated_at: str | None
-    started_at: str | None
-    completed_at: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+    started_at: datetime | None
+    completed_at: datetime | None
     source_event_start: int | None = Field(default=None, ge=0)
     source_event_end: int | None = Field(default=None, ge=0)
     selected_episode_count: int | None = Field(default=None, ge=0)
@@ -123,9 +124,11 @@ class CockpitTrainingSummaryResponse(_ResponseModel):
 
 
 @dataclass(frozen=True)
-class _JournalRef:
-    event_id: str
-    sequence: int
+class _ConfiguredNode:
+    node_id: str
+    role: Literal["inference", "worker"]
+    backend: Literal["local", "ssh"]
+    health: dict[str, Any]
 
 
 router = APIRouter(prefix="/api/training", tags=["training"])
@@ -148,55 +151,49 @@ def cockpit_training_summary(
     manager: AdapterRuntimeManager = Depends(get_adapter_runtime_manager),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> CockpitTrainingSummaryResponse:
+    raw_health = coordinator.cached_node_status()
+
     def build() -> CockpitTrainingSummaryResponse:
-        raw_nodes = coordinator.node_status()
+        configured_nodes = _configured_nodes(settings, raw_health)
         jobs = coordinator.list_jobs()
         adapters = registry.list()
         history = manager.history()
         journal = getattr(request.app.state, "event_journal", None)
-        journal_by_sequence = _journal_by_sequence(journal)
-        node_by_id = unique_by_id(raw_nodes, lambda item: _node_identifier(item))
+        journal_records = _journal_records(journal)
         job_by_id = unique_by_id(jobs, lambda item: item.job_id)
         adapter_by_id = unique_by_id(adapters, lambda item: item.adapter_id)
-        activation_by_adapter = unique_by_id(
-            (item for item in history if item.action.startswith("activate") and item.adapter_id),
-            lambda item: item.adapter_id or "",
-        )
-        rollback_by_adapter = unique_by_id(
-            (item for item in history if item.action.startswith("rollback") and item.adapter_id),
-            lambda item: item.adapter_id or "",
-        )
+        unique_jobs = list(job_by_id.values())
+        unique_adapters = list(adapter_by_id.values())
         ordered_jobs = sorted(
-            jobs,
+            unique_jobs,
             key=lambda item: (item.updated_at, item.created_at, item.job_id),
             reverse=True,
         )
         ordered_adapters = sorted(
-            adapters,
+            unique_adapters,
             key=lambda item: (item.updated_at, item.created_at, item.adapter_id),
             reverse=True,
         )
-        nodes = [_node_projection(node, settings) for node in node_by_id.values()]
+        nodes = [_node_projection(node, settings) for node in configured_nodes]
         return CockpitTrainingSummaryResponse(
-            node_count=len(node_by_id),
+            node_count=len(nodes),
             online_node_count=sum(node.status == "online" for node in nodes),
-            running_job_count=sum(item.status == TrainingJobStatus.RUNNING for item in jobs),
-            failed_job_count=sum(item.status == TrainingJobStatus.FAILED for item in jobs),
-            importing_job_count=sum(item.status == TrainingJobStatus.IMPORTING for item in jobs),
-            active_adapter_count=sum(item.status.value == "active" for item in adapters),
-            candidate_adapter_count=sum(item.status.value == "candidate" for item in adapters),
+            running_job_count=sum(item.status == TrainingJobStatus.RUNNING for item in unique_jobs),
+            failed_job_count=sum(item.status == TrainingJobStatus.FAILED for item in unique_jobs),
+            importing_job_count=sum(item.status == TrainingJobStatus.IMPORTING for item in unique_jobs),
+            active_adapter_count=sum(item.status.value == "active" for item in unique_adapters),
+            candidate_adapter_count=sum(item.status.value == "candidate" for item in unique_adapters),
             nodes=nodes[:limit],
             jobs=[
-                _job_projection(job if job_by_id.get(job.job_id) is job else None, adapter_by_id)
+                _job_projection(job, adapter_by_id)
                 for job in ordered_jobs[:limit]
             ],
             adapters=[
                 _adapter_projection(
-                    adapter if adapter_by_id.get(adapter.adapter_id) is adapter else None,
+                    adapter,
                     job_by_id,
-                    activation_by_adapter,
-                    rollback_by_adapter,
-                    journal_by_sequence,
+                    history,
+                    journal_records,
                 )
                 for adapter in ordered_adapters[:limit]
             ],
@@ -245,28 +242,43 @@ def dataset_revision(
     }
 
 
+def _configured_nodes(settings: Settings, health: list[dict[str, Any]]) -> list[_ConfiguredNode]:
+    by_node_id = unique_by_id(
+        (item for item in health if _safe_identifier(item.get("node_id")) is not None),
+        lambda item: _safe_identifier(item.get("node_id")) or "",
+    )
+    if settings.deployment.mode == DeploymentMode.SPLIT and settings.deployment.training.remote_worker is not None:
+        remote = settings.deployment.training.remote_worker
+        return [
+            _ConfiguredNode(settings.deployment.node.id, "inference", "ssh", {"reachable": True, "backend": "ssh"}),
+            _ConfiguredNode(remote.node_id, "worker", "ssh", by_node_id.get(remote.node_id, {})),
+        ]
+    return [
+        _ConfiguredNode(settings.deployment.node.id, "inference", "local", {"reachable": True, "backend": "local"})
+    ]
+
+
 def _node_projection(
-    node: dict[str, Any], settings: Settings
+    node: _ConfiguredNode, settings: Settings
 ) -> CockpitTrainingNodeResponse:
-    reachable = bool(node.get("reachable", False))
-    observed_model = _safe_optional_text(node.get("model_id")) if reachable else None
-    observed_revision = _safe_optional_text(node.get("model_revision")) if reachable else None
+    reachable = bool(node.health.get("reachable", False))
+    observed_model = _safe_optional_text(node.health.get("model_id")) if reachable else None
+    observed_revision = _safe_optional_text(node.health.get("model_revision")) if reachable else None
     expected = settings.deployment.training.remote_worker.expected_worker_model if (
-        settings.deployment.training.remote_worker is not None
-        and str(node.get("backend", "")) == "ssh"
+        node.role == "worker" and settings.deployment.training.remote_worker is not None
     ) else settings.model
-    gpu = node.get("gpu") if isinstance(node.get("gpu"), dict) else {}
+    gpu = node.health.get("gpu") if isinstance(node.health.get("gpu"), dict) else {}
     devices = gpu.get("devices") if isinstance(gpu, dict) else None
     gpu_name = None
     if isinstance(devices, list) and devices:
         gpu_name = _safe_optional_text(devices[0])
     status: Literal["online", "unavailable"] = "online" if reachable else "unavailable"
     return CockpitTrainingNodeResponse(
-        node_id=_safe_identifier(node.get("node_id")) or "unavailable",
-        role="worker" if str(node.get("backend", "")) == "ssh" else "inference",
-        backend=_safe_text(node.get("backend")) or "unavailable",
+        node_id=node.node_id,
+        role=node.role,
+        backend=node.backend,
         status=status,
-        last_contact_at=_safe_optional_text(node.get("last_contact") or node.get("heartbeat")) if reachable else None,
+        last_contact_at=_safe_datetime(node.health.get("last_contact") or node.health.get("heartbeat")) if reachable else None,
         expected_model_id=_safe_optional_text(getattr(expected, "model_id", settings.model.primary_id)),
         expected_model_revision=_safe_optional_text(getattr(expected, "revision", settings.model.revision)),
         expected_processor_revision=_safe_optional_text(getattr(expected, "processor_revision", settings.model.processor_revision)),
@@ -320,10 +332,10 @@ def _job_projection(
         attempt_id=job.attempt_id,
         status=job.status.value,
         backend=_safe_optional_text(job.backend),
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        started_at=job.phase_started_at if job.status in {TrainingJobStatus.RUNNING, TrainingJobStatus.SUCCEEDED, TrainingJobStatus.IMPORTING} else None,
-        completed_at=job.updated_at if terminal else None,
+        created_at=_safe_datetime(job.created_at),
+        updated_at=_safe_datetime(job.updated_at),
+        started_at=_safe_datetime(job.phase_started_at) if job.status in {TrainingJobStatus.RUNNING, TrainingJobStatus.SUCCEEDED, TrainingJobStatus.IMPORTING} else None,
+        completed_at=_safe_datetime(job.updated_at) if terminal else None,
         source_event_start=job.source_event_sequence_start,
         source_event_end=job.source_event_sequence_end,
         selected_episode_count=len(job.selected_episode_ids),
@@ -342,9 +354,8 @@ def _job_projection(
 def _adapter_projection(
     adapter: AdapterEntry | None,
     job_by_id: dict[str, TrainingJob],
-    activation_by_adapter: dict[str, AdapterActivationRecord],
-    rollback_by_adapter: dict[str, AdapterActivationRecord],
-    journal_by_sequence: dict[int, _JournalRef],
+    history: list[AdapterActivationRecord],
+    journal_records: list[Any],
 ) -> CockpitAdapterLineageResponse:
     if adapter is None:
         return CockpitAdapterLineageResponse(
@@ -371,13 +382,9 @@ def _adapter_projection(
     job = job_by_id.get(adapter.training_job_id or "")
     if job is not None and not _job_adapter_matches(job, adapter):
         job = None
-    activation = activation_by_adapter.get(adapter.adapter_id)
-    if activation is not None and not _activation_matches(adapter, activation):
-        activation = None
-    rollback = rollback_by_adapter.get(adapter.adapter_id)
-    if rollback is not None and not _activation_matches(adapter, rollback):
-        rollback = None
-    evaluation_id = adapter.real_model_behavioral_evaluation_id or adapter.behavioral_evaluation_id
+    activation = _latest_activation(adapter, history)
+    rollback = _latest_rollback(adapter, history)
+    evaluation_id, evaluation_status = _evaluation_binding(adapter)
     return CockpitAdapterLineageResponse(
         adapter_id=adapter.adapter_id,
         status=adapter.status.value,
@@ -390,13 +397,13 @@ def _adapter_projection(
         submitted_by_node_id=_safe_identifier(adapter.submitted_by_node_id),
         imported_by_node_id=_safe_identifier(adapter.imported_by_node_id),
         evaluation_id=_safe_identifier(evaluation_id),
-        evaluation_status=_evaluation_status(adapter),
+        evaluation_status=evaluation_status,
         approved=adapter.status.value in {"approved", "active", "archived"},
         active=adapter.status.value == "active",
         rollback_candidate=adapter.rollback_target_id is not None or adapter.rollout_state in {"canary", "canary_failed"},
-        activation_event_id=_event_id(activation, journal_by_sequence),
+        activation_event_id=_event_id(adapter, activation, journal_records),
         activation_event_sequence=None if activation is None else activation.activation_sequence,
-        rollback_event_id=_event_id(rollback, journal_by_sequence),
+        rollback_event_id=_event_id(adapter, rollback, journal_records),
         rollback_event_sequence=None if rollback is None else rollback.activation_sequence,
     )
 
@@ -404,35 +411,70 @@ def _adapter_projection(
 def _job_adapter_matches(job: TrainingJob, adapter: AdapterEntry) -> bool:
     return (
         job.candidate_adapter_id == adapter.adapter_id
-        and adapter.training_job_id in {None, job.job_id}
+        and adapter.training_job_id == job.job_id
         and adapter.base_model == job.base_model_id
         and adapter.base_model_revision == job.base_model_revision
-        and (adapter.training_node_id is None or adapter.training_node_id == job.worker_node_id)
+        and adapter.training_node_id is not None
+        and job.worker_node_id is not None
+        and adapter.training_node_id == job.worker_node_id
     )
 
 
-def _activation_matches(adapter: AdapterEntry, record: AdapterActivationRecord) -> bool:
-    return record.adapter_id == adapter.adapter_id and record.adapter_hash == adapter.adapter_hash
+def _latest_activation(
+    adapter: AdapterEntry, records: list[AdapterActivationRecord]
+) -> AdapterActivationRecord | None:
+    matches = [
+        record
+        for record in records
+        if record.action.startswith("activate")
+        and record.adapter_id == adapter.adapter_id
+        and record.adapter_hash == adapter.adapter_hash
+    ]
+    return None if not matches else max(matches, key=lambda item: (item.activation_sequence, item.created_at))
+
+
+def _latest_rollback(
+    adapter: AdapterEntry, records: list[AdapterActivationRecord]
+) -> AdapterActivationRecord | None:
+    matches = [
+        record
+        for record in records
+        if record.action.startswith("rollback")
+        and record.previous_adapter_id == adapter.adapter_id
+        and record.previous_adapter_hash == adapter.adapter_hash
+    ]
+    return None if not matches else max(matches, key=lambda item: (item.activation_sequence, item.created_at))
 
 
 def _event_id(
-    record: AdapterActivationRecord | None, journal_by_sequence: dict[int, _JournalRef]
+    adapter: AdapterEntry,
+    record: AdapterActivationRecord | None,
+    journal_records: list[JournalRecord],
 ) -> str | None:
     if record is None:
         return None
-    ref = journal_by_sequence.get(record.activation_sequence)
-    return None if ref is None else ref.event_id
+    matches = [
+        item
+        for item in journal_records
+        if item.processing_sequence == record.activation_sequence
+        and item.event_type == AgentEventType.ADAPTER_UPDATE.value
+        and _journal_matches_adapter(item, adapter.adapter_id)
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0].event_id
 
 
-def _journal_by_sequence(journal: EventJournal | None) -> dict[int, _JournalRef]:
+def _journal_records(journal: EventJournal | None) -> list[JournalRecord]:
     if journal is None:
-        return {}
-    refs: dict[int, _JournalRef] = {}
-    for record in journal.recent(500):
-        sequence = record.processing_sequence
-        if sequence is not None and record.event_type == AgentEventType.ADAPTER_UPDATE.value:
-            refs[sequence] = _JournalRef(record.event_id, sequence)
-    return refs
+        return []
+    return list(journal.recent(500))
+
+
+def _journal_matches_adapter(record: JournalRecord, adapter_id: str) -> bool:
+    refs = [record.target, record.correlation_id, record.causation_id]
+    constrained = [ref for ref in refs if ref and "adapter" in ref]
+    return not constrained or any(adapter_id in ref for ref in constrained)
 
 
 def unique_by_id(
@@ -442,10 +484,6 @@ def unique_by_id(
     for item in values:
         grouped.setdefault(identifier(item), []).append(item)
     return {record_id: items[0] for record_id, items in grouped.items() if len(items) == 1}
-
-
-def _node_identifier(item: dict[str, Any]) -> str:
-    return _safe_identifier(item.get("node_id")) or "unavailable"
 
 
 def _safe_identifier(value: object) -> str | None:
@@ -464,6 +502,15 @@ def _safe_text(value: object) -> str | None:
 
 def _safe_optional_text(value: object) -> str | None:
     return _safe_text(value)
+
+
+def _safe_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _digest(value: str | None) -> str | None:
@@ -499,17 +546,30 @@ def _failure_code(value: str | None) -> str | None:
     return mapping.get(value, "unknown_failure")
 
 
-def _evaluation_status(
+def _evaluation_binding(
     adapter: AdapterEntry,
-) -> Literal["passed", "failed", "stale", "corrupt", "unavailable"]:
-    state = adapter.real_model_behavioral_artifact_state or adapter.behavioral_artifact_state
-    gate = adapter.real_model_behavioral_gate_passed
-    if gate is None:
+) -> tuple[str | None, Literal["passed", "failed", "stale", "corrupt", "unavailable"]]:
+    evaluation_id: str | None
+    if adapter.real_model_behavioral_evaluation_id is not None:
+        evaluation_id = adapter.real_model_behavioral_evaluation_id
+        state = adapter.real_model_behavioral_artifact_state
+        gate = adapter.real_model_behavioral_gate_passed
+        candidate_hash = adapter.real_model_behavioral_candidate_adapter_hash
+        base_revision = adapter.real_model_behavioral_base_model_revision
+    else:
+        evaluation_id = adapter.behavioral_evaluation_id
+        state = adapter.behavioral_artifact_state
         gate = adapter.behavioral_gate_passed
+        candidate_hash = adapter.behavioral_candidate_adapter_hash
+        base_revision = adapter.behavioral_base_model_revision
+    if evaluation_id is None:
+        return None, "unavailable"
+    if candidate_hash != adapter.adapter_hash or base_revision != adapter.base_model_revision:
+        return None, "unavailable"
     if state in {"quarantined"}:
-        return "corrupt"
+        return evaluation_id, "corrupt"
     if state in {"prepared", "finalized"}:
-        return "stale"
+        return evaluation_id, "stale"
     if state == "reconciled":
-        return "passed" if gate is True else "failed"
-    return "unavailable"
+        return evaluation_id, "passed" if gate is True else "failed"
+    return None, "unavailable"

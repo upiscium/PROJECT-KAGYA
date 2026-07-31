@@ -9,7 +9,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...original,
     api: {
-      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), cockpitTraining: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
+      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), cockpitTraining: vi.fn(), behavioralEvaluations: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
     },
   };
 });
@@ -53,6 +53,7 @@ describe("CockpitClient", () => {
     expect(screen.getByText("gpu-1")).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: "job-1" })[0]).toHaveAttribute("href", "#training-job-job-1");
     expect(screen.getAllByRole("link", { name: "adapter-1" })[0]).toHaveAttribute("href", "#adapter-lineage-adapter-1");
+    expect(screen.getByRole("link", { name: "eval-1" })).toHaveAttribute("href", "/evaluations#evaluation-eval-1");
     expect(screen.getAllByRole("link", { name: "event-1" })[0]).toHaveAttribute("href", "#journal-event-1");
     const decisionSection = screen.getByText("Recent Decisions").closest(".ui-card") as HTMLElement;
     expect(within(decisionSection).getByRole("link", { name: "action-1" })).toHaveAttribute("href", "#action-action-1");
@@ -127,6 +128,32 @@ describe("CockpitClient", () => {
     expect(screen.getByText("Action Execution")).toBeInTheDocument();
   });
 
+  it("renders split training nodes with an offline worker without key warnings", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockedApi.cockpitTraining.mockResolvedValue({
+      ...cockpitTrainingProjection(),
+      node_count: 2,
+      online_node_count: 1,
+      nodes: [
+        { node_id: "node-main", role: "inference", backend: "ssh", status: "online", last_contact_at: null, expected_model_id: "model-1", expected_model_revision: "rev-1", expected_processor_revision: "proc-1", observed_model_id: null, observed_model_revision: null, model_matches_expected: null, gpu_name: null, cuda_version: null, driver_version: null },
+        { node_id: "training-01", role: "worker", backend: "ssh", status: "unavailable", last_contact_at: null, expected_model_id: "model-1", expected_model_revision: "rev-1", expected_processor_revision: "proc-1", observed_model_id: null, observed_model_revision: null, model_matches_expected: null, gpu_name: null, cuda_version: null, driver_version: null },
+      ],
+      adapters: [{ ...cockpitTrainingProjection().adapters[0], rollback_event_id: "event-1", rollback_event_sequence: 8 }],
+    } as never);
+
+    renderCockpit();
+
+    expect(await screen.findByText("training-01")).toBeInTheDocument();
+    expect(screen.getByText("Nodes").parentElement).toHaveTextContent("2");
+    expect(screen.getByText("Online").parentElement).toHaveTextContent("1");
+    expect(screen.getAllByText("unavailable").length).toBeGreaterThan(0);
+    expect(screen.queryByText("unavailable-1")).not.toBeInTheDocument();
+    expect(screen.getByText((_, element) => element?.tagName === "P" && element.textContent?.includes("Evaluation:") === true && element.textContent?.includes("passed") === true)).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "event-1" }).length).toBeGreaterThan(0);
+    expect(consoleError.mock.calls.flat().join("\n")).not.toContain("Each child in a list should have a unique");
+    consoleError.mockRestore();
+  });
+
   it("links a decision to its pre-intent failure when no intent exists", async () => {
     mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 0, retry_pending_count: 0, failed_count: 2, traces: [], pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never });
     const { queryClient } = renderCockpit();
@@ -158,6 +185,7 @@ function resolveRepresentativeData() {
   mockedApi.cockpitOutbox.mockResolvedValue({ pending_count: 42, critical_count: 9, messages: rawOutboxFixtures.map(cockpitOutboxProjection) });
   mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 2, retry_pending_count: 1, failed_count: 5, traces: rawActionFixtures.map(cockpitActionProjection) as never, pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never });
   mockedApi.cockpitTraining.mockResolvedValue(cockpitTrainingProjection());
+  mockedApi.behavioralEvaluations.mockResolvedValue({ results: [{ evaluation_id: "eval-1" }] } as never);
   mockedApi.eventJournal.mockResolvedValue({ records: [{ record_id: "record-1", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-1", event_type: "goal_update", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: "goal:goal-1", reauthenticated: null, previous_record_hash: null, record_hash: "hash", private_replay: "PRIVATE_SENTINEL" } as never] });
 }
 

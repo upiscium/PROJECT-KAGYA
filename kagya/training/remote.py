@@ -33,6 +33,12 @@ class SSHTrainingBackend:
         self._contract = TrainingArtifactContract()
         self._jobs: dict[str, TrainingJob] = {}
         self._metadata: dict[str, dict[str, Any]] = {}
+        self._node_status: dict[str, Any] = {
+            "node_id": self.settings.node_id,
+            "reachable": False,
+            "last_contact": None,
+            "backend": "ssh",
+        }
         self._shutdown = Event()
 
     def submit(self, job: TrainingJob, bundle_path: Path) -> str:
@@ -203,21 +209,26 @@ class SSHTrainingBackend:
                 timeout=self.settings.connect_timeout_seconds,
             )
             payload = _json_output(response.stdout)
-            return {
+            self._node_status = {
                 **payload,
+                "node_id": self.settings.node_id,
                 "reachable": True,
                 "last_contact": _now(),
                 "backend": "ssh",
             }
+            return dict(self._node_status)
         except (RuntimeError, TimeoutError) as exc:
-            return {
+            self._node_status = {
                 "node_id": self.settings.node_id,
-                "hostname": self.settings.host,
                 "reachable": False,
                 "last_contact": None,
                 "backend": "ssh",
                 "error": str(exc),
             }
+            return dict(self._node_status)
+
+    def cached_node_status(self) -> dict[str, Any]:
+        return dict(self._node_status)
 
     def job_metadata(self, job_id: str) -> dict[str, Any]:
         return dict(self._metadata.get(job_id, {}))
