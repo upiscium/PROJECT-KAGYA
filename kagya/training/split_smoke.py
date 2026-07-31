@@ -8,11 +8,14 @@ import socket
 from typing import Any
 from uuid import uuid4
 
+from kagya.artifact_provenance import build_adapter_artifact_manifest
 from kagya.config import Settings, load_settings
 from kagya.learning import (
     AdapterRegistry,
     AdapterRuntimeManager,
+    BehavioralArtifactStore,
     RuntimeAdapterState,
+    run_deterministic_runtime_evaluation,
 )
 from kagya.models import DummyProvider
 from kagya.runtime import AgentEventType, AgentRuntime
@@ -89,6 +92,35 @@ def run_split_smoke(settings: Settings, work_dir: Path) -> dict[str, Any]:
         score=1.0,
         result_path=training_result.artifact_path / "evaluation.json",
     )
+    evaluation_id = f"split-smoke-{entry.adapter_id}"
+    _, artifact_status = run_deterministic_runtime_evaluation(
+        isolated,
+        evaluation_id,
+        baseline_id="baseline",
+        candidate_id=entry.adapter_id,
+        candidate_adapter_path=Path(entry.path),
+        candidate_adapter_hash=entry.adapter_hash or "",
+        base_model_revision=entry.base_model_revision or settings.model.revision,
+        subject_revision="split-smoke",
+    )
+    if artifact_status != "prepared":
+        raise RuntimeError("Behavioral artifact did not enter prepared state")
+    store = BehavioralArtifactStore(isolated.adapter_registry.eval_result_dir)
+    registry.prepare_behavioral_evaluation(
+        entry.adapter_id,
+        evaluation_id=evaluation_id,
+        prepared_path=store.prepared_path(evaluation_id),
+        final_path=store.final_path(evaluation_id),
+    )
+    store.finalize(evaluation_id)
+    registry.finalize_behavioral_evaluation(
+        entry.adapter_id, evaluation_id=evaluation_id
+    )
+    if not any(
+        item.evaluation_id == evaluation_id and item.status.value == "valid"
+        for item in store.reconcile(registry)
+    ):
+        raise RuntimeError("Behavioral artifact cross-reconciliation failed")
     approved = registry.approve(entry.adapter_id, notes="split deployment smoke")
     activation, rollback = _exercise_lifecycle(registry, approved.adapter_id, work_dir)
     restored = registry.lookup(approved.adapter_id)
@@ -121,7 +153,7 @@ def _bundle_and_job(settings: Settings, work_dir: Path) -> tuple[Path, TrainingJ
         json.dumps(
             {
                 "input": "State one safe operational principle.",
-                "thought": "Prefer reversible, observable changes.",
+                "thought": "",
                 "output": "Make small changes, verify them, and keep rollback available.",
             },
             separators=(",", ":"),
@@ -204,6 +236,20 @@ def _exercise_lifecycle(
 ) -> tuple[Any, Any]:
     state = [RuntimeAdapterState(None, None, None, DummyProvider())]
 
+    def load_provider(entry):
+        provider = DummyProvider()
+        if entry is not None:
+            manifest = build_adapter_artifact_manifest(
+                Path(entry.path),
+                base_model_name=entry.base_model,
+                base_model_revision=entry.base_model_revision,
+            )
+            provider.adapter_artifact_manifest = manifest
+            provider.adapter_artifact_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_manifest_hash = manifest.sha256
+            provider.adapter_snapshot_hash = entry.adapter_hash
+        return provider
+
     def switch(provider, entry, sequence) -> None:
         state[0] = RuntimeAdapterState(
             None if entry is None else entry.adapter_id,
@@ -214,7 +260,7 @@ def _exercise_lifecycle(
 
     manager = AdapterRuntimeManager(
         registry,
-        provider_loader=lambda _entry: DummyProvider(),
+        provider_loader=load_provider,
         runtime_switch=switch,
         runtime_snapshot=lambda: state[0],
         history_path=work_dir / "adapter_registry_activations.json",
