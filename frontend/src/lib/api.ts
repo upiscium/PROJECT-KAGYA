@@ -490,32 +490,43 @@ export type Belief = {
 export type BeliefListResponse = { beliefs: Belief[] };
 export type MotivationState = { schema_version: number; records: Array<Record<string, unknown>>; episodes: Array<Record<string, unknown>> };
 export type OutboxMessage = {
-  schema_version: 1;
   message_id: string;
-  revision: number;
   kind: "question" | "approval_request" | "commitment_deadline" | "goal_state" | "action_result" | "anomaly" | "renegotiation" | "long_task_complete";
   title: string;
-  body: string;
-  context_id: string | null;
-  interlocutor_id: string | null;
-  references: { event_id: string | null; goal_id: string | null; plan_id: string | null; decision_id: string | null; action_id: string | null; commitment_id: string | null };
   urgency: "low" | "normal" | "high" | "critical";
-  not_before: string;
-  expires_at: string | null;
-  channel: "local";
-  privacy_class: "public" | "interlocutor" | "operator";
   delivery_status: "pending" | "delivered" | "failed" | "expired" | "cancelled";
   acknowledgment_status: "unacknowledged" | "read" | "replied" | "approved" | "rejected";
-  deduplication_key: string;
   created_at: string;
-  updated_at: string;
-  delivered_at: string | null;
-  acknowledged_at: string | null;
-  attempts: Array<{ attempt: number; attempted_at: string; status: "delivered" | "failed"; failure_code: string | null }>;
-  responses: Array<{ response_id: string; kind: string; actor_id: string; received_at: string; text: string | null; event_id: string | null; event_sequence: number | null }>;
+  channel: "local";
+  privacy_class: "public" | "interlocutor" | "operator";
   last_failure_code: string | null;
+  references: { event_id: string | null; goal_id: string | null; plan_id: string | null; decision_id: string | null; action_id: string | null; commitment_id: string | null };
 };
 export type OutboxMessageListResponse = { messages: OutboxMessage[] };
+
+export type RiskClass = "read_only" | "reversible_write" | "external_write" | "destructive" | "high_impact";
+export type ActionTool = { name: string; risk_class: RiskClass; approval_required: boolean; reversible: boolean; effect_code: string; validation_schema_revision: string; enabled: boolean; executable: boolean; execution_authority: "action_execution" };
+export type RegistryTool = { name: string; description: string | null; tool_type: string; status: string; generated: boolean; human_approved: boolean; execution_authority: "registry_only" };
+export type ArgumentSummary =
+  | { kind: "metadata_read"; namespace: string; key: string }
+  | { kind: "document_search"; scope_kind: string; max_results: number; query_length: number; query_digest: string }
+  | { kind: "calendar_read"; starts_at: string; ends_at: string; max_results: number }
+  | { kind: "notification"; channel: string; title: string; body_preview: string };
+export type OperatorAction = {
+  intent_id: string; revision: number; status: "awaiting_approval" | "approved" | "dry_run" | "executing" | "retry_pending" | "succeeded" | "failed" | "cancelled" | "rejected" | "compensated"; approval: { approval_id: string; status: "pending" | "approved" | "rejected"; requested_at: string } | null;
+  tool: ActionTool; argument_summary: ArgumentSummary; policy: { allowed: boolean; approval_required: boolean; reason_codes: string[] };
+  preview: { effect_code: string; effect: string; digest: string; compensation_available: boolean };
+  budget: { max_attempts: number; max_cost_units: number; max_monetary_cost: number; deadline_at: string | null; attempts: number; cost_units_used: number; retry_at: string | null };
+  provenance: { decision_id: string; plan_id: string | null; plan_revision: number | null; step_id: string | null; triggering_event_id: string | null };
+  receipt: { receipt_id: string; status: string } | null; verification: { verification_id: string; success: boolean; reason: string } | null;
+  idempotency_state: "reserved" | "released" | "completed" | "unknown"; available_commands: Array<"approve" | "reject" | "cancel" | "retry_now" | "compensate">;
+  confirmation: { required: boolean; phrase: string | null } | null;
+};
+export type ActionOperatorSummary = { pending_approval_count: number; operator_action_count: number; risk_ceiling: RiskClass; actions: OperatorAction[]; action_tools: ActionTool[]; registry_tools: RegistryTool[] };
+export type OperatorSummary = ActionOperatorSummary;
+export type ActionMutationCommon = { expected_intent_revision: number; expected_preview_digest: string; confirmation_phrase?: string };
+export type ApproveActionRequest = ActionMutationCommon & { expected_approval_id: string; reason?: string };
+export type ActionMutationResponse = { command: "approve" | "reject" | "cancel" | "retry_now" | "compensate"; event_id: string; processing_sequence: number; action: OperatorAction; disposition: "awaiting_scheduler" | "rejected" | "cancelled" | "executed" | "compensated" };
 export type CockpitOutboxMessage = {
   message_id: string;
   title: string;
@@ -1072,7 +1083,6 @@ function parsePlans(value: unknown): PlanListResponse {
 }
 
 const ACTION_TYPES = ["respond", "internal", "no_op", "defer", "observe", "request_information", "delegate", "refuse", "unable", "replan"] as const;
-const ACTION_TOOL_NAMES = ["restricted_metadata_read", "document_search", "calendar_read", "local_notification_enqueue"] as const;
 
 function parseDecisions(value: unknown): DecisionListResponse {
   const items = responseArray(value, "decisions", "decision");
@@ -1123,6 +1133,73 @@ function parseWorkingMemory(value: unknown): WorkingMemorySummary {
     token_capacity: nonnegativeInteger(value.token_capacity, "working-memory summary"),
   };
 }
+
+const ACTION_STATUSES = ["awaiting_approval", "approved", "dry_run", "executing", "retry_pending", "succeeded", "failed", "cancelled", "rejected", "compensated"] as const;
+const ACTION_TOOL_NAMES = ["restricted_metadata_read", "document_search", "calendar_read", "local_notification_enqueue"] as const;
+
+function parseOperatorSummary(value: unknown): ActionOperatorSummary {
+  exactRecord(value, ["pending_approval_count", "operator_action_count", "risk_ceiling", "actions", "action_tools", "registry_tools"], "operator summary");
+  return {
+    pending_approval_count: nonnegativeInteger(value.pending_approval_count, "operator summary pending count"),
+    operator_action_count: nonnegativeInteger(value.operator_action_count, "operator summary action count"),
+    risk_ceiling: enumValue(value.risk_ceiling, ["read_only", "reversible_write", "external_write", "destructive", "high_impact"] as const, "operator summary risk ceiling"),
+    actions: recordArray(value.actions, "operator action").map(parseOperatorAction),
+    action_tools: recordArray(value.action_tools, "action tool").map(parseActionTool),
+    registry_tools: recordArray(value.registry_tools, "registry tool").map(parseRegistryTool),
+  };
+}
+
+function parseActionTool(value: Record<string, unknown>): ActionTool {
+  exactRecord(value, ["name", "risk_class", "approval_required", "reversible", "effect_code", "validation_schema_revision", "enabled", "executable", "execution_authority"], "action tool");
+  return { name: enumValue(value.name, ACTION_TOOL_NAMES, "action tool name"), risk_class: enumValue(value.risk_class, ["read_only", "reversible_write", "external_write", "destructive", "high_impact"] as const, "action tool risk"), approval_required: booleanValue(value.approval_required, "action tool approval"), reversible: booleanValue(value.reversible, "action tool reversible"), effect_code: boundedCode(value.effect_code, "action tool effect code"), validation_schema_revision: digest(value.validation_schema_revision, "action tool schema revision"), enabled: booleanValue(value.enabled, "action tool enabled"), executable: booleanValue(value.executable, "action tool executable"), execution_authority: enumValue(value.execution_authority, ["action_execution"] as const, "action tool authority") };
+}
+
+function parseRegistryTool(value: Record<string, unknown>): RegistryTool {
+  exactRecord(value, ["name", "description", "tool_type", "status", "generated", "human_approved", "execution_authority"], "registry tool");
+  return { name: safeText(value.name, "registry tool name"), description: optionalSafeText(value.description, "registry tool description"), tool_type: boundedCode(value.tool_type, "registry tool type"), status: boundedCode(value.status, "registry tool status"), generated: booleanValue(value.generated, "registry tool generated"), human_approved: booleanValue(value.human_approved, "registry tool approval"), execution_authority: enumValue(value.execution_authority, ["registry_only"] as const, "registry tool authority") };
+}
+
+function parseOperatorAction(value: Record<string, unknown>): OperatorAction {
+  exactRecord(value, ["intent_id", "revision", "status", "approval", "tool", "argument_summary", "policy", "preview", "budget", "provenance", "receipt", "verification", "idempotency_state", "available_commands", "confirmation"], "operator action");
+  if (!isRecord(value.tool) || !isRecord(value.policy) || !isRecord(value.preview) || !isRecord(value.budget) || !isRecord(value.provenance)) invalid("operator action");
+  exactRecord(value.policy, ["allowed", "approval_required", "reason_codes"], "action policy");
+  exactRecord(value.preview, ["effect_code", "effect", "digest", "compensation_available"], "action preview");
+  exactRecord(value.budget, ["max_attempts", "max_cost_units", "max_monetary_cost", "deadline_at", "attempts", "cost_units_used", "retry_at"], "action budget");
+  exactRecord(value.provenance, ["decision_id", "plan_id", "plan_revision", "step_id", "triggering_event_id"], "action provenance");
+  const approval = value.approval === null ? null : parseApproval(value.approval);
+  const receipt = value.receipt === null ? null : parseSmallReceipt(value.receipt);
+  const verification = value.verification === null ? null : parseVerification(value.verification);
+  if (value.confirmation !== null && (!isRecord(value.confirmation))) invalid("action confirmation");
+  if (value.confirmation !== null) exactRecord(value.confirmation, ["required", "phrase"], "action confirmation");
+  return {
+    intent_id: safeId(value.intent_id, "action intent"), revision: positiveInteger(value.revision, "action revision"), status: enumValue(value.status, ACTION_STATUSES, "action status"), approval,
+    tool: parseActionTool(value.tool), argument_summary: parseArgumentSummary(value.argument_summary),
+    policy: { allowed: booleanValue(value.policy.allowed, "action policy allowed"), approval_required: booleanValue(value.policy.approval_required, "action policy approval"), reason_codes: stringArray(value.policy.reason_codes, "action policy codes").map((code) => boundedCode(code, "action policy code")) },
+    preview: { effect_code: boundedCode(value.preview.effect_code, "action preview effect"), effect: safeText(value.preview.effect, "action preview"), digest: digest(value.preview.digest, "action preview digest"), compensation_available: booleanValue(value.preview.compensation_available, "action compensation") },
+    budget: { max_attempts: positiveInteger(value.budget.max_attempts, "action budget attempts"), max_cost_units: nonnegativeNumber(value.budget.max_cost_units, "action budget cost"), max_monetary_cost: nonnegativeNumber(value.budget.max_monetary_cost, "action budget monetary cost"), deadline_at: optionalIsoTimestamp(value.budget.deadline_at, "action budget deadline"), attempts: nonnegativeInteger(value.budget.attempts, "action attempts"), cost_units_used: nonnegativeNumber(value.budget.cost_units_used, "action cost used"), retry_at: optionalIsoTimestamp(value.budget.retry_at, "action retry timestamp") },
+    provenance: { decision_id: safeId(value.provenance.decision_id, "action decision"), plan_id: optionalSafeId(value.provenance.plan_id, "action plan"), plan_revision: optionalPositiveInteger(value.provenance.plan_revision, "action plan revision"), step_id: optionalSafeId(value.provenance.step_id, "action step"), triggering_event_id: optionalSafeId(value.provenance.triggering_event_id, "action event") },
+    receipt, verification, idempotency_state: enumValue(value.idempotency_state, ["reserved", "released", "completed", "unknown"] as const, "action idempotency state"), available_commands: enumArray(value.available_commands, ["approve", "reject", "cancel", "retry_now", "compensate"] as const, "action commands"),
+    confirmation: value.confirmation === null ? null : { required: booleanValue(value.confirmation.required, "action confirmation required"), phrase: optionalSafeText(value.confirmation.phrase, "action confirmation phrase") },
+  };
+}
+
+function parseArgumentSummary(value: unknown): ArgumentSummary {
+  if (!isRecord(value) || typeof value.kind !== "string") invalid("action argument summary");
+  switch (value.kind) {
+    case "metadata_read": exactRecord(value, ["kind", "namespace", "key"], "metadata argument summary"); return { kind: value.kind, namespace: safeText(value.namespace, "metadata namespace"), key: safeText(value.key, "metadata key") };
+    case "document_search": exactRecord(value, ["kind", "scope_kind", "max_results", "query_length", "query_digest"], "document argument summary"); return { kind: value.kind, scope_kind: boundedCode(value.scope_kind, "document scope"), max_results: positiveInteger(value.max_results, "document max results"), query_length: nonnegativeInteger(value.query_length, "document query length"), query_digest: digest(value.query_digest, "document query digest") };
+    case "calendar_read": exactRecord(value, ["kind", "starts_at", "ends_at", "max_results"], "calendar argument summary"); return { kind: value.kind, starts_at: isoTimestamp(value.starts_at, "calendar start"), ends_at: isoTimestamp(value.ends_at, "calendar end"), max_results: positiveInteger(value.max_results, "calendar max results") };
+    case "notification": exactRecord(value, ["kind", "channel", "title", "body_preview"], "notification argument summary"); return { kind: value.kind, channel: boundedCode(value.channel, "notification channel"), title: publicPreviewText(value.title, "notification title", 120), body_preview: publicPreviewText(value.body_preview, "notification preview", 160) };
+    default: return invalid("action argument summary");
+  }
+}
+
+function parseApproval(value: unknown): NonNullable<OperatorAction["approval"]> { if (!isRecord(value)) invalid("action approval"); exactRecord(value, ["approval_id", "status", "requested_at"], "action approval"); return { approval_id: safeId(value.approval_id, "approval"), status: enumValue(value.status, ["pending", "approved", "rejected"] as const, "approval status"), requested_at: isoTimestamp(value.requested_at, "approval timestamp") }; }
+function parseSmallReceipt(value: unknown): NonNullable<OperatorAction["receipt"]> { if (!isRecord(value)) invalid("action receipt"); exactRecord(value, ["receipt_id", "status"], "action receipt"); return { receipt_id: safeId(value.receipt_id, "receipt"), status: enumValue(value.status, ["succeeded", "failed", "timed_out", "cancelled", "compensated"] as const, "receipt status") }; }
+function parseVerification(value: unknown): NonNullable<OperatorAction["verification"]> { if (!isRecord(value)) invalid("action verification"); exactRecord(value, ["verification_id", "success", "reason"], "action verification"); return { verification_id: safeId(value.verification_id, "verification"), success: booleanValue(value.success, "verification success"), reason: boundedCode(value.reason, "verification reason") }; }
+function enumArray<const T extends readonly string[]>(value: unknown, allowed: T, label: string): T[number][] { if (!Array.isArray(value)) invalid(label); return value.map((item) => enumValue(item, allowed, label)); }
+function parseOutboxMessage(value: unknown): OutboxMessage { return parseOutbox({ messages: [value] }).messages[0]; }
+function parseOutbox(value: unknown): OutboxMessageListResponse { if (!isRecord(value)) invalid("outbox"); exactRecord(value, ["messages"], "outbox"); return { messages: recordArray(value.messages, "outbox message").map((message) => { exactRecord(message, ["message_id", "kind", "title", "urgency", "delivery_status", "acknowledgment_status", "created_at", "channel", "privacy_class", "last_failure_code", "references"], "outbox message"); if (!isRecord(message.references)) invalid("outbox references"); exactRecord(message.references, ["event_id", "goal_id", "plan_id", "decision_id", "action_id", "commitment_id"], "outbox references"); return { message_id: safeId(message.message_id, "outbox message"), kind: enumValue(message.kind, ["question", "approval_request", "commitment_deadline", "goal_state", "action_result", "anomaly", "renegotiation", "long_task_complete"] as const, "outbox kind"), title: safeText(message.title, "outbox title"), urgency: enumValue(message.urgency, ["low", "normal", "high", "critical"] as const, "outbox urgency"), delivery_status: enumValue(message.delivery_status, ["pending", "delivered", "failed", "expired", "cancelled"] as const, "outbox delivery"), acknowledgment_status: enumValue(message.acknowledgment_status, ["unacknowledged", "read", "replied", "approved", "rejected"] as const, "outbox acknowledgment"), created_at: isoTimestamp(message.created_at, "outbox timestamp"), channel: enumValue(message.channel, ["local"] as const, "outbox channel"), privacy_class: enumValue(message.privacy_class, ["public", "interlocutor", "operator"] as const, "outbox privacy"), last_failure_code: message.last_failure_code === null ? null : boundedCode(message.last_failure_code, "outbox failure"), references: { event_id: optionalSafeId(message.references.event_id, "outbox event"), goal_id: optionalSafeId(message.references.goal_id, "outbox goal"), plan_id: optionalSafeId(message.references.plan_id, "outbox plan"), decision_id: optionalSafeId(message.references.decision_id, "outbox decision"), action_id: optionalSafeId(message.references.action_id, "outbox action"), commitment_id: optionalSafeId(message.references.commitment_id, "outbox commitment") } }; }) }; }
 
 function parseCockpitOutbox(value: unknown): CockpitOutboxResponse {
   if (!isRecord(value) || !Array.isArray(value.messages)) invalid("cockpit outbox");
@@ -1389,6 +1466,13 @@ function safeText(value: unknown, label: string): string {
   return result;
 }
 
+function publicPreviewText(value: unknown, label: string, maximum: number): string {
+  const result = text(value, label);
+  const lowered = result.toLowerCase();
+  if (result.length > maximum || /[\x00-\x1f\x7f]/.test(result) || ["private_sentinel", "hidden_thought", "raw_prompt", "<think", "</think", "credential", "password", "api_key", "api key", "access_token", "secret"].some((marker) => lowered.includes(marker))) invalid(label);
+  return result;
+}
+
 function optionalSafeText(value: unknown, label: string): string | null {
   return value === null ? null : safeText(value, label);
 }
@@ -1516,6 +1600,23 @@ async function cancelChatJob(operationId: string): Promise<ChatCancelResponse> {
   return response;
 }
 
+function actionMutation(path: string, body: ActionMutationCommon | (ApproveActionRequest & { approved: boolean })): Promise<ActionMutationResponse> {
+  return privateApiRequest<unknown>(path, { method: "POST", body: JSON.stringify(body) }).then(parseActionMutation);
+}
+
+function parseActionMutation(value: unknown): ActionMutationResponse {
+  if (!isRecord(value)) invalid("action mutation");
+  exactRecord(value, ["command", "event_id", "processing_sequence", "action", "disposition"], "action mutation");
+  if (!isRecord(value.action)) invalid("action mutation action");
+  return {
+    command: enumValue(value.command, ["approve", "reject", "cancel", "retry_now", "compensate"] as const, "action mutation command"),
+    event_id: safeId(value.event_id, "action mutation event"),
+    processing_sequence: positiveInteger(value.processing_sequence, "action mutation sequence"),
+    action: parseOperatorAction(value.action),
+    disposition: enumValue(value.disposition, ["awaiting_scheduler", "rejected", "cancelled", "executed", "compensated"] as const, "action mutation disposition"),
+  };
+}
+
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
   chatJobResult: (operationId: string) => request<ChatJobResult>(`/api/chat/jobs/${encodeURIComponent(operationId)}/result`),
@@ -1531,6 +1632,12 @@ export const api = {
   decisions: async () => parseDecisions(await privateApiRequest<unknown>("/decisions")),
   cockpitOutbox: async () => parseCockpitOutbox(await privateApiRequest<unknown>("/outbox/summary")),
   actionTrace: async () => parseActionTrace(await privateApiRequest<unknown>("/actions/trace")),
+  actionOperatorSummary: async () => parseOperatorSummary(await privateApiRequest<unknown>("/actions/operator-summary")),
+  approveAction: (intentId: string, body: ApproveActionRequest) => actionMutation(`/actions/operator/intents/${encodeURIComponent(id(intentId, "action intent"))}/approval`, { ...body, approved: true }),
+  rejectAction: (intentId: string, body: ApproveActionRequest) => actionMutation(`/actions/operator/intents/${encodeURIComponent(id(intentId, "action intent"))}/approval`, { ...body, approved: false }),
+  cancelAction: (intentId: string, body: ActionMutationCommon) => actionMutation(`/actions/operator/intents/${encodeURIComponent(id(intentId, "action intent"))}/cancel`, body),
+  retryAction: (intentId: string, body: ActionMutationCommon) => actionMutation(`/actions/operator/intents/${encodeURIComponent(id(intentId, "action intent"))}/retry`, body),
+  compensateAction: (intentId: string, body: ActionMutationCommon) => actionMutation(`/actions/operator/intents/${encodeURIComponent(id(intentId, "action intent"))}/compensate`, body),
   cockpitTraining: async () => parseCockpitTrainingSummary(await privateApiRequest<unknown>("/training/cockpit-summary")),
   memorySearch: (query: string) => privateApiRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
@@ -1577,7 +1684,7 @@ export const api = {
   beliefs: (activeOnly = false) => privateApiRequest<BeliefListResponse>(`/beliefs?active_only=${activeOnly}`),
   decisionExplanations: async () => parseDecisionExplanationResponse(await privateApiRequest<unknown>("/decisions/explanations")),
   motivation: () => privateApiRequest<MotivationState>("/motivation"),
-  outboxMessages: () => privateApiRequest<OutboxMessageListResponse>("/outbox/messages"),
-  deliverOutbox: () => privateApiRequest<OutboxMessageListResponse>("/outbox/deliveries", { method: "POST" }),
-  respondToOutbox: (messageId: string, kind: "read" | "reply" | "approval" | "reject", text?: string) => privateApiRequest<OutboxMessage>(`/outbox/messages/${encodeURIComponent(messageId)}/responses`, { method: "POST", body: JSON.stringify({ kind, text }) }),
+  outboxMessages: async () => parseOutbox(await privateApiRequest<unknown>("/outbox/messages")),
+  deliverOutbox: async () => parseOutbox(await privateApiRequest<unknown>("/outbox/deliveries", { method: "POST" })),
+  respondToOutbox: async (messageId: string, kind: "read" | "reply", text?: string) => parseOutboxMessage(await privateApiRequest<unknown>(`/outbox/messages/${encodeURIComponent(id(messageId, "outbox message"))}/responses`, { method: "POST", body: JSON.stringify({ kind, text }) })),
 };

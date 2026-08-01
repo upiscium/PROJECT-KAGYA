@@ -378,25 +378,46 @@ class Outbox:
         event_id: str | None = None,
         event_sequence: int | None = None,
     ) -> OutboxMessage | None:
-        message = next(
-            (
-                item
-                for item in self._state().messages
-                if item.kind == OutboxMessageKind.APPROVAL_REQUEST
-                and item.references.action_id == action_id
-            ),
-            None,
-        )
-        if message is None:
+        matches = [
+            item
+            for item in self._state().messages
+            if item.kind == OutboxMessageKind.APPROVAL_REQUEST
+            and item.references.action_id == action_id
+        ]
+        if len(matches) != 1:
             return None
-        return self.respond(
-            message.message_id,
-            kind="approval" if approved else "reject",
+        message = matches[0]
+        kind: Literal["approval", "reject"] = "approval" if approved else "reject"
+        requested = AcknowledgmentStatus.APPROVED if approved else AcknowledgmentStatus.REJECTED
+        if message.acknowledgment_status == requested:
+            return message
+        if message.acknowledgment_status in {
+            AcknowledgmentStatus.APPROVED,
+            AcknowledgmentStatus.REJECTED,
+        }:
+            return message
+        # Outbox is a correlated notification projection, not approval authority.
+        # A prior read/reply or delivery expiry must not veto an action transition
+        # that already passed the preview-bound ActionExecution contract.
+        now = self.clock()
+        response = OutboxResponse(
+            response_id=str(uuid4()),
+            kind=kind,
             actor_id=actor_id,
             text=text,
+            received_at=now,
             event_id=event_id,
             event_sequence=event_sequence,
         )
+        updated = message.model_copy(update={
+            "revision": message.revision + 1,
+            "acknowledgment_status": requested,
+            "acknowledged_at": now,
+            "updated_at": now,
+            "responses": (*message.responses, response),
+        })
+        self._replace(updated)
+        return updated
 
     def _state(self) -> OutboxState:
         raw = self.main_loop.persistent_state.extensions.get(OUTBOX_STATE_KEY)

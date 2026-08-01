@@ -6,10 +6,8 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from kagya.actions import ActionExecutionLayer
 from kagya.api.dependencies import (
     execute_agent_event,
-    get_action_execution,
     get_agent_runtime,
     get_outbox,
     get_private_operator,
@@ -79,6 +77,35 @@ class CockpitOutboxMessageResponse(BaseModel):
     references: CockpitOutboxReferencesResponse
 
 
+class SafeOutboxMessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    message_id: str
+    kind: Literal[
+        "question",
+        "approval_request",
+        "commitment_deadline",
+        "goal_state",
+        "action_result",
+        "anomaly",
+        "renegotiation",
+        "long_task_complete",
+    ]
+    title: str
+    urgency: OutboxUrgency
+    delivery_status: DeliveryStatus
+    acknowledgment_status: AcknowledgmentStatus
+    created_at: datetime
+    channel: Literal["local"]
+    privacy_class: PrivacyClass
+    last_failure_code: str | None
+    references: CockpitOutboxReferencesResponse
+
+
+class SafeOutboxListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    messages: list[SafeOutboxMessageResponse]
+
+
 class CockpitOutboxSummaryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -90,18 +117,18 @@ class CockpitOutboxSummaryResponse(BaseModel):
 router = APIRouter(prefix="/api/outbox", tags=["outbox"])
 
 
-@router.get("/messages")
+@router.get("/messages", response_model=SafeOutboxListResponse)
 def list_messages(
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-) -> dict[str, object]:
+) -> SafeOutboxListResponse:
     messages = execute_agent_event(
         runtime,
         AgentEventType.OUTBOX_READ,
         source="api.outbox.list",
         handler=outbox.list_messages,
     ).value
-    return {"messages": [item.model_dump(mode="json") for item in messages]}
+    return SafeOutboxListResponse(messages=[_safe_message(item) for item in messages])
 
 
 @router.get(
@@ -135,12 +162,12 @@ def cockpit_summary(
     ).value
 
 
-@router.post("/messages")
+@router.post("/messages", response_model=SafeOutboxMessageResponse)
 def enqueue_message(
     body: EnqueueRequest,
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-) -> dict[str, object]:
+) -> SafeOutboxMessageResponse:
     try:
         message = execute_agent_event(
             runtime,
@@ -159,20 +186,23 @@ def enqueue_message(
                 expires_at=body.expires_at,
                 privacy_class=body.privacy_class,
             ),
-            payload={"kind": body.kind.value, "deduplication_key": body.deduplication_key},
+            payload={
+                "kind": body.kind.value,
+                "deduplication_key": body.deduplication_key,
+            },
             correlation_id=body.deduplication_key,
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return message.model_dump(mode="json")
+    return _safe_message(message)
 
 
-@router.post("/deliveries")
+@router.post("/deliveries", response_model=SafeOutboxListResponse)
 def deliver_messages(
     limit: int = 20,
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-) -> dict[str, object]:
+) -> SafeOutboxListResponse:
     try:
         messages = execute_agent_event(
             runtime,
@@ -182,30 +212,25 @@ def deliver_messages(
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"messages": [item.model_dump(mode="json") for item in messages]}
+    return SafeOutboxListResponse(messages=[_safe_message(item) for item in messages])
 
 
-@router.post("/messages/{message_id}/responses")
+@router.post(
+    "/messages/{message_id}/responses", response_model=SafeOutboxMessageResponse
+)
 def respond_to_message(
     message_id: str,
     body: ResponseRequest,
     operator: PrivateOperator = Depends(get_private_operator),
     outbox: Outbox = Depends(get_outbox),
-    execution: ActionExecutionLayer = Depends(get_action_execution),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-) -> dict[str, object]:
+) -> SafeOutboxMessageResponse:
+    if body.kind in {"approval", "reject"}:
+        raise HTTPException(
+            status_code=409, detail={"code": "approval_requires_cockpit_preview"}
+        )
+
     def correlate() -> OutboxMessage:
-        message = outbox.get(message_id)
-        action_id = message.references.action_id
-        if body.kind in {"approval", "reject"}:
-            if action_id is None:
-                raise ValueError("Approval request has no originating action")
-            execution.resolve_approval(
-                action_id,
-                approved=body.kind == "approval",
-                actor_id=operator.actor_id,
-                reason=body.text,
-            )
         event = current_agent_event()
         return outbox.respond(
             message_id,
@@ -227,16 +252,19 @@ def respond_to_message(
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return message.model_dump(mode="json")
+    return _safe_message(message)
 
 
-@router.post("/messages/{message_id}/delivery-failures")
+@router.post(
+    "/messages/{message_id}/delivery-failures",
+    response_model=SafeOutboxMessageResponse,
+)
 def record_delivery_failure(
     message_id: str,
     body: FailureRequest,
     outbox: Outbox = Depends(get_outbox),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-) -> dict[str, object]:
+) -> SafeOutboxMessageResponse:
     try:
         message = execute_agent_event(
             runtime,
@@ -248,13 +276,13 @@ def record_delivery_failure(
         ).value
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return message.model_dump(mode="json")
+    return _safe_message(message)
 
 
 def _cockpit_message(message: OutboxMessage) -> CockpitOutboxMessageResponse:
     return CockpitOutboxMessageResponse(
         message_id=message.message_id,
-        title=message.title,
+        title=_operator_title(message.kind),
         urgency=message.urgency,
         delivery_status=message.delivery_status,
         acknowledgment_status=message.acknowledgment_status,
@@ -267,3 +295,39 @@ def _cockpit_message(message: OutboxMessage) -> CockpitOutboxMessageResponse:
             commitment_id=message.references.commitment_id,
         ),
     )
+
+
+def _safe_message(message: OutboxMessage) -> SafeOutboxMessageResponse:
+    return SafeOutboxMessageResponse(
+        message_id=message.message_id,
+        kind=message.kind.value,
+        title=_operator_title(message.kind),
+        urgency=message.urgency,
+        delivery_status=message.delivery_status,
+        acknowledgment_status=message.acknowledgment_status,
+        created_at=message.created_at,
+        channel="local",
+        privacy_class=message.privacy_class,
+        last_failure_code=message.last_failure_code,
+        references=CockpitOutboxReferencesResponse(
+            event_id=message.references.event_id,
+            goal_id=message.references.goal_id,
+            plan_id=message.references.plan_id,
+            decision_id=message.references.decision_id,
+            action_id=message.references.action_id,
+            commitment_id=message.references.commitment_id,
+        ),
+    )
+
+
+def _operator_title(kind: OutboxMessageKind) -> str:
+    return {
+        OutboxMessageKind.QUESTION: "Question",
+        OutboxMessageKind.APPROVAL_REQUEST: "Action approval required",
+        OutboxMessageKind.COMMITMENT_DEADLINE: "Commitment deadline",
+        OutboxMessageKind.GOAL_STATE: "Goal state update",
+        OutboxMessageKind.ACTION_RESULT: "Action result",
+        OutboxMessageKind.ANOMALY: "Runtime anomaly",
+        OutboxMessageKind.RENEGOTIATION: "Renegotiation requested",
+        OutboxMessageKind.LONG_TASK_COMPLETE: "Long task completed",
+    }[kind]

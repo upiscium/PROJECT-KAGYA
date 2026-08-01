@@ -772,7 +772,7 @@ def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
             "messages": [
                 {
                     "message_id": message.message_id,
-                    "title": "Release ready",
+                    "title": "Action result",
                     "urgency": "normal",
                     "delivery_status": "failed",
                     "acknowledgment_status": "replied",
@@ -4832,11 +4832,16 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "parameters": {
             "action": {
                 "tool_name": "local_notification_enqueue",
-                "arguments": {
-                    "channel": "local",
-                    "title": "Review",
-                    "body": "Please review the result",
-                },
+                    "arguments": {
+                        "channel": "local",
+                        "title": "Review",
+                        "body": "Please review the result",
+                        "public_preview": {
+                            "kind": "local_notification_enqueue",
+                            "title": "Review",
+                            "body": "Please review the result",
+                        },
+                    },
             }
         },
         "prerequisites": [],
@@ -4871,7 +4876,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "estimated_risk": 0.0,
     }
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/actions/intents").status_code == 200
+        assert client.get("/api/actions/intents").status_code == 409
         decision = client.post(
             "/api/decisions",
             headers=admin_headers(),
@@ -4896,11 +4901,14 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             json={
                 "decision_id": "api-action-decision",
                 "idempotency_key": "api-notification-1",
+                "budget": {"timeout_seconds": 10.0},
             },
         )
         assert created.status_code == 200
         intent = created.json()
         assert intent["status"] == "awaiting_approval"
+        assert "arguments" not in intent
+        assert "idempotency_key" not in intent
         awaiting_explanation = client.post(
             "/api/decisions/explanations/api-action-explanation/revisions",
             headers=admin_headers(),
@@ -4963,38 +4971,67 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert approval_message["references"]["action_id"] == intent["intent_id"]
         delivered = client.post("/api/outbox/deliveries", headers=admin_headers())
         assert delivered.status_code == 200
-        approved = client.post(
+        bypassed = client.post(
             f"/api/outbox/messages/{approval_message['message_id']}/responses",
             headers=admin_headers(),
             json={"kind": "approval", "text": "operator reviewed preview"},
         )
-        assert approved.status_code == 200
-        executed = client.post(
-            f"/api/actions/intents/{intent['intent_id']}/execute",
+        assert bypassed.status_code == 409
+        operator_action = client.get(
+            "/api/actions/operator-summary", headers=admin_headers()
+        ).json()["actions"][0]
+        approved = client.post(
+            f"/api/actions/operator/intents/{intent['intent_id']}/approval",
             headers=admin_headers(),
+            json={
+                "expected_intent_revision": operator_action["revision"],
+                "expected_preview_digest": operator_action["preview"]["digest"],
+                "expected_approval_id": operator_action["approval"]["approval_id"],
+                "approved": True,
+                "reason": "operator reviewed preview",
+            },
         )
-        assert executed.status_code == 200
-        assert executed.json()["status"] == "succeeded"
+        assert approved.status_code == 200
+        assert approved.json()["disposition"] == "awaiting_scheduler"
+        executed = client.app.state.agent_runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.scheduler.action_execution",
+            handler=lambda: client.app.state.action_execution.execute(
+                intent["intent_id"]
+            ),
+        ).value
+        assert executed.status == IntentStatus.SUCCEEDED
         completed_explanation = client.get(
             "/api/decisions/explanations/api-action-explanation",
             headers=admin_headers(),
         ).json()
         assert completed_explanation["disposition"] == "selected_action"
         assert completed_explanation["outcome"]["status"] == "succeeded"
-        assert completed_explanation["risk"]["receipt_ref"] == executed.json()["receipt_id"]
+        assert completed_explanation["risk"]["receipt_ref"] == executed.receipt_id
         succeeded_revision = completed_explanation["revision"]
-        payload = client.get("/api/actions/receipts", headers=admin_headers()).json()
-        assert len(payload["receipts"]) == len(payload["observations"]) == 1
-        assert (
-            payload["receipts"][0]["observation_id"]
-            == payload["observations"][0]["observation_id"]
+        assert client.get("/api/actions/receipts").status_code == 409
+        trace = next(
+            item
+            for item in client.get("/api/actions/trace").json()["traces"]
+            if item["intent_id"] == intent["intent_id"]
+        )
+        assert trace["receipt"]["receipt_id"] == executed.receipt_id
+        assert trace["observation"] is not None
+        compensable = next(
+            item
+            for item in client.get("/api/actions/operator-summary").json()["actions"]
+            if item["intent_id"] == intent["intent_id"]
         )
         compensated = client.post(
-            f"/api/actions/intents/{intent['intent_id']}/compensate",
+            f"/api/actions/operator/intents/{intent['intent_id']}/compensate",
             headers=admin_headers(),
+            json={
+                "expected_intent_revision": compensable["revision"],
+                "expected_preview_digest": compensable["preview"]["digest"],
+            },
         )
         assert compensated.status_code == 200
-        assert compensated.json()["status"] == "compensated"
+        assert compensated.json()["action"]["status"] == "compensated"
         compensated_explanation = client.get(
             "/api/decisions/explanations/api-action-explanation",
             headers=admin_headers(),
@@ -5003,7 +5040,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert compensated_explanation["outcome"]["status"] == "compensated"
         assert (
             compensated_explanation["risk"]["receipt_ref"]
-            == compensated.json()["receipt_id"]
+            == compensated.json()["action"]["receipt"]["receipt_id"]
         )
         explanation_history = client.app.state.main_loop.decision_explanation_store.history(
             "api-action-explanation"
@@ -5054,10 +5091,23 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
                 "idempotency_key": "api-failed-intent",
             },
         ).json()
+        failed_operator_action = next(
+            item
+            for item in client.get(
+                "/api/actions/operator-summary", headers=admin_headers()
+            ).json()["actions"]
+            if item["intent_id"] == failed_intent["intent_id"]
+        )
         rejected = client.post(
-            f"/api/actions/intents/{failed_intent['intent_id']}/approval",
+            f"/api/actions/operator/intents/{failed_intent['intent_id']}/approval",
             headers=admin_headers(),
-            json={"approved": False, "reason": "operator_rejected"},
+            json={
+                "expected_intent_revision": failed_operator_action["revision"],
+                "expected_preview_digest": failed_operator_action["preview"]["digest"],
+                "expected_approval_id": failed_operator_action["approval"]["approval_id"],
+                "approved": False,
+                "reason": "operator_rejected",
+            },
         )
         assert rejected.status_code == 200
         failed_explanation = client.post(
@@ -5138,18 +5188,21 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
     wal_types = {
         record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
     }
-    assert {"action_intent", "outbox_response", "action_execute"}.issubset(wal_types)
+    assert {"action_intent", "action_approval", "action_execute"}.issubset(wal_types)
     with _client(tmp_path, settings=settings) as restarted:
-        intents = restarted.get("/api/actions/intents", headers=admin_headers()).json()[
-            "intents"
-        ]
-        receipts = restarted.get(
-            "/api/actions/receipts", headers=admin_headers()
-        ).json()["receipts"]
-        assert len(intents) == 2
-        assert len(receipts) == 3
-        assert any(item["status"] == "compensated" for item in intents)
-        assert any(item["status"] == "rejected" for item in intents)
+        assert restarted.get("/api/actions/intents").status_code == 409
+        assert restarted.get("/api/actions/receipts").status_code == 409
+        action_state = ActionState.model_validate(
+            restarted.app.state.main_loop.persistent_state.extensions[
+                "action_execution"
+            ]
+        )
+        assert len(action_state.intents) == 2
+        assert len(action_state.receipts) == 3
+        assert any(
+            item.status == IntentStatus.COMPENSATED for item in action_state.intents
+        )
+        assert any(item.status == IntentStatus.REJECTED for item in action_state.intents)
         outbox_messages = restarted.get(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"]

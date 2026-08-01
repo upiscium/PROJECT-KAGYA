@@ -11,7 +11,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...original,
     api: {
-      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), cockpitTraining: vi.fn(), behavioralEvaluations: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
+      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), actionOperatorSummary: vi.fn(), approveAction: vi.fn(), rejectAction: vi.fn(), cancelAction: vi.fn(), retryAction: vi.fn(), compensateAction: vi.fn(), cockpitTraining: vi.fn(), behavioralEvaluations: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
     },
   };
 });
@@ -133,6 +133,34 @@ describe("CockpitClient", () => {
     expect(screen.getByText("ok")).toBeInTheDocument();
   });
 
+  it("renders server-authorized approval controls and submits preview binding only", async () => {
+    mockedApi.actionOperatorSummary.mockResolvedValue(operatorSummary());
+    mockedApi.approveAction.mockResolvedValue(operatorMutationResponse("approve") as never);
+    renderCockpit();
+
+    expect(await screen.findByText("Approval Inbox")).toBeInTheDocument();
+    expect(screen.getByText(/local notification · Public title · Public body/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry now" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(mockedApi.approveAction).toHaveBeenCalledWith("operator-action-1", {
+      expected_approval_id: "approval-1",
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    });
+  });
+
+  it("keeps action traces visible when operator controls fail", async () => {
+    mockedApi.actionOperatorSummary.mockRejectedValue(new Error("operator controls unavailable"));
+    renderCockpit();
+
+    expect(await screen.findByText("operator controls unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Action Execution")).toBeInTheDocument();
+    expect(screen.getAllByText("document_search").length).toBeGreaterThan(0);
+  });
+
   it("keeps successful sections visible after a training-only failure", async () => {
     mockedApi.cockpitTraining.mockRejectedValue(new Error("training unavailable"));
     renderCockpit();
@@ -198,6 +226,7 @@ function resolveRepresentativeData() {
   mockedApi.decisions.mockResolvedValue({ decisions: [{ decision_id: "decision-1", context_id: "context-1", active_goal_ids: ["goal-1"], selected_candidate_id: "candidate-1", selected_candidate: { candidate_id: "candidate-1", candidate_type: "respond", proposed_action: "Report result", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", goal_refs: ["goal-1"], commitment_refs: ["commitment-1"] }, selection_confidence: 0.8, status: "awaiting_outcome", outcome_status: "pending", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] });
   mockedApi.cockpitOutbox.mockResolvedValue({ pending_count: 42, critical_count: 9, messages: rawOutboxFixtures.map(cockpitOutboxProjection) });
   mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 2, retry_pending_count: 1, failed_count: 5, traces: rawActionFixtures.map(cockpitActionProjection) as never, pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never });
+  mockedApi.actionOperatorSummary.mockResolvedValue({ pending_approval_count: 0, operator_action_count: 0, risk_ceiling: "reversible_write", actions: [], action_tools: [], registry_tools: [] });
   mockedApi.cockpitTraining.mockResolvedValue(cockpitTrainingProjection());
   mockedApi.behavioralEvaluations.mockResolvedValue({ results: [{ evaluation_id: "eval-1" }] } as never);
   mockedApi.eventJournal.mockResolvedValue({ records: [{ record_id: "record-1", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-1", event_type: "goal_update", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: "goal:goal-1", reauthenticated: null, previous_record_hash: null, record_hash: "hash", private_replay: "PRIVATE_SENTINEL" } as never] });
@@ -216,6 +245,39 @@ function cockpitTrainingProjection() {
     jobs: [{ job_id: "job-1", attempt_id: "attempt-1", status: "running", backend: "ssh", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:01Z", started_at: "2026-01-01T00:00:01Z", completed_at: null, source_event_start: 1, source_event_end: 5, selected_episode_count: 3, remote_job_id: "job-1", worker_node_id: "node-1", retry_count: 0, transferred_bytes: 2048, failure_code: null, candidate_adapter_id: "adapter-1", import_status: "not_started", bundle_digest: "a".repeat(64), result_digest: "b".repeat(64) }],
     adapters: [{ adapter_id: "adapter-1", status: "active", adapter_hash: "b".repeat(64), base_model_id: "model-1", base_model_revision: "rev-1", parent_adapter_id: null, training_job_id: "job-1", training_node_id: "node-1", submitted_by_node_id: "submitter-1", imported_by_node_id: "node-1", evaluation_id: "eval-1", evaluation_status: "passed", approved: true, active: true, rollback_candidate: false, activation_event_id: "event-1", activation_event_sequence: 1, rollback_event_id: null, rollback_event_sequence: null }],
   } as never;
+}
+
+function operatorSummary() {
+  const action = {
+    intent_id: "operator-action-1",
+    revision: 3,
+    status: "awaiting_approval" as const,
+    approval: { approval_id: "approval-1", status: "pending" as const, requested_at: "2026-01-01T00:00:00Z" },
+    tool: { name: "local_notification_enqueue", risk_class: "reversible_write" as const, approval_required: true, reversible: true, effect_code: "notification.enqueue", validation_schema_revision: "b".repeat(64), enabled: true, executable: true, execution_authority: "action_execution" as const },
+    argument_summary: { kind: "notification" as const, channel: "local", title: "Public title", body_preview: "Public body" },
+    policy: { allowed: true, approval_required: true, reason_codes: ["human_approval_required"] },
+    preview: { effect_code: "notification.enqueue", effect: "Enqueue a notification", digest: "a".repeat(64), compensation_available: true },
+    budget: { max_attempts: 2, max_cost_units: 1, max_monetary_cost: 0, deadline_at: "2026-01-02T00:00:00Z", attempts: 0, cost_units_used: 0, retry_at: null },
+    provenance: { decision_id: "decision-1", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", triggering_event_id: "event-1" },
+    receipt: null,
+    verification: null,
+    idempotency_state: "reserved" as const,
+    available_commands: ["approve", "reject", "cancel"] as Array<"approve" | "reject" | "cancel">,
+    confirmation: null,
+  };
+  return {
+    pending_approval_count: 1,
+    operator_action_count: 1,
+    risk_ceiling: "reversible_write" as const,
+    actions: [action],
+    action_tools: [action.tool],
+    registry_tools: [{ name: "registry-only", description: null, tool_type: "metadata", status: "declared", generated: false, human_approved: false, execution_authority: "registry_only" as const }],
+  };
+}
+
+function operatorMutationResponse(command: "approve" | "reject") {
+  const action = operatorSummary().actions[0];
+  return { command, event_id: "operator-event-1", processing_sequence: 11, action, disposition: command === "approve" ? "awaiting_scheduler" : "rejected" };
 }
 
 const rawOutboxFixtures = [

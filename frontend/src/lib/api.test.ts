@@ -386,7 +386,66 @@ describe("api client", () => {
     await expect(streamChatJob({ text: "hello" }, { status: vi.fn(), token: vi.fn() })).rejects.toBeInstanceOf(errorType);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("strictly parses the action operator contract and rejects raw private fields", async () => {
+    fetchMock.mockReturnValue(jsonResponse(actionOperatorPayload));
+    const result = await api.actionOperatorSummary();
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/actions/operator-summary", expect.anything());
+    expect(result.actions[0].argument_summary).toEqual(expect.objectContaining({ kind: "notification", title: "Safe title" }));
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+
+    fetchMock.mockReturnValue(jsonResponse({
+      ...actionOperatorPayload,
+      actions: [{ ...actionOperatorPayload.actions[0], arguments: { body: "PRIVATE_SENTINEL" } }],
+    }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("binds approval mutations to revision, digest, and approval ID", async () => {
+    fetchMock.mockReturnValue(jsonResponse({ command: "approve", event_id: "event-operator-1", processing_sequence: 12, action: actionOperatorPayload.actions[0], disposition: "awaiting_scheduler" }));
+    await api.approveAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+      expected_approval_id: "approval-operator-1",
+    });
+    const [, options] = fetchMock.mock.calls[0];
+    expect(fetchMock.mock.calls[0][0]).toBe("/admin-proxy/actions/operator/intents/intent-operator-1/approval");
+    expect(JSON.parse(String(options.body))).toEqual({ expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), expected_approval_id: "approval-operator-1", approved: true });
+  });
+
+  it("accepts only the safe outbox projection", async () => {
+    const safe = {
+      message_id: "message-safe-1", kind: "approval_request", title: "Approval required", urgency: "high",
+      delivery_status: "pending", acknowledgment_status: "unacknowledged", created_at: "2026-01-01T00:00:00Z",
+      channel: "local", privacy_class: "operator", last_failure_code: null,
+      references: { event_id: null, goal_id: null, plan_id: "plan-1", decision_id: "decision-1", action_id: "intent-operator-1", commitment_id: null },
+    };
+    fetchMock.mockReturnValue(jsonResponse({ messages: [safe] }));
+    expect((await api.outboxMessages()).messages[0].kind).toBe("approval_request");
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, body: "PRIVATE_SENTINEL" }] }));
+    await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+  });
 });
+
+const actionOperatorPayload = {
+  pending_approval_count: 1,
+  operator_action_count: 1,
+  risk_ceiling: "reversible_write",
+  actions: [{
+    intent_id: "intent-operator-1", revision: 3, status: "awaiting_approval",
+    approval: { approval_id: "approval-operator-1", status: "pending", requested_at: "2026-01-01T00:00:00Z" },
+    tool: { name: "local_notification_enqueue", risk_class: "reversible_write", approval_required: true, reversible: true, effect_code: "notification.enqueue", validation_schema_revision: "b".repeat(64), enabled: true, executable: true, execution_authority: "action_execution" },
+    argument_summary: { kind: "notification", channel: "local", title: "Safe title", body_preview: "Safe preview" },
+    policy: { allowed: true, approval_required: true, reason_codes: ["human_approval_required"] },
+    preview: { effect_code: "notification.enqueue", effect: "Enqueue a notification", digest: "a".repeat(64), compensation_available: true },
+    budget: { max_attempts: 2, max_cost_units: 1, max_monetary_cost: 0, deadline_at: "2026-01-02T00:00:00Z", attempts: 0, cost_units_used: 0, retry_at: null },
+    provenance: { decision_id: "decision-1", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", triggering_event_id: "event-1" },
+    receipt: null, verification: null, idempotency_state: "reserved", available_commands: ["approve", "reject", "cancel"], confirmation: null,
+  }],
+  action_tools: [{ name: "local_notification_enqueue", risk_class: "reversible_write", approval_required: true, reversible: true, effect_code: "notification.enqueue", validation_schema_revision: "b".repeat(64), enabled: true, executable: true, execution_authority: "action_execution" }],
+  registry_tools: [{ name: "registry-tool", description: null, tool_type: "metadata", status: "declared", generated: false, human_approved: false, execution_authority: "registry_only" }],
+};
 
 const contextPayload = {
   contexts: [{ context_id: "context-1", context_type: "conversation", source_channel: "chat", source_session_id: "session-1", participant_ids: ["person-1"], active_topic: "Release", active_task: null, status: "active", hidden_thought: "PRIVATE_SENTINEL" }],

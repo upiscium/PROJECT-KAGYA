@@ -7,6 +7,7 @@ from enum import StrEnum
 import hashlib
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Literal, cast
 from uuid import uuid4
@@ -43,6 +44,137 @@ class RiskClass(StrEnum):
     EXTERNAL_WRITE = "external_write"
     DESTRUCTIVE = "destructive"
     HIGH_IMPACT = "high_impact"
+
+
+class OperatorCommand(StrEnum):
+    """Commands that an operator may request for an action intent."""
+
+    APPROVE = "approve"
+    REJECT = "reject"
+    CANCEL = "cancel"
+    RETRY_NOW = "retry_now"
+    COMPENSATE = "compensate"
+
+
+class _PublicSummary(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: str
+
+
+class MetadataPublicSummary(_PublicSummary):
+    kind: Literal["metadata"] = "metadata"
+    namespace: str
+    key: str
+
+
+class DocumentPublicSummary(_PublicSummary):
+    kind: Literal["document_search"] = "document_search"
+    max_results: int
+    query_length: int
+    query_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    path_scoped: bool
+
+
+class CalendarPublicSummary(_PublicSummary):
+    kind: Literal["calendar_read"] = "calendar_read"
+    starts_at: datetime
+    ends_at: datetime
+    max_results: int
+
+
+class NotificationPublicSummary(_PublicSummary):
+    kind: Literal["local_notification_enqueue"] = "local_notification_enqueue"
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=160)
+
+    @model_validator(mode="after")
+    def public_text_only(self) -> "NotificationPublicSummary":
+        for value in (self.title, self.body):
+            lowered = value.lower()
+            if (
+                any(ord(character) < 32 or ord(character) == 127 for character in value)
+                or any(
+                    marker in lowered
+                    for marker in (
+                        "private_sentinel",
+                        "hidden_thought",
+                        "raw_prompt",
+                        "<think",
+                        "</think",
+                        "credential",
+                        "password",
+                        "api_key",
+                        "api key",
+                        "access_token",
+                        "secret",
+                    )
+                )
+                or re.search(r"(?:^|\s)/(?:etc|home|root|tmp|var)/", value)
+            ):
+                raise ValueError("notification public preview contains private text")
+        return self
+
+
+PublicArgumentSummary = (
+    MetadataPublicSummary
+    | DocumentPublicSummary
+    | CalendarPublicSummary
+    | NotificationPublicSummary
+)
+
+
+class ActionToolDescriptor(_StrictModel):
+    """The complete, safe-to-render description of an allowlisted tool."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    tool_name: str
+    risk_class: RiskClass
+    effect: str
+    effect_code: str
+    approval_required: bool
+    reversible: bool
+    validation_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    public_preview_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    enabled: bool
+    executable: bool
+
+
+class ActionOperatorPreview(_StrictModel):
+    """Safe operator projection; it intentionally contains no raw arguments."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    intent_id: str
+    revision: int
+    tool: ActionToolDescriptor
+    arguments: PublicArgumentSummary
+    preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effect: str
+    effect_code: str
+    available_commands: tuple[OperatorCommand, ...]
+    approval_id: str | None = None
+
+    @property
+    def argument_digest(self) -> str:
+        """Compatibility spelling for consumers that call summaries arguments."""
+        return self.preview_digest
+
+
+class OperatorCommandRequest(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    intent_id: str
+    command: OperatorCommand
+    expected_revision: int = Field(ge=1)
+    expected_preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_approval_id: str | None = None
+    confirmation: str | None = Field(default=None, max_length=200)
+
+
+class OperatorCommandValidation(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    valid: bool
+    reason: str | None = None
+    command: OperatorCommand
+    intent_id: str
 
 
 class IntentStatus(StrEnum):
@@ -117,6 +249,24 @@ class NotificationArguments(_StrictModel):
     channel: Literal["local"] = "local"
     title: str = Field(min_length=1, max_length=120)
     body: str = Field(min_length=1, max_length=1000)
+    # The explicit public preview certifies the canonical executable text as
+    # operator-visible; the validator below prevents a different hidden payload.
+    public_preview: NotificationPublicSummary | None = None
+
+    @model_validator(mode="after")
+    def preview_is_bounded(self) -> "NotificationArguments":
+        if self.public_preview is None:
+            return self
+        if self.public_preview.kind != "local_notification_enqueue":
+            raise ValueError("notification public_preview has the wrong kind")
+        if (
+            self.public_preview.title != self.title
+            or self.public_preview.body != self.body
+        ):
+            raise ValueError(
+                "notification public_preview must exactly bind executable content"
+            )
+        return self
 
 
 class ActionBudget(_StrictModel):
@@ -373,12 +523,58 @@ def public_tool_name(value: str) -> str | None:
     """Return only stable, allowlisted tool identifiers."""
     return value if value in _TOOLS else None
 
+
 _VALIDATION_SCHEMA_REVISIONS = {
     "restricted_metadata_read": 1,
     "document_search": 1,
     "calendar_read": 1,
     "local_notification_enqueue": 1,
 }
+
+
+def _effect_code(tool_name: str) -> str:
+    return {
+        "restricted_metadata_read": "metadata.read",
+        "document_search": "documents.search",
+        "calendar_read": "calendar.read",
+        "local_notification_enqueue": "notification.enqueue",
+    }.get(tool_name, "action.unknown")
+
+
+def _public_summary(
+    tool_name: str, arguments: dict[str, JsonValue]
+) -> PublicArgumentSummary:
+    if tool_name == "restricted_metadata_read":
+        return MetadataPublicSummary(
+            namespace=str(arguments["namespace"]), key=str(arguments["key"])
+        )
+    if tool_name == "document_search":
+        query = str(arguments["query"])
+        return DocumentPublicSummary(
+            max_results=int(cast(int, arguments["max_results"])),
+            query_length=len(query),
+            query_digest=_digest(query),
+            path_scoped=arguments.get("relative_path") is not None,
+        )
+    if tool_name == "calendar_read":
+        return CalendarPublicSummary(
+            starts_at=datetime.fromisoformat(str(arguments["starts_at"])),
+            ends_at=datetime.fromisoformat(str(arguments["ends_at"])),
+            max_results=int(cast(int, arguments["max_results"])),
+        )
+    if tool_name == "local_notification_enqueue":
+        preview = arguments.get("public_preview")
+        if isinstance(preview, dict):
+            return NotificationPublicSummary.model_validate(preview)
+        # Legacy intents are still executable, but never expose their raw text.
+        return NotificationPublicSummary(
+            title="Local notification", body="A local notification is queued."
+        )
+    raise ActionPolicyError("Tool is not allowlisted")
+
+
+def _public_preview_revision(tool_name: str) -> str:
+    return _digest({"tool_name": tool_name, "preview_revision": 1})
 
 
 class ActionExecutionLayer:
@@ -399,6 +595,163 @@ class ActionExecutionLayer:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.monotonic = monotonic or time.monotonic
         self._state()
+
+    def list_tool_descriptors(self) -> tuple[ActionToolDescriptor, ...]:
+        """Return stable descriptors, never the internal tool registry."""
+        return tuple(self.get_tool_descriptor(name) for name in _TOOLS)
+
+    def get_tool_descriptor(self, tool_name: str) -> ActionToolDescriptor:
+        spec = _TOOLS.get(tool_name)
+        if spec is None:
+            raise ValueError("Unknown action tool")
+        enabled = spec.risk not in {
+            RiskClass.EXTERNAL_WRITE,
+            RiskClass.DESTRUCTIVE,
+            RiskClass.HIGH_IMPACT,
+        }
+        return ActionToolDescriptor(
+            tool_name=spec.name,
+            risk_class=spec.risk,
+            effect=spec.effect,
+            effect_code=_effect_code(spec.name),
+            approval_required=spec.approval_required,
+            reversible=spec.reversible,
+            validation_revision=_validation_schema_revision(spec.name, spec),
+            public_preview_revision=_public_preview_revision(spec.name),
+            enabled=enabled,
+            executable=enabled,
+        )
+
+    def operator_preview(self, intent_id: str) -> ActionOperatorPreview:
+        intent = self.get_intent(intent_id)
+        state = self._state_checked()
+        if not self._intent_records_consistent(state, intent):
+            raise ActionPolicyError("Action operator binding is invalid")
+        descriptor = self.get_tool_descriptor(intent.tool_name)
+        summary = _public_summary(intent.tool_name, intent.arguments)
+        digest = _digest(
+            cast(
+                JsonValue,
+                {
+                    "intent_id": intent.intent_id,
+                    "revision": intent.revision,
+                    "tool": descriptor.model_dump(mode="json"),
+                    "arguments": summary.model_dump(mode="json"),
+                    "effect": descriptor.effect,
+                    "effect_code": descriptor.effect_code,
+                    "policy": {
+                        "allowed": intent.policy.allowed,
+                        "approval_required": intent.policy.approval_required,
+                        "reasons": list(intent.policy.reasons),
+                    },
+                    "budget": intent.budget.model_dump(mode="json"),
+                },
+            )
+        )
+        return ActionOperatorPreview(
+            intent_id=intent.intent_id,
+            revision=intent.revision,
+            tool=descriptor,
+            arguments=summary,
+            preview_digest=digest,
+            effect=descriptor.effect,
+            effect_code=descriptor.effect_code,
+            available_commands=self.available_commands(intent_id),
+            approval_id=intent.approval_id,
+        )
+
+    # Alias used by API adapters which call this a projection.
+    operator_projection = operator_preview
+
+    def available_commands(self, intent_id: str) -> tuple[OperatorCommand, ...]:
+        intent = self.get_intent(intent_id)
+        state = self._state_checked()
+        descriptor = self.get_tool_descriptor(intent.tool_name)
+        if not descriptor.enabled or not self._intent_records_consistent(state, intent):
+            return ()
+        commands: list[OperatorCommand] = []
+        approval = self._unique_approval(state, intent)
+        has_public_preview = self._has_public_preview(intent)
+        if (
+            intent.status == IntentStatus.AWAITING_APPROVAL
+            and approval is not None
+            and approval.status == "pending"
+        ):
+            if has_public_preview:
+                commands.append(OperatorCommand.APPROVE)
+            commands.append(OperatorCommand.REJECT)
+        if intent.status in {
+            IntentStatus.AWAITING_APPROVAL,
+            IntentStatus.APPROVED,
+            IntentStatus.RETRY_PENDING,
+        }:
+            commands.append(OperatorCommand.CANCEL)
+        if intent.status == IntentStatus.RETRY_PENDING and self._retry_executable(
+            intent
+        ):
+            commands.append(OperatorCommand.RETRY_NOW)
+        if (
+            intent.status == IntentStatus.SUCCEEDED
+            and descriptor.reversible
+            and self._compensation_eligible(state, intent)
+        ):
+            commands.append(OperatorCommand.COMPENSATE)
+        return tuple(commands)
+
+    def confirmation_phrase(self, intent_id: str) -> str | None:
+        intent = self.get_intent(intent_id)
+        if intent.risk_class not in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+            return None
+        preview = self.operator_preview(intent_id)
+        return f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}"
+
+    def validate_command_request(
+        self, request: OperatorCommandRequest
+    ) -> OperatorCommandValidation:
+        intent = self.get_intent(request.intent_id)
+        preview = self.operator_preview(intent.intent_id)
+        reason: str | None = None
+        if request.expected_revision != intent.revision:
+            reason = "stale intent revision"
+        elif request.expected_preview_digest != preview.argument_digest:
+            reason = "stale preview digest"
+        elif request.command not in preview.available_commands:
+            reason = "command is not currently available"
+        elif (
+            request.command in {OperatorCommand.APPROVE, OperatorCommand.REJECT}
+            and request.expected_approval_id != intent.approval_id
+        ):
+            reason = "approval binding is stale"
+        elif intent.risk_class in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+            expected = self.confirmation_phrase(intent.intent_id)
+            if request.confirmation != expected:
+                reason = "confirmation phrase is invalid"
+        return OperatorCommandValidation(
+            valid=reason is None,
+            reason=reason,
+            command=request.command,
+            intent_id=intent.intent_id,
+        )
+
+    def execute_command(
+        self, request: OperatorCommandRequest, *, actor_id: str = "operator"
+    ) -> ActionIntent:
+        checked = self.validate_command_request(request)
+        if not checked.valid:
+            raise ActionPolicyError(checked.reason or "invalid operator command")
+        if request.command == OperatorCommand.APPROVE:
+            return self.resolve_approval(
+                request.intent_id, approved=True, actor_id=actor_id
+            )
+        if request.command == OperatorCommand.REJECT:
+            return self.resolve_approval(
+                request.intent_id, approved=False, actor_id=actor_id
+            )
+        if request.command == OperatorCommand.CANCEL:
+            return self.cancel(request.intent_id)
+        if request.command == OperatorCommand.RETRY_NOW:
+            return self.execute(request.intent_id)
+        return self.compensate(request.intent_id)
 
     def list_intents(self) -> tuple[ActionIntent, ...]:
         return self._state().intents
@@ -658,8 +1011,7 @@ class ActionExecutionLayer:
             (
                 item
                 for item in state.validation_records
-                if not item.arguments_valid
-                and item.idempotency_key == idempotency_key
+                if not item.arguments_valid and item.idempotency_key == idempotency_key
             ),
             None,
         )
@@ -1217,12 +1569,14 @@ class ActionExecutionLayer:
 
     def compensate(self, intent_id: str) -> ActionIntent:
         intent = self.get_intent(intent_id)
+        state = self._state_checked()
+        descriptor = self.get_tool_descriptor(intent.tool_name)
         if (
             intent.status != IntentStatus.SUCCEEDED
-            or intent.tool_name != "local_notification_enqueue"
+            or not descriptor.reversible
+            or not self._compensation_eligible(state, intent)
         ):
             raise ActionPolicyError("Action has no available compensation")
-        state = self._state()
         notifications = tuple(
             {**item, "status": "cancelled"}
             if item.get("idempotency_key") == intent.idempotency_key
@@ -1333,6 +1687,154 @@ class ActionExecutionLayer:
             }
         raise ActionPolicyError("Tool is not allowlisted")
 
+    def _state_checked(self) -> ActionState:
+        state = self._state()
+        ids = (
+            ([item.intent_id for item in state.intents], "intent"),
+            ([item.approval_id for item in state.approvals], "approval"),
+            ([item.receipt_id for item in state.receipts], "receipt"),
+            ([item.observation_id for item in state.observations], "observation"),
+            ([item.verification_id for item in state.verifications], "verification"),
+            ([item.validation_id for item in state.validation_records], "validation"),
+        )
+        for values, label in ids:
+            if any(value is None for value in values) or len(values) != len(
+                set(values)
+            ):
+                raise ActionPolicyError(f"Duplicate or corrupt {label} records")
+        intent_ids = {item.intent_id for item in state.intents}
+        if any(item.intent_id not in intent_ids for item in state.approvals):
+            raise ActionPolicyError("Approval record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.receipts):
+            raise ActionPolicyError("Receipt record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.observations):
+            raise ActionPolicyError("Observation record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.verifications):
+            raise ActionPolicyError("Verification record has an invalid intent binding")
+        receipt_ids = {item.receipt_id for item in state.receipts}
+        if any(item.receipt_id not in receipt_ids for item in state.observations):
+            raise ActionPolicyError("Observation record has an invalid receipt binding")
+        for intent in state.intents:
+            approval = [
+                item for item in state.approvals if item.intent_id == intent.intent_id
+            ]
+            if intent.approval_id is not None and [
+                item.approval_id for item in approval
+            ] != [intent.approval_id]:
+                raise ActionPolicyError("Approval binding is inconsistent")
+        return state
+
+    @staticmethod
+    def _unique_approval(
+        state: ActionState, intent: ActionIntent
+    ) -> ApprovalRecord | None:
+        values = [
+            item for item in state.approvals if item.intent_id == intent.intent_id
+        ]
+        if intent.approval_id is None:
+            return (
+                None if not values else (_raise_corrupt("Unexpected approval record"))
+            )
+        matches = [item for item in values if item.approval_id == intent.approval_id]
+        if len(values) != 1 or len(matches) != 1:
+            return _raise_corrupt("Approval binding is not unique")
+        return matches[0]
+
+    def _intent_records_consistent(
+        self, state: ActionState, intent: ActionIntent
+    ) -> bool:
+        try:
+            self._unique_approval(state, intent)
+            spec = _TOOLS.get(intent.tool_name)
+            if spec is None or intent.risk_class != spec.risk:
+                return False
+            if (
+                intent.policy.tool_name != intent.tool_name
+                or intent.policy.risk_class != intent.risk_class
+                or intent.policy.allowed is not True
+                or intent.policy.approval_required != spec.approval_required
+                or intent.preview.tool_name != intent.tool_name
+                or intent.preview.risk_class != intent.risk_class
+                or intent.preview.effect != spec.effect
+                or intent.preview.compensation_available != spec.reversible
+                or intent.preview.bounded_by != intent.budget
+            ):
+                return False
+            validated = spec.arguments.model_validate(intent.arguments).model_dump(
+                mode="json"
+            )
+            legacy_notification = (
+                intent.tool_name == "local_notification_enqueue"
+                and intent.arguments.get("public_preview") is None
+            )
+            if legacy_notification:
+                validated.pop("public_preview", None)
+            if validated != intent.arguments or validated != intent.preview.arguments:
+                return False
+            validation = [
+                item
+                for item in state.validation_records
+                if item.validation_id == intent.validation_record_id
+                and item.intent_id == intent.intent_id
+                and item.decision_id == intent.provenance.decision_id
+                and item.tool_name == intent.tool_name
+                and item.risk_class == intent.risk_class
+                and item.arguments_valid
+            ]
+            return bool(
+                len(validation) == 1
+                and validation[0].canonical_arguments_digest == _digest(validated)
+                and (
+                    legacy_notification
+                    or validation[0].validation_schema_revision
+                    == _validation_schema_revision(intent.tool_name, spec)
+                )
+                and intent.policy.argument_digest == _digest(validated)
+            )
+        except (ActionPolicyError, ValidationError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _has_public_preview(intent: ActionIntent) -> bool:
+        if intent.tool_name != "local_notification_enqueue":
+            return True
+        preview = intent.arguments.get("public_preview")
+        if not isinstance(preview, dict):
+            return False
+        try:
+            NotificationPublicSummary.model_validate(preview)
+        except ValidationError:
+            return False
+        return True
+
+    def _retry_executable(self, intent: ActionIntent) -> bool:
+        now = self.clock()
+        return bool(
+            now <= intent.deadline_at
+            and intent.attempts < intent.budget.max_attempts
+            and intent.cost_units_used < intent.budget.max_cost_units
+        )
+
+    def _compensation_eligible(self, state: ActionState, intent: ActionIntent) -> bool:
+        if intent.receipt_id is None:
+            return False
+        successful = [
+            item
+            for item in state.receipts
+            if item.receipt_id == intent.receipt_id
+            and item.intent_id == intent.intent_id
+            and item.idempotency_key == intent.idempotency_key
+            and item.status == ReceiptStatus.SUCCEEDED
+        ]
+        if len(successful) != 1 or not self._succeeded_receipt_valid(state, intent):
+            return False
+        return not any(
+            item.compensation_of == intent.receipt_id
+            and item.intent_id == intent.intent_id
+            and item.status == ReceiptStatus.COMPENSATED
+            for item in state.receipts
+        )
+
     def _document_search(self, arguments: dict[str, JsonValue]) -> JsonValue:
         root = self.document_root
         relative = arguments.get("relative_path")
@@ -1427,6 +1929,16 @@ class ActionExecutionLayer:
             validated = spec.arguments.model_validate(arguments)
         except ValidationError as exc:
             return spec, None, _validation_error_codes(tool_name, exc)
+        if (
+            tool_name == "local_notification_enqueue"
+            and isinstance(validated, NotificationArguments)
+            and validated.public_preview is None
+        ):
+            return (
+                spec,
+                None,
+                (ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+            )
         return spec, validated.model_dump(mode="json"), ()
 
     def _validated_arguments_for_execution(
@@ -1706,7 +2218,9 @@ class ActionExecutionLayer:
                 decision.actual_outcome is None
                 or decision.actual_outcome.success != success
             ):
-                raise ValueError("Terminal decision outcome contradicts action verification")
+                raise ValueError(
+                    "Terminal decision outcome contradicts action verification"
+                )
             return
         record_experience = getattr(
             self.main_loop, "record_verified_action_experience", None
@@ -1880,6 +2394,10 @@ def _digest(value: JsonValue | dict[str, JsonValue]) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _raise_corrupt(message: str) -> Any:
+    raise ActionPolicyError(message)
 
 
 def _validation_schema_revision(tool_name: str, spec: _ToolSpec | None) -> str:

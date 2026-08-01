@@ -15,6 +15,7 @@ from kagya.actions import (
     ActionState,
     ActionValidationRecord,
     IntentStatus,
+    OperatorCommand,
     ReceiptStatus,
 )
 from kagya.decision import (
@@ -263,7 +264,7 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         loop,
         "decision-notify",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Action needed"},
+        _notification_args("Review", "Action needed"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -289,6 +290,17 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
             source="test.notification.unapproved",
             handler=lambda: layer.execute(intent.intent_id),
         )
+
+    approval_message = next(
+        item
+        for item in loop.outbox.list_messages()
+        if item.kind.value == "approval_request"
+    )
+    loop.outbox.respond(
+        approval_message.message_id,
+        kind="read",
+        actor_id="operator-1",
+    )
 
     approved = runtime.execute(
         AgentEventType.ACTION_APPROVAL,
@@ -359,6 +371,177 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     assert outcome is not None and outcome.compensated
     assert outcome.compensation_receipt_id == compensated.receipt_id
     runtime.shutdown()
+
+
+def test_operator_preview_uses_explicit_public_notification_copy(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-public-preview",
+        "local_notification_enqueue",
+        {
+            "channel": "local",
+            "title": "Safe title",
+            "body": "Safe bounded preview",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Safe title",
+                "body": "Safe bounded preview",
+            },
+        },
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.preview",
+            handler=lambda: layer.create_from_decision(
+                "decision-public-preview", idempotency_key="public-preview"
+            ),
+        ).value
+        preview = layer.operator_preview(intent.intent_id)
+        duplicate = layer.operator_preview(intent.intent_id)
+    finally:
+        runtime.shutdown()
+
+    serialized = preview.model_dump_json()
+    assert "Safe bounded preview" in serialized
+    assert preview.preview_digest == duplicate.preview_digest
+    assert preview.available_commands == (
+        OperatorCommand.APPROVE,
+        OperatorCommand.REJECT,
+        OperatorCommand.CANCEL,
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"channel": "local", "title": "Private", "body": "PRIVATE_SENTINEL"},
+        {
+            "channel": "local",
+            "title": "Private",
+            "body": "PRIVATE_SENTINEL",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Safe title",
+                "body": "Safe body",
+            },
+        },
+        {
+            "channel": "local",
+            "title": "Private",
+            "body": "PRIVATE_SENTINEL",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Private",
+                "body": "PRIVATE_SENTINEL",
+            },
+        },
+    ],
+)
+def test_missing_or_mismatched_notification_preview_is_rejected(
+    tmp_path: Path, arguments: dict[str, object]
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-legacy-preview",
+        "local_notification_enqueue",
+        arguments,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.legacy",
+            handler=lambda: layer.create_from_decision(
+                "decision-legacy-preview", idempotency_key="legacy-preview"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert isinstance(intent, ActionValidationRecord)
+    assert intent.arguments_valid is False
+    assert "PRIVATE_SENTINEL" not in intent.model_dump_json()
+
+
+def test_legacy_pending_notification_can_be_governedly_rejected_or_cancelled(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-legacy-preview",
+        "local_notification_enqueue",
+        _notification_args("Legacy", "Review required"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.legacy.create",
+            handler=lambda: layer.create_from_decision(
+                "decision-legacy-preview", idempotency_key="legacy-preview"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    legacy_arguments = dict(intent.arguments)
+    legacy_arguments.pop("public_preview")
+    legacy_digest = action_execution._digest(legacy_arguments)
+    legacy_intent = intent.model_copy(
+        update={
+            "arguments": legacy_arguments,
+            "preview": intent.preview.model_copy(
+                update={"arguments": legacy_arguments}
+            ),
+            "policy": intent.policy.model_copy(
+                update={"argument_digest": legacy_digest}
+            ),
+        }
+    )
+    legacy_validation = state.validation_records[0].model_copy(
+        update={
+            "canonical_arguments_digest": legacy_digest,
+            "validation_schema_revision": "0" * 64,
+        }
+    )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={
+            "intents": (legacy_intent,),
+            "validation_records": (legacy_validation,),
+        }
+    ).model_dump(mode="json")
+
+    restored = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    preview = restored.operator_preview(intent.intent_id)
+    assert preview.available_commands == (
+        OperatorCommand.REJECT,
+        OperatorCommand.CANCEL,
+    )
+    assert "Review required" not in preview.model_dump_json()
 
 
 def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
@@ -547,7 +730,7 @@ def test_rejection_records_structured_verification_for_later_attribution(
         loop,
         "decision-rejected",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Reject this"},
+        _notification_args("Review", "Reject this"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -749,7 +932,7 @@ def test_valid_argument_record_is_persisted_before_risk_budget_rejection(
         loop,
         "decision-risk-budget",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Bounded body"},
+        _notification_args("Review", "Bounded body"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -788,7 +971,7 @@ def test_policy_rejection_retry_and_explanation_link_are_state_idempotent(
         loop,
         "decision-idempotent-policy",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Bounded body"},
+        _notification_args("Review", "Bounded body"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -940,7 +1123,9 @@ def test_failed_validation_is_idempotent_and_conflicts_without_new_state(
         ).value
         assert duplicate == first
         assert (
-            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            json.dumps(
+                loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+            )
             == state_after_first
         )
 
@@ -954,7 +1139,9 @@ def test_failed_validation_is_idempotent_and_conflicts_without_new_state(
                 ),
             )
         assert (
-            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            json.dumps(
+                loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+            )
             == state_after_first
         )
 
@@ -1032,7 +1219,7 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
             loop,
             "decision-policy-then-invalid",
             "local_notification_enqueue",
-            {"channel": "local", "title": "Review", "body": "Body"},
+            _notification_args("Review", "Body"),
         )
         runtime.execute(
             AgentEventType.ACTION_INTENT,
@@ -1074,7 +1261,7 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
             loop,
             "decision-invalid-then-policy",
             "local_notification_enqueue",
-            {"channel": "local", "title": "Review", "body": "Body"},
+            _notification_args("Review", "Body"),
         )
         runtime.execute(
             AgentEventType.ACTION_INTENT,
@@ -1121,7 +1308,9 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
     finally:
         runtime.shutdown()
 
-    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    )
     assert (
         _explanation(loop, "decision-invalid-then-policy").disposition.value
         == "blocked_policy"
@@ -1135,12 +1324,17 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
     loop._action_execution = restored
-    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    )
     assert (
         _explanation(loop, "decision-invalid-then-policy").disposition.value
         == "blocked_policy"
     )
-    assert _explanation(loop, "decision-terminal-intent").risk.receipt_ref == completed.receipt_id
+    assert (
+        _explanation(loop, "decision-terminal-intent").risk.receipt_ref
+        == completed.receipt_id
+    )
 
 
 def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
@@ -1240,6 +1434,19 @@ def test_action_validation_rejects_record_binding_and_event_mismatch(
         )
     assert layer.list_receipts() == ()
     runtime.shutdown()
+
+
+def _notification_args(title: str, body: str) -> dict[str, object]:
+    return {
+        "channel": "local",
+        "title": title,
+        "body": body,
+        "public_preview": {
+            "kind": "local_notification_enqueue",
+            "title": title,
+            "body": body,
+        },
+    }
 
 
 def _decision(
