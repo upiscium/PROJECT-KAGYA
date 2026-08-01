@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from itertools import islice
 import re
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -12,6 +13,7 @@ from kagya.actions import (
     ActionBudget,
     ActionExecutionLayer,
     ActionIntent,
+    ActionOperatorSnapshot,
     ActionPolicyError,
     ActionPolicyRejectionRecord,
     ActionValidationRecord,
@@ -132,7 +134,6 @@ class DocumentArgumentSummaryResponse(BaseModel):
     scope_kind: Literal["all", "path"]
     max_results: int = Field(ge=1)
     query_length: int = Field(ge=0)
-    query_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class CalendarArgumentSummaryResponse(BaseModel):
@@ -363,6 +364,7 @@ class CockpitActionTraceListResponse(BaseModel):
 
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
+REGISTRY_TOOLS_CAP = 100
 
 
 @router.get("/intents")
@@ -490,17 +492,15 @@ def operator_summary(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> OperatorSummaryResponse:
     def build() -> OperatorSummaryResponse:
-        unique_intents = _unique_by_id(
-            execution.list_intents(), lambda item: item.intent_id
-        )
+        snapshot = execution.operator_snapshot()
         actions: list[OperatorActionResponse] = []
         for item in sorted(
-            unique_intents.values(),
+            snapshot.intents.values(),
             key=lambda item: (item.updated_at, item.created_at, item.intent_id),
             reverse=True,
         ):
             try:
-                projected = _operator_action(execution, item)
+                projected = _operator_action(execution, item, snapshot)
             except (ValueError, ActionPolicyError):
                 continue
             if projected.available_commands:
@@ -516,7 +516,7 @@ def operator_summary(
                 human_approved=item.human_approved,
                 execution_authority="registry_only",
             )
-            for item in registry.list()
+            for item in islice(registry.list(), REGISTRY_TOOLS_CAP)
             if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", item.name)
         ]
         enabled_risks = [item.risk_class for item in descriptors if item.enabled]
@@ -765,26 +765,46 @@ def _action_tool(descriptor: Any) -> ActionToolResponse:
 
 
 def _operator_action(
-    execution: ActionExecutionLayer, intent: ActionIntent
+    execution: ActionExecutionLayer,
+    intent: ActionIntent,
+    snapshot: ActionOperatorSnapshot | None = None,
 ) -> OperatorActionResponse:
-    preview = execution.operator_preview(intent.intent_id)
-    state_approvals = _unique_by_id(
-        execution.list_approvals(), lambda item: item.approval_id
+    preview = (
+        execution.operator_preview_from_snapshot(snapshot, intent)
+        if snapshot is not None
+        else execution.operator_preview(intent.intent_id)
+    )
+    state_approvals = (
+        snapshot.approvals
+        if snapshot is not None
+        else _unique_by_id(execution.list_approvals(), lambda item: item.approval_id)
     )
     approval = state_approvals.get(intent.approval_id) if intent.approval_id else None
     if approval is not None and approval.intent_id != intent.intent_id:
         approval = None
-    receipts = _unique_by_id(execution.list_receipts(), lambda item: item.receipt_id)
+    receipts = (
+        snapshot.receipts
+        if snapshot is not None
+        else _unique_by_id(execution.list_receipts(), lambda item: item.receipt_id)
+    )
     receipt = receipts.get(intent.receipt_id) if intent.receipt_id else None
     if receipt is not None and not _receipt_matches_intent(receipt, intent):
         receipt = None
     verification = None
     if receipt is not None and receipt.verification_id:
-        candidate = _unique_by_id(
-            execution.list_verifications(), lambda item: item.verification_id
+        candidate = (
+            snapshot.verifications
+            if snapshot is not None
+            else _unique_by_id(
+                execution.list_verifications(), lambda item: item.verification_id
+            )
         ).get(receipt.verification_id)
-        observations = _unique_by_id(
-            execution.list_observations(), lambda item: item.observation_id
+        observations = (
+            snapshot.observations
+            if snapshot is not None
+            else _unique_by_id(
+                execution.list_observations(), lambda item: item.observation_id
+            )
         )
         observation = (
             None
@@ -865,13 +885,17 @@ def _operator_action(
             }
             else "reserved"
         ),
-        available_commands=list(execution.available_commands(intent.intent_id)),
+        available_commands=list(
+            execution.available_commands_from_snapshot(snapshot, intent)
+            if snapshot is not None
+            else execution.available_commands(intent.intent_id)
+        ),
         confirmation=(
             None
-            if execution.confirmation_phrase(intent.intent_id) is None
+            if intent.risk_class not in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}
             else OperatorConfirmationResponse(
                 required=True,
-                phrase=execution.confirmation_phrase(intent.intent_id) or "",
+                phrase=f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}",
             )
         ),
     )
@@ -892,7 +916,6 @@ def _operator_argument_summary(value: Any) -> OperatorArgumentSummaryResponse:
             scope_kind="path" if data["path_scoped"] else "all",
             max_results=int(data["max_results"]),
             query_length=int(data["query_length"]),
-            query_digest=str(data["query_digest"]),
         )
     if kind == "calendar_read":
         return CalendarArgumentSummaryResponse(

@@ -53,6 +53,7 @@ export function OutboxClient() {
                 <span>{message.kind.replaceAll("_", " ")}</span>
               </div>
               <h3>{message.title}</h3>
+              {message.body_preview ? <p>{message.body_preview}</p> : null}
                <p className="muted">Created {new Date(message.created_at).toLocaleString()} · {message.channel} · {message.privacy_class}</p>
               {message.last_failure_code ? <p className="error">Last delivery failure: {message.last_failure_code}</p> : null}
               <p className="mono muted">{referenceSummary(message)}</p>

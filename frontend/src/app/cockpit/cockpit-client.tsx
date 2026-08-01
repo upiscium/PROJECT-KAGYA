@@ -301,7 +301,7 @@ function RegistryToolCatalog({ tools }: { tools: RegistryTool[] }) {
 function formatArgumentSummary(action: OperatorAction): string {
   const summary = action.argument_summary;
   if (summary.kind === "metadata_read") return `Metadata ${summary.namespace} / ${summary.key}`;
-  if (summary.kind === "document_search") return `Document scope ${summary.scope_kind} · ${summary.max_results} results · query length ${summary.query_length} · digest ${summary.query_digest}`;
+  if (summary.kind === "document_search") return `Document scope ${summary.scope_kind} · ${summary.max_results} results · query length ${summary.query_length}`;
   if (summary.kind === "calendar_read") return `Calendar ${summary.starts_at} → ${summary.ends_at} · ${summary.max_results} results`;
   return `${summary.channel} notification · ${summary.title} · ${summary.body_preview}`;
 }

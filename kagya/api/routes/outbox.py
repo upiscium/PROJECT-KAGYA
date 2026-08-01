@@ -34,6 +34,7 @@ class EnqueueRequest(_Request):
     kind: OutboxMessageKind
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
+    public_preview: str | None = Field(default=None, min_length=1, max_length=160)
     deduplication_key: str = Field(min_length=1, max_length=256)
     context_id: str | None = None
     interlocutor_id: str | None = None
@@ -98,6 +99,7 @@ class SafeOutboxMessageResponse(BaseModel):
     channel: Literal["local"]
     privacy_class: PrivacyClass
     last_failure_code: str | None
+    body_preview: str | None = Field(default=None, max_length=160)
     references: CockpitOutboxReferencesResponse
 
 
@@ -177,6 +179,7 @@ def enqueue_message(
                 body.kind,
                 title=body.title,
                 body=body.body,
+                public_preview=body.public_preview,
                 deduplication_key=body.deduplication_key,
                 context_id=body.context_id,
                 interlocutor_id=body.interlocutor_id,
@@ -309,6 +312,7 @@ def _safe_message(message: OutboxMessage) -> SafeOutboxMessageResponse:
         channel="local",
         privacy_class=message.privacy_class,
         last_failure_code=message.last_failure_code,
+        body_preview=_public_body_preview(message),
         references=CockpitOutboxReferencesResponse(
             event_id=message.references.event_id,
             goal_id=message.references.goal_id,
@@ -318,6 +322,16 @@ def _safe_message(message: OutboxMessage) -> SafeOutboxMessageResponse:
             commitment_id=message.references.commitment_id,
         ),
     )
+
+
+def _public_body_preview(message: OutboxMessage) -> str | None:
+    """Return only the separately validated public conversational preview."""
+    if message.kind not in {
+        OutboxMessageKind.QUESTION,
+        OutboxMessageKind.RENEGOTIATION,
+    }:
+        return None
+    return message.public_preview
 
 
 def _operator_title(kind: OutboxMessageKind) -> str:

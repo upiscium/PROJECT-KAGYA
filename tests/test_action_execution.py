@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from kagya.decision import (
     build_explanation,
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
+from kagya.api.routes.actions import _operator_action
 from kagya.outbox import DeliveryStatus, Outbox
 from kagya.identity import (
     BoundaryAssessmentInput,
@@ -418,6 +420,147 @@ def test_operator_preview_uses_explicit_public_notification_copy(
         OperatorCommand.REJECT,
         OperatorCommand.CANCEL,
     )
+
+
+def test_document_search_public_preview_has_no_query_fingerprint(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    query = "release status"
+    _decision(
+        loop,
+        "decision-document-preview",
+        "document_search",
+        {"query": query, "relative_path": None, "max_results": 5},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.document-preview",
+            handler=lambda: layer.create_from_decision(
+                "decision-document-preview", idempotency_key="document-preview"
+            ),
+        ).value
+        snapshot = layer.operator_snapshot()
+        preview = layer.operator_preview_from_snapshot(snapshot, intent)
+        response = _operator_action(layer, intent, snapshot)
+    finally:
+        runtime.shutdown()
+
+    serialized = response.model_dump_json()
+    assert preview.arguments.query_length == len(query)
+    assert query not in serialized
+    assert hashlib.sha256(query.encode()).hexdigest() not in serialized
+    assert intent.validation_record_id not in serialized
+    assert intent.operator_binding_nonce not in serialized
+    alternate_binding = action_execution._operator_preview_digest(
+        intent.model_copy(
+            update={
+                "operator_binding_nonce": "00000000-0000-4000-8000-000000000001"
+            }
+        ),
+        preview.tool,
+        preview.arguments,
+    )
+    assert alternate_binding != preview.preview_digest
+
+
+def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-snapshot",
+        "document_search",
+        {"query": "bounded history", "relative_path": None, "max_results": 5},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        base = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.snapshot",
+            handler=lambda: layer.create_from_decision(
+                "decision-snapshot", idempotency_key="snapshot-base"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    base_validation = state.validation_records[0]
+    intents = []
+    validations = []
+    for index in range(300):
+        intent_id = f"intent-{index}"
+        validation_id = f"validation-{index}"
+        decision_id = f"decision-{index}"
+        intents.append(
+            base.model_copy(
+                update={
+                    "intent_id": intent_id,
+                    "idempotency_key": f"idempotency-{index}",
+                    "validation_record_id": validation_id,
+                    "provenance": base.provenance.model_copy(
+                        update={"decision_id": decision_id}
+                    ),
+                }
+            )
+        )
+        validations.append(
+            base_validation.model_copy(
+                update={
+                    "validation_id": validation_id,
+                    "intent_id": intent_id,
+                    "decision_id": decision_id,
+                    "idempotency_key": f"idempotency-{index}",
+                }
+            )
+        )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={"intents": tuple(intents), "validation_records": tuple(validations)}
+    ).model_dump(mode="json")
+
+    checked_calls = 0
+    original_state_checked = layer._state_checked
+
+    def counted_state_checked() -> ActionState:
+        nonlocal checked_calls
+        checked_calls += 1
+        return original_state_checked()
+
+    def unexpected_scan(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("operator projection performed a per-intent state scan")
+
+    monkeypatch.setattr(layer, "_state_checked", counted_state_checked)
+    for method in (
+        "list_approvals",
+        "list_receipts",
+        "list_observations",
+        "list_verifications",
+    ):
+        monkeypatch.setattr(layer, method, unexpected_scan)
+
+    snapshot = layer.operator_snapshot()
+    projected = [
+        _operator_action(layer, intent, snapshot)
+        for intent in snapshot.intents.values()
+    ]
+
+    assert checked_calls == 1
+    assert len(projected) == 300
+    assert all(item.available_commands == [OperatorCommand.CANCEL] for item in projected)
 
 
 @pytest.mark.parametrize(
@@ -1198,7 +1341,7 @@ def test_schema_v3_failed_validation_migrates_without_raw_arguments(
     migrated = restored.list_validation_records()[0]
     assert migrated.idempotency_key.startswith("legacy:")
     assert len(migrated.request_digest) == 64
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 5
     assert "private-body" not in json.dumps(
         loop.persistent_state.extensions[ACTION_STATE_KEY]
     )
@@ -1371,7 +1514,7 @@ def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     migrated = restored.get_intent(intent.intent_id)
     assert migrated.status == IntentStatus.REJECTED
     assert migrated.failure_code == "legacy_unvalidated_intent"
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 5
     persisted_revision = migrated.revision
 
     restarted = ActionExecutionLayer(

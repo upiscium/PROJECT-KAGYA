@@ -849,6 +849,83 @@ def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
         )
 
 
+def test_outbox_public_body_preview_is_bounded_and_approval_has_no_content(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        outbox = client.app.state.outbox
+        question = outbox.enqueue(
+            OutboxMessageKind.QUESTION,
+            title="Need a decision",
+            body="Choose the local option. " + ("x" * 200),
+            public_preview="Choose the local option. " + ("x" * 135),
+            deduplication_key="preview-question",
+        )
+        renegotiation = outbox.enqueue(
+            OutboxMessageKind.RENEGOTIATION,
+            title="Constraint changed",
+            body="The deadline needs to move by one day.",
+            public_preview="The deadline needs to move by one day.",
+            deduplication_key="preview-renegotiation",
+        )
+        approval = outbox.enqueue(
+            OutboxMessageKind.APPROVAL_REQUEST,
+            title="Approve action",
+            body="The action body remains Cockpit-only.",
+            deduplication_key="preview-approval",
+        )
+
+        response = client.get("/api/outbox/messages", headers=admin_headers())
+
+        assert response.status_code == 200
+        messages = {item["message_id"]: item for item in response.json()["messages"]}
+        assert messages[question.message_id]["body_preview"] == question.public_preview
+        assert len(messages[question.message_id]["body_preview"]) == 160
+        assert messages[renegotiation.message_id]["body_preview"] == renegotiation.body
+        assert messages[approval.message_id]["body_preview"] is None
+        for item in messages.values():
+            assert "body" not in item
+
+        private = client.post(
+            "/api/outbox/messages",
+            headers=admin_headers(),
+            json={
+                "kind": "question",
+                "title": "Private content",
+                "body": "private sentinel must not be projected",
+                "public_preview": "private sentinel must not be projected",
+                "deduplication_key": "preview-private",
+            },
+        )
+        assert private.status_code == 409
+        assert "private sentinel" not in private.text.lower()
+
+
+def test_action_operator_summary_caps_registry_tools_independently(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        client.app.state.tool_registry = SimpleNamespace(
+            list=lambda: [
+                SimpleNamespace(
+                    name=f"registry_tool_{index}",
+                    tool_type=SimpleNamespace(value="metadata"),
+                    status=SimpleNamespace(value="declared"),
+                    generated=False,
+                    human_approved=False,
+                )
+                for index in range(150)
+            ]
+        )
+
+        response = client.get(
+            "/api/actions/operator-summary?limit=1", headers=admin_headers()
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()["registry_tools"]) == 100
+
+
 def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
     tmp_path: Path,
 ) -> None:
@@ -5268,6 +5345,7 @@ def _cockpit_action_intent(
         approval_id=approval_id,
         receipt_id=receipt_id,
         failure_code=failure_code,
+        operator_binding_nonce="00000000-0000-4000-8000-000000000001",
     )
 
 

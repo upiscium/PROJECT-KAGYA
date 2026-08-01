@@ -1157,6 +1157,15 @@ class SubjectScheduler:
                 kind,
                 title=title,
                 body=body,
+                public_preview=(
+                    body
+                    if kind
+                    in {
+                        OutboxMessageKind.QUESTION,
+                        OutboxMessageKind.RENEGOTIATION,
+                    }
+                    else None
+                ),
                 deduplication_key=f"scheduler:{schedule.schedule_id}:{outcome}",
                 references=references,
                 urgency=urgency,

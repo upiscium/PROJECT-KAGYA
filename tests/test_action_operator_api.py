@@ -34,7 +34,7 @@ def test_operator_request_and_summary_are_strict() -> None:
         )
 
 
-def test_safe_outbox_projection_has_no_body_or_delivery_history() -> None:
+def test_safe_outbox_projection_has_bounded_preview_but_no_raw_body() -> None:
     value = SafeOutboxMessageResponse(
         message_id="message-1",
         kind="action_result",
@@ -46,6 +46,7 @@ def test_safe_outbox_projection_has_no_body_or_delivery_history() -> None:
         channel="local",
         privacy_class=PrivacyClass.OPERATOR,
         last_failure_code=None,
+        body_preview="A bounded operator-safe update.",
         references={
             "event_id": None,
             "goal_id": None,
@@ -56,5 +57,6 @@ def test_safe_outbox_projection_has_no_body_or_delivery_history() -> None:
         },
     )
     assert "body" not in value.model_dump()
+    assert value.body_preview == "A bounded operator-safe update."
     assert "deduplication_key" not in value.model_dump()
     assert "attempts" not in value.model_dump()

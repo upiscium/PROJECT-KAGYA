@@ -927,6 +927,7 @@ class RuntimeBehavioralRunner:
                         OutboxMessageKind.QUESTION,
                         title="Bounded question",
                         body="Choose one bounded option.",
+                        public_preview="Choose one bounded option.",
                         deduplication_key="behavioral-delivery",
                         urgency=OutboxUrgency.CRITICAL,
                     )

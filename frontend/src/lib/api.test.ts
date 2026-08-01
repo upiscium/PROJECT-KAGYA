@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ChatJobCanceledError, ChatJobFailedError, api, streamChatJob } from "./api";
 
@@ -417,7 +418,7 @@ describe("api client", () => {
     const safe = {
       message_id: "message-safe-1", kind: "approval_request", title: "Approval required", urgency: "high",
       delivery_status: "pending", acknowledgment_status: "unacknowledged", created_at: "2026-01-01T00:00:00Z",
-      channel: "local", privacy_class: "operator", last_failure_code: null,
+      channel: "local", privacy_class: "operator", last_failure_code: null, body_preview: null,
       references: { event_id: null, goal_id: null, plan_id: "plan-1", decision_id: "decision-1", action_id: "intent-operator-1", commitment_id: null },
     };
     fetchMock.mockReturnValue(jsonResponse({ messages: [safe] }));
@@ -425,6 +426,41 @@ describe("api client", () => {
 
     fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, body: "PRIVATE_SENTINEL" }] }));
     await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "question", body_preview: "Which local option should be used?" }] }));
+    expect((await api.outboxMessages()).messages[0].body_preview).toBe("Which local option should be used?");
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "renegotiation", body_preview: "Move the deadline by one day." }] }));
+    expect((await api.outboxMessages()).messages[0].body_preview).toBe("Move the deadline by one day.");
+
+    for (const body_preview of ["PRIVATE_SENTINEL", "hidden thought", "credential=secret", "x".repeat(161)]) {
+      fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "question", body_preview }] }));
+      await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+    }
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, body_preview: "Action details" }] }));
+    await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("does not retain a raw or deterministic document query fingerprint", async () => {
+    const query = "release status";
+    const queryHash = createHash("sha256").update(query).digest("hex");
+    const documentAction = {
+      ...actionOperatorPayload.actions[0],
+      tool: { ...actionOperatorPayload.actions[0].tool, name: "document_search", risk_class: "read_only", approval_required: false, reversible: false, effect_code: "documents.search" },
+      argument_summary: { kind: "document_search", scope_kind: "all", max_results: 5, query_length: query.length },
+      approval: null,
+      available_commands: [],
+    };
+    fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, actions: [documentAction] }));
+
+    const result = await api.actionOperatorSummary();
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(query);
+    expect(serialized).not.toContain(queryHash);
+
+    fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, actions: [{ ...documentAction, argument_summary: { ...documentAction.argument_summary, query_digest: queryHash } }] }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
   });
 });
 

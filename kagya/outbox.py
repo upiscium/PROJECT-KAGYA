@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
+import re
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -97,6 +98,7 @@ class OutboxMessage(_StrictModel):
     kind: OutboxMessageKind
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
+    public_preview: str | None = Field(default=None, min_length=1, max_length=160)
     context_id: str | None = None
     interlocutor_id: str | None = None
     references: OutboxReferences = Field(default_factory=OutboxReferences)
@@ -134,6 +136,15 @@ class OutboxMessage(_StrictModel):
             raise ValueError("Outbox expiry must be after not_before")
         if self.privacy_class == PrivacyClass.PRIVATE:
             raise ValueError("Private subject state cannot enter the outbox")
+        if self.public_preview is not None and self.kind not in {
+            OutboxMessageKind.QUESTION,
+            OutboxMessageKind.RENEGOTIATION,
+        }:
+            raise ValueError("Only conversational messages accept a public preview")
+        if self.public_preview is not None and not _is_public_preview_safe(
+            self.public_preview
+        ):
+            raise ValueError("Outbox public preview contains private text")
         if _contains_private_data(self.model_dump(mode="json")):
             raise ValueError("Outbox message contains a forbidden private field")
         return self
@@ -184,6 +195,7 @@ class Outbox:
         *,
         title: str,
         body: str,
+        public_preview: str | None = None,
         deduplication_key: str,
         context_id: str | None = None,
         interlocutor_id: str | None = None,
@@ -207,6 +219,7 @@ class Outbox:
             kind=kind,
             title=title,
             body=body,
+            public_preview=public_preview,
             context_id=context_id,
             interlocutor_id=interlocutor_id,
             references=references or OutboxReferences(),
@@ -516,6 +529,24 @@ def _contains_private_data(value: Any) -> bool:
         lowered = value.casefold()
         return "<think>" in lowered or "</think>" in lowered
     return False
+
+
+_PRIVATE_PREVIEW_MARKERS = re.compile(
+    r"(?:<\/?think\b|hidden[\s_-]*thought|private[\s_-]*(?:state|session|context|sentinel)|raw[\s_-]*prompt|api[\s_-]*key|access[\s_-]*token|credential|password|secret|bearer\s+token|\bsentinel\b)",
+    re.IGNORECASE,
+)
+_PRIVATE_PREVIEW_PATH = re.compile(
+    r"(?:[A-Za-z]:[\\/]|~[\\/]|(?:^|\s)/(?:[^\s/]+/)+[^\s]*)"
+)
+
+
+def _is_public_preview_safe(value: str) -> bool:
+    return bool(
+        value.strip()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        and _PRIVATE_PREVIEW_MARKERS.search(value) is None
+        and _PRIVATE_PREVIEW_PATH.search(value) is None
+    )
 
 
 __all__ = [
