@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
@@ -219,10 +219,191 @@ describe("CockpitClient", () => {
     expect(within(actionSection).getByRole("link", { name: "event-1" })).toHaveAttribute("href", "#journal-event-1");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "actions"]))).not.toContain("PRIVATE_SENTINEL");
   });
+
+  it("sends approve only, with every server binding, and leaves other commands untouched", async () => {
+    mockedApi.actionOperatorSummary.mockResolvedValue(operatorSummary());
+    mockedApi.approveAction.mockResolvedValue(operatorMutationResponse("approve") as never);
+    renderCockpit();
+
+    const reason = await screen.findByRole("textbox", { name: "Reason for operator-action-1" });
+    await userEvent.type(reason, "approved after review");
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(mockedApi.approveAction).toHaveBeenCalledWith("operator-action-1", expect.objectContaining({
+      expected_approval_id: "approval-1", expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), reason: "approved after review",
+    }));
+    expect(mockedApi.rejectAction).not.toHaveBeenCalled();
+    expect(mockedApi.cancelAction).not.toHaveBeenCalled();
+    expect(mockedApi.retryAction).not.toHaveBeenCalled();
+    expect(mockedApi.compensateAction).not.toHaveBeenCalled();
+  });
+
+  it("bounds rejection reasons and binds rejection to the approval", async () => {
+    mockedApi.actionOperatorSummary.mockResolvedValue(operatorSummary());
+    mockedApi.rejectAction.mockResolvedValue(operatorMutationResponse("reject") as never);
+    renderCockpit();
+
+    const reason = await screen.findByRole("textbox", { name: "Reason for operator-action-1" });
+    await userEvent.type(reason, "x".repeat(700));
+    expect(reason).toHaveValue("x".repeat(500));
+    await userEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(mockedApi.rejectAction).toHaveBeenCalledWith("operator-action-1", expect.objectContaining({
+      reason: "x".repeat(500), expected_approval_id: "approval-1", expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    }));
+  });
+
+  it("waits for the authoritative operator refetch after rejection", async () => {
+    const refreshed = { ...operatorSummary(), actions: [], operator_action_count: 0, pending_approval_count: 0 };
+    mockedApi.actionOperatorSummary.mockResolvedValueOnce(operatorSummary()).mockResolvedValue(refreshed);
+    mockedApi.rejectAction.mockResolvedValue(operatorMutationResponse("reject") as never);
+    renderCockpit();
+    await userEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument());
+    expect(mockedApi.actionOperatorSummary.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it.each([
+    ["cancel", "cancelAction", "cancelled"],
+    ["retry_now", "retryAction", "executed"],
+    ["compensate", "compensateAction", "compensated"],
+  ] as const)("clicks server-authorized %s and binds the request", async (command, method, disposition) => {
+    const commands = [command];
+    const action = operatorAction({ status: command === "retry_now" ? "retry_pending" : command === "compensate" ? "succeeded" : "approved", available_commands: commands, approval: null, receipt: command === "compensate" ? { receipt_id: "receipt-1", status: "succeeded" } : null });
+    mockedApi.actionOperatorSummary.mockResolvedValue({ ...operatorSummary(), actions: [action], operator_action_count: 1 });
+    mockedApi[method].mockResolvedValue({ ...operatorMutationResponse("approve"), command, disposition, action } as never);
+    renderCockpit();
+    const button = await screen.findByRole("button", { name: command === "retry_now" ? "Retry now" : command[0].toUpperCase() + command.slice(1) });
+    await userEvent.click(button);
+    expect(mockedApi[method]).toHaveBeenCalledWith("operator-action-1", {
+      expected_intent_revision: 3, expected_preview_digest: "a".repeat(64),
+    });
+    for (const other of ["approveAction", "rejectAction", "cancelAction", "retryAction", "compensateAction"] as const) {
+      if (other !== method) expect(mockedApi[other]).not.toHaveBeenCalled();
+    }
+    expect(screen.queryByRole("button", { name: "Approve" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
+  });
+
+  it.each([["retry_now", "Retry now"], ["compensate", "Compensate"]] as const)("does not invent omitted %s controls", async (command, label) => {
+    mockedApi.actionOperatorSummary.mockResolvedValue({ ...operatorSummary(), actions: [operatorAction({ available_commands: ["cancel"], approval: null })] });
+    renderCockpit();
+    await screen.findByText("Other operator actions");
+    expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+    expect(mockedApi[command === "retry_now" ? "retryAction" : "compensateAction"]).not.toHaveBeenCalled();
+  });
+
+  it("requires the exact non-null confirmation phrase and sends phrase, intent, revision, and digest", async () => {
+    const action = operatorAction({ available_commands: ["cancel"], approval: null, confirmation: { required: true, phrase: "CANCEL OPERATOR-ACTION-1" } });
+    mockedApi.actionOperatorSummary.mockResolvedValue({ ...operatorSummary(), actions: [action] });
+    mockedApi.cancelAction.mockResolvedValue(operatorMutationResponse("approve") as never);
+    renderCockpit();
+    const button = await screen.findByRole("button", { name: "Cancel" });
+    expect(button).toBeDisabled();
+    const phrase = screen.getByRole("textbox", { name: "Confirmation for operator-action-1" });
+    await userEvent.type(phrase, "CANCEL OPERATOR-ACTION-1x");
+    expect(button).toBeDisabled();
+    await userEvent.clear(phrase);
+    await userEvent.type(phrase, "CANCEL OPERATOR-ACTION-1");
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(mockedApi.cancelAction).toHaveBeenCalledWith("operator-action-1", {
+      confirmation_phrase: "CANCEL OPERATOR-ACTION-1", expected_intent_revision: 3, expected_preview_digest: "a".repeat(64),
+    });
+  });
+
+  it("locks duplicate clicks for one intent while allowing another intent", async () => {
+    const first = deferred<unknown>();
+    const second = deferred<unknown>();
+    const firstAction = operatorAction({ available_commands: ["cancel", "reject"], confirmation: null });
+    const secondAction = operatorAction({ intent_id: "operator-action-2", available_commands: ["cancel"], confirmation: null });
+    mockedApi.actionOperatorSummary.mockResolvedValue({ ...operatorSummary(), actions: [firstAction, secondAction], operator_action_count: 2 });
+    mockedApi.cancelAction.mockReturnValueOnce(first.promise as never).mockReturnValueOnce(second.promise as never);
+    renderCockpit();
+    const cancelButtons = await screen.findAllByRole("button", { name: "Cancel" });
+    fireEvent.click(cancelButtons[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Reject" })[0]);
+    await vi.waitFor(() => expect(mockedApi.cancelAction).toHaveBeenCalledTimes(1));
+    expect(mockedApi.rejectAction).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("button", { name: "Reject" })[0]).toBeDisabled();
+    expect(cancelButtons[1]).toBeEnabled();
+    await userEvent.click(cancelButtons[1]);
+    await vi.waitFor(() => expect(mockedApi.cancelAction).toHaveBeenCalledTimes(2));
+    expect(mockedApi.cancelAction.mock.calls.map(([intentId]) => intentId)).toEqual(["operator-action-1", "operator-action-2"]);
+    await act(async () => {
+      first.resolve(operatorMutationResponse("approve"));
+      second.resolve(operatorMutationResponse("approve"));
+    });
+  });
+
+  it.each([["success", true], ["stale 409", false]] as const)("refetches all authoritative caches after %s", async (_label, succeeds) => {
+    const mutation = deferred<unknown>();
+    const stale = operatorAction({ available_commands: ["cancel"], confirmation: null });
+    const refreshed = { ...operatorSummary(), actions: [], operator_action_count: 0, pending_approval_count: 0 };
+    const refreshedActions = { pending_approval_count: 0, retry_pending_count: 0, failed_count: 0, traces: [], pre_intent_failures: [] };
+    const refreshedDecisions = { decisions: [] };
+    const refreshedPlans = { plans: [] };
+    const refreshedOutbox = { pending_count: 0, critical_count: 0, messages: [] };
+    const refreshedJournal = { records: [] };
+    mockedApi.actionOperatorSummary.mockResolvedValueOnce({ ...operatorSummary(), actions: [stale] }).mockResolvedValue(refreshed);
+    mockedApi.actionTrace.mockResolvedValueOnce({ pending_approval_count: 1, retry_pending_count: 1, failed_count: 1, traces: rawActionFixtures.map(cockpitActionProjection) as never, pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never }).mockResolvedValue(refreshedActions);
+    mockedApi.decisions.mockResolvedValueOnce({ decisions: [{ decision_id: "decision-stale", context_id: null, active_goal_ids: [], selected_candidate_id: "candidate-stale", selected_candidate: { candidate_id: "candidate-stale", candidate_type: "no_op", proposed_action: "Wait", plan_id: null, plan_revision: null, step_id: null, goal_refs: [], commitment_refs: [] }, selection_confidence: 1, status: "awaiting_outcome", outcome_status: "pending", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] } as never).mockResolvedValue(refreshedDecisions);
+    mockedApi.plans.mockResolvedValueOnce({ plans: [{ plan_id: "plan-stale", goal_id: "goal-1", revision: 1, status: "active", steps: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }] } as never).mockResolvedValue(refreshedPlans);
+    mockedApi.cockpitOutbox.mockResolvedValueOnce({ pending_count: 1, critical_count: 1, messages: [cockpitOutboxProjection(rawOutboxFixtures[0])] }).mockResolvedValue(refreshedOutbox);
+    mockedApi.eventJournal.mockResolvedValueOnce({ records: [{ record_id: "record-stale", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-stale", event_type: "action_cancel", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: null, reauthenticated: null, previous_record_hash: null, record_hash: "hash" }] } as never).mockResolvedValue(refreshedJournal);
+    mockedApi.cancelAction.mockReturnValue(mutation.promise as never);
+    const standaloneExplanations = vi.fn().mockResolvedValueOnce({ explanations: [{ explanation_id: "stale" }] }).mockResolvedValue({ explanations: [{ explanation_id: "fresh" }] });
+    const standaloneOutbox = vi.fn().mockResolvedValueOnce({ messages: [{ message_id: "stale" }] }).mockResolvedValue({ messages: [{ message_id: "fresh" }] });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    await queryClient.prefetchQuery({ queryKey: ["decision-explanations"], queryFn: standaloneExplanations });
+    await queryClient.prefetchQuery({ queryKey: ["outbox"], queryFn: standaloneOutbox });
+    const cockpitKeys = ["action-operator", "actions", "decisions", "plans", "outbox", "journal"] as const;
+    const { queryClient: renderedClient } = renderCockpit(queryClient);
+    const invalidate = vi.spyOn(renderedClient, "invalidateQueries");
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    await vi.waitFor(() => {
+      expect(mockedApi.actionTrace).toHaveBeenCalled();
+      expect(mockedApi.decisions).toHaveBeenCalled();
+      expect(mockedApi.plans).toHaveBeenCalled();
+      expect(mockedApi.cockpitOutbox).toHaveBeenCalled();
+      expect(mockedApi.eventJournal).toHaveBeenCalled();
+    });
+    const before = Object.fromEntries(cockpitKeys.map((key) => [key, mockedApi[key === "action-operator" ? "actionOperatorSummary" : key === "actions" ? "actionTrace" : key === "decisions" ? "decisions" : key === "plans" ? "plans" : key === "outbox" ? "cockpitOutbox" : "eventJournal"].mock.calls.length]));
+    await userEvent.click(cancel);
+    expect(cancel).toBeDisabled();
+    expect(renderedClient.getQueryData(["cockpit", "action-operator"])).toEqual(expect.objectContaining({ actions: [expect.objectContaining({ intent_id: "operator-action-1" })] }));
+    mutation.promise.catch(() => undefined);
+    await act(async () => {
+      if (succeeds) mutation.resolve(operatorMutationResponse("approve"));
+      else mutation.reject(Object.assign(new Error("Action is stale"), { status: 409 }));
+    });
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument());
+    for (const key of cockpitKeys) {
+      const method = key === "action-operator" ? "actionOperatorSummary" : key === "actions" ? "actionTrace" : key === "decisions" ? "decisions" : key === "plans" ? "plans" : key === "outbox" ? "cockpitOutbox" : "eventJournal";
+      expect(mockedApi[method].mock.calls.length).toBeGreaterThan(before[key]);
+      expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["cockpit", key] }));
+    }
+    expect(standaloneExplanations).toHaveBeenCalledTimes(2);
+    expect(standaloneOutbox).toHaveBeenCalledTimes(2);
+    expect(renderedClient.getQueryData(["cockpit", "actions"])).toEqual(refreshedActions);
+    expect(renderedClient.getQueryData(["cockpit", "decisions"])).toEqual(refreshedDecisions);
+    expect(renderedClient.getQueryData(["cockpit", "plans"])).toEqual(refreshedPlans);
+    expect(renderedClient.getQueryData(["cockpit", "outbox"])).toEqual(refreshedOutbox);
+    expect(renderedClient.getQueryData(["cockpit", "journal"])).toEqual(refreshedJournal);
+    expect(renderedClient.getQueryData(["decision-explanations"])).toEqual({ explanations: [{ explanation_id: "fresh" }] });
+    expect(renderedClient.getQueryData(["outbox"])).toEqual({ messages: [{ message_id: "fresh" }] });
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["decision-explanations"] }));
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["outbox"] }));
+    const actionCache = renderedClient.getQueryCache().getAll().filter((query) => {
+      const key = JSON.stringify(query.queryKey);
+      return key.includes("action-operator") || key === '["decision-explanations"]' || key === '["outbox"]';
+    });
+    expect(JSON.stringify(actionCache)).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(renderedClient.getMutationCache().getAll())).not.toContain("PRIVATE_SENTINEL");
+    expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
+  });
 });
 
-function renderCockpit() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderCockpit(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })) {
   return { ...render(<QueryClientProvider client={queryClient}><CockpitClient /></QueryClientProvider>), queryClient };
 }
 
@@ -290,6 +471,17 @@ function operatorSummary() {
 function operatorMutationResponse(command: "approve" | "reject") {
   const action = operatorSummary().actions[0];
   return { command, event_id: "operator-event-1", processing_sequence: 11, action, disposition: command === "approve" ? "awaiting_scheduler" : "rejected" };
+}
+
+function operatorAction(overrides: Record<string, unknown> = {}) {
+  return { ...operatorSummary().actions[0], ...overrides } as never;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+  return { promise, resolve, reject };
 }
 
 const rawOutboxFixtures = [

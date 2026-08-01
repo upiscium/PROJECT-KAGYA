@@ -8,24 +8,25 @@ import { Card, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/input";
 import { api, errorMessage, type OutboxMessage } from "@/lib/api";
 import Link from "next/link";
+import { queryKeys } from "@/lib/query-keys";
 
 export function OutboxClient() {
   const queryClient = useQueryClient();
   const [replies, setReplies] = useState<Record<string, string>>({});
   const messages = useQuery({
-    queryKey: ["outbox"],
+    queryKey: queryKeys.outbox,
     queryFn: api.outboxMessages,
     refetchInterval: 5000,
   });
   const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: ["outbox"] });
-    void queryClient.invalidateQueries({ queryKey: ["cockpit", "outbox"] });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.outbox, refetchType: "all" });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.cockpit.outbox, refetchType: "all" });
   };
-  const deliver = useMutation({ mutationFn: api.deliverOutbox, onSuccess: refresh });
+  const deliver = useMutation({ mutationFn: api.deliverOutbox, onSettled: refresh });
   const respond = useMutation({
     mutationFn: ({ message, kind }: { message: OutboxMessage; kind: "read" | "reply" }) =>
       api.respondToOutbox(message.message_id, kind, kind === "reply" ? replies[message.message_id] : undefined),
-    onSuccess: refresh,
+    onSettled: refresh,
   });
   const error = messages.error ?? deliver.error ?? respond.error;
 

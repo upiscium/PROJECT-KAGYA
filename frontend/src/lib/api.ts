@@ -521,7 +521,7 @@ export type OperatorAction = {
   provenance: { decision_id: string; plan_id: string | null; plan_revision: number | null; step_id: string | null; triggering_event_id: string | null };
   receipt: { receipt_id: string; status: string } | null; verification: { verification_id: string; success: boolean; reason: string } | null;
   idempotency_state: "reserved" | "released" | "completed" | "unknown"; available_commands: Array<"approve" | "reject" | "cancel" | "retry_now" | "compensate">;
-  confirmation: { required: boolean; phrase: string | null } | null;
+  confirmation: { required: true; phrase: string } | null;
 };
 export type ActionOperatorSummary = { pending_approval_count: number; operator_action_count: number; risk_ceiling: RiskClass; actions: OperatorAction[]; action_tools: ActionTool[]; registry_tools: RegistryTool[] };
 export type OperatorSummary = ActionOperatorSummary;
@@ -1172,6 +1172,11 @@ function parseOperatorAction(value: Record<string, unknown>): OperatorAction {
   const verification = value.verification === null ? null : parseVerification(value.verification);
   if (value.confirmation !== null && (!isRecord(value.confirmation))) invalid("action confirmation");
   if (value.confirmation !== null) exactRecord(value.confirmation, ["required", "phrase"], "action confirmation");
+  if (value.confirmation !== null && booleanValue(value.confirmation.required, "action confirmation required") !== true) invalid("action confirmation required");
+  const confirmation = value.confirmation === null ? null : {
+    required: true as const,
+    phrase: safeText(value.confirmation.phrase, "action confirmation phrase"),
+  };
   return {
     intent_id: safeId(value.intent_id, "action intent"), revision: positiveInteger(value.revision, "action revision"), status: enumValue(value.status, ACTION_STATUSES, "action status"), approval,
     tool: parseActionTool(value.tool), argument_summary: parseArgumentSummary(value.argument_summary),
@@ -1180,7 +1185,7 @@ function parseOperatorAction(value: Record<string, unknown>): OperatorAction {
     budget: { max_attempts: positiveInteger(value.budget.max_attempts, "action budget attempts"), max_cost_units: nonnegativeNumber(value.budget.max_cost_units, "action budget cost"), max_monetary_cost: nonnegativeNumber(value.budget.max_monetary_cost, "action budget monetary cost"), deadline_at: optionalIsoTimestamp(value.budget.deadline_at, "action budget deadline"), attempts: nonnegativeInteger(value.budget.attempts, "action attempts"), cost_units_used: nonnegativeNumber(value.budget.cost_units_used, "action cost used"), retry_at: optionalIsoTimestamp(value.budget.retry_at, "action retry timestamp") },
     provenance: { decision_id: safeId(value.provenance.decision_id, "action decision"), plan_id: optionalSafeId(value.provenance.plan_id, "action plan"), plan_revision: optionalPositiveInteger(value.provenance.plan_revision, "action plan revision"), step_id: optionalSafeId(value.provenance.step_id, "action step"), triggering_event_id: optionalSafeId(value.provenance.triggering_event_id, "action event") },
     receipt, verification, idempotency_state: enumValue(value.idempotency_state, ["reserved", "released", "completed", "unknown"] as const, "action idempotency state"), available_commands: enumArray(value.available_commands, ["approve", "reject", "cancel", "retry_now", "compensate"] as const, "action commands"),
-    confirmation: value.confirmation === null ? null : { required: booleanValue(value.confirmation.required, "action confirmation required"), phrase: optionalSafeText(value.confirmation.phrase, "action confirmation phrase") },
+    confirmation,
   };
 }
 
@@ -1603,7 +1608,13 @@ async function cancelChatJob(operationId: string): Promise<ChatCancelResponse> {
 }
 
 function actionMutation(path: string, body: ActionMutationCommon | (ApproveActionRequest & { approved: boolean })): Promise<ActionMutationResponse> {
-  return privateApiRequest<unknown>(path, { method: "POST", body: JSON.stringify(body) }).then(parseActionMutation);
+  return privateApiRequest<unknown>(path, { method: "POST", body: JSON.stringify(body) }).then(parseActionMutation).catch((error: unknown) => {
+    if (error instanceof ApiError && error.status !== null) {
+      const status = error.status;
+      throw new ApiError(`Action request failed (${status}).`, status, null, `HTTP status ${status}.`);
+    }
+    throw error;
+  });
 }
 
 function parseActionMutation(value: unknown): ActionMutationResponse {

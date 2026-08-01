@@ -402,6 +402,18 @@ describe("api client", () => {
     await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
   });
 
+  it.each([
+    ["candidate argument", { arguments: { body: "PRIVATE_SENTINEL" } }],
+    ["preview argument", { preview: { ...actionOperatorPayload.actions[0].preview, arguments: { body: "PRIVATE_SENTINEL" } } }],
+    ["candidate preview field", { preview: { ...actionOperatorPayload.actions[0].preview, private_replay: "PRIVATE_SENTINEL" } }],
+  ])("rejects private sentinel in unknown action %s fields", async (_label, update) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...actionOperatorPayload,
+      actions: [{ ...actionOperatorPayload.actions[0], ...update }],
+    }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
   it("binds approval mutations to revision, digest, and approval ID", async () => {
     fetchMock.mockReturnValue(jsonResponse({ command: "approve", event_id: "event-operator-1", processing_sequence: 12, action: actionOperatorPayload.actions[0], disposition: "awaiting_scheduler" }));
     await api.approveAction("intent-operator-1", {
@@ -412,6 +424,19 @@ describe("api client", () => {
     const [, options] = fetchMock.mock.calls[0];
     expect(fetchMock.mock.calls[0][0]).toBe("/admin-proxy/actions/operator/intents/intent-operator-1/approval");
     expect(JSON.parse(String(options.body))).toEqual({ expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), expected_approval_id: "approval-operator-1", approved: true });
+  });
+
+  it.each([
+    ["reject", api.rejectAction, "/admin-proxy/actions/operator/intents/intent-operator-1/approval", { approved: false, reason: "not yet" }],
+    ["cancel", api.cancelAction, "/admin-proxy/actions/operator/intents/intent-operator-1/cancel", {}],
+    ["retry", api.retryAction, "/admin-proxy/actions/operator/intents/intent-operator-1/retry", {}],
+    ["compensate", api.compensateAction, "/admin-proxy/actions/operator/intents/intent-operator-1/compensate", {}],
+  ] as const)("sends the exact %s mutation endpoint and body", async (_label, client, path, extra) => {
+    fetchMock.mockReturnValue(jsonResponse({ command: _label === "retry" ? "retry_now" : _label, event_id: "event-operator-1", processing_sequence: 12, action: actionOperatorPayload.actions[0], disposition: _label === "reject" ? "rejected" : "cancelled" }));
+    await client("intent-operator-1", { expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), ...extra } as never);
+    const [, options] = fetchMock.mock.calls[0];
+    expect(fetchMock.mock.calls[0][0]).toBe(path);
+    expect(JSON.parse(String(options.body))).toEqual({ expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), ...extra });
   });
 
   it("accepts only the safe outbox projection", async () => {
@@ -478,6 +503,38 @@ describe("api client", () => {
       fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, registry_tools: [{ ...actionOperatorPayload.registry_tools[0], description }] }));
       await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
     }
+  });
+
+  it("sanitizes private conflict bodies into bounded public ApiErrors", async () => {
+    const secret = `PRIVATE_SENTINEL ${"x".repeat(2000)}`;
+    fetchMock.mockReturnValue(errorResponse(409, "Conflict", { detail: secret, hidden_thought: secret }));
+
+    const error = await api.cancelAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    }).catch((value) => value);
+    expect(error).toMatchObject({ name: "ApiError", status: 409 });
+    expect(String(error)).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(error)).not.toContain("PRIVATE_SENTINEL");
+    expect(String(error).length).toBeLessThan(500);
+  });
+
+  it.each([
+    ["arguments", { arguments: { value: "PRIVATE_SENTINEL" } }],
+    ["preview", { preview: { ...actionOperatorPayload.actions[0].preview, raw_prompt: "PRIVATE_SENTINEL" } }],
+  ])("rejects unsafe unknown %s fields in successful action mutation responses", async (_label, unsafe) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      command: "cancel",
+      event_id: "event-operator-unsafe",
+      processing_sequence: 12,
+      action: { ...actionOperatorPayload.actions[0], ...unsafe },
+      disposition: "cancelled",
+    }));
+
+    await expect(api.cancelAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    })).rejects.toMatchObject({ name: "ApiError" });
   });
 });
 

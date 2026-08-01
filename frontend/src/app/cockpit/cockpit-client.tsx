@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import Link from "next/link";
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { EmotionMeter } from "@/components/emotion-meter";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -27,28 +27,31 @@ import {
   type RegistryTool,
 } from "@/lib/api";
 import { evaluationHref } from "@/lib/anchors";
+import { actionMutationInvalidationKeys, queryKeys } from "@/lib/query-keys";
 
 type OperatorCommand = OperatorAction["available_commands"][number];
 type OperatorMutationVariables = { command: OperatorCommand; action: OperatorAction; reason?: string; phrase?: string };
 
 export function CockpitClient() {
   const queryClient = useQueryClient();
-  const runtime = useQuery({ queryKey: ["cockpit", "runtime"], queryFn: api.systemInfo });
-  const emotion = useQuery({ queryKey: ["cockpit", "emotion"], queryFn: api.emotion });
-  const workingMemory = useQuery({ queryKey: ["cockpit", "working-memory"], queryFn: api.workingMemory });
-  const contexts = useQuery({ queryKey: ["cockpit", "contexts"], queryFn: api.contexts });
-  const goals = useQuery({ queryKey: ["cockpit", "goals"], queryFn: api.goals });
-  const commitments = useQuery({ queryKey: ["cockpit", "commitments"], queryFn: api.commitments });
-  const plans = useQuery({ queryKey: ["cockpit", "plans"], queryFn: api.plans });
-  const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
-  const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
-  const actions = useQuery({ queryKey: ["cockpit", "actions"], queryFn: api.actionTrace });
-  const training = useQuery({ queryKey: ["cockpit", "training"], queryFn: api.cockpitTraining });
-  const evaluations = useQuery({ queryKey: ["cockpit", "evaluations"], queryFn: api.behavioralEvaluations });
-  const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
-  const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
+  const runtime = useQuery({ queryKey: queryKeys.cockpit.runtime, queryFn: api.systemInfo });
+  const emotion = useQuery({ queryKey: queryKeys.cockpit.emotion, queryFn: api.emotion });
+  const workingMemory = useQuery({ queryKey: queryKeys.cockpit.workingMemory, queryFn: api.workingMemory });
+  const contexts = useQuery({ queryKey: queryKeys.cockpit.contexts, queryFn: api.contexts });
+  const goals = useQuery({ queryKey: queryKeys.cockpit.goals, queryFn: api.goals });
+  const commitments = useQuery({ queryKey: queryKeys.cockpit.commitments, queryFn: api.commitments });
+  const plans = useQuery({ queryKey: queryKeys.cockpit.plans, queryFn: api.plans });
+  const decisions = useQuery({ queryKey: queryKeys.cockpit.decisions, queryFn: api.decisions });
+  const outbox = useQuery({ queryKey: queryKeys.cockpit.outbox, queryFn: api.cockpitOutbox });
+  const actions = useQuery({ queryKey: queryKeys.cockpit.actions, queryFn: api.actionTrace });
+  const training = useQuery({ queryKey: queryKeys.cockpit.training, queryFn: api.cockpitTraining });
+  const evaluations = useQuery({ queryKey: queryKeys.cockpit.evaluations, queryFn: api.behavioralEvaluations });
+  const journal = useQuery({ queryKey: queryKeys.cockpit.journal, queryFn: api.eventJournal });
+  const adapters = useQuery({ queryKey: queryKeys.cockpit.adapters, queryFn: api.adapters });
+  const pendingIntents = useRef(new Set<string>());
+  const [pendingIntentIds, setPendingIntentIds] = useState<Set<string>>(new Set());
   const operator = useQuery({
-    queryKey: ["cockpit", "action-operator"],
+    queryKey: queryKeys.cockpit.actionOperator,
     queryFn: api.actionOperatorSummary,
     refetchInterval: (query) => hasActiveOperatorItems(query.state.data) ? 5000 : false,
   });
@@ -74,11 +77,15 @@ export function CockpitClient() {
       if (command === "retry_now") return api.retryAction(action.intent_id, common);
       return api.compensateAction(action.intent_id, common);
     },
-    onSettled: () => {
-      for (const key of ["action-operator", "actions", "decisions", "plans", "outbox", "journal"]) {
-        void queryClient.invalidateQueries({ queryKey: ["cockpit", key] });
+    onSettled: async (_data, _error, variables) => {
+      try {
+        await Promise.all(actionMutationInvalidationKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey, refetchType: "all" })));
+      } finally {
+        if (variables) {
+          pendingIntents.current.delete(variables.action.intent_id);
+          setPendingIntentIds(new Set(pendingIntents.current));
+        }
       }
-      queueMicrotask(() => operatorMutation.reset());
     },
   });
 
@@ -165,7 +172,7 @@ export function CockpitClient() {
          </Section>
 
          <Section title="Action Operator" query={operator} empty={operator.data ? operatorActions.length === 0 : false} emptyText="No operator actions.">
-           {operator.data ? <ActionOperator actions={operatorActions} approvalInbox={approvalInbox} actionTools={operator.data.action_tools} registryTools={operator.data.registry_tools} mutation={operatorMutation} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} /> : null}
+           {operator.data ? <ActionOperator actions={operatorActions} approvalInbox={approvalInbox} actionTools={operator.data.action_tools} registryTools={operator.data.registry_tools} pendingIntentIds={pendingIntentIds} onRun={(action, command, reason, phrase) => { if (pendingIntents.current.has(action.intent_id)) return; pendingIntents.current.add(action.intent_id); setPendingIntentIds(new Set(pendingIntents.current)); operatorMutation.mutate({ command, action, reason, phrase }); }} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} /> : null}
          </Section>
 
         <Section title="Training / Adapters" query={training} empty={training.data ? training.data.nodes.length === 0 && training.data.jobs.length === 0 && training.data.adapters.length === 0 : false} emptyText="No training nodes, jobs, or adapter lineage records.">
@@ -256,17 +263,16 @@ function TrainingAdaptersSummary({ nodes, online, running, failed, importing, ac
   return <div className="metric-grid"><Metric label="Nodes" value={String(nodes)} /><Metric label="Online" value={String(online)} /><Metric label="Running" value={String(running)} /><Metric label="Failed" value={String(failed)} /><Metric label="Importing" value={String(importing)} /><Metric label="Active adapters" value={String(activeAdapters)} /><Metric label="Candidate adapters" value={String(candidateAdapters)} /></div>;
 }
 
-type OperatorMutation = { isPending: boolean; variables?: OperatorMutationVariables; mutate: (variables: OperatorMutationVariables) => void };
-function ActionOperator({ actions, approvalInbox, actionTools, registryTools, mutation, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { actions: OperatorAction[]; approvalInbox: OperatorAction[]; actionTools: ActionTool[]; registryTools: RegistryTool[]; mutation: OperatorMutation; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
+function ActionOperator({ actions, approvalInbox, actionTools, registryTools, pendingIntentIds, onRun, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { actions: OperatorAction[]; approvalInbox: OperatorAction[]; actionTools: ActionTool[]; registryTools: RegistryTool[]; pendingIntentIds: Set<string>; onRun: (action: OperatorAction, command: OperatorCommand, reason?: string, phrase?: string) => void; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
   const [reasons, setReasons] = useState<Record<string, string>>({});
   const [phrases, setPhrases] = useState<Record<string, string>>({});
   const approvalIds = new Set(approvalInbox.map((action) => action.intent_id));
-  const run = (action: OperatorAction, command: OperatorCommand) => mutation.mutate({ command, action, reason: reasons[action.intent_id], phrase: phrases[action.intent_id] });
+  const run = (action: OperatorAction, command: OperatorCommand) => onRun(action, command, reasons[action.intent_id], phrases[action.intent_id]);
   return <div className="stack">
     <h3 className="cockpit-subheading">Approval Inbox</h3>
-    {approvalInbox.length === 0 ? <p className="muted">No pending approvals.</p> : approvalInbox.map((action) => <OperatorRecord key={action.intent_id} action={action} mutation={mutation} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
+    {approvalInbox.length === 0 ? <p className="muted">No pending approvals.</p> : approvalInbox.map((action) => <OperatorRecord key={action.intent_id} action={action} pending={pendingIntentIds.has(action.intent_id)} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
     <h3 className="cockpit-subheading">Other operator actions</h3>
-    {actions.filter((action) => !approvalIds.has(action.intent_id)).map((action) => <OperatorRecord key={action.intent_id} action={action} mutation={mutation} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
+    {actions.filter((action) => !approvalIds.has(action.intent_id)).map((action) => <OperatorRecord key={action.intent_id} action={action} pending={pendingIntentIds.has(action.intent_id)} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
     <h3 className="cockpit-subheading">Action-executable tools</h3>
     <ActionToolCatalog tools={actionTools} />
     <h3 className="cockpit-subheading">Registry-only tools</h3>
@@ -274,10 +280,9 @@ function ActionOperator({ actions, approvalInbox, actionTools, registryTools, mu
   </div>;
 }
 
-function OperatorRecord({ action, mutation, reason, phrase, onReason, onPhrase, onRun, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { action: OperatorAction; mutation: OperatorMutation; reason: string; phrase: string; onReason: (value: string) => void; onPhrase: (value: string) => void; onRun: (action: OperatorAction, command: OperatorCommand) => void; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
+function OperatorRecord({ action, pending, reason, phrase, onReason, onPhrase, onRun, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { action: OperatorAction; pending: boolean; reason: string; phrase: string; onReason: (value: string) => void; onPhrase: (value: string) => void; onRun: (action: OperatorAction, command: OperatorCommand) => void; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
   const commands = action.available_commands;
   const confirmationNeeded = action.confirmation?.required === true;
-  const pendingThisAction = mutation.isPending && mutation.variables?.action.intent_id === action.intent_id;
   return <article className="record" id={anchor("action", action.intent_id)}>
     <div className="metadata-row"><Badge>{action.status}</Badge><Badge>{action.tool.risk_class}</Badge><strong>{action.tool.name}</strong><span className="mono">{action.intent_id}</span></div>
     <p>{formatArgumentSummary(action)}</p>
@@ -285,8 +290,8 @@ function OperatorRecord({ action, mutation, reason, phrase, onReason, onPhrase, 
     <p>Preview digest: <span className="mono">{action.preview.digest}</span> · Attempts: {action.budget.attempts}/{action.budget.max_attempts} · Cost: {action.budget.cost_units_used}/{action.budget.max_cost_units} · Deadline: {action.budget.deadline_at}</p>
     <p>Decision: <EntityReference kind="decision" id={action.provenance.decision_id} available={loadedDecisions} /> · Plan: <EntityReference kind="plan" id={action.provenance.plan_id} available={loadedPlans} />{action.provenance.step_id ? ` / step ${action.provenance.step_id}` : ""} · Journal: <EntityReference kind="journal" id={action.provenance.triggering_event_id} available={loadedJournal} /> · Receipt: <EntityReference kind="receipt" id={action.receipt?.receipt_id ?? null} available={loadedReceipts} /></p>
     {commands.includes("reject") ? <input aria-label={`Reason for ${action.intent_id}`} value={reason} maxLength={500} onChange={(event) => onReason(event.target.value)} placeholder="Optional reason" /> : null}
-    {confirmationNeeded && commands.length ? <div><p>Confirm target <span className="mono">{action.intent_id}</span> / digest <span className="mono">{action.preview.digest}</span>. Required phrase: <strong>{action.confirmation?.phrase}</strong></p><input aria-label={`Confirmation for ${action.intent_id}`} value={phrase} onChange={(event) => onPhrase(event.target.value)} /></div> : null}
-    <div className="action-row">{commands.map((command) => <Button key={command} disabled={pendingThisAction || (confirmationNeeded && phrase !== action.confirmation?.phrase)} onClick={() => onRun(action, command)}>{commandLabel(command)}</Button>)}</div>
+     {confirmationNeeded && commands.length ? <div><p>Confirm target <span className="mono">{action.intent_id}</span> / digest <span className="mono">{action.preview.digest}</span>. Required phrase: <strong>{action.confirmation?.phrase}</strong></p><input aria-label={`Confirmation for ${action.intent_id}`} value={phrase} onChange={(event) => onPhrase(event.target.value)} /></div> : null}
+     <div className="action-row">{commands.map((command) => <Button key={command} disabled={pending || (confirmationNeeded && phrase !== action.confirmation?.phrase)} onClick={() => onRun(action, command)}>{commandLabel(command)}</Button>)}</div>
   </article>;
 }
 

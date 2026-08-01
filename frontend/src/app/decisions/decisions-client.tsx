@@ -4,9 +4,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardTitle } from "@/components/ui/card";
 import { api, errorMessage } from "@/lib/api";
+import { queryKeys } from "@/lib/query-keys";
 
 export function DecisionsClient() {
-  const query = useQuery({ queryKey: ["decision-explanations"], queryFn: api.decisionExplanations });
+  const query = useQuery({ queryKey: queryKeys.decisionExplanations, queryFn: api.decisionExplanations });
 
   return (
     <div className="page">
