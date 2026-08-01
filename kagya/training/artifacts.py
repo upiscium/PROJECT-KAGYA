@@ -294,6 +294,7 @@ class TrainingArtifactContract:
         expected_model_revision: str | None = None,
         expected_parent_adapter_id: str | None | object = _UNSET,
         expected_parent_adapter_hash: str | None | object = _UNSET,
+        expected_worker_node_id: str | None = None,
     ) -> TrainingResultManifest:
         self._validate_tree(path)
         required = {
@@ -357,6 +358,11 @@ class TrainingArtifactContract:
             and manifest.parent_adapter_hash != expected_parent_adapter_hash
         ):
             raise ValueError("result parent adapter hash mismatch")
+        if (
+            expected_worker_node_id is not None
+            and manifest.worker_node_id != expected_worker_node_id
+        ):
+            raise ValueError("result worker node ID mismatch")
         return manifest
 
     def _atomic_finalize(

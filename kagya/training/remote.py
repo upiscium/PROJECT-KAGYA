@@ -12,7 +12,11 @@ from typing import Any
 from kagya.config.schema import RemoteWorkerSettings
 from kagya.learning import QloraTrainingResult
 from kagya.training.artifacts import TrainingArtifactContract, sha256_bytes
-from kagya.training.jobs import TrainingJob, TrainingJobStatus
+from kagya.training.jobs import (
+    RemoteWorkerCommandRejected,
+    TrainingJob,
+    TrainingJobStatus,
+)
 
 
 class SSHTrainingBackend:
@@ -43,6 +47,12 @@ class SSHTrainingBackend:
 
     def submit(self, job: TrainingJob, bundle_path: Path) -> str:
         _validate_identifier(job.job_id, "job ID")
+        expected_worker_node_id = job.worker_node_id or self.settings.node_id
+        if expected_worker_node_id != self.settings.node_id:
+            raise ValueError("training job worker node does not match configured worker")
+        self._metadata.setdefault(job.job_id, {})["worker_node_id"] = (
+            self.settings.node_id
+        )
         remote_idempotency_key = sha256_bytes(job.idempotency_key.encode("utf-8"))
         manifest = self._contract.validate_bundle(
             bundle_path,
@@ -61,19 +71,23 @@ class SSHTrainingBackend:
         self._metadata.setdefault(job.job_id, {})["transferred_bytes"] = _tree_size(
             bundle_path
         )
-        response = self._run_checked(
-            self._ssh_base()
-            + [
-                str(self.settings.command),
-                "run",
-                "--bundle",
-                str(remote_staging),
-                "--output",
-                str(self.settings.remote_results),
-                "--idempotency-key",
-                remote_idempotency_key,
-            ]
-        )
+        try:
+            response = self._run_checked(
+                self._ssh_base()
+                + [
+                    str(self.settings.command),
+                    "run",
+                    "--bundle",
+                    str(remote_staging),
+                    "--output",
+                    str(self.settings.remote_results),
+                    "--idempotency-key",
+                    remote_idempotency_key,
+                ]
+            )
+        except RemoteWorkerCommandRejected:
+            self._metadata[job.job_id]["remote_last_contact"] = _now()
+            raise
         payload = _json_output(response.stdout)
         remote_job_id = str(payload.get("job_id", ""))
         _validate_identifier(remote_job_id, "remote job ID")
@@ -132,6 +146,9 @@ class SSHTrainingBackend:
         job = self._jobs.get(job_id)
         if job is None:
             raise RuntimeError("remote training job provenance is unavailable")
+        expected_worker_node_id = job.worker_node_id or self.settings.node_id
+        if expected_worker_node_id != self.settings.node_id:
+            raise ValueError("training job worker node does not match configured worker")
         destination_root = self.local_result_root / "remote-results"
         destination_root.mkdir(parents=True, exist_ok=True)
         final_path = destination_root / f"result-{job_id}"
@@ -154,6 +171,7 @@ class SSHTrainingBackend:
                     expected_model_id=job.base_model_id,
                     expected_model_revision=job.base_model_revision,
                     expected_parent_adapter_id=job.parent_adapter_id,
+                    expected_worker_node_id=expected_worker_node_id,
                 )
                 staging.rename(final_path)
             except Exception:
@@ -166,6 +184,7 @@ class SSHTrainingBackend:
             expected_model_id=job.base_model_id,
             expected_model_revision=job.base_model_revision,
             expected_parent_adapter_id=job.parent_adapter_id,
+            expected_worker_node_id=expected_worker_node_id,
         )
         metadata = self._metadata.setdefault(job_id, {})
         metadata["transferred_bytes"] = metadata.get("transferred_bytes", 0) + _tree_size(
@@ -220,6 +239,8 @@ class SSHTrainingBackend:
                 "last_contact": self._node_status["last_contact"],
                 "backend": "ssh",
             }
+        except RemoteWorkerCommandRejected:
+            return dict(self._node_status)
         except (RuntimeError, TimeoutError):
             self._mark_node_contact(reachable=False)
             return dict(self._node_status)
@@ -246,9 +267,14 @@ class SSHTrainingBackend:
 
     def _worker_command(self, action: str, job_id: str) -> dict[str, Any]:
         _validate_identifier(job_id, "job ID")
-        response = self._run_checked(
-            self._ssh_base() + [str(self.settings.command), action, "--job-id", job_id]
-        )
+        try:
+            response = self._run_checked(
+                self._ssh_base()
+                + [str(self.settings.command), action, "--job-id", job_id]
+            )
+        except RemoteWorkerCommandRejected:
+            self._metadata.setdefault(job_id, {})["remote_last_contact"] = _now()
+            raise
         payload = _json_output(response.stdout)
         self._mark_node_contact(reachable=True)
         return payload
@@ -291,6 +317,17 @@ class SSHTrainingBackend:
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
             ) as exc:
+                if (
+                    isinstance(exc, subprocess.CalledProcessError)
+                    and argv[0] == "ssh"
+                    and exc.returncode != 255
+                ):
+                    self._mark_node_contact(reachable=True)
+                    category, retryable = _worker_command_failure(exc.stderr)
+                    raise RemoteWorkerCommandRejected(
+                        category,
+                        retryable=retryable,
+                    ) from exc
                 last_error = exc
                 if attempt < 2:
                     self._sleep(min(self.settings.poll_interval_seconds, 1.0))
@@ -365,6 +402,19 @@ def _cacheable_health(payload: dict[str, Any]) -> dict[str, Any]:
         "gpu",
     }
     return {key: value for key, value in payload.items() if key in allowed}
+
+
+def _worker_command_failure(stderr: str | None) -> tuple[str, bool]:
+    try:
+        payload = json.loads(stderr or "")
+    except json.JSONDecodeError:
+        payload = {}
+    error = str(payload.get("error", "")) if isinstance(payload, dict) else ""
+    if "max_concurrent_jobs" in error:
+        return "worker_capacity", True
+    if "Unknown worker job" in error:
+        return "unknown_remote_job", False
+    return "remote_command_rejected", False
 
 
 def _validate_identifier(value: str, label: str) -> None:

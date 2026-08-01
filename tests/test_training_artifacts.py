@@ -152,12 +152,15 @@ def test_result_finalize_validate_and_reject_partial_or_unsafe_path(
         expected_attempt_id="attempt-1",
         expected_model_id="google/gemma-4-12B-it",
         expected_model_revision="model-commit-123",
+        expected_worker_node_id="training-01",
     )
 
     assert restored.worker_node_id == "training-01"
     assert restored.candidate_adapter_hash == sha256_file_map(
         {"adapter/adapter_config.json": b"{}\n"}
     )
+    with pytest.raises(ValueError, match="worker node ID mismatch"):
+        contract.validate_result(path, expected_worker_node_id="other-worker")
     with pytest.raises(ValueError, match="unsafe|under adapter"):
         contract.finalize_result(
             tmp_path / "unsafe",

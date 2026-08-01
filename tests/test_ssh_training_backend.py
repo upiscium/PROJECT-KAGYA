@@ -17,6 +17,7 @@ from kagya.training import (
     sha256_bytes,
     sha256_file_map,
 )
+from kagya.training.jobs import RemoteWorkerCommandRejected
 
 
 def test_ssh_backend_uses_strict_argv_and_recovers_transient_disconnect(
@@ -140,6 +141,30 @@ def test_ssh_backend_rejects_partial_download(tmp_path: Path) -> None:
     assert not (tmp_path / "results" / "remote-results" / "result-job-1").exists()
 
 
+def test_ssh_backend_rejects_result_from_mismatched_worker(tmp_path: Path) -> None:
+    bundle, job = _bundle_and_job(tmp_path)
+    remote_result = _result(tmp_path, job, worker_node_id="unexpected-worker")
+
+    def run(argv, **kwargs):
+        if argv[0] == "rsync":
+            if "remote:/worker/results" in argv[-2]:
+                _copy_contents(remote_result, Path(argv[-1]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        action = argv[-3] if argv[-2] == "--job-id" else argv[-7]
+        status = "succeeded" if action == "status" else "ready"
+        return _completed(argv, {"job_id": job.job_id, "status": status})
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path), tmp_path / "results", run=run
+    )
+    backend.submit(job, bundle)
+
+    with pytest.raises(ValueError, match="worker node ID mismatch"):
+        backend.fetch_result(job.job_id)
+    assert backend.job_metadata(job.job_id)["worker_node_id"] == "training-01"
+    assert not (tmp_path / "results" / "remote-results" / "result-job-1").exists()
+
+
 def test_ssh_backend_reports_worker_heartbeat_and_partition(tmp_path: Path) -> None:
     settings = _remote_settings(tmp_path)
 
@@ -258,6 +283,106 @@ def test_ssh_backend_marks_spawn_failure_unavailable_without_caching_details(
     assert "PRIVATE_IDENTITY_PATH" not in str(backend.cached_node_status())
 
 
+@pytest.mark.parametrize(
+    ("error", "category", "retryable"),
+    [
+        ("worker has reached max_concurrent_jobs", "worker_capacity", True),
+        ("Unknown worker job: job-1", "unknown_remote_job", False),
+    ],
+)
+def test_ssh_backend_keeps_application_command_failures_online(
+    tmp_path: Path,
+    error: str,
+    category: str,
+    retryable: bool,
+) -> None:
+    calls = 0
+
+    def rejected(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.CalledProcessError(
+            1,
+            argv,
+            stderr=json.dumps({"error": error}),
+        )
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path),
+        tmp_path / "results",
+        run=rejected,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(RemoteWorkerCommandRejected) as captured:
+        backend.inspect("job-1")
+
+    assert calls == 1
+    assert captured.value.category == category
+    assert captured.value.retryable is retryable
+    assert backend.cached_node_status()["reachable"] is True
+    assert backend.cached_node_status()["last_contact"] is not None
+    assert backend.job_metadata("job-1")["remote_last_contact"] is not None
+    assert error not in str(backend.cached_node_status())
+
+
+def test_ssh_backend_capacity_rejection_during_submit_records_contact(
+    tmp_path: Path,
+) -> None:
+    bundle, job = _bundle_and_job(tmp_path)
+    calls = 0
+
+    def capacity_rejected(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if argv[0] == "rsync":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise subprocess.CalledProcessError(
+            1,
+            argv,
+            stderr=json.dumps(
+                {"error": "worker has reached max_concurrent_jobs"}
+            ),
+        )
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path),
+        tmp_path / "results",
+        run=capacity_rejected,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(RemoteWorkerCommandRejected) as captured:
+        backend.submit(job, bundle)
+
+    assert calls == 2
+    assert captured.value.category == "worker_capacity"
+    assert backend.cached_node_status()["reachable"] is True
+    assert backend.job_metadata(job.job_id)["remote_last_contact"] is not None
+    assert backend.job_metadata(job.job_id)["worker_node_id"] == "training-01"
+
+
+def test_ssh_backend_marks_subprocess_timeout_unavailable(tmp_path: Path) -> None:
+    calls = 0
+
+    def timed_out(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path),
+        tmp_path / "results",
+        run=timed_out,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(TimeoutError, match="remote command timed out"):
+        backend.cleanup(30)
+    assert calls == 3
+    assert backend.cached_node_status()["reachable"] is False
+
+
 def _remote_settings(tmp_path: Path) -> RemoteWorkerSettings:
     return RemoteWorkerSettings(
         node_id="training-01",
@@ -325,7 +450,12 @@ def _bundle_and_job(tmp_path: Path) -> tuple[Path, TrainingJob]:
     return bundle, job
 
 
-def _result(tmp_path: Path, job: TrainingJob) -> Path:
+def _result(
+    tmp_path: Path,
+    job: TrainingJob,
+    *,
+    worker_node_id: str = "training-01",
+) -> Path:
     adapter_files = {"adapter/adapter_config.json": b"{}\n"}
     return TrainingArtifactContract().finalize_result(
         tmp_path / "worker-results",
@@ -333,7 +463,7 @@ def _result(tmp_path: Path, job: TrainingJob) -> Path:
             job_id=job.job_id,
             attempt_id=job.attempt_id,
             created_at=datetime.now(UTC),
-            worker_node_id="training-01",
+            worker_node_id=worker_node_id,
             worker_hostname="worker",
             status="succeeded",
             candidate_adapter_id="adapter-1",

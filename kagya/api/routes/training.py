@@ -285,7 +285,7 @@ def _node_projection(
         role=node.role,
         backend=node.backend,
         status=status,
-        last_contact_at=_safe_datetime(node.health.get("last_contact") or node.health.get("heartbeat")) if reachable else None,
+        last_contact_at=_safe_datetime(node.health.get("last_contact") or node.health.get("heartbeat")),
         expected_model_id=_safe_optional_text(getattr(expected, "model_id", settings.model.primary_id)),
         expected_model_revision=_safe_optional_text(getattr(expected, "revision", settings.model.revision)),
         expected_processor_revision=_safe_optional_text(getattr(expected, "processor_revision", settings.model.processor_revision)),
@@ -333,7 +333,6 @@ def _job_projection(
     adapter = adapter_by_id.get(job.candidate_adapter_id or "")
     if adapter is not None and not _job_adapter_matches(job, adapter):
         adapter = None
-    terminal = job.status in {TrainingJobStatus.COMPLETED, TrainingJobStatus.FAILED, TrainingJobStatus.CANCELLED}
     return CockpitTrainingJobResponse(
         job_id=job.job_id,
         attempt_id=job.attempt_id,
@@ -341,8 +340,8 @@ def _job_projection(
         backend=_safe_optional_text(job.backend),
         created_at=_safe_datetime(job.created_at),
         updated_at=_safe_datetime(job.updated_at),
-        started_at=_safe_datetime(job.phase_started_at) if job.status in {TrainingJobStatus.RUNNING, TrainingJobStatus.SUCCEEDED, TrainingJobStatus.IMPORTING} else None,
-        completed_at=_safe_datetime(job.updated_at) if terminal else None,
+        started_at=_safe_datetime(job.started_at),
+        completed_at=_safe_datetime(job.completed_at),
         source_event_start=job.source_event_sequence_start,
         source_event_end=job.source_event_sequence_end,
         selected_episode_count=len(job.selected_episode_ids),

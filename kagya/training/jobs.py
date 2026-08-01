@@ -95,7 +95,9 @@ class TrainingJob:
     dataset_revision: str | None = None
     dataset_manifest_hash: str | None = None
     result_digest: str | None = None
-    schema_version: int = 2
+    started_at: str | None = None
+    completed_at: str | None = None
+    schema_version: int = 3
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "TrainingJob":
@@ -107,6 +109,19 @@ class TrainingJob:
             data.get("phase_durations_seconds") or {}
         )
         data["training_metrics"] = dict(data.get("training_metrics") or {})
+        if int(data.get("schema_version", 1)) < 3:
+            status = data["status"]
+            data["started_at"] = (
+                data.get("phase_started_at")
+                if status == TrainingJobStatus.RUNNING
+                else None
+            )
+            data["completed_at"] = (
+                data.get("phase_started_at") or data.get("updated_at")
+                if status == TrainingJobStatus.COMPLETED
+                else None
+            )
+            data["schema_version"] = 3
         return cls(**data)
 
 
@@ -127,6 +142,7 @@ class TrainingJobRegistry:
         backend: str,
         job_id: str | None = None,
         processor_revision: str | None = None,
+        worker_node_id: str | None = None,
     ) -> tuple[TrainingJob, bool]:
         with self._lock:
             existing = next(
@@ -165,6 +181,7 @@ class TrainingJobRegistry:
                 correlation_id=idempotency_key,
                 processor_revision=processor_revision,
                 training_metrics={},
+                worker_node_id=worker_node_id,
             )
             self._jobs[identifier] = job
             self._save()
@@ -212,6 +229,18 @@ class TrainingJobRegistry:
                     0.0,
                     (now - datetime.fromisoformat(current.created_at)).total_seconds(),
                 ),
+                started_at=(
+                    now.isoformat()
+                    if status == TrainingJobStatus.RUNNING
+                    and current.started_at is None
+                    else current.started_at
+                ),
+                completed_at=(
+                    now.isoformat()
+                    if status == TrainingJobStatus.COMPLETED
+                    and current.completed_at is None
+                    else current.completed_at
+                ),
                 **changes,
             )
             self._jobs[job_id] = updated
@@ -258,6 +287,13 @@ class TrainingBackend(Protocol):
     def cleanup(self, retention_days: int) -> dict[str, Any]: ...
 
 
+class RemoteWorkerCommandRejected(RuntimeError):
+    def __init__(self, category: str, *, retryable: bool) -> None:
+        self.category = category
+        self.retryable = retryable
+        super().__init__(f"remote worker command rejected: {category}")
+
+
 class LocalTrainingBackend:
     def __init__(self, trainer: QloraTrainer) -> None:
         self.trainer = trainer
@@ -270,16 +306,16 @@ class LocalTrainingBackend:
         if job.job_id in self._statuses:
             return job.job_id
         self._statuses[job.job_id] = TrainingJobStatus.RUNNING
-        if job.job_id in self._cancelled:
-            self._statuses[job.job_id] = TrainingJobStatus.CANCELLED
-            return job.job_id
-        result = self.trainer.train_bundle(bundle_path)
-        self._results[job.job_id] = result
         self._metadata[job.job_id] = {
             "remote_last_contact": _now(),
             "worker_node_id": self.trainer.settings.deployment.node.id,
             "worker_hostname": os.uname().nodename,
         }
+        if job.job_id in self._cancelled:
+            self._statuses[job.job_id] = TrainingJobStatus.CANCELLED
+            return job.job_id
+        result = self.trainer.train_bundle(bundle_path)
+        self._results[job.job_id] = result
         self._statuses[job.job_id] = TrainingJobStatus.SUCCEEDED
         return job.job_id
 
@@ -551,6 +587,11 @@ class SleepCoordinator:
         self._threads: dict[str, Thread] = {}
         self._cancel: dict[str, Event] = {}
         for job in self.registry.list():
+            if job.worker_node_id is None and job.status not in TERMINAL_JOB_STATUSES:
+                job = self.registry.update(
+                    job.job_id,
+                    worker_node_id=self._configured_worker_node_id(),
+                )
             if job.backend == "local" and job.status not in TERMINAL_JOB_STATUSES:
                 self.registry.transition(
                     job.job_id,
@@ -578,6 +619,7 @@ class SleepCoordinator:
             parent_adapter_id=None if active is None else active.adapter_id,
             backend=self.settings.deployment.training.backend.value,
             processor_revision=self.settings.model.processor_revision,
+            worker_node_id=self._configured_worker_node_id(),
         )
         if not created:
             return job
@@ -600,6 +642,7 @@ class SleepCoordinator:
             parent_adapter_id=previous.parent_adapter_id,
             backend=previous.backend,
             processor_revision=previous.processor_revision,
+            worker_node_id=self._configured_worker_node_id(),
         )
         if not created:
             return job
@@ -664,10 +707,11 @@ class SleepCoordinator:
         try:
             remote_status = self.backend.inspect(job.remote_job_id or job.job_id)
         except Exception as exc:
+            category, retryable = _classify_failure(exc)
             return self.registry.update(
                 job_id,
-                failure_category="worker_unreachable",
-                retryable=True,
+                failure_category=category,
+                retryable=retryable,
                 error=str(exc),
                 stale=self._is_stale(job),
             )
@@ -910,6 +954,14 @@ class SleepCoordinator:
         if metadata:
             self.registry.update(job_id, **metadata)
 
+    def _configured_worker_node_id(self) -> str:
+        remote = self.settings.deployment.training.remote_worker
+        return (
+            remote.node_id
+            if remote is not None
+            else self.settings.deployment.node.id
+        )
+
     def _is_stale(self, job: TrainingJob) -> bool:
         reference = datetime.fromisoformat(job.remote_last_contact or job.updated_at)
         remote = self.settings.deployment.training.remote_worker
@@ -1047,6 +1099,8 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _classify_failure(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, RemoteWorkerCommandRejected):
+        return exc.category, exc.retryable
     if isinstance(exc, TimeoutError):
         return "timeout", True
     if isinstance(exc, (ConnectionError, subprocess.SubprocessError)):

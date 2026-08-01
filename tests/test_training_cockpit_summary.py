@@ -78,6 +78,31 @@ def test_cockpit_training_split_uses_configured_inventory_and_cached_health(
     assert "PRIVATE_SENTINEL" not in json.dumps(payload)
 
 
+def test_cockpit_training_offline_worker_keeps_safe_last_contact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    last_contact = "2026-01-01T00:00:00+00:00"
+    client, _runtime, _coordinator = _client(
+        tmp_path,
+        monkeypatch,
+        split=True,
+        health=[
+            {
+                "node_id": "training-01",
+                "reachable": False,
+                "last_contact": last_contact,
+                "error": "PRIVATE_SENTINEL",
+            }
+        ],
+    )
+
+    worker = _get(client).json()["nodes"][1]
+
+    assert worker["status"] == "unavailable"
+    assert worker["last_contact_at"] == "2026-01-01T00:00:00Z"
+    assert "PRIVATE_SENTINEL" not in json.dumps(worker)
+
+
 def test_cockpit_training_counts_limit_duplicates_and_strict_bindings(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -222,6 +247,45 @@ def test_cockpit_training_uses_job_result_digest_not_adapter_hash(
     assert payload["jobs"][0]["result_digest"] != adapter.adapter_hash
 
 
+def test_cockpit_training_uses_persisted_lifecycle_timestamps(
+    tmp_path: Path, monkeypatch
+) -> None:
+    started_at = "2026-01-01T00:00:01+00:00"
+    completed_at = "2026-01-01T00:00:02+00:00"
+    jobs = [
+        _job(
+            "job-completed",
+            status=TrainingJobStatus.COMPLETED,
+            started_at=started_at,
+            completed_at=completed_at,
+        ),
+        _job(
+            "job-failed",
+            status=TrainingJobStatus.FAILED,
+            started_at=started_at,
+        ),
+        _job(
+            "job-cancelled",
+            status=TrainingJobStatus.CANCELLED,
+            started_at=started_at,
+        ),
+    ]
+    client, _runtime, _coordinator = _client(
+        tmp_path,
+        monkeypatch,
+        jobs=jobs,
+    )
+
+    projected = {item["job_id"]: item for item in _get(client).json()["jobs"]}
+
+    assert projected["job-completed"]["started_at"] == "2026-01-01T00:00:01Z"
+    assert projected["job-completed"]["completed_at"] == "2026-01-01T00:00:02Z"
+    assert projected["job-failed"]["started_at"] == "2026-01-01T00:00:01Z"
+    assert projected["job-failed"]["completed_at"] is None
+    assert projected["job-cancelled"]["started_at"] == "2026-01-01T00:00:01Z"
+    assert projected["job-cancelled"]["completed_at"] is None
+
+
 def _get(client: TestClient, suffix: str = ""):
     return client.get(f"/api/training/cockpit-summary{suffix}")
 
@@ -355,6 +419,8 @@ def _job(
     status: TrainingJobStatus = TrainingJobStatus.RUNNING,
     candidate_adapter_id: str | None = None,
     worker_node_id: str | None = "worker-1",
+    started_at: str | None = None,
+    completed_at: str | None = None,
 ) -> TrainingJob:
     now = "2026-01-01T00:00:00+00:00"
     return TrainingJob(
@@ -379,6 +445,8 @@ def _job(
         error="raw stderr PRIVATE_SENTINEL",
         worker_node_id=worker_node_id,
         failure_category=None,
+        started_at=started_at,
+        completed_at=completed_at,
     )
 
 
