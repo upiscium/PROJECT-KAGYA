@@ -45,6 +45,8 @@ describe("OutboxClient", () => {
     expect(screen.queryByRole("button", { name: "Reject" })).not.toBeInTheDocument();
     expect(screen.getByText("Which local option should be used?")).toBeInTheDocument();
     expect(screen.getByText("Move the deadline by one day.")).toBeInTheDocument();
+    expect(screen.getAllByRole("textbox")).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Reply" })).toHaveLength(2);
     expect(screen.queryByText("PRIVATE_SENTINEL")).not.toBeInTheDocument();
   });
 });

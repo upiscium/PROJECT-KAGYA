@@ -408,9 +408,6 @@ class ActionIntent(_StrictModel):
     receipt_id: str | None = None
     failure_code: str | None = None
     validation_record_id: str | None = None
-    operator_binding_nonce: str = Field(
-        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-    )
     explanation_refs: tuple[str, ...] = ()
 
 
@@ -460,7 +457,7 @@ class ExecutionReceipt(_StrictModel):
 
 
 class ActionState(_StrictModel):
-    schema_version: Literal[5] = 5
+    schema_version: Literal[4] = 4
     intents: tuple[ActionIntent, ...] = ()
     validation_records: tuple[ActionValidationRecord, ...] = ()
     policy_rejections: tuple[ActionPolicyRejectionRecord, ...] = ()
@@ -657,11 +654,6 @@ def _operator_preview_digest(
                 "revision": intent.revision,
                 "tool": descriptor.model_dump(mode="json"),
                 "arguments": summary.model_dump(mode="json"),
-                # This UUID is created with the validated arguments and is not
-                # exported. It salts the canonical argument digest so the
-                # returned binding cannot be used for query dictionaries.
-                "binding_nonce": intent.operator_binding_nonce,
-                "arguments_digest": intent.policy.argument_digest,
                 "effect": descriptor.effect,
                 "effect_code": descriptor.effect_code,
                 "policy": {
@@ -670,6 +662,15 @@ def _operator_preview_digest(
                     "reasons": list(intent.policy.reasons),
                 },
                 "budget": intent.budget.model_dump(mode="json"),
+                # The strictly bound validation UUID remains private and
+                # provides deterministic entropy without mutating state.
+                "private_binding": _digest(
+                    {
+                        "domain": "action_operator_preview_v1",
+                        "validation_record_id": intent.validation_record_id,
+                        "canonical_arguments_digest": intent.policy.argument_digest,
+                    }
+                ),
             },
         )
     )
@@ -1289,7 +1290,6 @@ class ActionExecutionLayer:
             deadline_at=now + timedelta(seconds=bounded.timeout_seconds),
             approval_id=approval_id,
             validation_record_id=validation.validation_id,
-            operator_binding_nonce=str(uuid4()),
         )
         approvals = state.approvals
         if approval_id is not None:
@@ -1895,6 +1895,7 @@ class ActionExecutionLayer:
             ]
             return bool(
                 len(validation) == 1
+                and validation[0].idempotency_key == intent.idempotency_key
                 and validation[0].canonical_arguments_digest == _digest(validated)
                 and (
                     legacy_notification
@@ -1952,6 +1953,7 @@ class ActionExecutionLayer:
                 and record.tool_name == intent.tool_name
                 and record.risk_class == intent.risk_class
                 and record.arguments_valid
+                and record.idempotency_key == intent.idempotency_key
                 and record.canonical_arguments_digest == _digest(validated)
                 and (
                     legacy_notification
@@ -2451,7 +2453,7 @@ class ActionExecutionLayer:
         try:
             version = raw.get("schema_version") if isinstance(raw, dict) else None
             legacy_v1 = version == 1
-            migrated = version in {1, 2, 3, 4}
+            migrated = version in {1, 2, 3, 5}
             if legacy_v1:
                 raw = {**raw, "validation_records": []}
             if version in {1, 2}:
@@ -2483,17 +2485,17 @@ class ActionExecutionLayer:
                     "schema_version": 4,
                     "validation_records": validations,
                 }
-            if version in {1, 2, 3, 4}:
+            elif version == 5:
                 raw = {
                     **raw,
-                    "schema_version": 5,
+                    "schema_version": 4,
                     "intents": [
                         {
-                            **item,
-                            "operator_binding_nonce": str(uuid4()),
+                            key: value
+                            for key, value in item.items()
+                            if key != "operator_binding_nonce"
                         }
                         if isinstance(item, dict)
-                        and "operator_binding_nonce" not in item
                         else item
                         for item in raw.get("intents", [])
                     ],
@@ -2522,7 +2524,9 @@ class ActionExecutionLayer:
                                 "status": IntentStatus.REJECTED,
                                 "failure_code": "legacy_unvalidated_intent",
                                 "retry_at": None,
-                                "updated_at": self.clock(),
+                                # Preserve a deterministic timestamp from the
+                                # authoritative legacy record during migration.
+                                "updated_at": intent.updated_at,
                             }
                         )
                     intents.append(intent)
@@ -2531,11 +2535,16 @@ class ActionExecutionLayer:
                     for item in intents
                     if item.failure_code == "legacy_unvalidated_intent"
                 }
+                rejected_at_by_id = {
+                    item.intent_id: item.updated_at
+                    for item in intents
+                    if item.intent_id in rejected_ids
+                }
                 approvals = tuple(
                     item.model_copy(
                         update={
                             "status": "rejected",
-                            "resolved_at": self.clock(),
+                            "resolved_at": rejected_at_by_id[item.intent_id],
                             "reason": "legacy_unvalidated_intent",
                         }
                     )

@@ -415,11 +415,149 @@ def test_operator_preview_uses_explicit_public_notification_copy(
     serialized = preview.model_dump_json()
     assert "Safe bounded preview" in serialized
     assert preview.preview_digest == duplicate.preview_digest
+    assert intent.idempotency_key not in serialized
     assert preview.available_commands == (
         OperatorCommand.APPROVE,
         OperatorCommand.REJECT,
         OperatorCommand.CANCEL,
     )
+
+
+def test_schema_v4_fixture_preview_binding_is_stable_across_independent_graphs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_loop = _Loop()
+    _decision(
+        source_loop,
+        "decision-stable-binding",
+        "document_search",
+        {"query": "stable fixture", "relative_path": None, "max_results": 5},
+    )
+    source_layer = ActionExecutionLayer(
+        source_loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.stable-binding",
+            handler=lambda: source_layer.create_from_decision(
+                "decision-stable-binding", idempotency_key="private-stable-key"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    fixture = json.loads(
+        json.dumps(source_loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
+    assert fixture["schema_version"] == 4
+    first_loop = _Loop()
+    second_loop = _Loop()
+    first_loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+        json.dumps(fixture)
+    )
+    second_loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+        json.dumps(fixture)
+    )
+    def unexpected_save(_layer: ActionExecutionLayer, _state: ActionState) -> None:
+        raise AssertionError("schema-v4 reads must not rewrite authoritative state")
+
+    with monkeypatch.context() as context:
+        context.setattr(ActionExecutionLayer, "_save", unexpected_save)
+        first = ActionExecutionLayer(
+            first_loop,
+            document_root=tmp_path,
+            calendar_path=tmp_path / "calendar.json",
+        )
+        second = ActionExecutionLayer(
+            second_loop,
+            document_root=tmp_path,
+            calendar_path=tmp_path / "calendar.json",
+        )
+        first_preview = first.operator_preview(intent.intent_id)
+        second_preview = second.operator_preview(intent.intent_id)
+
+    first_bytes = json.dumps(
+        first_loop.persistent_state.extensions[ACTION_STATE_KEY],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    second_bytes = json.dumps(
+        second_loop.persistent_state.extensions[ACTION_STATE_KEY],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert first_bytes == second_bytes
+    assert first_preview.preview_digest == second_preview.preview_digest
+    assert "private-stable-key" not in first_preview.model_dump_json()
+
+
+def test_obsolete_schema_v5_nonce_is_removed_deterministically(
+    tmp_path: Path,
+) -> None:
+    source_loop = _Loop()
+    _decision(
+        source_loop,
+        "decision-v5-compatibility",
+        "document_search",
+        {"query": "stable compatibility", "relative_path": None, "max_results": 5},
+    )
+    source = ActionExecutionLayer(
+        source_loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.v5-compatibility",
+            handler=lambda: source.create_from_decision(
+                "decision-v5-compatibility", idempotency_key="v5-private-key"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    fixture = json.loads(
+        json.dumps(source_loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
+    fixture["schema_version"] = 5
+    fixture["intents"] = [
+        {
+            **item,
+            "operator_binding_nonce": "00000000-0000-4000-8000-000000000001",
+        }
+        for item in fixture["intents"]
+    ]
+    loops = (_Loop(), _Loop())
+    layers = []
+    for loop in loops:
+        loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+            json.dumps(fixture)
+        )
+        layers.append(
+            ActionExecutionLayer(
+                loop,
+                document_root=tmp_path,
+                calendar_path=tmp_path / "calendar.json",
+            )
+        )
+
+    serialized = [
+        json.dumps(
+            loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for loop in loops
+    ]
+    previews = [layer.operator_preview(intent.intent_id) for layer in layers]
+    assert serialized[0] == serialized[1]
+    assert '"schema_version":4' in serialized[0]
+    assert "operator_binding_nonce" not in serialized[0]
+    assert previews[0].preview_digest == previews[1].preview_digest
 
 
 def test_document_search_public_preview_has_no_query_fingerprint(
@@ -457,17 +595,6 @@ def test_document_search_public_preview_has_no_query_fingerprint(
     assert query not in serialized
     assert hashlib.sha256(query.encode()).hexdigest() not in serialized
     assert intent.validation_record_id not in serialized
-    assert intent.operator_binding_nonce not in serialized
-    alternate_binding = action_execution._operator_preview_digest(
-        intent.model_copy(
-            update={
-                "operator_binding_nonce": "00000000-0000-4000-8000-000000000001"
-            }
-        ),
-        preview.tool,
-        preview.arguments,
-    )
-    assert alternate_binding != preview.preview_digest
 
 
 def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
@@ -946,6 +1073,7 @@ def test_action_validation_requires_event_and_missing_record_rejects_before_call
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
         update={"intents": (missing,)}
     ).model_dump(mode="json")
+    assert layer.available_commands(intent.intent_id) == ()
     called = False
 
     def invoke(_: object, __: object) -> object:
@@ -1341,7 +1469,7 @@ def test_schema_v3_failed_validation_migrates_without_raw_arguments(
     migrated = restored.list_validation_records()[0]
     assert migrated.idempotency_key.startswith("legacy:")
     assert len(migrated.request_digest) == 64
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 5
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
     assert "private-body" not in json.dumps(
         loop.persistent_state.extensions[ACTION_STATE_KEY]
     )
@@ -1514,7 +1642,7 @@ def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
     migrated = restored.get_intent(intent.intent_id)
     assert migrated.status == IntentStatus.REJECTED
     assert migrated.failure_code == "legacy_unvalidated_intent"
-    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 5
+    assert loop.persistent_state.extensions[ACTION_STATE_KEY]["schema_version"] == 4
     persisted_revision = migrated.revision
 
     restarted = ActionExecutionLayer(

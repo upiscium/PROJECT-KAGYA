@@ -857,8 +857,8 @@ def test_outbox_public_body_preview_is_bounded_and_approval_has_no_content(
         question = outbox.enqueue(
             OutboxMessageKind.QUESTION,
             title="Need a decision",
-            body="Choose the local option. " + ("x" * 200),
-            public_preview="Choose the local option. " + ("x" * 135),
+            body="Choose the local option.",
+            public_preview="Choose the local option.",
             deduplication_key="preview-question",
         )
         renegotiation = outbox.enqueue(
@@ -880,11 +880,37 @@ def test_outbox_public_body_preview_is_bounded_and_approval_has_no_content(
         assert response.status_code == 200
         messages = {item["message_id"]: item for item in response.json()["messages"]}
         assert messages[question.message_id]["body_preview"] == question.public_preview
-        assert len(messages[question.message_id]["body_preview"]) == 160
+        assert messages[question.message_id]["body_preview"] == question.body
         assert messages[renegotiation.message_id]["body_preview"] == renegotiation.body
         assert messages[approval.message_id]["body_preview"] is None
         for item in messages.values():
             assert "body" not in item
+
+        for kind in ("question", "renegotiation"):
+            missing = client.post(
+                "/api/outbox/messages",
+                headers=admin_headers(),
+                json={
+                    "kind": kind,
+                    "title": "Missing preview",
+                    "body": "A message without a public preview.",
+                    "deduplication_key": f"preview-missing-{kind}",
+                },
+            )
+            assert missing.status_code == 422
+
+        mismatched = client.post(
+            "/api/outbox/messages",
+            headers=admin_headers(),
+            json={
+                "kind": "question",
+                "title": "Mismatched preview",
+                "body": "Which option should continue?",
+                "public_preview": "Approve an unrelated option.",
+                "deduplication_key": "preview-mismatch",
+            },
+        )
+        assert mismatched.status_code == 422
 
         private = client.post(
             "/api/outbox/messages",
@@ -4995,6 +5021,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             },
         ).json()
         assert awaiting_explanation["disposition"] == "awaiting_approval"
+        assert awaiting_explanation["risk"]["validation_ref"] is None
         premature_outcome = client.post(
             "/api/decisions/api-action-decision/outcome",
             headers=admin_headers(),
@@ -5345,7 +5372,6 @@ def _cockpit_action_intent(
         approval_id=approval_id,
         receipt_id=receipt_id,
         failure_code=failure_code,
-        operator_binding_nonce="00000000-0000-4000-8000-000000000001",
     )
 
 

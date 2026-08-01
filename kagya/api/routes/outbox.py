@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kagya.api.dependencies import (
     execute_agent_event,
@@ -43,6 +43,20 @@ class EnqueueRequest(_Request):
     not_before: datetime | None = None
     expires_at: datetime | None = None
     privacy_class: PrivacyClass = PrivacyClass.OPERATOR
+
+    @model_validator(mode="after")
+    def validate_conversational_preview(self) -> "EnqueueRequest":
+        if self.kind in {
+            OutboxMessageKind.QUESTION,
+            OutboxMessageKind.RENEGOTIATION,
+        }:
+            if self.public_preview is None:
+                raise ValueError(
+                    "Conversational outbox messages require a public preview"
+                )
+            if self.body != self.public_preview:
+                raise ValueError("Conversational public preview must match body")
+        return self
 
 
 class ResponseRequest(_Request):

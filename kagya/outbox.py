@@ -141,6 +141,13 @@ class OutboxMessage(_StrictModel):
             OutboxMessageKind.RENEGOTIATION,
         }:
             raise ValueError("Only conversational messages accept a public preview")
+        if (
+            self.public_preview is not None
+            and self.kind
+            in {OutboxMessageKind.QUESTION, OutboxMessageKind.RENEGOTIATION}
+            and self.body != self.public_preview
+        ):
+            raise ValueError("Conversational public preview must match body")
         if self.public_preview is not None and not _is_public_preview_safe(
             self.public_preview
         ):
@@ -206,6 +213,13 @@ class Outbox:
         channel: OutboxChannel = OutboxChannel.LOCAL,
         privacy_class: PrivacyClass = PrivacyClass.OPERATOR,
     ) -> OutboxMessage:
+        if kind in {OutboxMessageKind.QUESTION, OutboxMessageKind.RENEGOTIATION}:
+            if public_preview is None:
+                raise ValueError(
+                    "Conversational outbox messages require a public preview"
+                )
+            if body != public_preview:
+                raise ValueError("Conversational public preview must match body")
         state = self._state()
         duplicate = next(
             (item for item in state.messages if item.deduplication_key == deduplication_key),

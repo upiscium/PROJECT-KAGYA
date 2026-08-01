@@ -824,7 +824,9 @@ def _risk(
         policy_ref=_public_optional_ref(intent.policy.evaluation_id),
         approval_ref=_public_optional_ref(intent.approval_id),
         action_intent_ref=_public_optional_ref(intent.intent_id),
-        validation_ref=_public_optional_ref(intent.validation_record_id),
+        # The validation UUID is retained as private entropy for the opaque
+        # operator preview binding and must not cross the public projection.
+        validation_ref=None,
         receipt_ref=None
         if receipt is None
         else _public_optional_ref(receipt.receipt_id),
