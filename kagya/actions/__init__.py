@@ -31,6 +31,7 @@ from kagya.actions.execution import (
     ReceiptStatus,
     RiskClass,
     public_tool_name,
+    receipt_matches_intent,
 )
 
 __all__ = [
@@ -64,4 +65,5 @@ __all__ = [
     "ReceiptStatus",
     "RiskClass",
     "public_tool_name",
+    "receipt_matches_intent",
 ]

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime
 from itertools import islice
 import re
+import unicodedata
 from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -25,6 +26,7 @@ from kagya.actions import (
     ReceiptStatus,
     RiskClass,
     public_tool_name,
+    receipt_matches_intent,
     OperatorCommand,
     OperatorCommandRequest,
 )
@@ -106,7 +108,7 @@ class ActionToolResponse(BaseModel):
 class RegistryToolResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str
-    description: str | None
+    description: str | None = Field(default=None, max_length=160)
     tool_type: str
     status: str
     generated: bool
@@ -509,7 +511,7 @@ def operator_summary(
         registry_tools = [
             RegistryToolResponse(
                 name=item.name,
-                description=None,
+                description=_public_registry_description(item.description),
                 tool_type=item.tool_type.value,
                 status=item.status.value,
                 generated=item.generated,
@@ -788,7 +790,7 @@ def _operator_action(
         else _unique_by_id(execution.list_receipts(), lambda item: item.receipt_id)
     )
     receipt = receipts.get(intent.receipt_id) if intent.receipt_id else None
-    if receipt is not None and not _receipt_matches_intent(receipt, intent):
+    if receipt is not None and not receipt_matches_intent(receipt, intent):
         receipt = None
     verification = None
     if receipt is not None and receipt.verification_id:
@@ -942,6 +944,9 @@ def _operator_command(
     reason: str | None = None,
 ) -> OperatorMutationResponse:
     try:
+        checked = execution.validate_command_request(request)
+        if not checked.valid:
+            raise _command_error(checked.reason)
         event_type = {
             OperatorCommand.APPROVE: AgentEventType.ACTION_APPROVAL,
             OperatorCommand.REJECT: AgentEventType.ACTION_APPROVAL,
@@ -1035,7 +1040,7 @@ def _action_trace(
 ) -> CockpitActionTraceResponse:
     if approval is not None and approval.intent_id != intent.intent_id:
         approval = None
-    if receipt is not None and not _receipt_matches_intent(receipt, intent):
+    if receipt is not None and not receipt_matches_intent(receipt, intent):
         receipt = None
     observation = None
     verification = None
@@ -1119,7 +1124,7 @@ def _action_trace(
                 (
                     item
                     for item in receipts.values()
-                    if _receipt_matches_intent(item, intent)
+                    if receipt_matches_intent(item, intent)
                     and (receipt is None or item.receipt_id != receipt.receipt_id)
                 ),
                 key=lambda item: (item.finished_at, item.receipt_id),
@@ -1184,20 +1189,6 @@ def _policy_rejection_failure(
     )
 
 
-def _receipt_matches_intent(
-    receipt: ExecutionReceipt,
-    intent: ActionIntent,
-) -> bool:
-    return (
-        receipt.intent_id == intent.intent_id
-        and receipt.idempotency_key == intent.idempotency_key
-        and receipt.decision_id == intent.provenance.decision_id
-        and receipt.plan_id == intent.provenance.plan_id
-        and receipt.plan_revision == intent.provenance.plan_revision
-        and receipt.step_id == intent.provenance.step_id
-    )
-
-
 def _safe_compensation_of(
     receipt: ExecutionReceipt,
     intent: ActionIntent,
@@ -1209,10 +1200,39 @@ def _safe_compensation_of(
     if (
         target is None
         or target.receipt_id == receipt.receipt_id
-        or not _receipt_matches_intent(target, intent)
+        or not receipt_matches_intent(target, intent)
     ):
         return None
     return target.receipt_id
+
+
+_PRIVATE_REGISTRY_DESCRIPTION = re.compile(
+    r"(?:</?think\b|hidden[\s_-]*thought|raw[\s_-]*prompt|private[\s_-]*(?:state|session|context|sentinel)|api[\s_-]*(?:key|token)|access[\s_-]*token|bearer\s+token|\b(?:credential|credentials|password|secret|secrets|token|tokens|sentinel)\b)",
+    re.IGNORECASE,
+)
+_REGISTRY_DESCRIPTION_PATH = re.compile(
+    r"(?:[A-Za-z]:[\\/]|~[\\/]|(?:^|\s)/(?:[^\s/]+/)+[^\s]*)"
+)
+_REGISTRY_DESCRIPTION_SCHEMA = re.compile(
+    r"\b(?:schema|input_schema|output_template)\b", re.IGNORECASE
+)
+
+
+def _public_registry_description(value: object) -> str | None:
+    """Return only a bounded, explicitly public-safe registry description."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 160
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in candidate)
+        or _PRIVATE_REGISTRY_DESCRIPTION.search(candidate) is not None
+        or _REGISTRY_DESCRIPTION_PATH.search(candidate) is not None
+        or _REGISTRY_DESCRIPTION_SCHEMA.search(candidate) is not None
+    ):
+        return None
+    return candidate
 
 
 def _validation_matches_rejection(

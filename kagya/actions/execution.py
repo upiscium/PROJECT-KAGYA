@@ -477,8 +477,11 @@ class ActionOperatorSnapshot:
     approvals_by_intent: Mapping[str, ApprovalRecord]
     receipts: Mapping[str, ExecutionReceipt]
     receipts_by_intent: Mapping[str, tuple[ExecutionReceipt, ...]]
+    compensations_by_target: Mapping[str, tuple[ExecutionReceipt, ...]]
     observations: Mapping[str, Observation]
+    observations_by_intent: Mapping[str, tuple[Observation, ...]]
     verifications: Mapping[str, OutcomeVerification]
+    verifications_by_intent: Mapping[str, tuple[OutcomeVerification, ...]]
     validations: Mapping[str, ActionValidationRecord]
 
     @classmethod
@@ -510,14 +513,47 @@ class ActionOperatorSnapshot:
             intent_id: tuple(receipts)
             for intent_id, receipts in receipts_by_intent_lists.items()
         }
+        compensations_by_target_lists: dict[str, list[ExecutionReceipt]] = {}
+        for receipt in state.receipts:
+            if receipt.compensation_of is not None:
+                compensations_by_target_lists.setdefault(
+                    receipt.compensation_of, []
+                ).append(receipt)
+        compensations_by_target_data = {
+            receipt_id: tuple(receipts)
+            for receipt_id, receipts in compensations_by_target_lists.items()
+        }
+        observations_by_intent_lists: dict[str, list[Observation]] = {}
+        for observation in state.observations:
+            observations_by_intent_lists.setdefault(observation.intent_id, []).append(
+                observation
+            )
+        verifications_by_intent_lists: dict[str, list[OutcomeVerification]] = {}
+        for verification in state.verifications:
+            verifications_by_intent_lists.setdefault(
+                verification.intent_id, []
+            ).append(verification)
         snapshot = cls(
             intents=index(state.intents, lambda item: item.intent_id, "intent"),
             approvals=index(state.approvals, lambda item: item.approval_id, "approval"),
             approvals_by_intent=MappingProxyType(approvals_by_intent_data),
             receipts=index(state.receipts, lambda item: item.receipt_id, "receipt"),
             receipts_by_intent=MappingProxyType(receipts_by_intent_data),
+            compensations_by_target=MappingProxyType(compensations_by_target_data),
             observations=index(state.observations, lambda item: item.observation_id, "observation"),
+            observations_by_intent=MappingProxyType(
+                {
+                    intent_id: tuple(observations)
+                    for intent_id, observations in observations_by_intent_lists.items()
+                }
+            ),
             verifications=index(state.verifications, lambda item: item.verification_id, "verification"),
+            verifications_by_intent=MappingProxyType(
+                {
+                    intent_id: tuple(verifications)
+                    for intent_id, verifications in verifications_by_intent_lists.items()
+                }
+            ),
             validations=index(state.validation_records, lambda item: item.validation_id, "validation"),
         )
         for intent in snapshot.intents.values():
@@ -532,6 +568,96 @@ class ActionOperatorSnapshot:
 
 class ActionPolicyError(ValueError):
     """An action was rejected before execution."""
+
+
+def receipt_matches_intent(receipt: ExecutionReceipt, intent: ActionIntent) -> bool:
+    """Return whether a receipt is immutably bound to an action intent."""
+    provenance = intent.provenance
+    return (
+        receipt.intent_id == intent.intent_id
+        and receipt.idempotency_key == intent.idempotency_key
+        and receipt.decision_id == provenance.decision_id
+        and receipt.plan_id == provenance.plan_id
+        and receipt.plan_revision == provenance.plan_revision
+        and receipt.step_id == provenance.step_id
+    )
+
+
+def _semantic_binding(
+    receipt: ExecutionReceipt,
+    intent: ActionIntent,
+    observation: Observation | None = None,
+    verification: OutcomeVerification | None = None,
+    *,
+    successful: bool = False,
+) -> bool:
+    """Validate the complete, non-rebindable receipt evidence contract."""
+    if not receipt_matches_intent(receipt, intent):
+        return False
+    if not successful:
+        return True
+    if (
+        receipt.status != ReceiptStatus.SUCCEEDED
+        or receipt.observation_id is None
+        or receipt.verification_id is None
+        or observation is None
+        or verification is None
+        or not observation.valid
+        or not verification.success
+    ):
+        return False
+    return bool(
+        observation.intent_id == intent.intent_id
+        and observation.receipt_id == receipt.receipt_id
+        and verification.intent_id == intent.intent_id
+        and verification.observation_id == observation.observation_id
+    )
+
+
+def _intent_receipts_semantically_valid(
+    intent: ActionIntent,
+    receipts: tuple[ExecutionReceipt, ...],
+    observations: Mapping[str, Observation],
+    verifications: Mapping[str, OutcomeVerification],
+    compensations: tuple[ExecutionReceipt, ...] = (),
+) -> bool:
+    """Validate only one intent's receipt/evidence graph; never raise globally."""
+    for receipt in receipts:
+        if not receipt_matches_intent(receipt, intent):
+            return False
+        if receipt.status == ReceiptStatus.SUCCEEDED and not _semantic_binding(
+            receipt,
+            intent,
+            observations.get(receipt.observation_id or ""),
+            verifications.get(receipt.verification_id or ""),
+            successful=True,
+        ):
+            return False
+    associated_ids = {item.receipt_id for item in receipts}
+    receipts_by_id = {item.receipt_id: item for item in receipts}
+    compensation_targets: set[str] = set()
+    for receipt in compensations:
+        target_id = receipt.compensation_of
+        if target_id is None or target_id not in associated_ids:
+            continue
+        target = receipts_by_id.get(target_id)
+        if (
+            receipt.status != ReceiptStatus.COMPENSATED
+            or not receipt_matches_intent(receipt, intent)
+            or target_id == receipt.receipt_id
+            or target is None
+            or target_id in compensation_targets
+            or not _semantic_binding(
+                target,
+                intent,
+                observations.get(target.observation_id or ""),
+                verifications.get(target.verification_id or ""),
+                successful=True,
+            )
+        ):
+            return False
+        compensation_targets.add(target_id)
+    return True
 
 
 ArgumentModel = type[_StrictModel]
@@ -767,8 +893,11 @@ class ActionExecutionLayer:
         self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
     ) -> tuple[OperatorCommand, ...]:
         descriptor = self.get_tool_descriptor(intent.tool_name)
-        if not descriptor.enabled or not self._intent_records_consistent_indexed(
-            snapshot, intent
+        if (
+            snapshot.intents.get(intent.intent_id) != intent
+            or not self._snapshot_ownership_valid(snapshot, intent)
+            or not descriptor.enabled
+            or not self._intent_records_consistent_indexed(snapshot, intent)
         ):
             return ()
         commands: list[OperatorCommand] = []
@@ -818,7 +947,9 @@ class ActionExecutionLayer:
             raise ValueError(f"Unknown action intent: {request.intent_id}")
         preview = self.operator_preview_from_snapshot(snapshot, intent)
         reason: str | None = None
-        if request.expected_revision != intent.revision:
+        if not self._intent_records_consistent_indexed(snapshot, intent):
+            reason = "action semantic binding is invalid"
+        elif request.expected_revision != intent.revision:
             reason = "stale intent revision"
         elif request.expected_preview_digest != preview.argument_digest:
             reason = "stale preview digest"
@@ -1883,6 +2014,24 @@ class ActionExecutionLayer:
                 validated.pop("public_preview", None)
             if validated != intent.arguments or validated != intent.preview.arguments:
                 return False
+            associated_receipts = tuple(
+                item for item in state.receipts if item.intent_id == intent.intent_id
+            )
+            associated_receipt_ids = {
+                item.receipt_id for item in associated_receipts
+            }
+            if not _intent_receipts_semantically_valid(
+                intent,
+                associated_receipts,
+                {item.observation_id: item for item in state.observations},
+                {item.verification_id: item for item in state.verifications},
+                tuple(
+                    item
+                    for item in state.receipts
+                    if item.compensation_of in associated_receipt_ids
+                ),
+            ):
+                return False
             validation = [
                 item
                 for item in state.validation_records
@@ -1906,6 +2055,26 @@ class ActionExecutionLayer:
             )
         except (ActionPolicyError, ValidationError, ValueError, TypeError):
             return False
+
+    @staticmethod
+    def _snapshot_ownership_valid(
+        snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> bool:
+        """Check ownership for one projection without rejecting other intents."""
+        for observation in snapshot.observations_by_intent.get(intent.intent_id, ()):
+            receipt = snapshot.receipts.get(observation.receipt_id)
+            if receipt is None or receipt.intent_id != intent.intent_id:
+                return False
+        for verification in snapshot.verifications_by_intent.get(intent.intent_id, ()):
+            bound_observation = snapshot.observations.get(
+                verification.observation_id or ""
+            )
+            if (
+                bound_observation is None
+                or bound_observation.intent_id != intent.intent_id
+            ):
+                return False
+        return True
 
     def _intent_records_consistent_indexed(
         self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
@@ -1942,6 +2111,23 @@ class ActionExecutionLayer:
             if legacy_notification:
                 validated.pop("public_preview", None)
             if validated != intent.arguments or validated != intent.preview.arguments:
+                return False
+            associated_receipts = snapshot.receipts_by_intent.get(
+                intent.intent_id, ()
+            )
+            if not _intent_receipts_semantically_valid(
+                intent,
+                associated_receipts,
+                snapshot.observations,
+                snapshot.verifications,
+                tuple(
+                    compensation
+                    for receipt in associated_receipts
+                    for compensation in snapshot.compensations_by_target.get(
+                        receipt.receipt_id, ()
+                    )
+                ),
+            ):
                 return False
             if intent.validation_record_id is None:
                 return False
@@ -1989,15 +2175,46 @@ class ActionExecutionLayer:
     def _compensation_eligible(self, state: ActionState, intent: ActionIntent) -> bool:
         if intent.receipt_id is None:
             return False
-        successful = [
-            item
-            for item in state.receipts
-            if item.receipt_id == intent.receipt_id
-            and item.intent_id == intent.intent_id
-            and item.idempotency_key == intent.idempotency_key
-            and item.status == ReceiptStatus.SUCCEEDED
-        ]
-        if len(successful) != 1 or not self._succeeded_receipt_valid(state, intent):
+        associated = tuple(
+            item for item in state.receipts if item.intent_id == intent.intent_id
+        )
+        targets = tuple(
+            item for item in associated if item.receipt_id == intent.receipt_id
+        )
+        if len(targets) != 1 or not _intent_receipts_semantically_valid(
+            intent,
+            associated,
+            {item.observation_id: item for item in state.observations},
+            {item.verification_id: item for item in state.verifications},
+            tuple(
+                item
+                for item in state.receipts
+                if item.compensation_of in {target.receipt_id for target in associated}
+            ),
+        ):
+            return False
+        successful = targets[0]
+        if not _semantic_binding(
+            successful,
+            intent,
+            next(
+                (
+                    item
+                    for item in state.observations
+                    if item.observation_id == successful.observation_id
+                ),
+                None,
+            ),
+            next(
+                (
+                    item
+                    for item in state.verifications
+                    if item.verification_id == successful.verification_id
+                ),
+                None,
+            ),
+            successful=True,
+        ):
             return False
         return not any(
             item.compensation_of == intent.receipt_id
@@ -2012,18 +2229,33 @@ class ActionExecutionLayer:
         if intent.receipt_id is None:
             return False
         receipt = snapshot.receipts.get(intent.receipt_id)
-        if receipt is None or not (
-            receipt.intent_id == intent.intent_id
-            and receipt.idempotency_key == intent.idempotency_key
-            and receipt.status == ReceiptStatus.SUCCEEDED
-        ) or not self._succeeded_receipt_valid_indexed(snapshot, intent):
+        associated = snapshot.receipts_by_intent.get(intent.intent_id, ())
+        if (
+            receipt is None
+            or sum(item.receipt_id == intent.receipt_id for item in associated) != 1
+            or not _intent_receipts_semantically_valid(
+                intent,
+                associated,
+                snapshot.observations,
+                snapshot.verifications,
+                tuple(
+                    compensation
+                    for target in associated
+                    for compensation in snapshot.compensations_by_target.get(
+                        target.receipt_id, ()
+                    )
+                ),
+            )
+            or not _semantic_binding(
+                receipt,
+                intent,
+                snapshot.observations.get(receipt.observation_id or ""),
+                snapshot.verifications.get(receipt.verification_id or ""),
+                successful=True,
+            )
+        ):
             return False
-        return not any(
-            item.compensation_of == intent.receipt_id
-            and item.intent_id == intent.intent_id
-            and item.status == ReceiptStatus.COMPENSATED
-            for item in snapshot.receipts_by_intent.get(intent.intent_id, ())
-        )
+        return not snapshot.compensations_by_target.get(intent.receipt_id, ())
 
     @staticmethod
     def _succeeded_receipt_valid_indexed(
@@ -2032,17 +2264,15 @@ class ActionExecutionLayer:
         if intent.receipt_id is None:
             return False
         receipt = snapshot.receipts.get(intent.receipt_id)
-        if receipt is None or receipt.status != ReceiptStatus.SUCCEEDED:
-            return False
-        observation = None if receipt.observation_id is None else snapshot.observations.get(receipt.observation_id)
-        verification = None if receipt.verification_id is None else snapshot.verifications.get(receipt.verification_id)
         return bool(
-            observation is not None and verification is not None
-            and observation.intent_id == intent.intent_id
-            and observation.receipt_id == receipt.receipt_id
-            and verification.intent_id == intent.intent_id
-            and verification.observation_id == observation.observation_id
-            and verification.success
+            receipt is not None
+            and _semantic_binding(
+                receipt,
+                intent,
+                snapshot.observations.get(receipt.observation_id or ""),
+                snapshot.verifications.get(receipt.verification_id or ""),
+                successful=True,
+            )
         )
 
     def _document_search(self, arguments: dict[str, JsonValue]) -> JsonValue:
@@ -2583,15 +2813,7 @@ class ActionExecutionLayer:
             (item for item in state.receipts if item.receipt_id == intent.receipt_id),
             None,
         )
-        if (
-            receipt is None
-            or receipt.status != ReceiptStatus.SUCCEEDED
-            or receipt.intent_id != intent.intent_id
-            or receipt.idempotency_key != intent.idempotency_key
-            or receipt.decision_id != intent.provenance.decision_id
-            or receipt.observation_id is None
-            or receipt.verification_id is None
-        ):
+        if receipt is None:
             return False
         observation = next(
             (
@@ -2610,14 +2832,13 @@ class ActionExecutionLayer:
             None,
         )
         return bool(
-            observation is not None
-            and observation.intent_id == intent.intent_id
-            and observation.receipt_id == receipt.receipt_id
-            and observation.valid
-            and verification is not None
-            and verification.intent_id == intent.intent_id
-            and verification.observation_id == observation.observation_id
-            and verification.success
+            _semantic_binding(
+                receipt,
+                intent,
+                observation,
+                verification,
+                successful=True,
+            )
         )
 
 

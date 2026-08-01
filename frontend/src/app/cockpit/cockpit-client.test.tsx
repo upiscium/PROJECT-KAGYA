@@ -76,6 +76,7 @@ describe("CockpitClient", () => {
     expect(document.body.textContent).not.toContain("<script>");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "outbox"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "actions"]))).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getQueryData(["cockpit", "action-operator"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "training"]))).not.toContain("PRIVATE_SENTINEL");
   });
 
@@ -150,6 +151,17 @@ describe("CockpitClient", () => {
       expected_intent_revision: 3,
       expected_preview_digest: "a".repeat(64),
     });
+  });
+
+  it("displays bounded registry descriptions without registry action controls", async () => {
+    mockedApi.actionOperatorSummary.mockResolvedValue({ ...operatorSummary(), registry_tools: [{ name: "registry-only", description: "Reads public metadata.", tool_type: "metadata", status: "declared", generated: false, human_approved: false, execution_authority: "registry_only" }] });
+    const { queryClient } = renderCockpit();
+
+    const registryHeading = await screen.findByText("Registry-only tools");
+    const registrySection = registryHeading.nextElementSibling as HTMLElement;
+    expect(within(registrySection).getByText(/Reads public metadata\./)).toBeInTheDocument();
+    expect(within(registrySection).queryAllByRole("button")).toHaveLength(0);
+    expect(queryClient.getQueryData(["cockpit", "action-operator"])).toEqual(expect.objectContaining({ registry_tools: [expect.objectContaining({ description: "Reads public metadata." })] }));
   });
 
   it("keeps action traces visible when operator controls fail", async () => {

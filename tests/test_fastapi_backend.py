@@ -935,6 +935,7 @@ def test_action_operator_summary_caps_registry_tools_independently(
             list=lambda: [
                 SimpleNamespace(
                     name=f"registry_tool_{index}",
+                    description="Reads public metadata.",
                     tool_type=SimpleNamespace(value="metadata"),
                     status=SimpleNamespace(value="declared"),
                     generated=False,
@@ -950,6 +951,147 @@ def test_action_operator_summary_caps_registry_tools_independently(
 
         assert response.status_code == 200
         assert len(response.json()["registry_tools"]) == 100
+        assert response.json()["registry_tools"][0]["description"] == "Reads public metadata."
+        assert response.json()["registry_tools"][0]["execution_authority"] == "registry_only"
+        assert "executable" not in response.json()["registry_tools"][0]
+
+
+def test_action_operator_summary_fails_closed_on_unsafe_registry_descriptions(
+    tmp_path: Path,
+) -> None:
+    descriptions = (
+        "x" * 161,
+        "hidden thought: PRIVATE_SENTINEL",
+        "Read /home/kagya/private/config.yaml",
+        "credential token secret",
+        'input_schema: {"query": "string"}',
+    )
+    with _client(tmp_path) as client:
+        client.app.state.tool_registry = SimpleNamespace(
+            list=lambda: [
+                SimpleNamespace(
+                    name=f"registry_tool_{index}",
+                    description=description,
+                    tool_type=SimpleNamespace(value="metadata"),
+                    status=SimpleNamespace(value="declared"),
+                    generated=False,
+                    human_approved=False,
+                    input_schema={"PRIVATE_SENTINEL": "secret"},
+                    output_template="PRIVATE_SENTINEL",
+                    metadata={"PRIVATE_SENTINEL": "secret"},
+                )
+                for index, description in enumerate(descriptions)
+            ]
+        )
+
+        response = client.get("/api/actions/operator-summary", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert [item["description"] for item in response.json()["registry_tools"]] == [
+            None
+        ] * len(descriptions)
+        assert "PRIVATE_SENTINEL" not in response.text
+        for item in response.json()["registry_tools"]:
+            assert set(item) == {
+                "name",
+                "description",
+                "tool_type",
+                "status",
+                "generated",
+                "human_approved",
+                "execution_authority",
+            }
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "decision",
+        "plan_id",
+        "plan_revision",
+        "step",
+        "invalid_observation",
+        "cross_bound_verification",
+        "self_compensation",
+        "duplicate_compensation",
+        "extra_cross_bound_receipt",
+    ),
+)
+def test_compensation_endpoint_fails_closed_on_corrupt_semantic_bindings(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "autonomy": settings.autonomy.model_copy(update={"enabled": False}),
+            "outbox": settings.outbox.model_copy(
+                update={"quiet_hours_start": 0, "quiet_hours_end": 0}
+            ),
+        }
+    )
+    with _client(tmp_path, settings=settings) as client:
+        intent_id, command = _prepare_compensable_api_action(client, corruption)
+        state = ActionState.model_validate(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY]
+        )
+        corrupted = _corrupt_compensation_state(state, corruption)
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            corrupted.model_dump(mode="json")
+        )
+
+        state_before = json.dumps(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+        )
+        decision_before = client.app.state.main_loop.decision_store.get(
+            f"decision-compensation-{corruption}"
+        )
+        outbox_before = tuple(
+            item.model_dump_json()
+            for item in client.app.state.main_loop.outbox.list_messages()
+        )
+
+        summary = client.get("/api/actions/operator-summary", headers=admin_headers())
+
+        assert summary.status_code == 200
+        projected = next(
+            (
+                item
+                for item in summary.json()["actions"]
+                if item["intent_id"] == intent_id
+            ),
+            None,
+        )
+        assert projected is None or "compensate" not in projected["available_commands"]
+        journal_before = len(EventJournal(settings.agent_journal.path).verify())
+
+        rejected = client.post(
+            f"/api/actions/operator/intents/{intent_id}/compensate",
+            headers=admin_headers(),
+            json=command,
+        )
+
+        assert rejected.status_code == 409
+        assert json.dumps(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+        ) == state_before
+        after = ActionState.model_validate(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY]
+        )
+        assert len(after.receipts) == len(corrupted.receipts)
+        assert tuple(item["status"] for item in after.notifications) == tuple(
+            item["status"] for item in corrupted.notifications
+        )
+        assert client.app.state.main_loop.decision_store.get(
+            f"decision-compensation-{corruption}"
+        ) == decision_before
+        assert tuple(
+            item.model_dump_json()
+            for item in client.app.state.main_loop.outbox.list_messages()
+        ) == outbox_before
+        assert len(EventJournal(settings.agent_journal.path).verify()) == journal_before
 
 
 def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
@@ -5454,6 +5596,183 @@ def _cockpit_observation(
         valid=valid,
         validation_errors=errors,
     )
+
+
+def _prepare_compensable_api_action(
+    client: TestClient, suffix: str
+) -> tuple[str, dict[str, object]]:
+    decision_id = f"decision-compensation-{suffix}"
+    candidate = {
+        "candidate_id": f"notify-{suffix}",
+        "candidate_type": "internal",
+        "proposed_action": "Queue local notification",
+        "parameters": {
+            "action": {
+                "tool_name": "local_notification_enqueue",
+                "arguments": {
+                    "channel": "local",
+                    "title": "Review",
+                    "body": "Please review the result",
+                    "public_preview": {
+                        "kind": "local_notification_enqueue",
+                        "title": "Review",
+                        "body": "Please review the result",
+                    },
+                },
+            }
+        },
+        "prerequisites": [],
+        "predicted_outcomes": [
+            {
+                "outcome_id": "queued",
+                "description": "Notification queued",
+                "probability": 1.0,
+                "utility": 1.0,
+            }
+        ],
+        "uncertainty": 0.0,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.1,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    fallback = {
+        **candidate,
+        "candidate_id": f"fallback-{suffix}",
+        "candidate_type": "no_op",
+        "proposed_action": "Do nothing",
+        "parameters": {},
+        "predicted_outcomes": [
+            {
+                "outcome_id": "idle",
+                "description": "No action",
+                "probability": 1.0,
+                "utility": -1.0,
+            }
+        ],
+        "estimated_risk": 0.0,
+    }
+    assert client.post(
+        "/api/decisions",
+        headers=admin_headers(),
+        json={"decision_id": decision_id, "candidates": [candidate, fallback]},
+    ).status_code == 200
+    created = client.post(
+        "/api/actions/intents",
+        headers=admin_headers(),
+        json={
+            "decision_id": decision_id,
+            "idempotency_key": f"compensation-{suffix}",
+            "budget": {"timeout_seconds": 10.0},
+        },
+    )
+    assert created.status_code == 200
+    intent_id = created.json()["intent_id"]
+    pending = next(
+        item
+        for item in client.get("/api/actions/operator-summary").json()["actions"]
+        if item["intent_id"] == intent_id
+    )
+    approved = client.post(
+        f"/api/actions/operator/intents/{intent_id}/approval",
+        headers=admin_headers(),
+        json={
+            "expected_intent_revision": pending["revision"],
+            "expected_preview_digest": pending["preview"]["digest"],
+            "expected_approval_id": pending["approval"]["approval_id"],
+            "approved": True,
+        },
+    )
+    assert approved.status_code == 200
+    executed = client.app.state.agent_runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.scheduler.compensation_binding",
+        handler=lambda: client.app.state.action_execution.execute(intent_id),
+    ).value
+    assert executed.status == IntentStatus.SUCCEEDED
+    compensable = next(
+        item
+        for item in client.get("/api/actions/operator-summary").json()["actions"]
+        if item["intent_id"] == intent_id
+    )
+    assert "compensate" in compensable["available_commands"]
+    return intent_id, {
+        "expected_intent_revision": compensable["revision"],
+        "expected_preview_digest": compensable["preview"]["digest"],
+    }
+
+
+def _corrupt_compensation_state(
+    state: ActionState, corruption: str
+) -> ActionState:
+    intent = state.intents[0]
+    target = next(item for item in state.receipts if item.receipt_id == intent.receipt_id)
+    if corruption == "decision":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"decision_id": "other"}),)}
+        )
+    if corruption == "plan_id":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"plan_id": "other"}),)}
+        )
+    if corruption == "plan_revision":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"plan_revision": 99}),)}
+        )
+    if corruption == "step":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"step_id": "other"}),)}
+        )
+    if corruption == "invalid_observation":
+        return state.model_copy(
+            update={
+                "observations": (
+                    state.observations[0].model_copy(update={"valid": False}),
+                )
+            }
+        )
+    if corruption == "cross_bound_verification":
+        other_observation = state.observations[0].model_copy(
+            update={"observation_id": "observation-cross-bound"}
+        )
+        return state.model_copy(
+            update={
+                "observations": (*state.observations, other_observation),
+                "verifications": (
+                    state.verifications[0].model_copy(
+                        update={"observation_id": other_observation.observation_id}
+                    ),
+                ),
+            }
+        )
+    compensation = target.model_copy(
+        update={
+            "receipt_id": f"compensation-{corruption}",
+            "status": ReceiptStatus.COMPENSATED,
+            "compensation_of": target.receipt_id,
+        }
+    )
+    if corruption == "self_compensation":
+        compensation = compensation.model_copy(
+            update={"compensation_of": compensation.receipt_id}
+        )
+        return state.model_copy(update={"receipts": (*state.receipts, compensation)})
+    if corruption == "duplicate_compensation":
+        return state.model_copy(
+            update={
+                "receipts": (
+                    *state.receipts,
+                    compensation,
+                    compensation.model_copy(update={"receipt_id": "compensation-2"}),
+                )
+            }
+        )
+    if corruption == "extra_cross_bound_receipt":
+        extra = target.model_copy(
+            update={"receipt_id": "receipt-cross-bound", "decision_id": "other"}
+        )
+        return state.model_copy(update={"receipts": (*state.receipts, extra)})
+    raise AssertionError(f"Unknown corruption: {corruption}")
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

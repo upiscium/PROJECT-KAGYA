@@ -15,6 +15,7 @@ from kagya.actions import (
     ActionPolicyError,
     ActionState,
     ActionValidationRecord,
+    ExecutionReceipt,
     IntentStatus,
     OperatorCommand,
     ReceiptStatus,
@@ -629,6 +630,7 @@ def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
     base_validation = state.validation_records[0]
     intents = []
     validations = []
+    receipts = []
     for index in range(300):
         intent_id = f"intent-{index}"
         validation_id = f"validation-{index}"
@@ -655,12 +657,34 @@ def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
                 }
             )
         )
+        receipts.append(
+            ExecutionReceipt(
+                receipt_id=f"receipt-{index}",
+                intent_id=intent_id,
+                idempotency_key=f"idempotency-{index}",
+                attempt=1,
+                status=ReceiptStatus.CANCELLED,
+                started_at=base.created_at,
+                finished_at=base.created_at,
+                duration_ms=0.0,
+                decision_id=decision_id,
+                plan_id=base.provenance.plan_id,
+                plan_revision=base.provenance.plan_revision,
+                step_id=base.provenance.step_id,
+            )
+        )
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
-        update={"intents": tuple(intents), "validation_records": tuple(validations)}
+        update={
+            "intents": tuple(intents),
+            "validation_records": tuple(validations),
+            "receipts": tuple(receipts),
+        }
     ).model_dump(mode="json")
 
     checked_calls = 0
+    semantic_receipt_visits = 0
     original_state_checked = layer._state_checked
+    original_semantic_validation = action_execution._intent_receipts_semantically_valid
 
     def counted_state_checked() -> ActionState:
         nonlocal checked_calls
@@ -670,7 +694,25 @@ def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
     def unexpected_scan(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("operator projection performed a per-intent state scan")
 
+    def counted_semantic_validation(
+        intent: object,
+        intent_receipts: tuple[ExecutionReceipt, ...],
+        observations: object,
+        verifications: object,
+        compensations: tuple[ExecutionReceipt, ...] = (),
+    ) -> bool:
+        nonlocal semantic_receipt_visits
+        semantic_receipt_visits += len(intent_receipts) + len(compensations)
+        return original_semantic_validation(
+            intent, intent_receipts, observations, verifications, compensations
+        )
+
     monkeypatch.setattr(layer, "_state_checked", counted_state_checked)
+    monkeypatch.setattr(
+        action_execution,
+        "_intent_receipts_semantically_valid",
+        counted_semantic_validation,
+    )
     for method in (
         "list_approvals",
         "list_receipts",
@@ -686,6 +728,7 @@ def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
     ]
 
     assert checked_calls == 1
+    assert semantic_receipt_visits == len(receipts) * 3
     assert len(projected) == 300
     assert all(item.available_commands == [OperatorCommand.CANCEL] for item in projected)
 
@@ -1815,3 +1858,133 @@ def _explanation(loop: _Loop, decision_id: str) -> Any:
         event_id="explanation-event",
         event_sequence=999,
     )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "decision",
+        "plan_id",
+        "plan_revision",
+        "step",
+        "invalid_observation",
+        "cross_bound_verification",
+        "self_compensation",
+        "duplicate_compensation",
+        "extra_cross_bound_receipt",
+    ],
+)
+def test_corrupt_success_evidence_cannot_enable_compensation(
+    tmp_path: Path, corruption: str
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-compensation-corruption",
+        "local_notification_enqueue",
+        _notification_args("Review", "Body"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.compensation-corruption.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-compensation-corruption", idempotency_key="corruption"
+            ),
+        ).value
+        approved = runtime.execute(
+            AgentEventType.ACTION_APPROVAL,
+            source="test.compensation-corruption.approve",
+            handler=lambda: layer.resolve_approval(
+                intent.intent_id, approved=True, actor_id="operator"
+            ),
+        ).value
+        completed = runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.compensation-corruption.execute",
+            handler=lambda: layer.execute(approved.intent_id),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    receipt = state.receipts[0]
+    if corruption == "decision":
+        receipts = (
+            receipt.model_copy(update={"decision_id": "cross-bound"}),
+        )
+        corrupted = state.model_copy(update={"receipts": receipts})
+    elif corruption == "plan_id":
+        corrupted = state.model_copy(
+            update={"receipts": (receipt.model_copy(update={"plan_id": "other"}),)}
+        )
+    elif corruption == "plan_revision":
+        corrupted = state.model_copy(
+            update={
+                "receipts": (
+                    receipt.model_copy(update={"plan_revision": 99}),
+                )
+            }
+        )
+    elif corruption == "step":
+        corrupted = state.model_copy(
+            update={"receipts": (receipt.model_copy(update={"step_id": "other"}),)}
+        )
+    elif corruption == "invalid_observation":
+        corrupted = state.model_copy(
+            update={
+                "observations": (
+                    state.observations[0].model_copy(update={"valid": False}),
+                )
+            }
+        )
+    elif corruption == "cross_bound_verification":
+        corrupted = state.model_copy(
+            update={
+                "verifications": (
+                    state.verifications[0].model_copy(
+                        update={"observation_id": "cross-bound"}
+                    ),
+                )
+            }
+        )
+    else:
+        compensation = receipt.model_copy(
+            update={
+                "receipt_id": f"compensation-{corruption}",
+                "status": ReceiptStatus.COMPENSATED,
+                "compensation_of": (
+                    receipt.receipt_id
+                    if corruption != "self_compensation"
+                    else f"compensation-{corruption}"
+                ),
+            }
+        )
+        if corruption == "duplicate_compensation":
+            compensation = (
+                compensation,
+                compensation.model_copy(update={"receipt_id": "compensation-2"}),
+            )
+        else:
+            compensation = (compensation,)
+        if corruption == "extra_cross_bound_receipt":
+            compensation = (
+                receipt.model_copy(
+                    update={"receipt_id": "extra", "decision_id": "cross-bound"}
+                ),
+            )
+        corrupted = state.model_copy(update={"receipts": (receipt, *compensation)})
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = corrupted.model_dump(mode="json")
+    before = json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+    assert layer.available_commands(completed.intent_id) == ()
+    with pytest.raises(ActionPolicyError):
+        layer.compensate(completed.intent_id)
+    assert json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True) == before
+    assert len(layer.list_receipts()) == len(corrupted.receipts)

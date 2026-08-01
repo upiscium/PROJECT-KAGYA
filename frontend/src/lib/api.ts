@@ -1157,7 +1157,7 @@ function parseActionTool(value: Record<string, unknown>): ActionTool {
 
 function parseRegistryTool(value: Record<string, unknown>): RegistryTool {
   exactRecord(value, ["name", "description", "tool_type", "status", "generated", "human_approved", "execution_authority"], "registry tool");
-  return { name: safeText(value.name, "registry tool name"), description: optionalSafeText(value.description, "registry tool description"), tool_type: boundedCode(value.tool_type, "registry tool type"), status: boundedCode(value.status, "registry tool status"), generated: booleanValue(value.generated, "registry tool generated"), human_approved: booleanValue(value.human_approved, "registry tool approval"), execution_authority: enumValue(value.execution_authority, ["registry_only"] as const, "registry tool authority") };
+  return { name: safeText(value.name, "registry tool name"), description: value.description === null ? null : publicPreviewText(value.description, "registry tool description", 160), tool_type: boundedCode(value.tool_type, "registry tool type"), status: boundedCode(value.status, "registry tool status"), generated: booleanValue(value.generated, "registry tool generated"), human_approved: booleanValue(value.human_approved, "registry tool approval"), execution_authority: enumValue(value.execution_authority, ["registry_only"] as const, "registry tool authority") };
 }
 
 function parseOperatorAction(value: Record<string, unknown>): OperatorAction {
@@ -1469,9 +1469,9 @@ function safeText(value: unknown, label: string): string {
 
 function publicPreviewText(value: unknown, label: string, maximum: number): string {
   const result = text(value, label);
-  const privateMarker = /<\/?think\b|hidden[\s_-]*thought|private[\s_-]*(?:state|session|context|sentinel)|raw[\s_-]*prompt|api[\s_-]*key|access[\s_-]*token|credential|password|secret|bearer\s+token|\bsentinel\b/i;
+  const privateMarker = /<\/?think\b|hidden[\s_-]*thought|private[\s_-]*(?:state|session|context|sentinel)|raw[\s_-]*prompt|api[\s_-]*(?:key|token)|access[\s_-]*token|\b(?:credential|credentials|password|secret|secrets|token|tokens)\b|bearer\s+token|(?:^|[^A-Z0-9])sentinel(?:$|[^A-Z0-9])/i;
   const filesystemPath = /(?:[A-Za-z]:[\\/]|~[\\/]|(?:^|\s)\/(?:[^\s/]+\/)+[^\s]*)/;
-  if (result.length > maximum || /[\x00-\x1f\x7f]/.test(result) || privateMarker.test(result) || filesystemPath.test(result)) invalid(label);
+  if (result.length > maximum || /[\p{Cc}\p{Cf}]/u.test(result) || privateMarker.test(result) || filesystemPath.test(result)) invalid(label);
   return result;
 }
 

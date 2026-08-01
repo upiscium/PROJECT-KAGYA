@@ -462,6 +462,23 @@ describe("api client", () => {
     fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, actions: [{ ...documentAction, argument_summary: { ...documentAction.argument_summary, query_digest: queryHash } }] }));
     await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
   });
+
+  it("accepts only safe bounded registry descriptions", async () => {
+    const safe = { ...actionOperatorPayload, registry_tools: [{ ...actionOperatorPayload.registry_tools[0], description: "Reads public metadata." }] };
+    fetchMock.mockReturnValue(jsonResponse(safe));
+    expect((await api.actionOperatorSummary()).registry_tools[0].description).toBe("Reads public metadata.");
+
+    for (const description of [
+      "x".repeat(161),
+      "hidden thought: PRIVATE_SENTINEL",
+      "See /home/kagya/private/config.yaml",
+      "credential token secret",
+      "SCHEMA_SENTINEL",
+    ]) {
+      fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, registry_tools: [{ ...actionOperatorPayload.registry_tools[0], description }] }));
+      await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+    }
+  });
 });
 
 const actionOperatorPayload = {
