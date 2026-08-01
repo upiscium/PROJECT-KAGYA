@@ -108,6 +108,7 @@ describe("api client", () => {
       [api.workingMemory, workingMemoryPayload, "/admin-proxy/state/working-memory", "item_count"],
       [api.cockpitOutbox, cockpitOutboxPayload, "/admin-proxy/outbox/summary", "messages"],
       [api.actionTrace, actionTracePayload, "/admin-proxy/actions/trace", "traces"],
+      [api.cockpitTraining, cockpitTrainingPayload, "/admin-proxy/training/cockpit-summary", "nodes"],
     ] as const;
 
     for (const [client, payload, path, projectionKey] of cases) {
@@ -209,6 +210,44 @@ describe("api client", () => {
     expect(result.traces[0]).not.toHaveProperty("idempotency_key");
     expect(result.traces[0].approval).not.toHaveProperty("reason");
     expect(result.traces[0].observation).not.toHaveProperty("data");
+  });
+
+  it("parses only public-safe cockpit training summary fields", async () => {
+    fetchMock.mockReturnValue(jsonResponse(cockpitTrainingPayload));
+
+    const result = await api.cockpitTraining();
+
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/training/cockpit-summary", expect.anything());
+    expect(result.node_count).toBe(1);
+    expect(result.nodes[0].status).toBe("online");
+    expect(result.jobs[0].failure_code).toBeNull();
+    expect(result.adapters[0].activation_event_id).toBe("event-1");
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+    expect(result.jobs[0]).not.toHaveProperty("stderr");
+    expect(result.adapters[0]).not.toHaveProperty("private_path");
+  });
+
+  it.each([
+    ["unavailable worker", { ...cockpitTrainingPayload, nodes: [{ ...cockpitTrainingPayload.nodes[0], status: "unavailable", last_contact_at: null, observed_model_id: null, observed_model_revision: null, model_matches_expected: null }] }],
+    ["split projection", { ...cockpitTrainingPayload, nodes: [{ ...cockpitTrainingPayload.nodes[0], role: "inference" }], jobs: [{ ...cockpitTrainingPayload.jobs[0], worker_node_id: null, candidate_adapter_id: null }], adapters: [{ ...cockpitTrainingPayload.adapters[0], training_job_id: null, training_node_id: null }] }],
+  ])("accepts cockpit training %s", async (_label, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(api.cockpitTraining()).resolves.toHaveProperty("nodes");
+  });
+
+  it.each([
+    ["root", null],
+    ["unknown field", { ...cockpitTrainingPayload, private: "PRIVATE_SENTINEL" }],
+    ["missing field", { nodes: cockpitTrainingPayload.nodes, jobs: cockpitTrainingPayload.jobs, adapters: cockpitTrainingPayload.adapters }],
+    ["malformed enum", { ...cockpitTrainingPayload, jobs: [{ ...cockpitTrainingPayload.jobs[0], status: "invented" }] }],
+    ["negative count", { ...cockpitTrainingPayload, failed_job_count: -1 }],
+    ["invalid digest", { ...cockpitTrainingPayload, jobs: [{ ...cockpitTrainingPayload.jobs[0], bundle_digest: "bad" }] }],
+    ["invalid timestamp", { ...cockpitTrainingPayload, nodes: [{ ...cockpitTrainingPayload.nodes[0], last_contact_at: "not-time" }] }],
+    ["unsafe code", { ...cockpitTrainingPayload, jobs: [{ ...cockpitTrainingPayload.jobs[0], failure_code: "raw worker stderr PRIVATE_SENTINEL" }] }],
+    ["unsafe GPU", { ...cockpitTrainingPayload, nodes: [{ ...cockpitTrainingPayload.nodes[0], gpu_name: "<script>PRIVATE_SENTINEL</script>" }] }],
+  ])("rejects malformed cockpit training %s", async (_label, payload) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(api.cockpitTraining()).rejects.toMatchObject({ name: "ApiError" });
   });
 
   it.each([
@@ -417,6 +456,75 @@ const actionTracePayload = {
     { failure_id: "validation-1", failure_type: "validation", decision_id: "decision-1", candidate_id: null, tool_name: "document_search", risk_class: "read_only", error_codes: ["arguments_schema_invalid"], event_id: "event-1", event_sequence: 42, occurred_at: "2026-07-30T00:00:00Z", idempotency_key: "PRIVATE_SENTINEL", request_digest: "PRIVATE_SENTINEL", canonical_arguments_digest: "PRIVATE_SENTINEL", arguments: { secret: "PRIVATE_SENTINEL" } },
     { failure_id: "rejection-1", failure_type: "policy_rejection", decision_id: "decision-2", candidate_id: "candidate-2", tool_name: null, risk_class: "reversible_write", error_codes: ["risk_class_exceeds_budget"], event_id: "event-2", event_sequence: 43, occurred_at: "2026-07-30T00:00:01Z", idempotency_key: "PRIVATE_SENTINEL" },
   ],
+};
+
+const cockpitTrainingPayload = {
+  node_count: 1,
+  online_node_count: 1,
+  running_job_count: 1,
+  failed_job_count: 0,
+  importing_job_count: 0,
+  active_adapter_count: 1,
+  candidate_adapter_count: 1,
+  nodes: [{
+    node_id: "node-1",
+    role: "worker",
+    backend: "ssh",
+    status: "online",
+    last_contact_at: "2026-01-01T00:00:00Z",
+    expected_model_id: "model-1",
+    expected_model_revision: "rev-1",
+    expected_processor_revision: "proc-1",
+    observed_model_id: "model-1",
+    observed_model_revision: "rev-1",
+    model_matches_expected: true,
+    gpu_name: "NVIDIA GPU 1",
+    cuda_version: "12.1",
+    driver_version: "550",
+  }],
+  jobs: [{
+    job_id: "job-1",
+    attempt_id: "attempt-1",
+    status: "running",
+    backend: "ssh",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:01Z",
+    started_at: "2026-01-01T00:00:01Z",
+    completed_at: null,
+    source_event_start: 1,
+    source_event_end: 5,
+    selected_episode_count: 3,
+    remote_job_id: "job-1",
+    worker_node_id: "node-1",
+    retry_count: 0,
+    transferred_bytes: 2048,
+    failure_code: null,
+    candidate_adapter_id: "adapter-1",
+    import_status: "not_started",
+    bundle_digest: "a".repeat(64),
+    result_digest: "b".repeat(64),
+  }],
+  adapters: [{
+    adapter_id: "adapter-1",
+    status: "active",
+    adapter_hash: "b".repeat(64),
+    base_model_id: "model-1",
+    base_model_revision: "rev-1",
+    parent_adapter_id: null,
+    training_job_id: "job-1",
+    training_node_id: "node-1",
+    submitted_by_node_id: "submitter-1",
+    imported_by_node_id: "node-1",
+    evaluation_id: "eval-1",
+    evaluation_status: "passed",
+    approved: true,
+    active: true,
+    rollback_candidate: false,
+    activation_event_id: "event-1",
+    activation_event_sequence: 1,
+    rollback_event_id: null,
+    rollback_event_sequence: null,
+  }],
 };
 
 function actionTraceWith(update: Record<string, unknown>) {

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
@@ -10,6 +10,8 @@ const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
+  Element.prototype.scrollIntoView = vi.fn();
+  window.history.replaceState(null, "", "/evaluations");
 });
 
 function renderWithQuery() {
@@ -128,4 +130,85 @@ describe("EvaluationsClient", () => {
     expect(await screen.findByText("No evaluation results yet.")).toBeInTheDocument();
     expect(screen.getByText("Select an evaluation result to inspect its JSON payload.")).toBeInTheDocument();
   });
+
+  it("selects and anchors behavioral evaluations from the URL hash", async () => {
+    window.history.replaceState(null, "", "/evaluations#evaluation-behavior-target");
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === "/admin-proxy/evaluations/behavioral") {
+        return {
+          ok: true,
+          json: async () => ({
+            results: [
+              behavioralSummary("behavior-first", 0.1),
+              behavioralSummary("behavior-target", 0.9),
+            ],
+          }),
+        };
+      }
+      if (url === "/admin-proxy/evaluations/behavioral/behavior-target") {
+        return { ok: true, json: async () => ({ evaluation_id: "behavior-target", payload: { reproduction_artifacts: [] } }) };
+      }
+      if (url === "/admin-proxy/evaluations/behavioral/behavior-first") {
+        return { ok: true, json: async () => ({ evaluation_id: "behavior-first", payload: { reproduction_artifacts: [] } }) };
+      }
+      return { ok: true, json: async () => ({ results: [] }) };
+    });
+
+    renderWithQuery();
+
+    expect(await screen.findByText("behavior-target")).toBeInTheDocument();
+    expect(document.getElementById("evaluation-behavior-target")).not.toBeNull();
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/evaluations/behavioral/behavior-target", expect.any(Object));
+      expect(within(document.getElementById("evaluation-behavior-target")!).getByRole("button", { name: "Selected" })).toBeInTheDocument();
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+    });
+    window.location.hash = "#evaluation-behavior-first";
+    await waitFor(() => {
+      expect(within(document.getElementById("evaluation-behavior-first")!).getByRole("button", { name: "Selected" })).toBeInTheDocument();
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/evaluations/behavioral/behavior-first", expect.any(Object));
+    expect(window.location.hash).toBe("#evaluation-behavior-first");
+  });
+
+  it("falls back normally for unknown and malformed evaluation hashes", async () => {
+    window.history.replaceState(null, "", "/evaluations#evaluation-unknown");
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url === "/admin-proxy/evaluations/behavioral") {
+        return { ok: true, json: async () => ({ results: [behavioralSummary("behavior-first", 0.9)] }) };
+      }
+      if (url === "/admin-proxy/evaluations/behavioral/behavior-first") {
+        return { ok: true, json: async () => ({ evaluation_id: "behavior-first", payload: { reproduction_artifacts: [] } }) };
+      }
+      return { ok: true, json: async () => ({ results: [] }) };
+    });
+
+    renderWithQuery();
+
+    expect(await screen.findByRole("button", { name: "Selected" })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/evaluations/behavioral/behavior-first", expect.any(Object));
+
+    window.location.hash = "#evaluation-%E0%A4%A";
+    expect(await screen.findByRole("button", { name: "Selected" })).toBeInTheDocument();
+  });
 });
+
+function behavioralSummary(evaluationId: string, candidateScore: number) {
+  return {
+    evaluation_id: evaluationId,
+    runtime_kind: "deterministic_runtime",
+    baseline_id: "base",
+    candidate_id: "candidate",
+    baseline_score: 1,
+    candidate_score: candidateScore,
+    baseline_dimensions: { tool_safety: 1 },
+    candidate_dimensions: { tool_safety: candidateScore },
+    dimension_deltas: { tool_safety: candidateScore - 1 },
+    activation_gate_passed: candidateScore > 0.5,
+    regression_dimensions: [],
+    threshold_failure_dimensions: [],
+    hard_gate_failures: [],
+    tool_execution_dimensions_complete: true,
+    created_at: "2026-07-23T00:00:00+00:00",
+  };
+}

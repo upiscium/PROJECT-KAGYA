@@ -613,6 +613,79 @@ export type CockpitActionTraceResponse = {
   pre_intent_failures: CockpitPreIntentFailure[];
 };
 
+export type CockpitTrainingNode = {
+  node_id: string;
+  role: "inference" | "worker";
+  backend: string;
+  status: "online" | "unavailable";
+  last_contact_at: string | null;
+  expected_model_id: string | null;
+  expected_model_revision: string | null;
+  expected_processor_revision: string | null;
+  observed_model_id: string | null;
+  observed_model_revision: string | null;
+  model_matches_expected: boolean | null;
+  gpu_name: string | null;
+  cuda_version: string | null;
+  driver_version: string | null;
+};
+export type CockpitTrainingFailureCode = "worker_unavailable" | "ssh_failed" | "transfer_failed" | "timeout" | "cancelled" | "bundle_invalid" | "result_invalid" | "training_failed" | "cuda_oom" | "non_finite_metrics" | "import_failed" | "evaluation_failed" | "unknown_failure";
+export type CockpitTrainingJob = {
+  job_id: string;
+  attempt_id: string;
+  status: "preparing" | "ready" | "dispatched" | "running" | "succeeded" | "importing" | "completed" | "failed" | "cancelled" | "unavailable";
+  backend: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  source_event_start: number | null;
+  source_event_end: number | null;
+  selected_episode_count: number | null;
+  remote_job_id: string | null;
+  worker_node_id: string | null;
+  retry_count: number | null;
+  transferred_bytes: number | null;
+  failure_code: CockpitTrainingFailureCode | null;
+  candidate_adapter_id: string | null;
+  import_status: "not_started" | "importing" | "completed" | "failed" | "unavailable";
+  bundle_digest: string | null;
+  result_digest: string | null;
+};
+export type CockpitAdapterLineage = {
+  adapter_id: string;
+  status: string;
+  adapter_hash: string | null;
+  base_model_id: string | null;
+  base_model_revision: string | null;
+  parent_adapter_id: string | null;
+  training_job_id: string | null;
+  training_node_id: string | null;
+  submitted_by_node_id: string | null;
+  imported_by_node_id: string | null;
+  evaluation_id: string | null;
+  evaluation_status: "passed" | "failed" | "stale" | "corrupt" | "unavailable";
+  approved: boolean;
+  active: boolean;
+  rollback_candidate: boolean;
+  activation_event_id: string | null;
+  activation_event_sequence: number | null;
+  rollback_event_id: string | null;
+  rollback_event_sequence: number | null;
+};
+export type CockpitTrainingSummary = {
+  node_count: number;
+  online_node_count: number;
+  running_job_count: number;
+  failed_job_count: number;
+  importing_job_count: number;
+  active_adapter_count: number;
+  candidate_adapter_count: number;
+  nodes: CockpitTrainingNode[];
+  jobs: CockpitTrainingJob[];
+  adapters: CockpitAdapterLineage[];
+};
+
 export type ContextFrame = {
   context_id: string;
   context_type: string;
@@ -1174,6 +1247,93 @@ function parseActionVerification(value: unknown): CockpitActionVerification | nu
   };
 }
 
+export function parseCockpitTrainingSummary(value: unknown): CockpitTrainingSummary {
+  exactRecord(value, ["node_count", "online_node_count", "running_job_count", "failed_job_count", "importing_job_count", "active_adapter_count", "candidate_adapter_count", "nodes", "jobs", "adapters"], "cockpit training summary");
+  return {
+    node_count: nonnegativeInteger(value.node_count, "cockpit training node count"),
+    online_node_count: nonnegativeInteger(value.online_node_count, "cockpit training online node count"),
+    running_job_count: nonnegativeInteger(value.running_job_count, "cockpit training running job count"),
+    failed_job_count: nonnegativeInteger(value.failed_job_count, "cockpit training failed job count"),
+    importing_job_count: nonnegativeInteger(value.importing_job_count, "cockpit training importing job count"),
+    active_adapter_count: nonnegativeInteger(value.active_adapter_count, "cockpit training active adapter count"),
+    candidate_adapter_count: nonnegativeInteger(value.candidate_adapter_count, "cockpit training candidate adapter count"),
+    nodes: recordArray(value.nodes, "cockpit training node").map(parseCockpitTrainingNode),
+    jobs: recordArray(value.jobs, "cockpit training job").map(parseCockpitTrainingJob),
+    adapters: recordArray(value.adapters, "cockpit adapter lineage").map(parseCockpitAdapterLineage),
+  };
+}
+
+function parseCockpitTrainingNode(node: Record<string, unknown>): CockpitTrainingNode {
+  exactRecord(node, ["node_id", "role", "backend", "status", "last_contact_at", "expected_model_id", "expected_model_revision", "expected_processor_revision", "observed_model_id", "observed_model_revision", "model_matches_expected", "gpu_name", "cuda_version", "driver_version"], "cockpit training node");
+  return {
+    node_id: safeId(node.node_id, "cockpit training node"),
+    role: enumValue(node.role, ["inference", "worker"] as const, "cockpit training node role"),
+    backend: safeText(node.backend, "cockpit training node backend"),
+    status: enumValue(node.status, ["online", "unavailable"] as const, "cockpit training node health"),
+    last_contact_at: optionalIsoTimestamp(node.last_contact_at, "cockpit training node last contact"),
+    expected_model_id: optionalSafeText(node.expected_model_id, "cockpit training expected model"),
+    expected_model_revision: optionalSafeText(node.expected_model_revision, "cockpit training expected revision"),
+    expected_processor_revision: optionalSafeText(node.expected_processor_revision, "cockpit training expected processor revision"),
+    observed_model_id: optionalSafeText(node.observed_model_id, "cockpit training observed model"),
+    observed_model_revision: optionalSafeText(node.observed_model_revision, "cockpit training observed revision"),
+    model_matches_expected: optionalBoolean(node.model_matches_expected, "cockpit training model match"),
+    gpu_name: optionalSafeText(node.gpu_name, "cockpit training GPU"),
+    cuda_version: optionalSafeText(node.cuda_version, "cockpit training CUDA"),
+    driver_version: optionalSafeText(node.driver_version, "cockpit training driver"),
+  };
+}
+
+function parseCockpitTrainingJob(job: Record<string, unknown>): CockpitTrainingJob {
+  exactRecord(job, ["job_id", "attempt_id", "status", "backend", "created_at", "updated_at", "started_at", "completed_at", "source_event_start", "source_event_end", "selected_episode_count", "remote_job_id", "worker_node_id", "retry_count", "transferred_bytes", "failure_code", "candidate_adapter_id", "import_status", "bundle_digest", "result_digest"], "cockpit training job");
+  return {
+    job_id: safeId(job.job_id, "cockpit training job"),
+    attempt_id: safeId(job.attempt_id, "cockpit training attempt"),
+    status: enumValue(job.status, ["preparing", "ready", "dispatched", "running", "succeeded", "importing", "completed", "failed", "cancelled", "unavailable"] as const, "cockpit training job status"),
+    backend: optionalSafeText(job.backend, "cockpit training job backend"),
+    created_at: optionalIsoTimestamp(job.created_at, "cockpit training job created"),
+    updated_at: optionalIsoTimestamp(job.updated_at, "cockpit training job updated"),
+    started_at: optionalIsoTimestamp(job.started_at, "cockpit training job started"),
+    completed_at: optionalIsoTimestamp(job.completed_at, "cockpit training job completed"),
+    source_event_start: optionalNonnegativeInteger(job.source_event_start, "cockpit training source event start"),
+    source_event_end: optionalNonnegativeInteger(job.source_event_end, "cockpit training source event end"),
+    selected_episode_count: optionalNonnegativeInteger(job.selected_episode_count, "cockpit training selected episodes"),
+    remote_job_id: optionalSafeId(job.remote_job_id, "cockpit training remote job"),
+    worker_node_id: optionalSafeId(job.worker_node_id, "cockpit training worker"),
+    retry_count: optionalNonnegativeInteger(job.retry_count, "cockpit training retry"),
+    transferred_bytes: optionalNonnegativeInteger(job.transferred_bytes, "cockpit training transferred bytes"),
+    failure_code: job.failure_code === null ? null : enumValue(job.failure_code, ["worker_unavailable", "ssh_failed", "transfer_failed", "timeout", "cancelled", "bundle_invalid", "result_invalid", "training_failed", "cuda_oom", "non_finite_metrics", "import_failed", "evaluation_failed", "unknown_failure"] as const, "cockpit training failure code"),
+    candidate_adapter_id: optionalSafeId(job.candidate_adapter_id, "cockpit training candidate adapter"),
+    import_status: enumValue(job.import_status, ["not_started", "importing", "completed", "failed", "unavailable"] as const, "cockpit training import status"),
+    bundle_digest: optionalDigest(job.bundle_digest, "cockpit training bundle digest"),
+    result_digest: optionalDigest(job.result_digest, "cockpit training result digest"),
+  };
+}
+
+function parseCockpitAdapterLineage(adapter: Record<string, unknown>): CockpitAdapterLineage {
+  exactRecord(adapter, ["adapter_id", "status", "adapter_hash", "base_model_id", "base_model_revision", "parent_adapter_id", "training_job_id", "training_node_id", "submitted_by_node_id", "imported_by_node_id", "evaluation_id", "evaluation_status", "approved", "active", "rollback_candidate", "activation_event_id", "activation_event_sequence", "rollback_event_id", "rollback_event_sequence"], "cockpit adapter lineage");
+  return {
+    adapter_id: safeId(adapter.adapter_id, "cockpit adapter lineage"),
+    status: safeText(adapter.status, "cockpit adapter status"),
+    adapter_hash: optionalDigest(adapter.adapter_hash, "cockpit adapter hash"),
+    base_model_id: optionalSafeText(adapter.base_model_id, "cockpit adapter base model"),
+    base_model_revision: optionalSafeText(adapter.base_model_revision, "cockpit adapter base revision"),
+    parent_adapter_id: optionalSafeId(adapter.parent_adapter_id, "cockpit parent adapter"),
+    training_job_id: optionalSafeId(adapter.training_job_id, "cockpit adapter training job"),
+    training_node_id: optionalSafeId(adapter.training_node_id, "cockpit adapter training node"),
+    submitted_by_node_id: optionalSafeId(adapter.submitted_by_node_id, "cockpit adapter submitter"),
+    imported_by_node_id: optionalSafeId(adapter.imported_by_node_id, "cockpit adapter importer"),
+    evaluation_id: optionalSafeId(adapter.evaluation_id, "cockpit adapter evaluation"),
+    evaluation_status: enumValue(adapter.evaluation_status, ["passed", "failed", "stale", "corrupt", "unavailable"] as const, "cockpit adapter evaluation"),
+    approved: booleanValue(adapter.approved, "cockpit adapter approved"),
+    active: booleanValue(adapter.active, "cockpit adapter active"),
+    rollback_candidate: booleanValue(adapter.rollback_candidate, "cockpit adapter rollback candidate"),
+    activation_event_id: optionalSafeId(adapter.activation_event_id, "cockpit adapter activation event"),
+    activation_event_sequence: optionalPositiveInteger(adapter.activation_event_sequence, "cockpit adapter activation sequence"),
+    rollback_event_id: optionalSafeId(adapter.rollback_event_id, "cockpit adapter rollback event"),
+    rollback_event_sequence: optionalPositiveInteger(adapter.rollback_event_sequence, "cockpit adapter rollback sequence"),
+  };
+}
+
 function identityOrigin(value: unknown, label: string): string {
   if (!isRecord(value)) invalid(`${label} origin`);
   const actor = text(value.actor, `${label} origin`);
@@ -1204,6 +1364,16 @@ function id(value: unknown, label: string): string {
   return value;
 }
 
+function safeId(value: unknown, label: string): string {
+  const result = id(value, label);
+  if (result.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(result)) invalid(`${label} ID`);
+  return result;
+}
+
+function optionalSafeId(value: unknown, label: string): string | null {
+  return value === null ? null : safeId(value, label);
+}
+
 function optionalId(value: unknown, label: string): string | null {
   return value === null ? null : id(value, label);
 }
@@ -1211,6 +1381,36 @@ function optionalId(value: unknown, label: string): string | null {
 function text(value: unknown, label: string): string {
   if (typeof value !== "string" || !value.trim()) invalid(label);
   return value;
+}
+
+function safeText(value: unknown, label: string): string {
+  const result = text(value, label);
+  if (result.length > 160 || !/^[A-Za-z0-9 ._+:/(),-]+$/.test(result)) invalid(label);
+  return result;
+}
+
+function optionalSafeText(value: unknown, label: string): string | null {
+  return value === null ? null : safeText(value, label);
+}
+
+function isoTimestamp(value: unknown, label: string): string {
+  const result = text(value, label);
+  if (Number.isNaN(Date.parse(result))) invalid(label);
+  return result;
+}
+
+function optionalIsoTimestamp(value: unknown, label: string): string | null {
+  return value === null ? null : isoTimestamp(value, label);
+}
+
+function digest(value: unknown, label: string): string {
+  const result = text(value, label);
+  if (!/^[0-9a-f]{64}$/.test(result)) invalid(label);
+  return result;
+}
+
+function optionalDigest(value: unknown, label: string): string | null {
+  return value === null ? null : digest(value, label);
 }
 
 function boundedCode(value: unknown, label: string): string {
@@ -1259,6 +1459,10 @@ function optionalNumber(value: unknown, label: string): number | null {
   return value === null ? null : finiteNumber(value, label);
 }
 
+function optionalNonnegativeInteger(value: unknown, label: string): number | null {
+  return value === null ? null : nonnegativeInteger(value, label);
+}
+
 function nonnegativeInteger(value: unknown, label: string): number {
   const result = finiteNumber(value, label);
   if (!Number.isInteger(result) || result < 0) invalid(label);
@@ -1278,6 +1482,17 @@ function optionalPositiveInteger(value: unknown, label: string): number | null {
 function booleanValue(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") invalid(label);
   return value;
+}
+
+function optionalBoolean(value: unknown, label: string): boolean | null {
+  return value === null ? null : booleanValue(value, label);
+}
+
+function exactRecord<const T extends readonly string[]>(value: unknown, keys: T, label: string): asserts value is Record<T[number], unknown> {
+  if (!isRecord(value)) invalid(label);
+  const allowed = new Set(keys);
+  const actual = Object.keys(value);
+  if (actual.length !== keys.length || actual.some((key) => !allowed.has(key))) invalid(label);
 }
 
 function enumValue<const T extends readonly string[]>(value: unknown, values: T, label: string): T[number] {
@@ -1316,6 +1531,7 @@ export const api = {
   decisions: async () => parseDecisions(await privateApiRequest<unknown>("/decisions")),
   cockpitOutbox: async () => parseCockpitOutbox(await privateApiRequest<unknown>("/outbox/summary")),
   actionTrace: async () => parseActionTrace(await privateApiRequest<unknown>("/actions/trace")),
+  cockpitTraining: async () => parseCockpitTrainingSummary(await privateApiRequest<unknown>("/training/cockpit-summary")),
   memorySearch: (query: string) => privateApiRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
   archiveEpisodeMemory: (episodeId: string) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/archive`, { method: "POST" }),
   updateEpisodeMemoryMetadata: (episodeId: string, body: MemoryMetadataUpdate) => privateApiRequest<EpisodeMemory>(`/memory/episodes/${encodeURIComponent(episodeId)}/metadata`, { method: "POST", body: JSON.stringify(body) }),

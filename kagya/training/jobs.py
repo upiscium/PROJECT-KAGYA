@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -93,7 +94,10 @@ class TrainingJob:
     stale: bool = False
     dataset_revision: str | None = None
     dataset_manifest_hash: str | None = None
-    schema_version: int = 2
+    result_digest: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    schema_version: int = 3
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "TrainingJob":
@@ -105,6 +109,19 @@ class TrainingJob:
             data.get("phase_durations_seconds") or {}
         )
         data["training_metrics"] = dict(data.get("training_metrics") or {})
+        if int(data.get("schema_version", 1)) < 3:
+            status = data["status"]
+            data["started_at"] = (
+                data.get("phase_started_at")
+                if status == TrainingJobStatus.RUNNING
+                else None
+            )
+            data["completed_at"] = (
+                data.get("phase_started_at") or data.get("updated_at")
+                if status == TrainingJobStatus.COMPLETED
+                else None
+            )
+            data["schema_version"] = 3
         return cls(**data)
 
 
@@ -125,6 +142,7 @@ class TrainingJobRegistry:
         backend: str,
         job_id: str | None = None,
         processor_revision: str | None = None,
+        worker_node_id: str | None = None,
     ) -> tuple[TrainingJob, bool]:
         with self._lock:
             existing = next(
@@ -163,6 +181,7 @@ class TrainingJobRegistry:
                 correlation_id=idempotency_key,
                 processor_revision=processor_revision,
                 training_metrics={},
+                worker_node_id=worker_node_id,
             )
             self._jobs[identifier] = job
             self._save()
@@ -210,6 +229,18 @@ class TrainingJobRegistry:
                     0.0,
                     (now - datetime.fromisoformat(current.created_at)).total_seconds(),
                 ),
+                started_at=(
+                    now.isoformat()
+                    if status == TrainingJobStatus.RUNNING
+                    and current.started_at is None
+                    else current.started_at
+                ),
+                completed_at=(
+                    now.isoformat()
+                    if status == TrainingJobStatus.COMPLETED
+                    and current.completed_at is None
+                    else current.completed_at
+                ),
                 **changes,
             )
             self._jobs[job_id] = updated
@@ -256,17 +287,30 @@ class TrainingBackend(Protocol):
     def cleanup(self, retention_days: int) -> dict[str, Any]: ...
 
 
+class RemoteWorkerCommandRejected(RuntimeError):
+    def __init__(self, category: str, *, retryable: bool) -> None:
+        self.category = category
+        self.retryable = retryable
+        super().__init__(f"remote worker command rejected: {category}")
+
+
 class LocalTrainingBackend:
     def __init__(self, trainer: QloraTrainer) -> None:
         self.trainer = trainer
         self._statuses: dict[str, TrainingJobStatus] = {}
         self._results: dict[str, QloraTrainingResult] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
         self._cancelled: set[str] = set()
 
     def submit(self, job: TrainingJob, bundle_path: Path) -> str:
         if job.job_id in self._statuses:
             return job.job_id
         self._statuses[job.job_id] = TrainingJobStatus.RUNNING
+        self._metadata[job.job_id] = {
+            "remote_last_contact": _now(),
+            "worker_node_id": self.trainer.settings.deployment.node.id,
+            "worker_hostname": os.uname().nodename,
+        }
         if job.job_id in self._cancelled:
             self._statuses[job.job_id] = TrainingJobStatus.CANCELLED
             return job.job_id
@@ -303,8 +347,20 @@ class LocalTrainingBackend:
             "backend": "local",
         }
 
+    def cached_node_status(self) -> dict[str, Any]:
+        return self.node_status()
+
     def job_metadata(self, job_id: str) -> dict[str, Any]:
-        return {"remote_last_contact": _now()}
+        return dict(
+            self._metadata.get(
+                job_id,
+                {
+                    "remote_last_contact": _now(),
+                    "worker_node_id": self.trainer.settings.deployment.node.id,
+                    "worker_hostname": os.uname().nodename,
+                },
+            )
+        )
 
     def cleanup(self, retention_days: int) -> dict[str, Any]:
         return {"removed": [], "retention_days": retention_days}
@@ -531,6 +587,11 @@ class SleepCoordinator:
         self._threads: dict[str, Thread] = {}
         self._cancel: dict[str, Event] = {}
         for job in self.registry.list():
+            if job.worker_node_id is None and job.status not in TERMINAL_JOB_STATUSES:
+                job = self.registry.update(
+                    job.job_id,
+                    worker_node_id=self._configured_worker_node_id(),
+                )
             if job.backend == "local" and job.status not in TERMINAL_JOB_STATUSES:
                 self.registry.transition(
                     job.job_id,
@@ -558,6 +619,7 @@ class SleepCoordinator:
             parent_adapter_id=None if active is None else active.adapter_id,
             backend=self.settings.deployment.training.backend.value,
             processor_revision=self.settings.model.processor_revision,
+            worker_node_id=self._configured_worker_node_id(),
         )
         if not created:
             return job
@@ -580,6 +642,7 @@ class SleepCoordinator:
             parent_adapter_id=previous.parent_adapter_id,
             backend=previous.backend,
             processor_revision=previous.processor_revision,
+            worker_node_id=self._configured_worker_node_id(),
         )
         if not created:
             return job
@@ -621,6 +684,21 @@ class SleepCoordinator:
             status() if status is not None else {"reachable": True, "backend": "test"}
         ]
 
+    def cached_node_status(self) -> list[dict[str, Any]]:
+        status = getattr(self.backend, "cached_node_status", None)
+        if status is None:
+            if self.settings.deployment.training.remote_worker is not None:
+                return [
+                    {
+                        "node_id": self.settings.deployment.training.remote_worker.node_id,
+                        "reachable": False,
+                        "last_contact": None,
+                        "backend": self.settings.deployment.training.backend.value,
+                    }
+                ]
+            return self.node_status()
+        return [status()]
+
     def reconcile(self, job_id: str) -> TrainingJob:
         job = self.registry.get(job_id)
         if job.backend == "local" or job.status in TERMINAL_JOB_STATUSES:
@@ -629,10 +707,11 @@ class SleepCoordinator:
         try:
             remote_status = self.backend.inspect(job.remote_job_id or job.job_id)
         except Exception as exc:
+            category, retryable = _classify_failure(exc)
             return self.registry.update(
                 job_id,
-                failure_category="worker_unreachable",
-                retryable=True,
+                failure_category=category,
+                retryable=retryable,
                 error=str(exc),
                 stale=self._is_stale(job),
             )
@@ -768,7 +847,7 @@ class SleepCoordinator:
             entry = self.subject_executor(
                 "runtime.sleep.resume_finalize",
                 lambda: self._finalize_subject_state(
-                    preparation, job.attempt_id, result
+                    preparation, job, result
                 ),
             )
             self.registry.transition(
@@ -847,7 +926,7 @@ class SleepCoordinator:
             entry = self.subject_executor(
                 "runtime.sleep.finalize",
                 lambda: self._finalize_subject_state(
-                    preparation, job.attempt_id, result
+                    preparation, self.registry.get(job_id), result
                 ),
             )
             self.registry.transition(
@@ -874,6 +953,14 @@ class SleepCoordinator:
         metadata = {} if metadata_getter is None else metadata_getter(job_id)
         if metadata:
             self.registry.update(job_id, **metadata)
+
+    def _configured_worker_node_id(self) -> str:
+        remote = self.settings.deployment.training.remote_worker
+        return (
+            remote.node_id
+            if remote is not None
+            else self.settings.deployment.node.id
+        )
 
     def _is_stale(self, job: TrainingJob) -> bool:
         reference = datetime.fromisoformat(job.remote_last_contact or job.updated_at)
@@ -911,16 +998,21 @@ class SleepCoordinator:
     def _finalize_subject_state(
         self,
         preparation: ConsolidationPreparation,
-        attempt_id: str,
+        job: TrainingJob,
         result: QloraTrainingResult,
     ):
         if result.artifact_path is not None:
             if self.candidate_importer is None:
                 raise RuntimeError("remote training result requires candidate importer")
+            result_digest = _artifact_digest(result.artifact_path)
             entry = self.candidate_importer.import_result(
                 result.artifact_path, result.dataset_path.parent
             )
-            self.consolidator.complete(preparation, attempt_id)
+            self.registry.update(
+                job.job_id,
+                result_digest=result_digest,
+            )
+            self.consolidator.complete(preparation, job.attempt_id)
             return entry
         entry = self.adapter_registry.lookup(result.adapter_id)
         if entry is None:
@@ -934,6 +1026,10 @@ class SleepCoordinator:
                 adapter_hash=result.adapter_hash,
                 parent_adapter_id=result.parent_adapter_id,
                 parent_adapter_hash=result.parent_adapter_hash,
+                training_job_id=job.job_id,
+                training_node_id=self.settings.deployment.node.id,
+                submitted_by_node_id=self.settings.deployment.node.id,
+                imported_by_node_id=self.settings.deployment.node.id,
                 evaluation_set_hashes=(
                     (
                         sha256_bytes(
@@ -952,7 +1048,7 @@ class SleepCoordinator:
                 ),
                 notes=f"registered by {self.settings.deployment.training.backend.value} sleep job",
             )
-        self.consolidator.complete(preparation, attempt_id)
+        self.consolidator.complete(preparation, job.attempt_id)
         return entry
 
 
@@ -975,6 +1071,25 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _artifact_digest(path: Path) -> str:
+    digest = sha256()
+    files = sorted(
+        item
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
+    for item in files:
+        file_digest = sha256()
+        with item.open("rb") as artifact:
+            for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+        digest.update(item.relative_to(path).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(file_digest.hexdigest().encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -984,6 +1099,8 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _classify_failure(exc: Exception) -> tuple[str, bool]:
+    if isinstance(exc, RemoteWorkerCommandRejected):
+        return exc.category, exc.retryable
     if isinstance(exc, TimeoutError):
         return "timeout", True
     if isinstance(exc, (ConnectionError, subprocess.SubprocessError)):
