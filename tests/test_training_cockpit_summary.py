@@ -140,6 +140,49 @@ def test_cockpit_training_activation_rollback_and_evaluation_binding(
     assert adapters["adapter-corrupt"]["evaluation_status"] == "corrupt"
 
 
+def test_cockpit_training_marks_rollback_target_adapter_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = _adapter("adapter-target", status=AdapterStatus.ARCHIVED)
+    active = replace(
+        _adapter("adapter-active", status=AdapterStatus.ACTIVE),
+        rollback_target_id="adapter-target",
+    )
+    missing_target_active = replace(
+        _adapter("adapter-active-missing", status=AdapterStatus.ACTIVE),
+        rollback_target_id="missing-target",
+    )
+    archived_with_target = replace(
+        _adapter("adapter-archived-source", status=AdapterStatus.ARCHIVED),
+        rollback_target_id="adapter-unrelated",
+    )
+    unrelated = _adapter("adapter-unrelated", status=AdapterStatus.ARCHIVED)
+    canary = replace(
+        _adapter("adapter-canary"),
+        rollout_state="canary",
+    )
+    client, _runtime, _coordinator = _client(
+        tmp_path,
+        monkeypatch,
+        adapters=[
+            target,
+            active,
+            missing_target_active,
+            archived_with_target,
+            unrelated,
+            canary,
+        ],
+    )
+
+    adapters = {item["adapter_id"]: item for item in _get(client).json()["adapters"]}
+
+    assert adapters["adapter-target"]["rollback_candidate"] is True
+    assert adapters["adapter-active"]["rollback_candidate"] is False
+    assert adapters["adapter-active-missing"]["rollback_candidate"] is False
+    assert adapters["adapter-unrelated"]["rollback_candidate"] is False
+    assert adapters["adapter-canary"]["rollback_candidate"] is False
+
+
 def test_cockpit_training_cross_record_mismatches_fail_closed(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -157,6 +200,26 @@ def test_cockpit_training_cross_record_mismatches_fail_closed(
 
     assert payload["jobs"][0]["candidate_adapter_id"] is None
     assert all(item["training_job_id"] is None for item in payload["adapters"])
+
+
+def test_cockpit_training_uses_job_result_digest_not_adapter_hash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result_digest = "c" * 64
+    job = replace(
+        _job("job-1", status=TrainingJobStatus.COMPLETED, candidate_adapter_id="adapter-1"),
+        result_digest=result_digest,
+    )
+    adapter = _adapter("adapter-1", adapter_hash=DIGEST_A)
+    client, _runtime, _coordinator = _client(
+        tmp_path, monkeypatch, jobs=[job], adapters=[adapter]
+    )
+
+    payload = _get(client).json()
+
+    assert payload["jobs"][0]["candidate_adapter_id"] == "adapter-1"
+    assert payload["jobs"][0]["result_digest"] == result_digest
+    assert payload["jobs"][0]["result_digest"] != adapter.adapter_hash
 
 
 def _get(client: TestClient, suffix: str = ""):

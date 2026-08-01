@@ -209,22 +209,19 @@ class SSHTrainingBackend:
                 timeout=self.settings.connect_timeout_seconds,
             )
             payload = _json_output(response.stdout)
-            self._node_status = {
+            self._mark_node_contact(
+                reachable=True,
+                payload=_cacheable_health(payload),
+            )
+            return {
                 **payload,
                 "node_id": self.settings.node_id,
                 "reachable": True,
-                "last_contact": _now(),
+                "last_contact": self._node_status["last_contact"],
                 "backend": "ssh",
             }
-            return dict(self._node_status)
-        except (RuntimeError, TimeoutError) as exc:
-            self._node_status = {
-                "node_id": self.settings.node_id,
-                "reachable": False,
-                "last_contact": None,
-                "backend": "ssh",
-                "error": str(exc),
-            }
+        except (RuntimeError, TimeoutError):
+            self._mark_node_contact(reachable=False)
             return dict(self._node_status)
 
     def cached_node_status(self) -> dict[str, Any]:
@@ -243,39 +240,68 @@ class SSHTrainingBackend:
                 str(retention_days),
             ]
         )
-        return _json_output(response.stdout)
+        payload = _json_output(response.stdout)
+        self._mark_node_contact(reachable=True)
+        return payload
 
     def _worker_command(self, action: str, job_id: str) -> dict[str, Any]:
         _validate_identifier(job_id, "job ID")
         response = self._run_checked(
             self._ssh_base() + [str(self.settings.command), action, "--job-id", job_id]
         )
-        return _json_output(response.stdout)
+        payload = _json_output(response.stdout)
+        self._mark_node_contact(reachable=True)
+        return payload
+
+    def _mark_node_contact(
+        self,
+        *,
+        reachable: bool,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        previous = self._node_status
+        self._node_status = {
+            **previous,
+            **(payload or {}),
+            "node_id": self.settings.node_id,
+            "reachable": reachable,
+            "last_contact": _now() if reachable else previous.get("last_contact"),
+            "backend": "ssh",
+        }
 
     def _run_checked(
         self, argv: list[str], *, timeout: float | None = None
     ) -> subprocess.CompletedProcess[str]:
-        last_error: subprocess.CalledProcessError | None = None
+        last_error: (
+            OSError | subprocess.CalledProcessError | subprocess.TimeoutExpired | None
+        ) = None
         for attempt in range(3):
             try:
-                return self._run(
+                response = self._run(
                     argv,
                     check=True,
                     capture_output=True,
                     text=True,
                     timeout=timeout or self.settings.job_timeout_seconds,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                last_error = (
-                    exc if isinstance(exc, subprocess.CalledProcessError) else None
-                )
+                self._mark_node_contact(reachable=True)
+                return response
+            except (
+                OSError,
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+            ) as exc:
+                last_error = exc
                 if attempt < 2:
                     self._sleep(min(self.settings.poll_interval_seconds, 1.0))
-        if last_error is not None:
+        self._mark_node_contact(reachable=False)
+        if isinstance(last_error, subprocess.CalledProcessError):
             raise RuntimeError(
                 f"remote command failed: {last_error.stderr}"
             ) from last_error
-        raise TimeoutError("remote command timed out")
+        if isinstance(last_error, subprocess.TimeoutExpired):
+            raise TimeoutError("remote command timed out") from last_error
+        raise RuntimeError("remote command unavailable") from last_error
 
     def _ssh_base(self) -> list[str]:
         return [
@@ -326,6 +352,19 @@ def _json_output(value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("remote worker returned invalid payload")
     return payload
+
+
+def _cacheable_health(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "heartbeat",
+        "model_id",
+        "model_revision",
+        "processor_revision",
+        "max_concurrent_jobs",
+        "active_jobs",
+        "gpu",
+    }
+    return {key: value for key, value in payload.items() if key in allowed}
 
 
 def _validate_identifier(value: str, label: str) -> None:

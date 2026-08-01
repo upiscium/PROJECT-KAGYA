@@ -22,6 +22,7 @@ import {
   type CockpitOutboxMessage,
   type Plan,
 } from "@/lib/api";
+import { evaluationHref } from "@/lib/anchors";
 
 export function CockpitClient() {
   const runtime = useQuery({ queryKey: ["cockpit", "runtime"], queryFn: api.systemInfo });
@@ -236,7 +237,7 @@ function EntityReference({ kind, id, available }: { kind: string; id: string | n
 
 function EvaluationReference({ id, available }: { id: string | null; available: Set<string> }) {
   if (id === null) return <>unavailable</>;
-  return available.has(id) ? <Link className="entity-link mono" href={`/evaluations#${anchor("evaluation", id)}`}>{id}</Link> : <span className="mono muted">{id}</span>;
+  return available.has(id) ? <Link className="entity-link mono" href={evaluationHref(id)}>{id}</Link> : <span className="mono muted">{id}</span>;
 }
 
 function ReferenceList({ kind, ids, available }: { kind: string; ids: string[]; available: Set<string> }) {

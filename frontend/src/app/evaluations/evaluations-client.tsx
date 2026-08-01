@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { api, errorMessage, type BehavioralEvaluationSummary, type EvaluationResultSummary } from "@/lib/api";
+import { evaluationAnchor, evaluationIdFromHash } from "@/lib/anchors";
 import { formatNumber, statusTone } from "@/lib/format";
 
 export function EvaluationsClient() {
@@ -21,6 +22,24 @@ export function EvaluationsClient() {
   });
   const [selectedBehavioralId, setSelectedBehavioralId] = useState<string | null>(null);
   const behavioralId = selectedBehavioralId ?? (behavioral.data?.results ?? [])[0]?.evaluation_id ?? null;
+  useEffect(() => {
+    const selectFromLocation = () => {
+      const id = evaluationIdFromHash(window.location.hash);
+      const selected = id !== null && behavioral.data?.results.some((result) => result.evaluation_id === id)
+        ? id
+        : null;
+      setSelectedBehavioralId(selected);
+      setFailureScenario(null);
+    };
+    selectFromLocation();
+    window.addEventListener("hashchange", selectFromLocation);
+    return () => window.removeEventListener("hashchange", selectFromLocation);
+  }, [behavioral.data?.results]);
+  useEffect(() => {
+    const linkedId = evaluationIdFromHash(window.location.hash);
+    if (linkedId !== behavioralId) return;
+    document.getElementById(evaluationAnchor(linkedId))?.scrollIntoView?.({ block: "nearest" });
+  }, [behavioralId]);
   const behavioralDetail = useQuery({
     queryKey: ["behavioral-evaluation", behavioralId],
     queryFn: () => api.behavioralEvaluation(behavioralId ?? ""),
@@ -63,9 +82,9 @@ export function EvaluationsClient() {
         {rerun.error ? <p className="error">{errorMessage(rerun.error)}</p> : null}
         {rerun.data ? <p className="muted">Rerun {rerun.data.evaluation_id}: hashes {rerun.data.fixture_hashes_match ? "verified" : "mismatched"}</p> : null}
         <div className="grid">
-          <EvidenceSection title="Synthetic evaluator contract" kind="synthetic_evaluator_contract" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
-          <EvidenceSection title="Deterministic runtime evaluation" kind="deterministic_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
-          <EvidenceSection title="Real-model runtime evaluation" kind="real_model_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <EvidenceSection title="Synthetic evaluator contract" kind="synthetic_evaluator_contract" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { selectBehavioralEvaluation(id); setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <EvidenceSection title="Deterministic runtime evaluation" kind="deterministic_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { selectBehavioralEvaluation(id); setSelectedBehavioralId(id); setFailureScenario(null); }} />
+          <EvidenceSection title="Real-model runtime evaluation" kind="real_model_runtime" results={behavioral.data?.results ?? []} selectedId={behavioralId} onSelect={(id) => { selectBehavioralEvaluation(id); setSelectedBehavioralId(id); setFailureScenario(null); }} />
           <Card>
             <CardTitle>Hardware evidence</CardTitle>
             <p className="muted">Pending an explicit real-model run on the configured model and adapter artifacts. Deterministic evidence does not satisfy the production hardware gate.</p>
@@ -126,7 +145,7 @@ function EvidenceSection({ title, kind, results, selectedId, onSelect }: { title
 
 function BehavioralRow({ result, selected, onSelect }: { result: BehavioralEvaluationSummary; selected: boolean; onSelect: () => void }) {
   return (
-    <article className="record">
+    <article className="record" id={evaluationAnchor(result.evaluation_id)}>
       <div className="metadata-row">
         <Badge data-tone={result.activation_gate_passed ? "success" : "danger"}>{result.runtime_kind === "synthetic_evaluator_contract" ? (result.activation_gate_passed ? "contract passed" : "contract failed") : (result.activation_gate_passed ? "gate passed" : "blocked")}</Badge>
         <span className="mono">{result.evaluation_id}</span>
@@ -138,6 +157,11 @@ function BehavioralRow({ result, selected, onSelect }: { result: BehavioralEvalu
       <Button onClick={onSelect} disabled={selected}>{selected ? "Selected" : "Inspect"}</Button>
     </article>
   );
+}
+
+function selectBehavioralEvaluation(id: string): void {
+  if (typeof window === "undefined") return;
+  window.history.replaceState(null, "", `#${evaluationAnchor(id)}`);
 }
 
 function EvaluationRow({ result, selected, onSelect }: { result: EvaluationResultSummary; selected: boolean; onSelect: () => void }) {

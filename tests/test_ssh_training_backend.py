@@ -157,6 +157,26 @@ def test_ssh_backend_reports_worker_heartbeat_and_partition(tmp_path: Path) -> N
     assert status["reachable"] is True
     assert status["node_id"] == "training-01"
 
+    cached = SSHTrainingBackend(
+        settings,
+        tmp_path / "results-cached",
+        run=lambda argv, **kwargs: _completed(
+            argv,
+            {
+                "hostname": "PRIVATE_HOST",
+                "host": "PRIVATE_HOST",
+                "user": "PRIVATE_USER",
+                "command": "PRIVATE_COMMAND",
+                "identity": "PRIVATE_IDENTITY",
+                "error": "PRIVATE_ERROR",
+                "model_id": "model",
+            },
+        ),
+    )
+    cached.node_status()
+    assert cached.cached_node_status()["model_id"] == "model"
+    assert "PRIVATE_" not in str(cached.cached_node_status())
+
     def partitioned(argv, **kwargs):
         raise subprocess.CalledProcessError(255, argv, stderr="partition")
 
@@ -167,7 +187,75 @@ def test_ssh_backend_reports_worker_heartbeat_and_partition(tmp_path: Path) -> N
         sleep=lambda _: None,
     ).node_status()
     assert unavailable["reachable"] is False
-    assert "partition" in unavailable["error"]
+    assert "error" not in unavailable
+
+
+def test_ssh_backend_updates_cached_health_on_worker_contact(tmp_path: Path) -> None:
+    bundle, job = _bundle_and_job(tmp_path)
+    remote_result = _result(tmp_path, job)
+    failures_remaining = 0
+
+    def run(argv, **kwargs):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise subprocess.CalledProcessError(255, argv, stderr="partition")
+        if argv[0] == "rsync":
+            if "remote:/worker/results" in argv[-2]:
+                _copy_contents(remote_result, Path(argv[-1]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        action = argv[-3] if argv[-2] == "--job-id" else argv[-7]
+        if action == "health":
+            return _completed(argv, {"hostname": "worker"})
+        if action == "run":
+            return _completed(argv, {"job_id": job.job_id, "status": "ready"})
+        return _completed(argv, {"job_id": job.job_id, "status": "succeeded"})
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path), tmp_path / "results", run=run, sleep=lambda _: None
+    )
+    assert backend.cached_node_status()["reachable"] is False
+
+    backend.submit(job, bundle)
+    online = backend.cached_node_status()
+    assert online["reachable"] is True
+    assert online["last_contact"] is not None
+    failures_remaining = 3
+    with pytest.raises(RuntimeError, match="remote command failed"):
+        backend.inspect(job.job_id)
+    unavailable = backend.cached_node_status()
+    assert unavailable["reachable"] is False
+    assert unavailable["last_contact"] == online["last_contact"]
+    assert "partition" not in str(unavailable)
+    assert "remote" not in str(unavailable)
+    assert "worker" not in str(unavailable)
+    assert "identity" not in str(unavailable)
+
+    backend.fetch_result(job.job_id)
+    assert backend.cached_node_status()["reachable"] is True
+
+    calls_before_cache_read = failures_remaining
+    backend.cached_node_status()
+    assert failures_remaining == calls_before_cache_read
+
+
+def test_ssh_backend_marks_spawn_failure_unavailable_without_caching_details(
+    tmp_path: Path,
+) -> None:
+    def missing_executable(argv, **kwargs):
+        raise OSError("PRIVATE_IDENTITY_PATH")
+
+    backend = SSHTrainingBackend(
+        _remote_settings(tmp_path),
+        tmp_path / "results",
+        run=missing_executable,
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="remote command unavailable"):
+        backend.cleanup(30)
+    assert backend.cached_node_status()["reachable"] is False
+    assert "PRIVATE_IDENTITY_PATH" not in str(backend.cached_node_status())
 
 
 def _remote_settings(tmp_path: Path) -> RemoteWorkerSettings:

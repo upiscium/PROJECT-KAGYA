@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -93,6 +94,7 @@ class TrainingJob:
     stale: bool = False
     dataset_revision: str | None = None
     dataset_manifest_hash: str | None = None
+    result_digest: str | None = None
     schema_version: int = 2
 
     @classmethod
@@ -261,6 +263,7 @@ class LocalTrainingBackend:
         self.trainer = trainer
         self._statuses: dict[str, TrainingJobStatus] = {}
         self._results: dict[str, QloraTrainingResult] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
         self._cancelled: set[str] = set()
 
     def submit(self, job: TrainingJob, bundle_path: Path) -> str:
@@ -272,6 +275,11 @@ class LocalTrainingBackend:
             return job.job_id
         result = self.trainer.train_bundle(bundle_path)
         self._results[job.job_id] = result
+        self._metadata[job.job_id] = {
+            "remote_last_contact": _now(),
+            "worker_node_id": self.trainer.settings.deployment.node.id,
+            "worker_hostname": os.uname().nodename,
+        }
         self._statuses[job.job_id] = TrainingJobStatus.SUCCEEDED
         return job.job_id
 
@@ -307,7 +315,16 @@ class LocalTrainingBackend:
         return self.node_status()
 
     def job_metadata(self, job_id: str) -> dict[str, Any]:
-        return {"remote_last_contact": _now()}
+        return dict(
+            self._metadata.get(
+                job_id,
+                {
+                    "remote_last_contact": _now(),
+                    "worker_node_id": self.trainer.settings.deployment.node.id,
+                    "worker_hostname": os.uname().nodename,
+                },
+            )
+        )
 
     def cleanup(self, retention_days: int) -> dict[str, Any]:
         return {"removed": [], "retention_days": retention_days}
@@ -786,7 +803,7 @@ class SleepCoordinator:
             entry = self.subject_executor(
                 "runtime.sleep.resume_finalize",
                 lambda: self._finalize_subject_state(
-                    preparation, job.attempt_id, result
+                    preparation, job, result
                 ),
             )
             self.registry.transition(
@@ -865,7 +882,7 @@ class SleepCoordinator:
             entry = self.subject_executor(
                 "runtime.sleep.finalize",
                 lambda: self._finalize_subject_state(
-                    preparation, job.attempt_id, result
+                    preparation, self.registry.get(job_id), result
                 ),
             )
             self.registry.transition(
@@ -929,16 +946,21 @@ class SleepCoordinator:
     def _finalize_subject_state(
         self,
         preparation: ConsolidationPreparation,
-        attempt_id: str,
+        job: TrainingJob,
         result: QloraTrainingResult,
     ):
         if result.artifact_path is not None:
             if self.candidate_importer is None:
                 raise RuntimeError("remote training result requires candidate importer")
+            result_digest = _artifact_digest(result.artifact_path)
             entry = self.candidate_importer.import_result(
                 result.artifact_path, result.dataset_path.parent
             )
-            self.consolidator.complete(preparation, attempt_id)
+            self.registry.update(
+                job.job_id,
+                result_digest=result_digest,
+            )
+            self.consolidator.complete(preparation, job.attempt_id)
             return entry
         entry = self.adapter_registry.lookup(result.adapter_id)
         if entry is None:
@@ -952,6 +974,10 @@ class SleepCoordinator:
                 adapter_hash=result.adapter_hash,
                 parent_adapter_id=result.parent_adapter_id,
                 parent_adapter_hash=result.parent_adapter_hash,
+                training_job_id=job.job_id,
+                training_node_id=self.settings.deployment.node.id,
+                submitted_by_node_id=self.settings.deployment.node.id,
+                imported_by_node_id=self.settings.deployment.node.id,
                 evaluation_set_hashes=(
                     (
                         sha256_bytes(
@@ -970,7 +996,7 @@ class SleepCoordinator:
                 ),
                 notes=f"registered by {self.settings.deployment.training.backend.value} sleep job",
             )
-        self.consolidator.complete(preparation, attempt_id)
+        self.consolidator.complete(preparation, job.attempt_id)
         return entry
 
 
@@ -991,6 +1017,25 @@ def _lineage_records(lineage: list[Any]) -> list[bytes]:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _artifact_digest(path: Path) -> str:
+    digest = sha256()
+    files = sorted(
+        item
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
+    for item in files:
+        file_digest = sha256()
+        with item.open("rb") as artifact:
+            for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+        digest.update(item.relative_to(path).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(file_digest.hexdigest().encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:

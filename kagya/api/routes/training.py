@@ -19,7 +19,7 @@ from kagya.api.dependencies import (
 )
 from kagya.config import DeploymentMode, Settings
 from kagya.learning import AdapterRegistry, AdapterRuntimeManager
-from kagya.learning.adapter_registry import AdapterEntry
+from kagya.learning.adapter_registry import AdapterEntry, AdapterStatus
 from kagya.learning.adapter_runtime import AdapterActivationRecord
 from kagya.runtime import AgentEventType, AgentRuntime, EventJournal, JournalRecord
 from kagya.training import DatasetGovernanceStore, SleepCoordinator
@@ -174,6 +174,12 @@ def cockpit_training_summary(
             key=lambda item: (item.updated_at, item.created_at, item.adapter_id),
             reverse=True,
         )
+        rollback_target_adapter_ids = {
+            item.rollback_target_id
+            for item in unique_adapters
+            if item.status == AdapterStatus.ACTIVE
+            and item.rollback_target_id is not None
+        }
         nodes = [_node_projection(node, settings) for node in configured_nodes]
         return CockpitTrainingSummaryResponse(
             node_count=len(nodes),
@@ -194,6 +200,7 @@ def cockpit_training_summary(
                     job_by_id,
                     history,
                     journal_records,
+                    rollback_target_adapter_ids,
                 )
                 for adapter in ordered_adapters[:limit]
             ],
@@ -347,7 +354,7 @@ def _job_projection(
         candidate_adapter_id=None if adapter is None else adapter.adapter_id,
         import_status=_import_status(job.import_status),
         bundle_digest=_digest(job.bundle_hash),
-        result_digest=None if adapter is None else _digest(adapter.adapter_hash),
+        result_digest=_digest(job.result_digest),
     )
 
 
@@ -356,6 +363,7 @@ def _adapter_projection(
     job_by_id: dict[str, TrainingJob],
     history: list[AdapterActivationRecord],
     journal_records: list[Any],
+    rollback_target_adapter_ids: set[str],
 ) -> CockpitAdapterLineageResponse:
     if adapter is None:
         return CockpitAdapterLineageResponse(
@@ -400,7 +408,7 @@ def _adapter_projection(
         evaluation_status=evaluation_status,
         approved=adapter.status.value in {"approved", "active", "archived"},
         active=adapter.status.value == "active",
-        rollback_candidate=adapter.rollback_target_id is not None or adapter.rollout_state in {"canary", "canary_failed"},
+        rollback_candidate=adapter.adapter_id in rollback_target_adapter_ids,
         activation_event_id=_event_id(adapter, activation, journal_records),
         activation_event_sequence=None if activation is None else activation.activation_sequence,
         rollback_event_id=_event_id(adapter, rollback, journal_records),

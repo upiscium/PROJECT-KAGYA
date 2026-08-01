@@ -1,7 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
+import { evaluationAnchor, evaluationHref } from "@/lib/anchors";
 import { CockpitClient } from "./cockpit-client";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -18,6 +20,7 @@ const mockedApi = vi.mocked(api);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.history.replaceState(null, "", "/cockpit");
   resolveRepresentativeData();
 });
 
@@ -74,6 +77,17 @@ describe("CockpitClient", () => {
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "outbox"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "actions"]))).not.toContain("PRIVATE_SENTINEL");
     expect(JSON.stringify(queryClient.getQueryData(["cockpit", "training"]))).not.toContain("PRIVATE_SENTINEL");
+  });
+
+  it("targets cockpit evaluation links at the selected evaluation anchor on click", async () => {
+    renderCockpit();
+
+    const link = await screen.findByRole("link", { name: "eval-1" });
+    link.addEventListener("click", (event) => event.preventDefault());
+    await userEvent.click(link);
+
+    expect(link).toHaveAttribute("href", evaluationHref("eval-1"));
+    expect(new URL(link.getAttribute("href") ?? "", window.location.origin).hash).toBe(`#${evaluationAnchor("eval-1")}`);
   });
 
   it("shows action loading without hiding loaded sections", async () => {
