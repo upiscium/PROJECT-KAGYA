@@ -18,9 +18,10 @@ describe("private backend proxy", () => {
     );
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(backendFetch).toHaveBeenCalledWith(
       new URL("http://127.0.0.1:8000/api/system/events?limit=5"),
-      expect.objectContaining({ method: "GET", body: undefined }),
+      expect.objectContaining({ method: "GET", body: undefined, cache: "no-store" }),
     );
   });
 

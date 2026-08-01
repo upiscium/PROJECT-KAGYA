@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 import hashlib
 import json
 from pathlib import Path
+import re
 import time
-from typing import Any, Callable, Literal, cast
+from types import MappingProxyType
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -43,6 +47,136 @@ class RiskClass(StrEnum):
     EXTERNAL_WRITE = "external_write"
     DESTRUCTIVE = "destructive"
     HIGH_IMPACT = "high_impact"
+
+
+class OperatorCommand(StrEnum):
+    """Commands that an operator may request for an action intent."""
+
+    APPROVE = "approve"
+    REJECT = "reject"
+    CANCEL = "cancel"
+    RETRY_NOW = "retry_now"
+    COMPENSATE = "compensate"
+
+
+class _PublicSummary(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: str
+
+
+class MetadataPublicSummary(_PublicSummary):
+    kind: Literal["metadata"] = "metadata"
+    namespace: str
+    key: str
+
+
+class DocumentPublicSummary(_PublicSummary):
+    kind: Literal["document_search"] = "document_search"
+    max_results: int
+    query_length: int
+    path_scoped: bool
+
+
+class CalendarPublicSummary(_PublicSummary):
+    kind: Literal["calendar_read"] = "calendar_read"
+    starts_at: datetime
+    ends_at: datetime
+    max_results: int
+
+
+class NotificationPublicSummary(_PublicSummary):
+    kind: Literal["local_notification_enqueue"] = "local_notification_enqueue"
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=160)
+
+    @model_validator(mode="after")
+    def public_text_only(self) -> "NotificationPublicSummary":
+        for value in (self.title, self.body):
+            lowered = value.lower()
+            if (
+                any(ord(character) < 32 or ord(character) == 127 for character in value)
+                or any(
+                    marker in lowered
+                    for marker in (
+                        "private_sentinel",
+                        "hidden_thought",
+                        "raw_prompt",
+                        "<think",
+                        "</think",
+                        "credential",
+                        "password",
+                        "api_key",
+                        "api key",
+                        "access_token",
+                        "secret",
+                    )
+                )
+                or re.search(r"(?:^|\s)/(?:etc|home|root|tmp|var)/", value)
+            ):
+                raise ValueError("notification public preview contains private text")
+        return self
+
+
+PublicArgumentSummary = (
+    MetadataPublicSummary
+    | DocumentPublicSummary
+    | CalendarPublicSummary
+    | NotificationPublicSummary
+)
+
+
+class ActionToolDescriptor(_StrictModel):
+    """The complete, safe-to-render description of an allowlisted tool."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    tool_name: str
+    risk_class: RiskClass
+    effect: str
+    effect_code: str
+    approval_required: bool
+    reversible: bool
+    validation_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    public_preview_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    enabled: bool
+    executable: bool
+
+
+class ActionOperatorPreview(_StrictModel):
+    """Safe operator projection; it intentionally contains no raw arguments."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    intent_id: str
+    revision: int
+    tool: ActionToolDescriptor
+    arguments: PublicArgumentSummary
+    preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effect: str
+    effect_code: str
+    available_commands: tuple[OperatorCommand, ...]
+    approval_id: str | None = None
+
+    @property
+    def argument_digest(self) -> str:
+        """Compatibility spelling for consumers that call summaries arguments."""
+        return self.preview_digest
+
+
+class OperatorCommandRequest(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    intent_id: str
+    command: OperatorCommand
+    expected_revision: int = Field(ge=1)
+    expected_preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_approval_id: str | None = None
+    confirmation: str | None = Field(default=None, max_length=200)
+
+
+class OperatorCommandValidation(_StrictModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    valid: bool
+    reason: str | None = None
+    command: OperatorCommand
+    intent_id: str
 
 
 class IntentStatus(StrEnum):
@@ -117,6 +251,24 @@ class NotificationArguments(_StrictModel):
     channel: Literal["local"] = "local"
     title: str = Field(min_length=1, max_length=120)
     body: str = Field(min_length=1, max_length=1000)
+    # The explicit public preview certifies the canonical executable text as
+    # operator-visible; the validator below prevents a different hidden payload.
+    public_preview: NotificationPublicSummary | None = None
+
+    @model_validator(mode="after")
+    def preview_is_bounded(self) -> "NotificationArguments":
+        if self.public_preview is None:
+            return self
+        if self.public_preview.kind != "local_notification_enqueue":
+            raise ValueError("notification public_preview has the wrong kind")
+        if (
+            self.public_preview.title != self.title
+            or self.public_preview.body != self.body
+        ):
+            raise ValueError(
+                "notification public_preview must exactly bind executable content"
+            )
+        return self
 
 
 class ActionBudget(_StrictModel):
@@ -316,8 +468,196 @@ class ActionState(_StrictModel):
     notifications: tuple[dict[str, JsonValue], ...] = ()
 
 
+@dataclass(frozen=True)
+class ActionOperatorSnapshot:
+    """One validated state read and immutable indexes for an operator request."""
+
+    intents: Mapping[str, ActionIntent]
+    approvals: Mapping[str, ApprovalRecord]
+    approvals_by_intent: Mapping[str, ApprovalRecord]
+    receipts: Mapping[str, ExecutionReceipt]
+    receipts_by_intent: Mapping[str, tuple[ExecutionReceipt, ...]]
+    compensations_by_target: Mapping[str, tuple[ExecutionReceipt, ...]]
+    observations: Mapping[str, Observation]
+    observations_by_intent: Mapping[str, tuple[Observation, ...]]
+    verifications: Mapping[str, OutcomeVerification]
+    verifications_by_intent: Mapping[str, tuple[OutcomeVerification, ...]]
+    validations: Mapping[str, ActionValidationRecord]
+
+    @classmethod
+    def build(cls, execution: "ActionExecutionLayer") -> "ActionOperatorSnapshot":
+        state = execution._state_checked()
+
+        def index(
+            values: tuple[Any, ...],
+            identifier: Callable[[Any], str],
+            label: str,
+        ) -> Mapping[str, Any]:
+            result: dict[str, Any] = {}
+            for value in values:
+                key = identifier(value)
+                if key in result:
+                    raise ActionPolicyError(f"Duplicate or corrupt {label} records")
+                result[key] = value
+            return MappingProxyType(result)
+
+        approvals_by_intent_data: dict[str, ApprovalRecord] = {}
+        for approval in state.approvals:
+            if approval.intent_id in approvals_by_intent_data:
+                raise ActionPolicyError("Approval binding is not unique")
+            approvals_by_intent_data[approval.intent_id] = approval
+        receipts_by_intent_lists: dict[str, list[ExecutionReceipt]] = {}
+        for receipt in state.receipts:
+            receipts_by_intent_lists.setdefault(receipt.intent_id, []).append(receipt)
+        receipts_by_intent_data = {
+            intent_id: tuple(receipts)
+            for intent_id, receipts in receipts_by_intent_lists.items()
+        }
+        compensations_by_target_lists: dict[str, list[ExecutionReceipt]] = {}
+        for receipt in state.receipts:
+            if receipt.compensation_of is not None:
+                compensations_by_target_lists.setdefault(
+                    receipt.compensation_of, []
+                ).append(receipt)
+        compensations_by_target_data = {
+            receipt_id: tuple(receipts)
+            for receipt_id, receipts in compensations_by_target_lists.items()
+        }
+        observations_by_intent_lists: dict[str, list[Observation]] = {}
+        for observation in state.observations:
+            observations_by_intent_lists.setdefault(observation.intent_id, []).append(
+                observation
+            )
+        verifications_by_intent_lists: dict[str, list[OutcomeVerification]] = {}
+        for verification in state.verifications:
+            verifications_by_intent_lists.setdefault(
+                verification.intent_id, []
+            ).append(verification)
+        snapshot = cls(
+            intents=index(state.intents, lambda item: item.intent_id, "intent"),
+            approvals=index(state.approvals, lambda item: item.approval_id, "approval"),
+            approvals_by_intent=MappingProxyType(approvals_by_intent_data),
+            receipts=index(state.receipts, lambda item: item.receipt_id, "receipt"),
+            receipts_by_intent=MappingProxyType(receipts_by_intent_data),
+            compensations_by_target=MappingProxyType(compensations_by_target_data),
+            observations=index(state.observations, lambda item: item.observation_id, "observation"),
+            observations_by_intent=MappingProxyType(
+                {
+                    intent_id: tuple(observations)
+                    for intent_id, observations in observations_by_intent_lists.items()
+                }
+            ),
+            verifications=index(state.verifications, lambda item: item.verification_id, "verification"),
+            verifications_by_intent=MappingProxyType(
+                {
+                    intent_id: tuple(verifications)
+                    for intent_id, verifications in verifications_by_intent_lists.items()
+                }
+            ),
+            validations=index(state.validation_records, lambda item: item.validation_id, "validation"),
+        )
+        for intent in snapshot.intents.values():
+            bound_approval = snapshot.approvals_by_intent.get(intent.intent_id)
+            if (intent.approval_id is None) != (bound_approval is None) or (
+                bound_approval is not None
+                and bound_approval.approval_id != intent.approval_id
+            ):
+                raise ActionPolicyError("Approval binding is inconsistent")
+        return snapshot
+
+
 class ActionPolicyError(ValueError):
     """An action was rejected before execution."""
+
+
+def receipt_matches_intent(receipt: ExecutionReceipt, intent: ActionIntent) -> bool:
+    """Return whether a receipt is immutably bound to an action intent."""
+    provenance = intent.provenance
+    return (
+        receipt.intent_id == intent.intent_id
+        and receipt.idempotency_key == intent.idempotency_key
+        and receipt.decision_id == provenance.decision_id
+        and receipt.plan_id == provenance.plan_id
+        and receipt.plan_revision == provenance.plan_revision
+        and receipt.step_id == provenance.step_id
+    )
+
+
+def _semantic_binding(
+    receipt: ExecutionReceipt,
+    intent: ActionIntent,
+    observation: Observation | None = None,
+    verification: OutcomeVerification | None = None,
+    *,
+    successful: bool = False,
+) -> bool:
+    """Validate the complete, non-rebindable receipt evidence contract."""
+    if not receipt_matches_intent(receipt, intent):
+        return False
+    if not successful:
+        return True
+    if (
+        receipt.status != ReceiptStatus.SUCCEEDED
+        or receipt.observation_id is None
+        or receipt.verification_id is None
+        or observation is None
+        or verification is None
+        or not observation.valid
+        or not verification.success
+    ):
+        return False
+    return bool(
+        observation.intent_id == intent.intent_id
+        and observation.receipt_id == receipt.receipt_id
+        and verification.intent_id == intent.intent_id
+        and verification.observation_id == observation.observation_id
+    )
+
+
+def _intent_receipts_semantically_valid(
+    intent: ActionIntent,
+    receipts: tuple[ExecutionReceipt, ...],
+    observations: Mapping[str, Observation],
+    verifications: Mapping[str, OutcomeVerification],
+    compensations: tuple[ExecutionReceipt, ...] = (),
+) -> bool:
+    """Validate only one intent's receipt/evidence graph; never raise globally."""
+    for receipt in receipts:
+        if not receipt_matches_intent(receipt, intent):
+            return False
+        if receipt.status == ReceiptStatus.SUCCEEDED and not _semantic_binding(
+            receipt,
+            intent,
+            observations.get(receipt.observation_id or ""),
+            verifications.get(receipt.verification_id or ""),
+            successful=True,
+        ):
+            return False
+    associated_ids = {item.receipt_id for item in receipts}
+    receipts_by_id = {item.receipt_id: item for item in receipts}
+    compensation_targets: set[str] = set()
+    for receipt in compensations:
+        target_id = receipt.compensation_of
+        if target_id is None or target_id not in associated_ids:
+            continue
+        target = receipts_by_id.get(target_id)
+        if (
+            receipt.status != ReceiptStatus.COMPENSATED
+            or not receipt_matches_intent(receipt, intent)
+            or target_id == receipt.receipt_id
+            or target is None
+            or target_id in compensation_targets
+            or not _semantic_binding(
+                target,
+                intent,
+                observations.get(target.observation_id or ""),
+                verifications.get(target.verification_id or ""),
+                successful=True,
+            )
+        ):
+            return False
+        compensation_targets.add(target_id)
+    return True
 
 
 ArgumentModel = type[_StrictModel]
@@ -373,12 +713,93 @@ def public_tool_name(value: str) -> str | None:
     """Return only stable, allowlisted tool identifiers."""
     return value if value in _TOOLS else None
 
+
 _VALIDATION_SCHEMA_REVISIONS = {
     "restricted_metadata_read": 1,
     "document_search": 1,
     "calendar_read": 1,
     "local_notification_enqueue": 1,
 }
+
+
+def _effect_code(tool_name: str) -> str:
+    return {
+        "restricted_metadata_read": "metadata.read",
+        "document_search": "documents.search",
+        "calendar_read": "calendar.read",
+        "local_notification_enqueue": "notification.enqueue",
+    }.get(tool_name, "action.unknown")
+
+
+def _public_summary(
+    tool_name: str, arguments: dict[str, JsonValue]
+) -> PublicArgumentSummary:
+    if tool_name == "restricted_metadata_read":
+        return MetadataPublicSummary(
+            namespace=str(arguments["namespace"]), key=str(arguments["key"])
+        )
+    if tool_name == "document_search":
+        query = str(arguments["query"])
+        return DocumentPublicSummary(
+            max_results=int(cast(int, arguments["max_results"])),
+            query_length=len(query),
+            path_scoped=arguments.get("relative_path") is not None,
+        )
+    if tool_name == "calendar_read":
+        return CalendarPublicSummary(
+            starts_at=datetime.fromisoformat(str(arguments["starts_at"])),
+            ends_at=datetime.fromisoformat(str(arguments["ends_at"])),
+            max_results=int(cast(int, arguments["max_results"])),
+        )
+    if tool_name == "local_notification_enqueue":
+        preview = arguments.get("public_preview")
+        if isinstance(preview, dict):
+            return NotificationPublicSummary.model_validate(preview)
+        # Legacy intents are still executable, but never expose their raw text.
+        return NotificationPublicSummary(
+            title="Local notification", body="A local notification is queued."
+        )
+    raise ActionPolicyError("Tool is not allowlisted")
+
+
+def _public_preview_revision(tool_name: str) -> str:
+    return _digest({"tool_name": tool_name, "preview_revision": 1})
+
+
+def _operator_preview_digest(
+    intent: ActionIntent,
+    descriptor: ActionToolDescriptor,
+    summary: PublicArgumentSummary,
+) -> str:
+    """Create an opaque exact binding without publishing an argument oracle."""
+    return _digest(
+        cast(
+            JsonValue,
+            {
+                "intent_id": intent.intent_id,
+                "revision": intent.revision,
+                "tool": descriptor.model_dump(mode="json"),
+                "arguments": summary.model_dump(mode="json"),
+                "effect": descriptor.effect,
+                "effect_code": descriptor.effect_code,
+                "policy": {
+                    "allowed": intent.policy.allowed,
+                    "approval_required": intent.policy.approval_required,
+                    "reasons": list(intent.policy.reasons),
+                },
+                "budget": intent.budget.model_dump(mode="json"),
+                # The strictly bound validation UUID remains private and
+                # provides deterministic entropy without mutating state.
+                "private_binding": _digest(
+                    {
+                        "domain": "action_operator_preview_v1",
+                        "validation_record_id": intent.validation_record_id,
+                        "canonical_arguments_digest": intent.policy.argument_digest,
+                    }
+                ),
+            },
+        )
+    )
 
 
 class ActionExecutionLayer:
@@ -399,6 +820,176 @@ class ActionExecutionLayer:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.monotonic = monotonic or time.monotonic
         self._state()
+
+    def list_tool_descriptors(self) -> tuple[ActionToolDescriptor, ...]:
+        """Return stable descriptors, never the internal tool registry."""
+        return tuple(self.get_tool_descriptor(name) for name in _TOOLS)
+
+    def get_tool_descriptor(self, tool_name: str) -> ActionToolDescriptor:
+        spec = _TOOLS.get(tool_name)
+        if spec is None:
+            raise ValueError("Unknown action tool")
+        enabled = spec.risk not in {
+            RiskClass.EXTERNAL_WRITE,
+            RiskClass.DESTRUCTIVE,
+            RiskClass.HIGH_IMPACT,
+        }
+        return ActionToolDescriptor(
+            tool_name=spec.name,
+            risk_class=spec.risk,
+            effect=spec.effect,
+            effect_code=_effect_code(spec.name),
+            approval_required=spec.approval_required,
+            reversible=spec.reversible,
+            validation_revision=_validation_schema_revision(spec.name, spec),
+            public_preview_revision=_public_preview_revision(spec.name),
+            enabled=enabled,
+            executable=enabled,
+        )
+
+    def operator_preview(self, intent_id: str) -> ActionOperatorPreview:
+        snapshot = self.operator_snapshot()
+        intent = snapshot.intents.get(intent_id)
+        if intent is None:
+            raise ValueError(f"Unknown action intent: {intent_id}")
+        return self.operator_preview_from_snapshot(snapshot, intent)
+
+    def operator_snapshot(self) -> ActionOperatorSnapshot:
+        return ActionOperatorSnapshot.build(self)
+
+    def operator_preview_from_snapshot(
+        self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> ActionOperatorPreview:
+        if snapshot.intents.get(intent.intent_id) != intent:
+            raise ActionPolicyError("Action operator snapshot binding is invalid")
+        if not self._intent_records_consistent_indexed(snapshot, intent):
+            raise ActionPolicyError("Action operator binding is invalid")
+        descriptor = self.get_tool_descriptor(intent.tool_name)
+        summary = _public_summary(intent.tool_name, intent.arguments)
+        digest = _operator_preview_digest(intent, descriptor, summary)
+        return ActionOperatorPreview(
+            intent_id=intent.intent_id,
+            revision=intent.revision,
+            tool=descriptor,
+            arguments=summary,
+            preview_digest=digest,
+            effect=descriptor.effect,
+            effect_code=descriptor.effect_code,
+            available_commands=self.available_commands_from_snapshot(snapshot, intent),
+            approval_id=intent.approval_id,
+        )
+
+    # Alias used by API adapters which call this a projection.
+    operator_projection = operator_preview
+
+    def available_commands(self, intent_id: str) -> tuple[OperatorCommand, ...]:
+        snapshot = self.operator_snapshot()
+        intent = snapshot.intents.get(intent_id)
+        if intent is None:
+            raise ValueError(f"Unknown action intent: {intent_id}")
+        return self.available_commands_from_snapshot(snapshot, intent)
+
+    def available_commands_from_snapshot(
+        self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> tuple[OperatorCommand, ...]:
+        descriptor = self.get_tool_descriptor(intent.tool_name)
+        if (
+            snapshot.intents.get(intent.intent_id) != intent
+            or not self._snapshot_ownership_valid(snapshot, intent)
+            or not descriptor.enabled
+            or not self._intent_records_consistent_indexed(snapshot, intent)
+        ):
+            return ()
+        commands: list[OperatorCommand] = []
+        approval = snapshot.approvals_by_intent.get(intent.intent_id)
+        has_public_preview = self._has_public_preview(intent)
+        if (
+            intent.status == IntentStatus.AWAITING_APPROVAL
+            and approval is not None
+            and approval.approval_id == intent.approval_id
+            and approval.status == "pending"
+        ):
+            if has_public_preview:
+                commands.append(OperatorCommand.APPROVE)
+            commands.append(OperatorCommand.REJECT)
+        if intent.status in {
+            IntentStatus.AWAITING_APPROVAL,
+            IntentStatus.APPROVED,
+            IntentStatus.RETRY_PENDING,
+        }:
+            commands.append(OperatorCommand.CANCEL)
+        if intent.status == IntentStatus.RETRY_PENDING and self._retry_executable(intent):
+            commands.append(OperatorCommand.RETRY_NOW)
+        if (
+            intent.status == IntentStatus.SUCCEEDED
+            and descriptor.reversible
+            and self._compensation_eligible_indexed(snapshot, intent)
+        ):
+            commands.append(OperatorCommand.COMPENSATE)
+        return tuple(commands)
+
+    def confirmation_phrase(self, intent_id: str) -> str | None:
+        snapshot = self.operator_snapshot()
+        intent = snapshot.intents.get(intent_id)
+        if intent is None:
+            raise ValueError(f"Unknown action intent: {intent_id}")
+        if intent.risk_class not in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+            return None
+        preview = self.operator_preview_from_snapshot(snapshot, intent)
+        return f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}"
+
+    def validate_command_request(
+        self, request: OperatorCommandRequest
+    ) -> OperatorCommandValidation:
+        snapshot = self.operator_snapshot()
+        intent = snapshot.intents.get(request.intent_id)
+        if intent is None:
+            raise ValueError(f"Unknown action intent: {request.intent_id}")
+        preview = self.operator_preview_from_snapshot(snapshot, intent)
+        reason: str | None = None
+        if not self._intent_records_consistent_indexed(snapshot, intent):
+            reason = "action semantic binding is invalid"
+        elif request.expected_revision != intent.revision:
+            reason = "stale intent revision"
+        elif request.expected_preview_digest != preview.argument_digest:
+            reason = "stale preview digest"
+        elif request.command not in preview.available_commands:
+            reason = "command is not currently available"
+        elif (
+            request.command in {OperatorCommand.APPROVE, OperatorCommand.REJECT}
+            and request.expected_approval_id != intent.approval_id
+        ):
+            reason = "approval binding is stale"
+        elif intent.risk_class in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
+            expected = f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}"
+            if request.confirmation != expected:
+                reason = "confirmation phrase is invalid"
+        return OperatorCommandValidation(
+            valid=reason is None,
+            reason=reason,
+            command=request.command,
+            intent_id=intent.intent_id,
+        )
+
+    def execute_command(
+        self, request: OperatorCommandRequest, *, actor_id: str = "operator"
+    ) -> ActionIntent:
+        checked = self.validate_command_request(request)
+        if not checked.valid:
+            raise ActionPolicyError(checked.reason or "invalid operator command")
+        if request.command == OperatorCommand.APPROVE:
+            return self.resolve_approval(
+                request.intent_id, approved=True, actor_id=actor_id
+            )
+        if request.command == OperatorCommand.REJECT:
+            return self.resolve_approval(
+                request.intent_id, approved=False, actor_id=actor_id
+            )
+        if request.command == OperatorCommand.CANCEL:
+            return self.cancel(request.intent_id)
+        if request.command == OperatorCommand.RETRY_NOW:
+            return self.execute(request.intent_id)
+        return self.compensate(request.intent_id)
 
     def list_intents(self) -> tuple[ActionIntent, ...]:
         return self._state().intents
@@ -658,8 +1249,7 @@ class ActionExecutionLayer:
             (
                 item
                 for item in state.validation_records
-                if not item.arguments_valid
-                and item.idempotency_key == idempotency_key
+                if not item.arguments_valid and item.idempotency_key == idempotency_key
             ),
             None,
         )
@@ -1217,12 +1807,14 @@ class ActionExecutionLayer:
 
     def compensate(self, intent_id: str) -> ActionIntent:
         intent = self.get_intent(intent_id)
+        state = self._state_checked()
+        descriptor = self.get_tool_descriptor(intent.tool_name)
         if (
             intent.status != IntentStatus.SUCCEEDED
-            or intent.tool_name != "local_notification_enqueue"
+            or not descriptor.reversible
+            or not self._compensation_eligible(state, intent)
         ):
             raise ActionPolicyError("Action has no available compensation")
-        state = self._state()
         notifications = tuple(
             {**item, "status": "cancelled"}
             if item.get("idempotency_key") == intent.idempotency_key
@@ -1333,6 +1925,356 @@ class ActionExecutionLayer:
             }
         raise ActionPolicyError("Tool is not allowlisted")
 
+    def _state_checked(self) -> ActionState:
+        state = self._state()
+        ids = (
+            ([item.intent_id for item in state.intents], "intent"),
+            ([item.approval_id for item in state.approvals], "approval"),
+            ([item.receipt_id for item in state.receipts], "receipt"),
+            ([item.observation_id for item in state.observations], "observation"),
+            ([item.verification_id for item in state.verifications], "verification"),
+            ([item.validation_id for item in state.validation_records], "validation"),
+        )
+        for values, label in ids:
+            if any(value is None for value in values) or len(values) != len(
+                set(values)
+            ):
+                raise ActionPolicyError(f"Duplicate or corrupt {label} records")
+        intents_by_id = {item.intent_id: item for item in state.intents}
+        intent_ids = set(intents_by_id)
+        if any(item.intent_id not in intent_ids for item in state.approvals):
+            raise ActionPolicyError("Approval record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.receipts):
+            raise ActionPolicyError("Receipt record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.observations):
+            raise ActionPolicyError("Observation record has an invalid intent binding")
+        if any(item.intent_id not in intent_ids for item in state.verifications):
+            raise ActionPolicyError("Verification record has an invalid intent binding")
+        receipt_ids = {item.receipt_id for item in state.receipts}
+        if any(item.receipt_id not in receipt_ids for item in state.observations):
+            raise ActionPolicyError("Observation record has an invalid receipt binding")
+        approvals_by_intent: dict[str, ApprovalRecord] = {}
+        for approval in state.approvals:
+            if approval.intent_id in approvals_by_intent:
+                raise ActionPolicyError("Approval binding is not unique")
+            approvals_by_intent[approval.intent_id] = approval
+        for intent in state.intents:
+            bound_approval = approvals_by_intent.get(intent.intent_id)
+            if (intent.approval_id is None) != (bound_approval is None) or (
+                bound_approval is not None
+                and bound_approval.approval_id != intent.approval_id
+            ):
+                raise ActionPolicyError("Approval binding is inconsistent")
+        return state
+
+    @staticmethod
+    def _unique_approval(
+        state: ActionState, intent: ActionIntent
+    ) -> ApprovalRecord | None:
+        values = [
+            item for item in state.approvals if item.intent_id == intent.intent_id
+        ]
+        if intent.approval_id is None:
+            return (
+                None if not values else (_raise_corrupt("Unexpected approval record"))
+            )
+        matches = [item for item in values if item.approval_id == intent.approval_id]
+        if len(values) != 1 or len(matches) != 1:
+            return _raise_corrupt("Approval binding is not unique")
+        return matches[0]
+
+    def _intent_records_consistent(
+        self, state: ActionState, intent: ActionIntent
+    ) -> bool:
+        try:
+            self._unique_approval(state, intent)
+            spec = _TOOLS.get(intent.tool_name)
+            if spec is None or intent.risk_class != spec.risk:
+                return False
+            if (
+                intent.policy.tool_name != intent.tool_name
+                or intent.policy.risk_class != intent.risk_class
+                or intent.policy.allowed is not True
+                or intent.policy.approval_required != spec.approval_required
+                or intent.preview.tool_name != intent.tool_name
+                or intent.preview.risk_class != intent.risk_class
+                or intent.preview.effect != spec.effect
+                or intent.preview.compensation_available != spec.reversible
+                or intent.preview.bounded_by != intent.budget
+            ):
+                return False
+            validated = spec.arguments.model_validate(intent.arguments).model_dump(
+                mode="json"
+            )
+            legacy_notification = (
+                intent.tool_name == "local_notification_enqueue"
+                and intent.arguments.get("public_preview") is None
+            )
+            if legacy_notification:
+                validated.pop("public_preview", None)
+            if validated != intent.arguments or validated != intent.preview.arguments:
+                return False
+            associated_receipts = tuple(
+                item for item in state.receipts if item.intent_id == intent.intent_id
+            )
+            associated_receipt_ids = {
+                item.receipt_id for item in associated_receipts
+            }
+            if not _intent_receipts_semantically_valid(
+                intent,
+                associated_receipts,
+                {item.observation_id: item for item in state.observations},
+                {item.verification_id: item for item in state.verifications},
+                tuple(
+                    item
+                    for item in state.receipts
+                    if item.compensation_of in associated_receipt_ids
+                ),
+            ):
+                return False
+            validation = [
+                item
+                for item in state.validation_records
+                if item.validation_id == intent.validation_record_id
+                and item.intent_id == intent.intent_id
+                and item.decision_id == intent.provenance.decision_id
+                and item.tool_name == intent.tool_name
+                and item.risk_class == intent.risk_class
+                and item.arguments_valid
+            ]
+            return bool(
+                len(validation) == 1
+                and validation[0].idempotency_key == intent.idempotency_key
+                and validation[0].canonical_arguments_digest == _digest(validated)
+                and (
+                    legacy_notification
+                    or validation[0].validation_schema_revision
+                    == _validation_schema_revision(intent.tool_name, spec)
+                )
+                and intent.policy.argument_digest == _digest(validated)
+            )
+        except (ActionPolicyError, ValidationError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _snapshot_ownership_valid(
+        snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> bool:
+        """Check ownership for one projection without rejecting other intents."""
+        for observation in snapshot.observations_by_intent.get(intent.intent_id, ()):
+            receipt = snapshot.receipts.get(observation.receipt_id)
+            if receipt is None or receipt.intent_id != intent.intent_id:
+                return False
+        for verification in snapshot.verifications_by_intent.get(intent.intent_id, ()):
+            bound_observation = snapshot.observations.get(
+                verification.observation_id or ""
+            )
+            if (
+                bound_observation is None
+                or bound_observation.intent_id != intent.intent_id
+            ):
+                return False
+        return True
+
+    def _intent_records_consistent_indexed(
+        self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> bool:
+        try:
+            if intent.approval_id is not None:
+                approval = snapshot.approvals.get(intent.approval_id)
+                if approval is None or approval.intent_id != intent.intent_id:
+                    return False
+            elif intent.intent_id in snapshot.approvals_by_intent:
+                return False
+            spec = _TOOLS.get(intent.tool_name)
+            if spec is None or intent.risk_class != spec.risk:
+                return False
+            if (
+                intent.policy.tool_name != intent.tool_name
+                or intent.policy.risk_class != intent.risk_class
+                or intent.policy.allowed is not True
+                or intent.policy.approval_required != spec.approval_required
+                or intent.preview.tool_name != intent.tool_name
+                or intent.preview.risk_class != intent.risk_class
+                or intent.preview.effect != spec.effect
+                or intent.preview.compensation_available != spec.reversible
+                or intent.preview.bounded_by != intent.budget
+            ):
+                return False
+            validated = spec.arguments.model_validate(intent.arguments).model_dump(
+                mode="json"
+            )
+            legacy_notification = (
+                intent.tool_name == "local_notification_enqueue"
+                and intent.arguments.get("public_preview") is None
+            )
+            if legacy_notification:
+                validated.pop("public_preview", None)
+            if validated != intent.arguments or validated != intent.preview.arguments:
+                return False
+            associated_receipts = snapshot.receipts_by_intent.get(
+                intent.intent_id, ()
+            )
+            if not _intent_receipts_semantically_valid(
+                intent,
+                associated_receipts,
+                snapshot.observations,
+                snapshot.verifications,
+                tuple(
+                    compensation
+                    for receipt in associated_receipts
+                    for compensation in snapshot.compensations_by_target.get(
+                        receipt.receipt_id, ()
+                    )
+                ),
+            ):
+                return False
+            if intent.validation_record_id is None:
+                return False
+            record = snapshot.validations.get(intent.validation_record_id)
+            return bool(
+                record is not None
+                and record.intent_id == intent.intent_id
+                and record.decision_id == intent.provenance.decision_id
+                and record.tool_name == intent.tool_name
+                and record.risk_class == intent.risk_class
+                and record.arguments_valid
+                and record.idempotency_key == intent.idempotency_key
+                and record.canonical_arguments_digest == _digest(validated)
+                and (
+                    legacy_notification
+                    or record.validation_schema_revision
+                    == _validation_schema_revision(intent.tool_name, spec)
+                )
+                and intent.policy.argument_digest == _digest(validated)
+            )
+        except (ActionPolicyError, ValidationError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _has_public_preview(intent: ActionIntent) -> bool:
+        if intent.tool_name != "local_notification_enqueue":
+            return True
+        preview = intent.arguments.get("public_preview")
+        if not isinstance(preview, dict):
+            return False
+        try:
+            NotificationPublicSummary.model_validate(preview)
+        except ValidationError:
+            return False
+        return True
+
+    def _retry_executable(self, intent: ActionIntent) -> bool:
+        now = self.clock()
+        return bool(
+            now <= intent.deadline_at
+            and intent.attempts < intent.budget.max_attempts
+            and intent.cost_units_used < intent.budget.max_cost_units
+        )
+
+    def _compensation_eligible(self, state: ActionState, intent: ActionIntent) -> bool:
+        if intent.receipt_id is None:
+            return False
+        associated = tuple(
+            item for item in state.receipts if item.intent_id == intent.intent_id
+        )
+        targets = tuple(
+            item for item in associated if item.receipt_id == intent.receipt_id
+        )
+        if len(targets) != 1 or not _intent_receipts_semantically_valid(
+            intent,
+            associated,
+            {item.observation_id: item for item in state.observations},
+            {item.verification_id: item for item in state.verifications},
+            tuple(
+                item
+                for item in state.receipts
+                if item.compensation_of in {target.receipt_id for target in associated}
+            ),
+        ):
+            return False
+        successful = targets[0]
+        if not _semantic_binding(
+            successful,
+            intent,
+            next(
+                (
+                    item
+                    for item in state.observations
+                    if item.observation_id == successful.observation_id
+                ),
+                None,
+            ),
+            next(
+                (
+                    item
+                    for item in state.verifications
+                    if item.verification_id == successful.verification_id
+                ),
+                None,
+            ),
+            successful=True,
+        ):
+            return False
+        return not any(
+            item.compensation_of == intent.receipt_id
+            and item.intent_id == intent.intent_id
+            and item.status == ReceiptStatus.COMPENSATED
+            for item in state.receipts
+        )
+
+    def _compensation_eligible_indexed(
+        self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> bool:
+        if intent.receipt_id is None:
+            return False
+        receipt = snapshot.receipts.get(intent.receipt_id)
+        associated = snapshot.receipts_by_intent.get(intent.intent_id, ())
+        if (
+            receipt is None
+            or sum(item.receipt_id == intent.receipt_id for item in associated) != 1
+            or not _intent_receipts_semantically_valid(
+                intent,
+                associated,
+                snapshot.observations,
+                snapshot.verifications,
+                tuple(
+                    compensation
+                    for target in associated
+                    for compensation in snapshot.compensations_by_target.get(
+                        target.receipt_id, ()
+                    )
+                ),
+            )
+            or not _semantic_binding(
+                receipt,
+                intent,
+                snapshot.observations.get(receipt.observation_id or ""),
+                snapshot.verifications.get(receipt.verification_id or ""),
+                successful=True,
+            )
+        ):
+            return False
+        return not snapshot.compensations_by_target.get(intent.receipt_id, ())
+
+    @staticmethod
+    def _succeeded_receipt_valid_indexed(
+        snapshot: ActionOperatorSnapshot, intent: ActionIntent
+    ) -> bool:
+        if intent.receipt_id is None:
+            return False
+        receipt = snapshot.receipts.get(intent.receipt_id)
+        return bool(
+            receipt is not None
+            and _semantic_binding(
+                receipt,
+                intent,
+                snapshot.observations.get(receipt.observation_id or ""),
+                snapshot.verifications.get(receipt.verification_id or ""),
+                successful=True,
+            )
+        )
+
     def _document_search(self, arguments: dict[str, JsonValue]) -> JsonValue:
         root = self.document_root
         relative = arguments.get("relative_path")
@@ -1427,6 +2369,16 @@ class ActionExecutionLayer:
             validated = spec.arguments.model_validate(arguments)
         except ValidationError as exc:
             return spec, None, _validation_error_codes(tool_name, exc)
+        if (
+            tool_name == "local_notification_enqueue"
+            and isinstance(validated, NotificationArguments)
+            and validated.public_preview is None
+        ):
+            return (
+                spec,
+                None,
+                (ActionValidationErrorCode.ARGUMENTS_SCHEMA_INVALID,),
+            )
         return spec, validated.model_dump(mode="json"), ()
 
     def _validated_arguments_for_execution(
@@ -1706,7 +2658,9 @@ class ActionExecutionLayer:
                 decision.actual_outcome is None
                 or decision.actual_outcome.success != success
             ):
-                raise ValueError("Terminal decision outcome contradicts action verification")
+                raise ValueError(
+                    "Terminal decision outcome contradicts action verification"
+                )
             return
         record_experience = getattr(
             self.main_loop, "record_verified_action_experience", None
@@ -1729,12 +2683,12 @@ class ActionExecutionLayer:
         try:
             version = raw.get("schema_version") if isinstance(raw, dict) else None
             legacy_v1 = version == 1
-            migrated = version in {1, 2, 3}
+            migrated = version in {1, 2, 3, 5}
             if legacy_v1:
                 raw = {**raw, "validation_records": []}
             if version in {1, 2}:
                 raw = {**raw, "policy_rejections": []}
-            if migrated:
+            if version in {1, 2, 3}:
                 intent_keys = {
                     item.get("validation_record_id"): item.get("idempotency_key")
                     for item in raw.get("intents", [])
@@ -1761,6 +2715,21 @@ class ActionExecutionLayer:
                     "schema_version": 4,
                     "validation_records": validations,
                 }
+            elif version == 5:
+                raw = {
+                    **raw,
+                    "schema_version": 4,
+                    "intents": [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key != "operator_binding_nonce"
+                        }
+                        if isinstance(item, dict)
+                        else item
+                        for item in raw.get("intents", [])
+                    ],
+                }
             state = ActionState.model_validate(raw)
             if legacy_v1:
                 pending = {
@@ -1785,7 +2754,9 @@ class ActionExecutionLayer:
                                 "status": IntentStatus.REJECTED,
                                 "failure_code": "legacy_unvalidated_intent",
                                 "retry_at": None,
-                                "updated_at": self.clock(),
+                                # Preserve a deterministic timestamp from the
+                                # authoritative legacy record during migration.
+                                "updated_at": intent.updated_at,
                             }
                         )
                     intents.append(intent)
@@ -1794,11 +2765,16 @@ class ActionExecutionLayer:
                     for item in intents
                     if item.failure_code == "legacy_unvalidated_intent"
                 }
+                rejected_at_by_id = {
+                    item.intent_id: item.updated_at
+                    for item in intents
+                    if item.intent_id in rejected_ids
+                }
                 approvals = tuple(
                     item.model_copy(
                         update={
                             "status": "rejected",
-                            "resolved_at": self.clock(),
+                            "resolved_at": rejected_at_by_id[item.intent_id],
                             "reason": "legacy_unvalidated_intent",
                         }
                     )
@@ -1837,15 +2813,7 @@ class ActionExecutionLayer:
             (item for item in state.receipts if item.receipt_id == intent.receipt_id),
             None,
         )
-        if (
-            receipt is None
-            or receipt.status != ReceiptStatus.SUCCEEDED
-            or receipt.intent_id != intent.intent_id
-            or receipt.idempotency_key != intent.idempotency_key
-            or receipt.decision_id != intent.provenance.decision_id
-            or receipt.observation_id is None
-            or receipt.verification_id is None
-        ):
+        if receipt is None:
             return False
         observation = next(
             (
@@ -1864,14 +2832,13 @@ class ActionExecutionLayer:
             None,
         )
         return bool(
-            observation is not None
-            and observation.intent_id == intent.intent_id
-            and observation.receipt_id == receipt.receipt_id
-            and observation.valid
-            and verification is not None
-            and verification.intent_id == intent.intent_id
-            and verification.observation_id == observation.observation_id
-            and verification.success
+            _semantic_binding(
+                receipt,
+                intent,
+                observation,
+                verification,
+                successful=True,
+            )
         )
 
 
@@ -1880,6 +2847,10 @@ def _digest(value: JsonValue | dict[str, JsonValue]) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _raise_corrupt(message: str) -> Any:
+    raise ActionPolicyError(message)
 
 
 def _validation_schema_revision(tool_name: str, spec: _ToolSpec | None) -> str:

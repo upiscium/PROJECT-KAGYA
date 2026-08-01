@@ -772,7 +772,7 @@ def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
             "messages": [
                 {
                     "message_id": message.message_id,
-                    "title": "Release ready",
+                    "title": "Action result",
                     "urgency": "normal",
                     "delivery_status": "failed",
                     "acknowledgment_status": "replied",
@@ -847,6 +847,251 @@ def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
         assert [message["message_id"] for message in payload["messages"]] == list(
             reversed(created_ids[-5:])
         )
+
+
+def test_outbox_public_body_preview_is_bounded_and_approval_has_no_content(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        outbox = client.app.state.outbox
+        question = outbox.enqueue(
+            OutboxMessageKind.QUESTION,
+            title="Need a decision",
+            body="Choose the local option.",
+            public_preview="Choose the local option.",
+            deduplication_key="preview-question",
+        )
+        renegotiation = outbox.enqueue(
+            OutboxMessageKind.RENEGOTIATION,
+            title="Constraint changed",
+            body="The deadline needs to move by one day.",
+            public_preview="The deadline needs to move by one day.",
+            deduplication_key="preview-renegotiation",
+        )
+        approval = outbox.enqueue(
+            OutboxMessageKind.APPROVAL_REQUEST,
+            title="Approve action",
+            body="The action body remains Cockpit-only.",
+            deduplication_key="preview-approval",
+        )
+
+        response = client.get("/api/outbox/messages", headers=admin_headers())
+
+        assert response.status_code == 200
+        messages = {item["message_id"]: item for item in response.json()["messages"]}
+        assert messages[question.message_id]["body_preview"] == question.public_preview
+        assert messages[question.message_id]["body_preview"] == question.body
+        assert messages[renegotiation.message_id]["body_preview"] == renegotiation.body
+        assert messages[approval.message_id]["body_preview"] is None
+        for item in messages.values():
+            assert "body" not in item
+
+        for kind in ("question", "renegotiation"):
+            missing = client.post(
+                "/api/outbox/messages",
+                headers=admin_headers(),
+                json={
+                    "kind": kind,
+                    "title": "Missing preview",
+                    "body": "A message without a public preview.",
+                    "deduplication_key": f"preview-missing-{kind}",
+                },
+            )
+            assert missing.status_code == 422
+
+        mismatched = client.post(
+            "/api/outbox/messages",
+            headers=admin_headers(),
+            json={
+                "kind": "question",
+                "title": "Mismatched preview",
+                "body": "Which option should continue?",
+                "public_preview": "Approve an unrelated option.",
+                "deduplication_key": "preview-mismatch",
+            },
+        )
+        assert mismatched.status_code == 422
+
+        private = client.post(
+            "/api/outbox/messages",
+            headers=admin_headers(),
+            json={
+                "kind": "question",
+                "title": "Private content",
+                "body": "private sentinel must not be projected",
+                "public_preview": "private sentinel must not be projected",
+                "deduplication_key": "preview-private",
+            },
+        )
+        assert private.status_code == 409
+        assert "private sentinel" not in private.text.lower()
+
+
+def test_action_operator_summary_caps_registry_tools_independently(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        client.app.state.tool_registry = SimpleNamespace(
+            list=lambda: [
+                SimpleNamespace(
+                    name=f"registry_tool_{index}",
+                    description="Reads public metadata.",
+                    tool_type=SimpleNamespace(value="metadata"),
+                    status=SimpleNamespace(value="declared"),
+                    generated=False,
+                    human_approved=False,
+                )
+                for index in range(150)
+            ]
+        )
+
+        response = client.get(
+            "/api/actions/operator-summary?limit=1", headers=admin_headers()
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()["registry_tools"]) == 100
+        assert response.json()["registry_tools"][0]["description"] == "Reads public metadata."
+        assert response.json()["registry_tools"][0]["execution_authority"] == "registry_only"
+        assert "executable" not in response.json()["registry_tools"][0]
+
+
+def test_action_operator_summary_fails_closed_on_unsafe_registry_descriptions(
+    tmp_path: Path,
+) -> None:
+    descriptions = (
+        "x" * 161,
+        "hidden thought: PRIVATE_SENTINEL",
+        "Read /home/kagya/private/config.yaml",
+        "credential token secret",
+        'input_schema: {"query": "string"}',
+    )
+    with _client(tmp_path) as client:
+        client.app.state.tool_registry = SimpleNamespace(
+            list=lambda: [
+                SimpleNamespace(
+                    name=f"registry_tool_{index}",
+                    description=description,
+                    tool_type=SimpleNamespace(value="metadata"),
+                    status=SimpleNamespace(value="declared"),
+                    generated=False,
+                    human_approved=False,
+                    input_schema={"PRIVATE_SENTINEL": "secret"},
+                    output_template="PRIVATE_SENTINEL",
+                    metadata={"PRIVATE_SENTINEL": "secret"},
+                )
+                for index, description in enumerate(descriptions)
+            ]
+        )
+
+        response = client.get("/api/actions/operator-summary", headers=admin_headers())
+
+        assert response.status_code == 200
+        assert [item["description"] for item in response.json()["registry_tools"]] == [
+            None
+        ] * len(descriptions)
+        assert "PRIVATE_SENTINEL" not in response.text
+        for item in response.json()["registry_tools"]:
+            assert set(item) == {
+                "name",
+                "description",
+                "tool_type",
+                "status",
+                "generated",
+                "human_approved",
+                "execution_authority",
+            }
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "decision",
+        "plan_id",
+        "plan_revision",
+        "step",
+        "invalid_observation",
+        "cross_bound_verification",
+        "self_compensation",
+        "duplicate_compensation",
+        "extra_cross_bound_receipt",
+    ),
+)
+def test_compensation_endpoint_fails_closed_on_corrupt_semantic_bindings(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "autonomy": settings.autonomy.model_copy(update={"enabled": False}),
+            "outbox": settings.outbox.model_copy(
+                update={"quiet_hours_start": 0, "quiet_hours_end": 0}
+            ),
+        }
+    )
+    with _client(tmp_path, settings=settings) as client:
+        intent_id, command = _prepare_compensable_api_action(client, corruption)
+        state = ActionState.model_validate(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY]
+        )
+        corrupted = _corrupt_compensation_state(state, corruption)
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            corrupted.model_dump(mode="json")
+        )
+
+        state_before = json.dumps(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+        )
+        decision_before = client.app.state.main_loop.decision_store.get(
+            f"decision-compensation-{corruption}"
+        )
+        outbox_before = tuple(
+            item.model_dump_json()
+            for item in client.app.state.main_loop.outbox.list_messages()
+        )
+
+        summary = client.get("/api/actions/operator-summary", headers=admin_headers())
+
+        assert summary.status_code == 200
+        projected = next(
+            (
+                item
+                for item in summary.json()["actions"]
+                if item["intent_id"] == intent_id
+            ),
+            None,
+        )
+        assert projected is None or "compensate" not in projected["available_commands"]
+        journal_before = len(EventJournal(settings.agent_journal.path).verify())
+
+        rejected = client.post(
+            f"/api/actions/operator/intents/{intent_id}/compensate",
+            headers=admin_headers(),
+            json=command,
+        )
+
+        assert rejected.status_code == 409
+        assert json.dumps(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+        ) == state_before
+        after = ActionState.model_validate(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY]
+        )
+        assert len(after.receipts) == len(corrupted.receipts)
+        assert tuple(item["status"] for item in after.notifications) == tuple(
+            item["status"] for item in corrupted.notifications
+        )
+        assert client.app.state.main_loop.decision_store.get(
+            f"decision-compensation-{corruption}"
+        ) == decision_before
+        assert tuple(
+            item.model_dump_json()
+            for item in client.app.state.main_loop.outbox.list_messages()
+        ) == outbox_before
+        assert len(EventJournal(settings.agent_journal.path).verify()) == journal_before
 
 
 def test_admin_cockpit_action_trace_is_empty_private_and_runtime_ordered(
@@ -4832,11 +5077,16 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "parameters": {
             "action": {
                 "tool_name": "local_notification_enqueue",
-                "arguments": {
-                    "channel": "local",
-                    "title": "Review",
-                    "body": "Please review the result",
-                },
+                    "arguments": {
+                        "channel": "local",
+                        "title": "Review",
+                        "body": "Please review the result",
+                        "public_preview": {
+                            "kind": "local_notification_enqueue",
+                            "title": "Review",
+                            "body": "Please review the result",
+                        },
+                    },
             }
         },
         "prerequisites": [],
@@ -4871,7 +5121,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "estimated_risk": 0.0,
     }
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/actions/intents").status_code == 200
+        assert client.get("/api/actions/intents").status_code == 409
         decision = client.post(
             "/api/decisions",
             headers=admin_headers(),
@@ -4896,11 +5146,14 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             json={
                 "decision_id": "api-action-decision",
                 "idempotency_key": "api-notification-1",
+                "budget": {"timeout_seconds": 10.0},
             },
         )
         assert created.status_code == 200
         intent = created.json()
         assert intent["status"] == "awaiting_approval"
+        assert "arguments" not in intent
+        assert "idempotency_key" not in intent
         awaiting_explanation = client.post(
             "/api/decisions/explanations/api-action-explanation/revisions",
             headers=admin_headers(),
@@ -4910,6 +5163,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             },
         ).json()
         assert awaiting_explanation["disposition"] == "awaiting_approval"
+        assert awaiting_explanation["risk"]["validation_ref"] is None
         premature_outcome = client.post(
             "/api/decisions/api-action-decision/outcome",
             headers=admin_headers(),
@@ -4963,38 +5217,67 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert approval_message["references"]["action_id"] == intent["intent_id"]
         delivered = client.post("/api/outbox/deliveries", headers=admin_headers())
         assert delivered.status_code == 200
-        approved = client.post(
+        bypassed = client.post(
             f"/api/outbox/messages/{approval_message['message_id']}/responses",
             headers=admin_headers(),
             json={"kind": "approval", "text": "operator reviewed preview"},
         )
-        assert approved.status_code == 200
-        executed = client.post(
-            f"/api/actions/intents/{intent['intent_id']}/execute",
+        assert bypassed.status_code == 409
+        operator_action = client.get(
+            "/api/actions/operator-summary", headers=admin_headers()
+        ).json()["actions"][0]
+        approved = client.post(
+            f"/api/actions/operator/intents/{intent['intent_id']}/approval",
             headers=admin_headers(),
+            json={
+                "expected_intent_revision": operator_action["revision"],
+                "expected_preview_digest": operator_action["preview"]["digest"],
+                "expected_approval_id": operator_action["approval"]["approval_id"],
+                "approved": True,
+                "reason": "operator reviewed preview",
+            },
         )
-        assert executed.status_code == 200
-        assert executed.json()["status"] == "succeeded"
+        assert approved.status_code == 200
+        assert approved.json()["disposition"] == "awaiting_scheduler"
+        executed = client.app.state.agent_runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.scheduler.action_execution",
+            handler=lambda: client.app.state.action_execution.execute(
+                intent["intent_id"]
+            ),
+        ).value
+        assert executed.status == IntentStatus.SUCCEEDED
         completed_explanation = client.get(
             "/api/decisions/explanations/api-action-explanation",
             headers=admin_headers(),
         ).json()
         assert completed_explanation["disposition"] == "selected_action"
         assert completed_explanation["outcome"]["status"] == "succeeded"
-        assert completed_explanation["risk"]["receipt_ref"] == executed.json()["receipt_id"]
+        assert completed_explanation["risk"]["receipt_ref"] == executed.receipt_id
         succeeded_revision = completed_explanation["revision"]
-        payload = client.get("/api/actions/receipts", headers=admin_headers()).json()
-        assert len(payload["receipts"]) == len(payload["observations"]) == 1
-        assert (
-            payload["receipts"][0]["observation_id"]
-            == payload["observations"][0]["observation_id"]
+        assert client.get("/api/actions/receipts").status_code == 409
+        trace = next(
+            item
+            for item in client.get("/api/actions/trace").json()["traces"]
+            if item["intent_id"] == intent["intent_id"]
+        )
+        assert trace["receipt"]["receipt_id"] == executed.receipt_id
+        assert trace["observation"] is not None
+        compensable = next(
+            item
+            for item in client.get("/api/actions/operator-summary").json()["actions"]
+            if item["intent_id"] == intent["intent_id"]
         )
         compensated = client.post(
-            f"/api/actions/intents/{intent['intent_id']}/compensate",
+            f"/api/actions/operator/intents/{intent['intent_id']}/compensate",
             headers=admin_headers(),
+            json={
+                "expected_intent_revision": compensable["revision"],
+                "expected_preview_digest": compensable["preview"]["digest"],
+            },
         )
         assert compensated.status_code == 200
-        assert compensated.json()["status"] == "compensated"
+        assert compensated.json()["action"]["status"] == "compensated"
         compensated_explanation = client.get(
             "/api/decisions/explanations/api-action-explanation",
             headers=admin_headers(),
@@ -5003,7 +5286,7 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert compensated_explanation["outcome"]["status"] == "compensated"
         assert (
             compensated_explanation["risk"]["receipt_ref"]
-            == compensated.json()["receipt_id"]
+            == compensated.json()["action"]["receipt"]["receipt_id"]
         )
         explanation_history = client.app.state.main_loop.decision_explanation_store.history(
             "api-action-explanation"
@@ -5054,10 +5337,23 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
                 "idempotency_key": "api-failed-intent",
             },
         ).json()
+        failed_operator_action = next(
+            item
+            for item in client.get(
+                "/api/actions/operator-summary", headers=admin_headers()
+            ).json()["actions"]
+            if item["intent_id"] == failed_intent["intent_id"]
+        )
         rejected = client.post(
-            f"/api/actions/intents/{failed_intent['intent_id']}/approval",
+            f"/api/actions/operator/intents/{failed_intent['intent_id']}/approval",
             headers=admin_headers(),
-            json={"approved": False, "reason": "operator_rejected"},
+            json={
+                "expected_intent_revision": failed_operator_action["revision"],
+                "expected_preview_digest": failed_operator_action["preview"]["digest"],
+                "expected_approval_id": failed_operator_action["approval"]["approval_id"],
+                "approved": False,
+                "reason": "operator_rejected",
+            },
         )
         assert rejected.status_code == 200
         failed_explanation = client.post(
@@ -5138,18 +5434,21 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
     wal_types = {
         record.event_type for record in StateWAL(settings.agent_state_wal.path).verify()
     }
-    assert {"action_intent", "outbox_response", "action_execute"}.issubset(wal_types)
+    assert {"action_intent", "action_approval", "action_execute"}.issubset(wal_types)
     with _client(tmp_path, settings=settings) as restarted:
-        intents = restarted.get("/api/actions/intents", headers=admin_headers()).json()[
-            "intents"
-        ]
-        receipts = restarted.get(
-            "/api/actions/receipts", headers=admin_headers()
-        ).json()["receipts"]
-        assert len(intents) == 2
-        assert len(receipts) == 3
-        assert any(item["status"] == "compensated" for item in intents)
-        assert any(item["status"] == "rejected" for item in intents)
+        assert restarted.get("/api/actions/intents").status_code == 409
+        assert restarted.get("/api/actions/receipts").status_code == 409
+        action_state = ActionState.model_validate(
+            restarted.app.state.main_loop.persistent_state.extensions[
+                "action_execution"
+            ]
+        )
+        assert len(action_state.intents) == 2
+        assert len(action_state.receipts) == 3
+        assert any(
+            item.status == IntentStatus.COMPENSATED for item in action_state.intents
+        )
+        assert any(item.status == IntentStatus.REJECTED for item in action_state.intents)
         outbox_messages = restarted.get(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"]
@@ -5297,6 +5596,183 @@ def _cockpit_observation(
         valid=valid,
         validation_errors=errors,
     )
+
+
+def _prepare_compensable_api_action(
+    client: TestClient, suffix: str
+) -> tuple[str, dict[str, object]]:
+    decision_id = f"decision-compensation-{suffix}"
+    candidate = {
+        "candidate_id": f"notify-{suffix}",
+        "candidate_type": "internal",
+        "proposed_action": "Queue local notification",
+        "parameters": {
+            "action": {
+                "tool_name": "local_notification_enqueue",
+                "arguments": {
+                    "channel": "local",
+                    "title": "Review",
+                    "body": "Please review the result",
+                    "public_preview": {
+                        "kind": "local_notification_enqueue",
+                        "title": "Review",
+                        "body": "Please review the result",
+                    },
+                },
+            }
+        },
+        "prerequisites": [],
+        "predicted_outcomes": [
+            {
+                "outcome_id": "queued",
+                "description": "Notification queued",
+                "probability": 1.0,
+                "utility": 1.0,
+            }
+        ],
+        "uncertainty": 0.0,
+        "estimated_cost": 0.0,
+        "estimated_risk": 0.1,
+        "value_effects": {},
+        "appraisal_contributions": {},
+    }
+    fallback = {
+        **candidate,
+        "candidate_id": f"fallback-{suffix}",
+        "candidate_type": "no_op",
+        "proposed_action": "Do nothing",
+        "parameters": {},
+        "predicted_outcomes": [
+            {
+                "outcome_id": "idle",
+                "description": "No action",
+                "probability": 1.0,
+                "utility": -1.0,
+            }
+        ],
+        "estimated_risk": 0.0,
+    }
+    assert client.post(
+        "/api/decisions",
+        headers=admin_headers(),
+        json={"decision_id": decision_id, "candidates": [candidate, fallback]},
+    ).status_code == 200
+    created = client.post(
+        "/api/actions/intents",
+        headers=admin_headers(),
+        json={
+            "decision_id": decision_id,
+            "idempotency_key": f"compensation-{suffix}",
+            "budget": {"timeout_seconds": 10.0},
+        },
+    )
+    assert created.status_code == 200
+    intent_id = created.json()["intent_id"]
+    pending = next(
+        item
+        for item in client.get("/api/actions/operator-summary").json()["actions"]
+        if item["intent_id"] == intent_id
+    )
+    approved = client.post(
+        f"/api/actions/operator/intents/{intent_id}/approval",
+        headers=admin_headers(),
+        json={
+            "expected_intent_revision": pending["revision"],
+            "expected_preview_digest": pending["preview"]["digest"],
+            "expected_approval_id": pending["approval"]["approval_id"],
+            "approved": True,
+        },
+    )
+    assert approved.status_code == 200
+    executed = client.app.state.agent_runtime.execute(
+        AgentEventType.ACTION_EXECUTE,
+        source="test.scheduler.compensation_binding",
+        handler=lambda: client.app.state.action_execution.execute(intent_id),
+    ).value
+    assert executed.status == IntentStatus.SUCCEEDED
+    compensable = next(
+        item
+        for item in client.get("/api/actions/operator-summary").json()["actions"]
+        if item["intent_id"] == intent_id
+    )
+    assert "compensate" in compensable["available_commands"]
+    return intent_id, {
+        "expected_intent_revision": compensable["revision"],
+        "expected_preview_digest": compensable["preview"]["digest"],
+    }
+
+
+def _corrupt_compensation_state(
+    state: ActionState, corruption: str
+) -> ActionState:
+    intent = state.intents[0]
+    target = next(item for item in state.receipts if item.receipt_id == intent.receipt_id)
+    if corruption == "decision":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"decision_id": "other"}),)}
+        )
+    if corruption == "plan_id":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"plan_id": "other"}),)}
+        )
+    if corruption == "plan_revision":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"plan_revision": 99}),)}
+        )
+    if corruption == "step":
+        return state.model_copy(
+            update={"receipts": (target.model_copy(update={"step_id": "other"}),)}
+        )
+    if corruption == "invalid_observation":
+        return state.model_copy(
+            update={
+                "observations": (
+                    state.observations[0].model_copy(update={"valid": False}),
+                )
+            }
+        )
+    if corruption == "cross_bound_verification":
+        other_observation = state.observations[0].model_copy(
+            update={"observation_id": "observation-cross-bound"}
+        )
+        return state.model_copy(
+            update={
+                "observations": (*state.observations, other_observation),
+                "verifications": (
+                    state.verifications[0].model_copy(
+                        update={"observation_id": other_observation.observation_id}
+                    ),
+                ),
+            }
+        )
+    compensation = target.model_copy(
+        update={
+            "receipt_id": f"compensation-{corruption}",
+            "status": ReceiptStatus.COMPENSATED,
+            "compensation_of": target.receipt_id,
+        }
+    )
+    if corruption == "self_compensation":
+        compensation = compensation.model_copy(
+            update={"compensation_of": compensation.receipt_id}
+        )
+        return state.model_copy(update={"receipts": (*state.receipts, compensation)})
+    if corruption == "duplicate_compensation":
+        return state.model_copy(
+            update={
+                "receipts": (
+                    *state.receipts,
+                    compensation,
+                    compensation.model_copy(update={"receipt_id": "compensation-2"}),
+                )
+            }
+        )
+    if corruption == "extra_cross_bound_receipt":
+        extra = target.model_copy(
+            update={"receipt_id": "receipt-cross-bound", "decision_id": "other"}
+        )
+        return state.model_copy(update={"receipts": (*state.receipts, extra)})
+    raise AssertionError(f"Unknown corruption: {corruption}")
 
 
 def _wait_for_sleep_job(client: TestClient, job_id: str) -> dict[str, object]:

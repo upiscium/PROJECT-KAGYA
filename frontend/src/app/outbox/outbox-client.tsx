@@ -7,21 +7,26 @@ import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/input";
 import { api, errorMessage, type OutboxMessage } from "@/lib/api";
+import Link from "next/link";
+import { queryKeys } from "@/lib/query-keys";
 
 export function OutboxClient() {
   const queryClient = useQueryClient();
   const [replies, setReplies] = useState<Record<string, string>>({});
   const messages = useQuery({
-    queryKey: ["outbox"],
+    queryKey: queryKeys.outbox,
     queryFn: api.outboxMessages,
     refetchInterval: 5000,
   });
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ["outbox"] });
-  const deliver = useMutation({ mutationFn: api.deliverOutbox, onSuccess: refresh });
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.outbox, refetchType: "all" });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.cockpit.outbox, refetchType: "all" });
+  };
+  const deliver = useMutation({ mutationFn: api.deliverOutbox, onSettled: refresh });
   const respond = useMutation({
-    mutationFn: ({ message, kind }: { message: OutboxMessage; kind: "read" | "reply" | "approval" | "reject" }) =>
-      api.respondToOutbox(message.message_id, kind, kind === "reply" || kind === "reject" ? replies[message.message_id] : undefined),
-    onSuccess: refresh,
+    mutationFn: ({ message, kind }: { message: OutboxMessage; kind: "read" | "reply" }) =>
+      api.respondToOutbox(message.message_id, kind, kind === "reply" ? replies[message.message_id] : undefined),
+    onSettled: refresh,
   });
   const error = messages.error ?? deliver.error ?? respond.error;
 
@@ -49,11 +54,12 @@ export function OutboxClient() {
                 <span>{message.kind.replaceAll("_", " ")}</span>
               </div>
               <h3>{message.title}</h3>
-              <p>{message.body}</p>
-              <p className="muted">Created {new Date(message.created_at).toLocaleString()} · {message.channel} · {message.privacy_class}</p>
+              {message.body_preview ? <p>{message.body_preview}</p> : null}
+               <p className="muted">Created {new Date(message.created_at).toLocaleString()} · {message.channel} · {message.privacy_class}</p>
               {message.last_failure_code ? <p className="error">Last delivery failure: {message.last_failure_code}</p> : null}
               <p className="mono muted">{referenceSummary(message)}</p>
-              {message.delivery_status === "delivered" && message.acknowledgment_status === "unacknowledged" ? (
+              {message.kind === "approval_request" ? <p><Link className="entity-link" href={`/cockpit#action-${encodeURIComponent(message.references.action_id ?? message.message_id)}`}>Open in Cockpit</Link></p> : null}
+              {message.kind !== "approval_request" && message.delivery_status === "delivered" && message.acknowledgment_status === "unacknowledged" ? (
                 <div className="composer">
                   {message.kind === "question" || message.kind === "renegotiation" ? (
                     <Textarea aria-label={`Reply to ${message.title}`} value={replies[message.message_id] ?? ""} onChange={(event) => setReplies((current) => ({ ...current, [message.message_id]: event.target.value }))} placeholder="Reply with information that should be correlated to the originating state" />
@@ -61,8 +67,6 @@ export function OutboxClient() {
                   <div className="action-row">
                     <Button onClick={() => respond.mutate({ message, kind: "read" })}>Mark read</Button>
                     {message.kind === "question" || message.kind === "renegotiation" ? <Button disabled={!replies[message.message_id]?.trim()} onClick={() => respond.mutate({ message, kind: "reply" })}>Reply</Button> : null}
-                    {message.kind === "approval_request" ? <Button onClick={() => respond.mutate({ message, kind: "approval" })}>Approve</Button> : null}
-                    {message.kind === "approval_request" ? <Button onClick={() => respond.mutate({ message, kind: "reject" })}>Reject</Button> : null}
                   </div>
                 </div>
               ) : null}

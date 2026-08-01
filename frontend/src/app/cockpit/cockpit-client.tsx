@@ -1,11 +1,12 @@
 "use client";
 
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { EmotionMeter } from "@/components/emotion-meter";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import {
   api,
   errorMessage,
@@ -21,24 +22,72 @@ import {
   type JournalRecord,
   type CockpitOutboxMessage,
   type Plan,
+  type OperatorAction,
+  type ActionTool,
+  type RegistryTool,
 } from "@/lib/api";
 import { evaluationHref } from "@/lib/anchors";
+import { actionMutationInvalidationKeys, queryKeys } from "@/lib/query-keys";
+
+type OperatorCommand = OperatorAction["available_commands"][number];
+type OperatorMutationVariables = { command: OperatorCommand; action: OperatorAction; reason?: string; phrase?: string };
 
 export function CockpitClient() {
-  const runtime = useQuery({ queryKey: ["cockpit", "runtime"], queryFn: api.systemInfo });
-  const emotion = useQuery({ queryKey: ["cockpit", "emotion"], queryFn: api.emotion });
-  const workingMemory = useQuery({ queryKey: ["cockpit", "working-memory"], queryFn: api.workingMemory });
-  const contexts = useQuery({ queryKey: ["cockpit", "contexts"], queryFn: api.contexts });
-  const goals = useQuery({ queryKey: ["cockpit", "goals"], queryFn: api.goals });
-  const commitments = useQuery({ queryKey: ["cockpit", "commitments"], queryFn: api.commitments });
-  const plans = useQuery({ queryKey: ["cockpit", "plans"], queryFn: api.plans });
-  const decisions = useQuery({ queryKey: ["cockpit", "decisions"], queryFn: api.decisions });
-  const outbox = useQuery({ queryKey: ["cockpit", "outbox"], queryFn: api.cockpitOutbox });
-  const actions = useQuery({ queryKey: ["cockpit", "actions"], queryFn: api.actionTrace });
-  const training = useQuery({ queryKey: ["cockpit", "training"], queryFn: api.cockpitTraining });
-  const evaluations = useQuery({ queryKey: ["cockpit", "evaluations"], queryFn: api.behavioralEvaluations });
-  const journal = useQuery({ queryKey: ["cockpit", "journal"], queryFn: api.eventJournal });
-  const adapters = useQuery({ queryKey: ["cockpit", "adapters"], queryFn: api.adapters });
+  const queryClient = useQueryClient();
+  const runtime = useQuery({ queryKey: queryKeys.cockpit.runtime, queryFn: api.systemInfo });
+  const emotion = useQuery({ queryKey: queryKeys.cockpit.emotion, queryFn: api.emotion });
+  const workingMemory = useQuery({ queryKey: queryKeys.cockpit.workingMemory, queryFn: api.workingMemory });
+  const contexts = useQuery({ queryKey: queryKeys.cockpit.contexts, queryFn: api.contexts });
+  const goals = useQuery({ queryKey: queryKeys.cockpit.goals, queryFn: api.goals });
+  const commitments = useQuery({ queryKey: queryKeys.cockpit.commitments, queryFn: api.commitments });
+  const plans = useQuery({ queryKey: queryKeys.cockpit.plans, queryFn: api.plans });
+  const decisions = useQuery({ queryKey: queryKeys.cockpit.decisions, queryFn: api.decisions });
+  const outbox = useQuery({ queryKey: queryKeys.cockpit.outbox, queryFn: api.cockpitOutbox });
+  const actions = useQuery({ queryKey: queryKeys.cockpit.actions, queryFn: api.actionTrace });
+  const training = useQuery({ queryKey: queryKeys.cockpit.training, queryFn: api.cockpitTraining });
+  const evaluations = useQuery({ queryKey: queryKeys.cockpit.evaluations, queryFn: api.behavioralEvaluations });
+  const journal = useQuery({ queryKey: queryKeys.cockpit.journal, queryFn: api.eventJournal });
+  const adapters = useQuery({ queryKey: queryKeys.cockpit.adapters, queryFn: api.adapters });
+  const pendingIntents = useRef(new Set<string>());
+  const [pendingIntentIds, setPendingIntentIds] = useState<Set<string>>(new Set());
+  const operator = useQuery({
+    queryKey: queryKeys.cockpit.actionOperator,
+    queryFn: api.actionOperatorSummary,
+    refetchInterval: (query) => hasActiveOperatorItems(query.state.data) ? 5000 : false,
+  });
+  const operatorMutation = useMutation({
+    mutationFn: ({ command, action, reason, phrase }: OperatorMutationVariables) => {
+      const common = {
+        expected_intent_revision: action.revision,
+        expected_preview_digest: action.preview.digest,
+        ...(phrase ? { confirmation_phrase: phrase } : {}),
+      };
+      if (command === "approve" || command === "reject") {
+        if (action.approval === null) throw new Error("Approval binding is unavailable");
+        const request = {
+          ...common,
+          expected_approval_id: action.approval.approval_id,
+          ...(reason ? { reason } : {}),
+        };
+        return command === "approve"
+          ? api.approveAction(action.intent_id, request)
+          : api.rejectAction(action.intent_id, request);
+      }
+      if (command === "cancel") return api.cancelAction(action.intent_id, common);
+      if (command === "retry_now") return api.retryAction(action.intent_id, common);
+      return api.compensateAction(action.intent_id, common);
+    },
+    onSettled: async (_data, _error, variables) => {
+      try {
+        await Promise.all(actionMutationInvalidationKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey, refetchType: "all" })));
+      } finally {
+        if (variables) {
+          pendingIntents.current.delete(variables.action.intent_id);
+          setPendingIntentIds(new Set(pendingIntents.current));
+        }
+      }
+    },
+  });
 
   const currentGoals = goals.data?.goals.filter(isCurrentGoal) ?? [];
   const currentCommitments = commitments.data?.commitments.filter(isCurrentCommitment) ?? [];
@@ -64,12 +113,14 @@ export function CockpitClient() {
   const loadedCockpitAdapters = new Set(training.data?.adapters.map((item) => item.adapter_id));
   const loadedEvaluations = new Set(evaluations.data?.results.map((item) => item.evaluation_id));
   const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
+  const operatorActions = operator.data?.actions ?? [];
+  const approvalInbox = operatorActions.filter((item) => item.status === "awaiting_approval");
 
   return (
     <div className="page cockpit-page">
       <header className="page-header">
         <div>
-          <p className="cockpit-kicker">SUBJECT / READ ONLY</p>
+          <p className="cockpit-kicker">SUBJECT / GOVERNED OPERATOR</p>
           <h1 className="page-title">Cockpit</h1>
           <p className="page-subtitle">Current runtime state and traceable Goal → Plan → Decision → Action / Outbox references.</p>
         </div>
@@ -114,11 +165,15 @@ export function CockpitClient() {
           <div className="stack">{recentDecisions.map((decision) => <DecisionRecord key={decision.decision_id} decision={decision} actions={actions.data?.traces ?? []} actionFailures={actions.data?.pre_intent_failures ?? []} outbox={outbox.data?.messages ?? []} loadedContexts={loadedContexts} loadedGoals={loadedGoals} loadedPlans={loadedPlans} loadedCommitments={loadedCommitments} loadedOutbox={loadedOutbox} loadedActions={loadedActions} loadedActionFailures={loadedActionFailures} />)}</div>
         </Section>
 
-        <Section title="Action Execution" query={actions} empty={actions.data ? actions.data.traces.length === 0 && actions.data.pre_intent_failures.length === 0 : false} emptyText="No action execution traces.">
+         <Section title="Action Execution" query={actions} empty={actions.data ? actions.data.traces.length === 0 && actions.data.pre_intent_failures.length === 0 : false} emptyText="No action execution traces.">
           {actions.data ? <div className="metric-grid"><Metric label="Pending approvals" value={String(actions.data.pending_approval_count)} /><Metric label="Retry pending" value={String(actions.data.retry_pending_count)} /><Metric label="Failed" value={String(actions.data.failed_count)} /></div> : null}
           <div className="stack">{actions.data?.pre_intent_failures.map((failure) => <PreIntentFailureRecord key={failure.failure_id} failure={failure} loadedDecisions={loadedDecisions} loadedJournal={loadedJournal} />)}</div>
           <div className="stack">{actions.data?.traces.map((trace) => <ActionTraceRecord key={trace.intent_id} trace={trace} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}</div>
-        </Section>
+         </Section>
+
+         <Section title="Action Operator" query={operator} empty={operator.data ? operatorActions.length === 0 : false} emptyText="No operator actions.">
+           {operator.data ? <ActionOperator actions={operatorActions} approvalInbox={approvalInbox} actionTools={operator.data.action_tools} registryTools={operator.data.registry_tools} pendingIntentIds={pendingIntentIds} onRun={(action, command, reason, phrase) => { if (pendingIntents.current.has(action.intent_id)) return; pendingIntents.current.add(action.intent_id); setPendingIntentIds(new Set(pendingIntents.current)); operatorMutation.mutate({ command, action, reason, phrase }); }} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} /> : null}
+         </Section>
 
         <Section title="Training / Adapters" query={training} empty={training.data ? training.data.nodes.length === 0 && training.data.jobs.length === 0 && training.data.adapters.length === 0 : false} emptyText="No training nodes, jobs, or adapter lineage records.">
           {training.data ? <TrainingAdaptersSummary nodes={training.data.node_count} online={training.data.online_node_count} running={training.data.running_job_count} failed={training.data.failed_job_count} importing={training.data.importing_job_count} activeAdapters={training.data.active_adapter_count} candidateAdapters={training.data.candidate_adapter_count} /> : null}
@@ -206,6 +261,62 @@ function ActionTraceRecord({ trace, loadedDecisions, loadedPlans, loadedJournal,
 
 function TrainingAdaptersSummary({ nodes, online, running, failed, importing, activeAdapters, candidateAdapters }: { nodes: number; online: number; running: number; failed: number; importing: number; activeAdapters: number; candidateAdapters: number }) {
   return <div className="metric-grid"><Metric label="Nodes" value={String(nodes)} /><Metric label="Online" value={String(online)} /><Metric label="Running" value={String(running)} /><Metric label="Failed" value={String(failed)} /><Metric label="Importing" value={String(importing)} /><Metric label="Active adapters" value={String(activeAdapters)} /><Metric label="Candidate adapters" value={String(candidateAdapters)} /></div>;
+}
+
+function ActionOperator({ actions, approvalInbox, actionTools, registryTools, pendingIntentIds, onRun, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { actions: OperatorAction[]; approvalInbox: OperatorAction[]; actionTools: ActionTool[]; registryTools: RegistryTool[]; pendingIntentIds: Set<string>; onRun: (action: OperatorAction, command: OperatorCommand, reason?: string, phrase?: string) => void; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
+  const [reasons, setReasons] = useState<Record<string, string>>({});
+  const [phrases, setPhrases] = useState<Record<string, string>>({});
+  const approvalIds = new Set(approvalInbox.map((action) => action.intent_id));
+  const run = (action: OperatorAction, command: OperatorCommand) => onRun(action, command, reasons[action.intent_id], phrases[action.intent_id]);
+  return <div className="stack">
+    <h3 className="cockpit-subheading">Approval Inbox</h3>
+    {approvalInbox.length === 0 ? <p className="muted">No pending approvals.</p> : approvalInbox.map((action) => <OperatorRecord key={action.intent_id} action={action} pending={pendingIntentIds.has(action.intent_id)} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
+    <h3 className="cockpit-subheading">Other operator actions</h3>
+    {actions.filter((action) => !approvalIds.has(action.intent_id)).map((action) => <OperatorRecord key={action.intent_id} action={action} pending={pendingIntentIds.has(action.intent_id)} reason={reasons[action.intent_id] ?? ""} phrase={phrases[action.intent_id] ?? ""} onReason={(value) => setReasons((current) => ({ ...current, [action.intent_id]: value.slice(0, 500) }))} onPhrase={(value) => setPhrases((current) => ({ ...current, [action.intent_id]: value }))} onRun={run} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}
+    <h3 className="cockpit-subheading">Action-executable tools</h3>
+    <ActionToolCatalog tools={actionTools} />
+    <h3 className="cockpit-subheading">Registry-only tools</h3>
+    <RegistryToolCatalog tools={registryTools} />
+  </div>;
+}
+
+function OperatorRecord({ action, pending, reason, phrase, onReason, onPhrase, onRun, loadedDecisions, loadedPlans, loadedJournal, loadedReceipts }: { action: OperatorAction; pending: boolean; reason: string; phrase: string; onReason: (value: string) => void; onPhrase: (value: string) => void; onRun: (action: OperatorAction, command: OperatorCommand) => void; loadedDecisions: Set<string>; loadedPlans: Set<string>; loadedJournal: Set<string>; loadedReceipts: Set<string> }) {
+  const commands = action.available_commands;
+  const confirmationNeeded = action.confirmation?.required === true;
+  return <article className="record" id={anchor("action", action.intent_id)}>
+    <div className="metadata-row"><Badge>{action.status}</Badge><Badge>{action.tool.risk_class}</Badge><strong>{action.tool.name}</strong><span className="mono">{action.intent_id}</span></div>
+    <p>{formatArgumentSummary(action)}</p>
+    <p>Effect: {action.preview.effect} · Policy: {action.policy.reason_codes.join(", ")}</p>
+    <p>Preview digest: <span className="mono">{action.preview.digest}</span> · Attempts: {action.budget.attempts}/{action.budget.max_attempts} · Cost: {action.budget.cost_units_used}/{action.budget.max_cost_units} · Deadline: {action.budget.deadline_at}</p>
+    <p>Decision: <EntityReference kind="decision" id={action.provenance.decision_id} available={loadedDecisions} /> · Plan: <EntityReference kind="plan" id={action.provenance.plan_id} available={loadedPlans} />{action.provenance.step_id ? ` / step ${action.provenance.step_id}` : ""} · Journal: <EntityReference kind="journal" id={action.provenance.triggering_event_id} available={loadedJournal} /> · Receipt: <EntityReference kind="receipt" id={action.receipt?.receipt_id ?? null} available={loadedReceipts} /></p>
+    {commands.includes("reject") ? <input aria-label={`Reason for ${action.intent_id}`} value={reason} maxLength={500} onChange={(event) => onReason(event.target.value)} placeholder="Optional reason" /> : null}
+     {confirmationNeeded && commands.length ? <div><p>Confirm target <span className="mono">{action.intent_id}</span> / digest <span className="mono">{action.preview.digest}</span>. Required phrase: <strong>{action.confirmation?.phrase}</strong></p><input aria-label={`Confirmation for ${action.intent_id}`} value={phrase} onChange={(event) => onPhrase(event.target.value)} /></div> : null}
+     <div className="action-row">{commands.map((command) => <Button key={command} disabled={pending || (confirmationNeeded && phrase !== action.confirmation?.phrase)} onClick={() => onRun(action, command)}>{commandLabel(command)}</Button>)}</div>
+  </article>;
+}
+
+function ActionToolCatalog({ tools }: { tools: ActionTool[] }) {
+  return tools.length ? <div className="stack">{tools.map((tool) => <div className="record" key={tool.name}><strong>{tool.name}</strong><p>{tool.effect_code} · Risk: {tool.risk_class} · {tool.executable ? "executable" : "disabled"} · schema {tool.validation_schema_revision.slice(0, 12)}...</p></div>)}</div> : <p className="muted">No action tools.</p>;
+}
+
+function RegistryToolCatalog({ tools }: { tools: RegistryTool[] }) {
+  return tools.length ? <div className="stack">{tools.map((tool) => <div className="record" key={tool.name}><strong>{tool.name}</strong><p>{tool.description ?? "Description unavailable."} · {tool.tool_type} · {tool.status} · registry only</p></div>)}</div> : <p className="muted">No registry tools.</p>;
+}
+
+function formatArgumentSummary(action: OperatorAction): string {
+  const summary = action.argument_summary;
+  if (summary.kind === "metadata_read") return `Metadata ${summary.namespace} / ${summary.key}`;
+  if (summary.kind === "document_search") return `Document scope ${summary.scope_kind} · ${summary.max_results} results · query length ${summary.query_length}`;
+  if (summary.kind === "calendar_read") return `Calendar ${summary.starts_at} → ${summary.ends_at} · ${summary.max_results} results`;
+  return `${summary.channel} notification · ${summary.title} · ${summary.body_preview}`;
+}
+
+function commandLabel(command: OperatorCommand): string {
+  return command === "retry_now" ? "Retry now" : command[0].toUpperCase() + command.slice(1);
+}
+
+function hasActiveOperatorItems(data: { actions: OperatorAction[] } | undefined): boolean {
+  return Boolean(data?.actions.some((action) => ["awaiting_approval", "approved", "retry_pending", "executing"].includes(action.status)));
 }
 
 function TrainingNodeRecord({ node, jobs, loadedJobs }: { node: CockpitTrainingNode; jobs: CockpitTrainingJob[]; loadedJobs: Set<string> }) {

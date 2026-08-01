@@ -40,6 +40,7 @@ async function proxyRequest(request: NextRequest, context: RouteContext): Promis
   target.search = request.nextUrl.search;
   const response = await fetch(target, {
     method: request.method,
+    cache: "no-store",
     headers: {
       "Content-Type": request.headers.get("Content-Type") ?? "application/json",
     },
@@ -51,6 +52,7 @@ async function proxyRequest(request: NextRequest, context: RouteContext): Promis
     statusText: response.statusText,
     headers: {
       "Content-Type": response.headers.get("Content-Type") ?? "application/json",
+      "Cache-Control": "no-store",
     },
   });
 }

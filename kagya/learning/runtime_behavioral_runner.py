@@ -828,7 +828,16 @@ class RuntimeBehavioralRunner:
                 arguments: dict[str, object] = (
                     {"query": "x", "relative_path": "../private"}
                     if event_type == "invalid_action_arguments"
-                    else {"channel": "local", "title": "Review", "body": "Wait"}
+                    else {
+                        "channel": "local",
+                        "title": "Review",
+                        "body": "Wait",
+                        "public_preview": {
+                            "kind": "local_notification_enqueue",
+                            "title": "Review",
+                            "body": "Wait",
+                        },
+                    }
                 )
                 decision_id = f"behavioral-{event_type}"
                 harness.execute(
@@ -918,6 +927,7 @@ class RuntimeBehavioralRunner:
                         OutboxMessageKind.QUESTION,
                         title="Bounded question",
                         body="Choose one bounded option.",
+                        public_preview="Choose one bounded option.",
                         deduplication_key="behavioral-delivery",
                         urgency=OutboxUrgency.CRITICAL,
                     )
@@ -1112,7 +1122,9 @@ def _verify_public_attack_path(
         )
         before_boundary = _boundary_assessments(before)
         after_boundary = _boundary_assessments(trace.final_authoritative_state)
-        assessment = after_boundary[-1] if len(after_boundary) > len(before_boundary) else None
+        assessment = (
+            after_boundary[-1] if len(after_boundary) > len(before_boundary) else None
+        )
         runtime_proof = (
             isinstance(assessment, dict)
             and assessment.get("disposition") == "refuse"

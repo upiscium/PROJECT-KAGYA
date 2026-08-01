@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,9 @@ from kagya.actions import (
     ActionPolicyError,
     ActionState,
     ActionValidationRecord,
+    ExecutionReceipt,
     IntentStatus,
+    OperatorCommand,
     ReceiptStatus,
 )
 from kagya.decision import (
@@ -26,6 +29,7 @@ from kagya.decision import (
     build_explanation,
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
+from kagya.api.routes.actions import _operator_action
 from kagya.outbox import DeliveryStatus, Outbox
 from kagya.identity import (
     BoundaryAssessmentInput,
@@ -263,7 +267,7 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
         loop,
         "decision-notify",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Action needed"},
+        _notification_args("Review", "Action needed"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -289,6 +293,17 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
             source="test.notification.unapproved",
             handler=lambda: layer.execute(intent.intent_id),
         )
+
+    approval_message = next(
+        item
+        for item in loop.outbox.list_messages()
+        if item.kind.value == "approval_request"
+    )
+    loop.outbox.respond(
+        approval_message.message_id,
+        kind="read",
+        actor_id="operator-1",
+    )
 
     approved = runtime.execute(
         AgentEventType.ACTION_APPROVAL,
@@ -359,6 +374,487 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     assert outcome is not None and outcome.compensated
     assert outcome.compensation_receipt_id == compensated.receipt_id
     runtime.shutdown()
+
+
+def test_operator_preview_uses_explicit_public_notification_copy(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-public-preview",
+        "local_notification_enqueue",
+        {
+            "channel": "local",
+            "title": "Safe title",
+            "body": "Safe bounded preview",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Safe title",
+                "body": "Safe bounded preview",
+            },
+        },
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.preview",
+            handler=lambda: layer.create_from_decision(
+                "decision-public-preview", idempotency_key="public-preview"
+            ),
+        ).value
+        preview = layer.operator_preview(intent.intent_id)
+        duplicate = layer.operator_preview(intent.intent_id)
+    finally:
+        runtime.shutdown()
+
+    serialized = preview.model_dump_json()
+    assert "Safe bounded preview" in serialized
+    assert preview.preview_digest == duplicate.preview_digest
+    assert intent.idempotency_key not in serialized
+    assert preview.available_commands == (
+        OperatorCommand.APPROVE,
+        OperatorCommand.REJECT,
+        OperatorCommand.CANCEL,
+    )
+
+
+def test_schema_v4_fixture_preview_binding_is_stable_across_independent_graphs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_loop = _Loop()
+    _decision(
+        source_loop,
+        "decision-stable-binding",
+        "document_search",
+        {"query": "stable fixture", "relative_path": None, "max_results": 5},
+    )
+    source_layer = ActionExecutionLayer(
+        source_loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.stable-binding",
+            handler=lambda: source_layer.create_from_decision(
+                "decision-stable-binding", idempotency_key="private-stable-key"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    fixture = json.loads(
+        json.dumps(source_loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
+    assert fixture["schema_version"] == 4
+    first_loop = _Loop()
+    second_loop = _Loop()
+    first_loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+        json.dumps(fixture)
+    )
+    second_loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+        json.dumps(fixture)
+    )
+    def unexpected_save(_layer: ActionExecutionLayer, _state: ActionState) -> None:
+        raise AssertionError("schema-v4 reads must not rewrite authoritative state")
+
+    with monkeypatch.context() as context:
+        context.setattr(ActionExecutionLayer, "_save", unexpected_save)
+        first = ActionExecutionLayer(
+            first_loop,
+            document_root=tmp_path,
+            calendar_path=tmp_path / "calendar.json",
+        )
+        second = ActionExecutionLayer(
+            second_loop,
+            document_root=tmp_path,
+            calendar_path=tmp_path / "calendar.json",
+        )
+        first_preview = first.operator_preview(intent.intent_id)
+        second_preview = second.operator_preview(intent.intent_id)
+
+    first_bytes = json.dumps(
+        first_loop.persistent_state.extensions[ACTION_STATE_KEY],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    second_bytes = json.dumps(
+        second_loop.persistent_state.extensions[ACTION_STATE_KEY],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert first_bytes == second_bytes
+    assert first_preview.preview_digest == second_preview.preview_digest
+    assert "private-stable-key" not in first_preview.model_dump_json()
+
+
+def test_obsolete_schema_v5_nonce_is_removed_deterministically(
+    tmp_path: Path,
+) -> None:
+    source_loop = _Loop()
+    _decision(
+        source_loop,
+        "decision-v5-compatibility",
+        "document_search",
+        {"query": "stable compatibility", "relative_path": None, "max_results": 5},
+    )
+    source = ActionExecutionLayer(
+        source_loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.v5-compatibility",
+            handler=lambda: source.create_from_decision(
+                "decision-v5-compatibility", idempotency_key="v5-private-key"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    fixture = json.loads(
+        json.dumps(source_loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
+    fixture["schema_version"] = 5
+    fixture["intents"] = [
+        {
+            **item,
+            "operator_binding_nonce": "00000000-0000-4000-8000-000000000001",
+        }
+        for item in fixture["intents"]
+    ]
+    loops = (_Loop(), _Loop())
+    layers = []
+    for loop in loops:
+        loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
+            json.dumps(fixture)
+        )
+        layers.append(
+            ActionExecutionLayer(
+                loop,
+                document_root=tmp_path,
+                calendar_path=tmp_path / "calendar.json",
+            )
+        )
+
+    serialized = [
+        json.dumps(
+            loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for loop in loops
+    ]
+    previews = [layer.operator_preview(intent.intent_id) for layer in layers]
+    assert serialized[0] == serialized[1]
+    assert '"schema_version":4' in serialized[0]
+    assert "operator_binding_nonce" not in serialized[0]
+    assert previews[0].preview_digest == previews[1].preview_digest
+
+
+def test_document_search_public_preview_has_no_query_fingerprint(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    query = "release status"
+    _decision(
+        loop,
+        "decision-document-preview",
+        "document_search",
+        {"query": query, "relative_path": None, "max_results": 5},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.document-preview",
+            handler=lambda: layer.create_from_decision(
+                "decision-document-preview", idempotency_key="document-preview"
+            ),
+        ).value
+        snapshot = layer.operator_snapshot()
+        preview = layer.operator_preview_from_snapshot(snapshot, intent)
+        response = _operator_action(layer, intent, snapshot)
+    finally:
+        runtime.shutdown()
+
+    serialized = response.model_dump_json()
+    assert preview.arguments.query_length == len(query)
+    assert query not in serialized
+    assert hashlib.sha256(query.encode()).hexdigest() not in serialized
+    assert intent.validation_record_id not in serialized
+
+
+def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-snapshot",
+        "document_search",
+        {"query": "bounded history", "relative_path": None, "max_results": 5},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        base = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.snapshot",
+            handler=lambda: layer.create_from_decision(
+                "decision-snapshot", idempotency_key="snapshot-base"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    base_validation = state.validation_records[0]
+    intents = []
+    validations = []
+    receipts = []
+    for index in range(300):
+        intent_id = f"intent-{index}"
+        validation_id = f"validation-{index}"
+        decision_id = f"decision-{index}"
+        intents.append(
+            base.model_copy(
+                update={
+                    "intent_id": intent_id,
+                    "idempotency_key": f"idempotency-{index}",
+                    "validation_record_id": validation_id,
+                    "provenance": base.provenance.model_copy(
+                        update={"decision_id": decision_id}
+                    ),
+                }
+            )
+        )
+        validations.append(
+            base_validation.model_copy(
+                update={
+                    "validation_id": validation_id,
+                    "intent_id": intent_id,
+                    "decision_id": decision_id,
+                    "idempotency_key": f"idempotency-{index}",
+                }
+            )
+        )
+        receipts.append(
+            ExecutionReceipt(
+                receipt_id=f"receipt-{index}",
+                intent_id=intent_id,
+                idempotency_key=f"idempotency-{index}",
+                attempt=1,
+                status=ReceiptStatus.CANCELLED,
+                started_at=base.created_at,
+                finished_at=base.created_at,
+                duration_ms=0.0,
+                decision_id=decision_id,
+                plan_id=base.provenance.plan_id,
+                plan_revision=base.provenance.plan_revision,
+                step_id=base.provenance.step_id,
+            )
+        )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={
+            "intents": tuple(intents),
+            "validation_records": tuple(validations),
+            "receipts": tuple(receipts),
+        }
+    ).model_dump(mode="json")
+
+    checked_calls = 0
+    semantic_receipt_visits = 0
+    original_state_checked = layer._state_checked
+    original_semantic_validation = action_execution._intent_receipts_semantically_valid
+
+    def counted_state_checked() -> ActionState:
+        nonlocal checked_calls
+        checked_calls += 1
+        return original_state_checked()
+
+    def unexpected_scan(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("operator projection performed a per-intent state scan")
+
+    def counted_semantic_validation(
+        intent: object,
+        intent_receipts: tuple[ExecutionReceipt, ...],
+        observations: object,
+        verifications: object,
+        compensations: tuple[ExecutionReceipt, ...] = (),
+    ) -> bool:
+        nonlocal semantic_receipt_visits
+        semantic_receipt_visits += len(intent_receipts) + len(compensations)
+        return original_semantic_validation(
+            intent, intent_receipts, observations, verifications, compensations
+        )
+
+    monkeypatch.setattr(layer, "_state_checked", counted_state_checked)
+    monkeypatch.setattr(
+        action_execution,
+        "_intent_receipts_semantically_valid",
+        counted_semantic_validation,
+    )
+    for method in (
+        "list_approvals",
+        "list_receipts",
+        "list_observations",
+        "list_verifications",
+    ):
+        monkeypatch.setattr(layer, method, unexpected_scan)
+
+    snapshot = layer.operator_snapshot()
+    projected = [
+        _operator_action(layer, intent, snapshot)
+        for intent in snapshot.intents.values()
+    ]
+
+    assert checked_calls == 1
+    assert semantic_receipt_visits == len(receipts) * 3
+    assert len(projected) == 300
+    assert all(item.available_commands == [OperatorCommand.CANCEL] for item in projected)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"channel": "local", "title": "Private", "body": "PRIVATE_SENTINEL"},
+        {
+            "channel": "local",
+            "title": "Private",
+            "body": "PRIVATE_SENTINEL",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Safe title",
+                "body": "Safe body",
+            },
+        },
+        {
+            "channel": "local",
+            "title": "Private",
+            "body": "PRIVATE_SENTINEL",
+            "public_preview": {
+                "kind": "local_notification_enqueue",
+                "title": "Private",
+                "body": "PRIVATE_SENTINEL",
+            },
+        },
+    ],
+)
+def test_missing_or_mismatched_notification_preview_is_rejected(
+    tmp_path: Path, arguments: dict[str, object]
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-legacy-preview",
+        "local_notification_enqueue",
+        arguments,
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.legacy",
+            handler=lambda: layer.create_from_decision(
+                "decision-legacy-preview", idempotency_key="legacy-preview"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    assert isinstance(intent, ActionValidationRecord)
+    assert intent.arguments_valid is False
+    assert "PRIVATE_SENTINEL" not in intent.model_dump_json()
+
+
+def test_legacy_pending_notification_can_be_governedly_rejected_or_cancelled(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-legacy-preview",
+        "local_notification_enqueue",
+        _notification_args("Legacy", "Review required"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.operator.legacy.create",
+            handler=lambda: layer.create_from_decision(
+                "decision-legacy-preview", idempotency_key="legacy-preview"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    legacy_arguments = dict(intent.arguments)
+    legacy_arguments.pop("public_preview")
+    legacy_digest = action_execution._digest(legacy_arguments)
+    legacy_intent = intent.model_copy(
+        update={
+            "arguments": legacy_arguments,
+            "preview": intent.preview.model_copy(
+                update={"arguments": legacy_arguments}
+            ),
+            "policy": intent.policy.model_copy(
+                update={"argument_digest": legacy_digest}
+            ),
+        }
+    )
+    legacy_validation = state.validation_records[0].model_copy(
+        update={
+            "canonical_arguments_digest": legacy_digest,
+            "validation_schema_revision": "0" * 64,
+        }
+    )
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
+        update={
+            "intents": (legacy_intent,),
+            "validation_records": (legacy_validation,),
+        }
+    ).model_dump(mode="json")
+
+    restored = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    preview = restored.operator_preview(intent.intent_id)
+    assert preview.available_commands == (
+        OperatorCommand.REJECT,
+        OperatorCommand.CANCEL,
+    )
+    assert "Review required" not in preview.model_dump_json()
 
 
 def test_invalid_tools_arguments_dry_run_and_corrupt_state_fail_closed(
@@ -547,7 +1043,7 @@ def test_rejection_records_structured_verification_for_later_attribution(
         loop,
         "decision-rejected",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Reject this"},
+        _notification_args("Review", "Reject this"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -620,6 +1116,7 @@ def test_action_validation_requires_event_and_missing_record_rejects_before_call
     loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_copy(
         update={"intents": (missing,)}
     ).model_dump(mode="json")
+    assert layer.available_commands(intent.intent_id) == ()
     called = False
 
     def invoke(_: object, __: object) -> object:
@@ -749,7 +1246,7 @@ def test_valid_argument_record_is_persisted_before_risk_budget_rejection(
         loop,
         "decision-risk-budget",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Bounded body"},
+        _notification_args("Review", "Bounded body"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -788,7 +1285,7 @@ def test_policy_rejection_retry_and_explanation_link_are_state_idempotent(
         loop,
         "decision-idempotent-policy",
         "local_notification_enqueue",
-        {"channel": "local", "title": "Review", "body": "Bounded body"},
+        _notification_args("Review", "Bounded body"),
     )
     layer = ActionExecutionLayer(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
@@ -940,7 +1437,9 @@ def test_failed_validation_is_idempotent_and_conflicts_without_new_state(
         ).value
         assert duplicate == first
         assert (
-            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            json.dumps(
+                loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+            )
             == state_after_first
         )
 
@@ -954,7 +1453,9 @@ def test_failed_validation_is_idempotent_and_conflicts_without_new_state(
                 ),
             )
         assert (
-            json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+            json.dumps(
+                loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+            )
             == state_after_first
         )
 
@@ -1032,7 +1533,7 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
             loop,
             "decision-policy-then-invalid",
             "local_notification_enqueue",
-            {"channel": "local", "title": "Review", "body": "Body"},
+            _notification_args("Review", "Body"),
         )
         runtime.execute(
             AgentEventType.ACTION_INTENT,
@@ -1074,7 +1575,7 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
             loop,
             "decision-invalid-then-policy",
             "local_notification_enqueue",
-            {"channel": "local", "title": "Review", "body": "Body"},
+            _notification_args("Review", "Body"),
         )
         runtime.execute(
             AgentEventType.ACTION_INTENT,
@@ -1121,7 +1622,9 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
     finally:
         runtime.shutdown()
 
-    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    )
     assert (
         _explanation(loop, "decision-invalid-then-policy").disposition.value
         == "blocked_policy"
@@ -1135,12 +1638,17 @@ def test_explanation_uses_latest_authoritative_action_attempt_after_restart(
         loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
     )
     loop._action_execution = restored
-    assert _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    assert (
+        _explanation(loop, "decision-policy-then-invalid").disposition.value == "unable"
+    )
     assert (
         _explanation(loop, "decision-invalid-then-policy").disposition.value
         == "blocked_policy"
     )
-    assert _explanation(loop, "decision-terminal-intent").risk.receipt_ref == completed.receipt_id
+    assert (
+        _explanation(loop, "decision-terminal-intent").risk.receipt_ref
+        == completed.receipt_id
+    )
 
 
 def test_schema_v1_action_state_migration_is_persisted_and_fail_closed(
@@ -1242,6 +1750,19 @@ def test_action_validation_rejects_record_binding_and_event_mismatch(
     runtime.shutdown()
 
 
+def _notification_args(title: str, body: str) -> dict[str, object]:
+    return {
+        "channel": "local",
+        "title": title,
+        "body": body,
+        "public_preview": {
+            "kind": "local_notification_enqueue",
+            "title": title,
+            "body": body,
+        },
+    }
+
+
 def _decision(
     loop: _Loop,
     decision_id: str,
@@ -1337,3 +1858,133 @@ def _explanation(loop: _Loop, decision_id: str) -> Any:
         event_id="explanation-event",
         event_sequence=999,
     )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "decision",
+        "plan_id",
+        "plan_revision",
+        "step",
+        "invalid_observation",
+        "cross_bound_verification",
+        "self_compensation",
+        "duplicate_compensation",
+        "extra_cross_bound_receipt",
+    ],
+)
+def test_corrupt_success_evidence_cannot_enable_compensation(
+    tmp_path: Path, corruption: str
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-compensation-corruption",
+        "local_notification_enqueue",
+        _notification_args("Review", "Body"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.compensation-corruption.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-compensation-corruption", idempotency_key="corruption"
+            ),
+        ).value
+        approved = runtime.execute(
+            AgentEventType.ACTION_APPROVAL,
+            source="test.compensation-corruption.approve",
+            handler=lambda: layer.resolve_approval(
+                intent.intent_id, approved=True, actor_id="operator"
+            ),
+        ).value
+        completed = runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.compensation-corruption.execute",
+            handler=lambda: layer.execute(approved.intent_id),
+        ).value
+    finally:
+        runtime.shutdown()
+
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    receipt = state.receipts[0]
+    if corruption == "decision":
+        receipts = (
+            receipt.model_copy(update={"decision_id": "cross-bound"}),
+        )
+        corrupted = state.model_copy(update={"receipts": receipts})
+    elif corruption == "plan_id":
+        corrupted = state.model_copy(
+            update={"receipts": (receipt.model_copy(update={"plan_id": "other"}),)}
+        )
+    elif corruption == "plan_revision":
+        corrupted = state.model_copy(
+            update={
+                "receipts": (
+                    receipt.model_copy(update={"plan_revision": 99}),
+                )
+            }
+        )
+    elif corruption == "step":
+        corrupted = state.model_copy(
+            update={"receipts": (receipt.model_copy(update={"step_id": "other"}),)}
+        )
+    elif corruption == "invalid_observation":
+        corrupted = state.model_copy(
+            update={
+                "observations": (
+                    state.observations[0].model_copy(update={"valid": False}),
+                )
+            }
+        )
+    elif corruption == "cross_bound_verification":
+        corrupted = state.model_copy(
+            update={
+                "verifications": (
+                    state.verifications[0].model_copy(
+                        update={"observation_id": "cross-bound"}
+                    ),
+                )
+            }
+        )
+    else:
+        compensation = receipt.model_copy(
+            update={
+                "receipt_id": f"compensation-{corruption}",
+                "status": ReceiptStatus.COMPENSATED,
+                "compensation_of": (
+                    receipt.receipt_id
+                    if corruption != "self_compensation"
+                    else f"compensation-{corruption}"
+                ),
+            }
+        )
+        if corruption == "duplicate_compensation":
+            compensation = (
+                compensation,
+                compensation.model_copy(update={"receipt_id": "compensation-2"}),
+            )
+        else:
+            compensation = (compensation,)
+        if corruption == "extra_cross_bound_receipt":
+            compensation = (
+                receipt.model_copy(
+                    update={"receipt_id": "extra", "decision_id": "cross-bound"}
+                ),
+            )
+        corrupted = state.model_copy(update={"receipts": (receipt, *compensation)})
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = corrupted.model_dump(mode="json")
+    before = json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+    assert layer.available_commands(completed.intent_id) == ()
+    with pytest.raises(ActionPolicyError):
+        layer.compensate(completed.intent_id)
+    assert json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True) == before
+    assert len(layer.list_receipts()) == len(corrupted.receipts)

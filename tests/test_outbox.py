@@ -58,6 +58,7 @@ def test_outbox_persists_references_and_deduplicates_across_restart() -> None:
         OutboxMessageKind.QUESTION,
         title="Need input",
         body="Which bounded option should continue?",
+        public_preview="Which bounded option should continue?",
         deduplication_key="goal-question:one",
         context_id="context-1",
         interlocutor_id="operator-1",
@@ -77,6 +78,7 @@ def test_outbox_persists_references_and_deduplicates_across_restart() -> None:
         OutboxMessageKind.QUESTION,
         title="Duplicate",
         body="This body must not replace the first message.",
+        public_preview="This body must not replace the first message.",
         deduplication_key="goal-question:one",
     )
 
@@ -162,6 +164,60 @@ def test_private_content_is_rejected_and_failures_are_safely_audited() -> None:
     assert "A public result is ready" not in serialized_audit
 
 
+@pytest.mark.parametrize(
+    "kind", [OutboxMessageKind.QUESTION, OutboxMessageKind.RENEGOTIATION]
+)
+def test_conversational_enqueue_requires_body_bound_public_preview(
+    kind: OutboxMessageKind,
+) -> None:
+    outbox = _outbox(_Clock(datetime(2026, 7, 23, 12, tzinfo=UTC)))
+
+    with pytest.raises(ValueError, match="require a public preview"):
+        outbox.enqueue(
+            kind,
+            title="Need input",
+            body="A conversational body.",
+            deduplication_key=f"missing-preview:{kind}",
+        )
+    with pytest.raises(ValueError, match="must match body"):
+        outbox.enqueue(
+            kind,
+            title="Need input",
+            body="A conversational body.",
+            public_preview="An unrelated preview.",
+            deduplication_key=f"mismatched-preview:{kind}",
+        )
+
+
+def test_legacy_conversational_record_with_null_preview_remains_readable() -> None:
+    timestamp = datetime(2026, 7, 23, 12, tzinfo=UTC)
+    state = PersistentAgentState(
+        extensions={
+            OUTBOX_STATE_KEY: {
+                "schema_version": 1,
+                "messages": [
+                    {
+                        "schema_version": 1,
+                        "message_id": "legacy-question",
+                        "kind": "question",
+                        "title": "Legacy question",
+                        "body": "Legacy body remains operator-only.",
+                        "public_preview": None,
+                        "not_before": timestamp.isoformat(),
+                        "deduplication_key": "legacy-question",
+                        "created_at": timestamp.isoformat(),
+                        "updated_at": timestamp.isoformat(),
+                    }
+                ],
+            }
+        }
+    )
+
+    message = _outbox(_Clock(timestamp), state=state).get("legacy-question")
+
+    assert message.public_preview is None
+
+
 def test_reply_preserves_authoritative_origin_and_is_idempotent() -> None:
     clock = _Clock(datetime(2026, 7, 23, 12, tzinfo=UTC))
     outbox = _outbox(clock)
@@ -169,6 +225,7 @@ def test_reply_preserves_authoritative_origin_and_is_idempotent() -> None:
         OutboxMessageKind.QUESTION,
         title="Goal question",
         body="Provide the missing constraint.",
+        public_preview="Provide the missing constraint.",
         deduplication_key="question:goal-2",
         references=OutboxReferences(goal_id="goal-2", decision_id="decision-2"),
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
+import re
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -97,6 +98,7 @@ class OutboxMessage(_StrictModel):
     kind: OutboxMessageKind
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
+    public_preview: str | None = Field(default=None, min_length=1, max_length=160)
     context_id: str | None = None
     interlocutor_id: str | None = None
     references: OutboxReferences = Field(default_factory=OutboxReferences)
@@ -134,6 +136,22 @@ class OutboxMessage(_StrictModel):
             raise ValueError("Outbox expiry must be after not_before")
         if self.privacy_class == PrivacyClass.PRIVATE:
             raise ValueError("Private subject state cannot enter the outbox")
+        if self.public_preview is not None and self.kind not in {
+            OutboxMessageKind.QUESTION,
+            OutboxMessageKind.RENEGOTIATION,
+        }:
+            raise ValueError("Only conversational messages accept a public preview")
+        if (
+            self.public_preview is not None
+            and self.kind
+            in {OutboxMessageKind.QUESTION, OutboxMessageKind.RENEGOTIATION}
+            and self.body != self.public_preview
+        ):
+            raise ValueError("Conversational public preview must match body")
+        if self.public_preview is not None and not _is_public_preview_safe(
+            self.public_preview
+        ):
+            raise ValueError("Outbox public preview contains private text")
         if _contains_private_data(self.model_dump(mode="json")):
             raise ValueError("Outbox message contains a forbidden private field")
         return self
@@ -184,6 +202,7 @@ class Outbox:
         *,
         title: str,
         body: str,
+        public_preview: str | None = None,
         deduplication_key: str,
         context_id: str | None = None,
         interlocutor_id: str | None = None,
@@ -194,6 +213,13 @@ class Outbox:
         channel: OutboxChannel = OutboxChannel.LOCAL,
         privacy_class: PrivacyClass = PrivacyClass.OPERATOR,
     ) -> OutboxMessage:
+        if kind in {OutboxMessageKind.QUESTION, OutboxMessageKind.RENEGOTIATION}:
+            if public_preview is None:
+                raise ValueError(
+                    "Conversational outbox messages require a public preview"
+                )
+            if body != public_preview:
+                raise ValueError("Conversational public preview must match body")
         state = self._state()
         duplicate = next(
             (item for item in state.messages if item.deduplication_key == deduplication_key),
@@ -207,6 +233,7 @@ class Outbox:
             kind=kind,
             title=title,
             body=body,
+            public_preview=public_preview,
             context_id=context_id,
             interlocutor_id=interlocutor_id,
             references=references or OutboxReferences(),
@@ -378,25 +405,46 @@ class Outbox:
         event_id: str | None = None,
         event_sequence: int | None = None,
     ) -> OutboxMessage | None:
-        message = next(
-            (
-                item
-                for item in self._state().messages
-                if item.kind == OutboxMessageKind.APPROVAL_REQUEST
-                and item.references.action_id == action_id
-            ),
-            None,
-        )
-        if message is None:
+        matches = [
+            item
+            for item in self._state().messages
+            if item.kind == OutboxMessageKind.APPROVAL_REQUEST
+            and item.references.action_id == action_id
+        ]
+        if len(matches) != 1:
             return None
-        return self.respond(
-            message.message_id,
-            kind="approval" if approved else "reject",
+        message = matches[0]
+        kind: Literal["approval", "reject"] = "approval" if approved else "reject"
+        requested = AcknowledgmentStatus.APPROVED if approved else AcknowledgmentStatus.REJECTED
+        if message.acknowledgment_status == requested:
+            return message
+        if message.acknowledgment_status in {
+            AcknowledgmentStatus.APPROVED,
+            AcknowledgmentStatus.REJECTED,
+        }:
+            return message
+        # Outbox is a correlated notification projection, not approval authority.
+        # A prior read/reply or delivery expiry must not veto an action transition
+        # that already passed the preview-bound ActionExecution contract.
+        now = self.clock()
+        response = OutboxResponse(
+            response_id=str(uuid4()),
+            kind=kind,
             actor_id=actor_id,
             text=text,
+            received_at=now,
             event_id=event_id,
             event_sequence=event_sequence,
         )
+        updated = message.model_copy(update={
+            "revision": message.revision + 1,
+            "acknowledgment_status": requested,
+            "acknowledged_at": now,
+            "updated_at": now,
+            "responses": (*message.responses, response),
+        })
+        self._replace(updated)
+        return updated
 
     def _state(self) -> OutboxState:
         raw = self.main_loop.persistent_state.extensions.get(OUTBOX_STATE_KEY)
@@ -495,6 +543,24 @@ def _contains_private_data(value: Any) -> bool:
         lowered = value.casefold()
         return "<think>" in lowered or "</think>" in lowered
     return False
+
+
+_PRIVATE_PREVIEW_MARKERS = re.compile(
+    r"(?:<\/?think\b|hidden[\s_-]*thought|private[\s_-]*(?:state|session|context|sentinel)|raw[\s_-]*prompt|api[\s_-]*key|access[\s_-]*token|credential|password|secret|bearer\s+token|\bsentinel\b)",
+    re.IGNORECASE,
+)
+_PRIVATE_PREVIEW_PATH = re.compile(
+    r"(?:[A-Za-z]:[\\/]|~[\\/]|(?:^|\s)/(?:[^\s/]+/)+[^\s]*)"
+)
+
+
+def _is_public_preview_safe(value: str) -> bool:
+    return bool(
+        value.strip()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+        and _PRIVATE_PREVIEW_MARKERS.search(value) is None
+        and _PRIVATE_PREVIEW_PATH.search(value) is None
+    )
 
 
 __all__ = [

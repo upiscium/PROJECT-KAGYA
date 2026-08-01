@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { ChatJobCanceledError, ChatJobFailedError, api, streamChatJob } from "./api";
 
@@ -386,7 +387,175 @@ describe("api client", () => {
     await expect(streamChatJob({ text: "hello" }, { status: vi.fn(), token: vi.fn() })).rejects.toBeInstanceOf(errorType);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it("strictly parses the action operator contract and rejects raw private fields", async () => {
+    fetchMock.mockReturnValue(jsonResponse(actionOperatorPayload));
+    const result = await api.actionOperatorSummary();
+    expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/actions/operator-summary", expect.anything());
+    expect(result.actions[0].argument_summary).toEqual(expect.objectContaining({ kind: "notification", title: "Safe title" }));
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+
+    fetchMock.mockReturnValue(jsonResponse({
+      ...actionOperatorPayload,
+      actions: [{ ...actionOperatorPayload.actions[0], arguments: { body: "PRIVATE_SENTINEL" } }],
+    }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it.each([
+    ["candidate argument", { arguments: { body: "PRIVATE_SENTINEL" } }],
+    ["preview argument", { preview: { ...actionOperatorPayload.actions[0].preview, arguments: { body: "PRIVATE_SENTINEL" } } }],
+    ["candidate preview field", { preview: { ...actionOperatorPayload.actions[0].preview, private_replay: "PRIVATE_SENTINEL" } }],
+  ])("rejects private sentinel in unknown action %s fields", async (_label, update) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...actionOperatorPayload,
+      actions: [{ ...actionOperatorPayload.actions[0], ...update }],
+    }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("binds approval mutations to revision, digest, and approval ID", async () => {
+    fetchMock.mockReturnValue(jsonResponse({ command: "approve", event_id: "event-operator-1", processing_sequence: 12, action: actionOperatorPayload.actions[0], disposition: "awaiting_scheduler" }));
+    await api.approveAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+      expected_approval_id: "approval-operator-1",
+    });
+    const [, options] = fetchMock.mock.calls[0];
+    expect(fetchMock.mock.calls[0][0]).toBe("/admin-proxy/actions/operator/intents/intent-operator-1/approval");
+    expect(JSON.parse(String(options.body))).toEqual({ expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), expected_approval_id: "approval-operator-1", approved: true });
+  });
+
+  it.each([
+    ["reject", api.rejectAction, "/admin-proxy/actions/operator/intents/intent-operator-1/approval", { approved: false, reason: "not yet" }],
+    ["cancel", api.cancelAction, "/admin-proxy/actions/operator/intents/intent-operator-1/cancel", {}],
+    ["retry", api.retryAction, "/admin-proxy/actions/operator/intents/intent-operator-1/retry", {}],
+    ["compensate", api.compensateAction, "/admin-proxy/actions/operator/intents/intent-operator-1/compensate", {}],
+  ] as const)("sends the exact %s mutation endpoint and body", async (_label, client, path, extra) => {
+    fetchMock.mockReturnValue(jsonResponse({ command: _label === "retry" ? "retry_now" : _label, event_id: "event-operator-1", processing_sequence: 12, action: actionOperatorPayload.actions[0], disposition: _label === "reject" ? "rejected" : "cancelled" }));
+    await client("intent-operator-1", { expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), ...extra } as never);
+    const [, options] = fetchMock.mock.calls[0];
+    expect(fetchMock.mock.calls[0][0]).toBe(path);
+    expect(JSON.parse(String(options.body))).toEqual({ expected_intent_revision: 3, expected_preview_digest: "a".repeat(64), ...extra });
+  });
+
+  it("accepts only the safe outbox projection", async () => {
+    const safe = {
+      message_id: "message-safe-1", kind: "approval_request", title: "Approval required", urgency: "high",
+      delivery_status: "pending", acknowledgment_status: "unacknowledged", created_at: "2026-01-01T00:00:00Z",
+      channel: "local", privacy_class: "operator", last_failure_code: null, body_preview: null,
+      references: { event_id: null, goal_id: null, plan_id: "plan-1", decision_id: "decision-1", action_id: "intent-operator-1", commitment_id: null },
+    };
+    fetchMock.mockReturnValue(jsonResponse({ messages: [safe] }));
+    expect((await api.outboxMessages()).messages[0].kind).toBe("approval_request");
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, body: "PRIVATE_SENTINEL" }] }));
+    await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "question", body_preview: "Which local option should be used?" }] }));
+    expect((await api.outboxMessages()).messages[0].body_preview).toBe("Which local option should be used?");
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "renegotiation", body_preview: "Move the deadline by one day." }] }));
+    expect((await api.outboxMessages()).messages[0].body_preview).toBe("Move the deadline by one day.");
+
+    for (const body_preview of ["PRIVATE_SENTINEL", "hidden thought", "credential=secret", "x".repeat(161)]) {
+      fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, kind: "question", body_preview }] }));
+      await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+    }
+
+    fetchMock.mockReturnValue(jsonResponse({ messages: [{ ...safe, body_preview: "Action details" }] }));
+    await expect(api.outboxMessages()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("does not retain a raw or deterministic document query fingerprint", async () => {
+    const query = "release status";
+    const queryHash = createHash("sha256").update(query).digest("hex");
+    const documentAction = {
+      ...actionOperatorPayload.actions[0],
+      tool: { ...actionOperatorPayload.actions[0].tool, name: "document_search", risk_class: "read_only", approval_required: false, reversible: false, effect_code: "documents.search" },
+      argument_summary: { kind: "document_search", scope_kind: "all", max_results: 5, query_length: query.length },
+      approval: null,
+      available_commands: [],
+    };
+    fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, actions: [documentAction] }));
+
+    const result = await api.actionOperatorSummary();
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(query);
+    expect(serialized).not.toContain(queryHash);
+
+    fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, actions: [{ ...documentAction, argument_summary: { ...documentAction.argument_summary, query_digest: queryHash } }] }));
+    await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("accepts only safe bounded registry descriptions", async () => {
+    const safe = { ...actionOperatorPayload, registry_tools: [{ ...actionOperatorPayload.registry_tools[0], description: "Reads public metadata." }] };
+    fetchMock.mockReturnValue(jsonResponse(safe));
+    expect((await api.actionOperatorSummary()).registry_tools[0].description).toBe("Reads public metadata.");
+
+    for (const description of [
+      "x".repeat(161),
+      "hidden thought: PRIVATE_SENTINEL",
+      "See /home/kagya/private/config.yaml",
+      "credential token secret",
+      "SCHEMA_SENTINEL",
+    ]) {
+      fetchMock.mockReturnValue(jsonResponse({ ...actionOperatorPayload, registry_tools: [{ ...actionOperatorPayload.registry_tools[0], description }] }));
+      await expect(api.actionOperatorSummary()).rejects.toMatchObject({ name: "ApiError" });
+    }
+  });
+
+  it("sanitizes private conflict bodies into bounded public ApiErrors", async () => {
+    const secret = `PRIVATE_SENTINEL ${"x".repeat(2000)}`;
+    fetchMock.mockReturnValue(errorResponse(409, "Conflict", { detail: secret, hidden_thought: secret }));
+
+    const error = await api.cancelAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    }).catch((value) => value);
+    expect(error).toMatchObject({ name: "ApiError", status: 409 });
+    expect(String(error)).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(error)).not.toContain("PRIVATE_SENTINEL");
+    expect(String(error).length).toBeLessThan(500);
+  });
+
+  it.each([
+    ["arguments", { arguments: { value: "PRIVATE_SENTINEL" } }],
+    ["preview", { preview: { ...actionOperatorPayload.actions[0].preview, raw_prompt: "PRIVATE_SENTINEL" } }],
+  ])("rejects unsafe unknown %s fields in successful action mutation responses", async (_label, unsafe) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      command: "cancel",
+      event_id: "event-operator-unsafe",
+      processing_sequence: 12,
+      action: { ...actionOperatorPayload.actions[0], ...unsafe },
+      disposition: "cancelled",
+    }));
+
+    await expect(api.cancelAction("intent-operator-1", {
+      expected_intent_revision: 3,
+      expected_preview_digest: "a".repeat(64),
+    })).rejects.toMatchObject({ name: "ApiError" });
+  });
 });
+
+const actionOperatorPayload = {
+  pending_approval_count: 1,
+  operator_action_count: 1,
+  risk_ceiling: "reversible_write",
+  actions: [{
+    intent_id: "intent-operator-1", revision: 3, status: "awaiting_approval",
+    approval: { approval_id: "approval-operator-1", status: "pending", requested_at: "2026-01-01T00:00:00Z" },
+    tool: { name: "local_notification_enqueue", risk_class: "reversible_write", approval_required: true, reversible: true, effect_code: "notification.enqueue", validation_schema_revision: "b".repeat(64), enabled: true, executable: true, execution_authority: "action_execution" },
+    argument_summary: { kind: "notification", channel: "local", title: "Safe title", body_preview: "Safe preview" },
+    policy: { allowed: true, approval_required: true, reason_codes: ["human_approval_required"] },
+    preview: { effect_code: "notification.enqueue", effect: "Enqueue a notification", digest: "a".repeat(64), compensation_available: true },
+    budget: { max_attempts: 2, max_cost_units: 1, max_monetary_cost: 0, deadline_at: "2026-01-02T00:00:00Z", attempts: 0, cost_units_used: 0, retry_at: null },
+    provenance: { decision_id: "decision-1", plan_id: "plan-1", plan_revision: 1, step_id: "step-1", triggering_event_id: "event-1" },
+    receipt: null, verification: null, idempotency_state: "reserved", available_commands: ["approve", "reject", "cancel"], confirmation: null,
+  }],
+  action_tools: [{ name: "local_notification_enqueue", risk_class: "reversible_write", approval_required: true, reversible: true, effect_code: "notification.enqueue", validation_schema_revision: "b".repeat(64), enabled: true, executable: true, execution_authority: "action_execution" }],
+  registry_tools: [{ name: "registry-tool", description: null, tool_type: "metadata", status: "declared", generated: false, human_approved: false, execution_authority: "registry_only" }],
+};
 
 const contextPayload = {
   contexts: [{ context_id: "context-1", context_type: "conversation", source_channel: "chat", source_session_id: "session-1", participant_ids: ["person-1"], active_topic: "Release", active_task: null, status: "active", hidden_thought: "PRIVATE_SENTINEL" }],
