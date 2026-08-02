@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 import hashlib
@@ -11,7 +14,7 @@ from threading import Lock
 from typing import Any, Callable, Literal, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kagya.external_transaction import (
     ExternalTransactionCoordinator,
@@ -23,9 +26,10 @@ from kagya.runtime.event_journal import (
     EventJournal,
     JournalIntegrityError,
     JournalLifecycle,
+    JournalRecord,
     hash_snapshot,
 )
-from kagya.runtime.state_wal import StateWAL, StateWalIntegrityError
+from kagya.runtime.state_wal import StateWAL, StateWalIntegrityError, StateWalRecord
 
 
 class RestoreErrorCode(StrEnum):
@@ -81,6 +85,12 @@ class RestoreRef(_Strict):
     ]
     id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
+    @model_validator(mode="after")
+    def validate_public_id(self) -> "RestoreRef":
+        if not public_reference(self.id, self.kind):
+            raise ValueError("reference ID is not public-safe")
+        return self
+
 
 class RestoreDomain(_Strict):
     domain: Literal[
@@ -122,6 +132,13 @@ class RestoreArtifact(_Strict):
     refs: list[str] = Field(max_length=256)
     truncated: bool
 
+    @field_validator("refs")
+    @classmethod
+    def validate_public_refs(cls, values: list[str]) -> list[str]:
+        if any(not public_reference(value) for value in values):
+            raise ValueError("artifact reference is not public-safe")
+        return values
+
 
 class RestoreExternal(_Strict):
     consistency_status: Literal["consistent", "inconsistent"]
@@ -162,6 +179,13 @@ class RestoreOperation(_Strict):
     error_code: str | None
     external_side_effects_replayed: Literal[False] = False
 
+    @field_validator("operation_id", "event_id")
+    @classmethod
+    def validate_public_ids(cls, value: str) -> str:
+        if not public_reference(value):
+            raise ValueError("operation ID is not public-safe")
+        return value
+
 
 class RestoreSummary(_Strict):
     schema_version: Literal[1] = 1
@@ -195,6 +219,13 @@ class RestorePreview(_Strict):
     external_side_effects_replayed: Literal[False] = False
     confirmation_phrase: str
 
+    @field_validator("operation_id")
+    @classmethod
+    def validate_public_operation_id(cls, value: str) -> str:
+        if not public_reference(value):
+            raise ValueError("operation ID is not public-safe")
+        return value
+
 
 class RestoreCommitResponse(_Strict):
     command: Literal["restore"] = "restore"
@@ -211,6 +242,13 @@ class RestoreCommitResponse(_Strict):
     ]
     error_code: str | None
     external_side_effects_replayed: Literal[False] = False
+
+    @field_validator("operation_id", "event_id")
+    @classmethod
+    def validate_public_ids(cls, value: str) -> str:
+        if not public_reference(value):
+            raise ValueError("operation ID is not public-safe")
+        return value
 
 
 _RESERVED = "operator_restore"
@@ -246,6 +284,40 @@ _EXTERNAL_REARM_DOMAINS = {
     "subject_scheduler",
 }
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PRIVATE_REFERENCE = re.compile(
+    r"private[_-]*(?:sentinel|state|session|context)|"
+    r"hidden[_-]*thought|raw[_-]*prompt|chain[_-]*of[_-]*thought|"
+    r"api[_-]*(?:key|token|secret)|access[_-]*token|bearer|"
+    r"credential|token|secret|password|prompt|attachment[_-]*body",
+    re.IGNORECASE,
+)
+_PATH_REFERENCE = re.compile(r"^(?:[A-Za-z]:|~[\\/]|[\\/])")
+_UUID_REFERENCE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+_OPAQUE_REFERENCE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_.:-]{0,96}[-:](?:\d+|[a-f0-9]{16,}|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+_OPAQUE_TAIL = re.compile(
+    r"(?:\d+|[a-f0-9]{16,}|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+_REFERENCE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "goal": ("goal-",),
+    "commitment": ("commitment-",),
+    "decision": ("decision-", "goal-decision-"),
+    "plan": ("plan-",),
+    "action": ("action-", "intent-"),
+    "outbox": ("outbox-", "message-"),
+    "journal": ("event-", "operator-restore-", "journal-"),
+    "experience": ("experience-",),
+    "memory": ("memory-", "episode-", "semantic-"),
+    "belief": ("belief-",),
+}
 _REF_KEYS: dict[str, str] = {
     "goal_id": "goal",
     "commitment_id": "commitment",
@@ -269,6 +341,53 @@ _ENTITY_ID_KEYS = tuple(_REF_KEYS) + (
     "rejection_id",
     "notification_id",
 )
+
+
+@dataclass
+class _SequenceEvidence:
+    eligible: list[tuple[JournalRecord, str]] = field(default_factory=list)
+    non_target: list[JournalRecord] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _VerifiedTarget:
+    wal: StateWalRecord
+    journal: StateWalRecord | JournalRecord
+    kind: str
+    semantic_count: int
+
+
+@dataclass(frozen=True)
+class _EvidenceIndex:
+    floor: int
+    maximum: int
+    semantic_revision: int
+    semantic_transition_count: int
+    targets: tuple[_VerifiedTarget, ...]
+
+
+def public_reference(value: str, kind: str | None = None) -> bool:
+    """Return whether an opaque identifier is safe for public projections."""
+
+    if (
+        not _SAFE.fullmatch(value)
+        or _PRIVATE_REFERENCE.search(value)
+        or _PATH_REFERENCE.search(value)
+    ):
+        return False
+    opaque = bool(
+        _UUID_REFERENCE.fullmatch(value)
+        or re.fullmatch(r"[a-f0-9]{32,}", value, re.IGNORECASE)
+        or _OPAQUE_REFERENCE.fullmatch(value)
+    )
+    if not opaque or kind is None or _UUID_REFERENCE.fullmatch(value):
+        return opaque
+    lowered = value.casefold()
+    return any(
+        lowered.startswith(prefix)
+        and bool(_OPAQUE_TAIL.fullmatch(value[len(prefix) :]))
+        for prefix in _REFERENCE_PREFIXES[kind]
+    )
 
 
 def _hash(value: Any) -> str:
@@ -319,7 +438,7 @@ def _record_map(items: Any, prefix: str, id_keys: tuple[str, ...]) -> dict[str, 
                 for key in id_keys
                 if isinstance(item, dict)
                 and isinstance(item.get(key), str)
-                and _SAFE.fullmatch(item[key])
+                and public_reference(item[key])
             ),
             None,
         )
@@ -384,21 +503,35 @@ def _extension_records(value: Any) -> Any:
     return list_records if list_records else value
 
 
+def _changed_record_values(before: Any, after: Any) -> list[Any]:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return [before, after] if before != after else []
+    changed: list[Any] = []
+    for key in set(before) | set(after):
+        if before.get(key) != after.get(key):
+            if key in before:
+                changed.append(before[key])
+            if key in after:
+                changed.append(after[key])
+    return changed
+
+
 def _safe_refs(value: Any, *, limit: int = 20) -> tuple[list[RestoreRef], bool]:
     refs: dict[tuple[str, str], RestoreRef] = {}
+    omitted = False
 
     def visit(item: Any) -> None:
+        nonlocal omitted
         if len(refs) > limit:
             return
         if isinstance(item, dict):
             for key, child in item.items():
                 kind = _REF_KEYS.get(str(key))
-                if (
-                    kind is not None
-                    and isinstance(child, str)
-                    and _SAFE.fullmatch(child)
-                ):
-                    refs[(kind, child)] = RestoreRef(kind=cast(Any, kind), id=child)
+                if kind is not None and isinstance(child, str):
+                    if public_reference(child, kind):
+                        refs[(kind, child)] = RestoreRef(kind=cast(Any, kind), id=child)
+                    else:
+                        omitted = True
                 visit(child)
         elif isinstance(item, list):
             for child in item:
@@ -406,7 +539,7 @@ def _safe_refs(value: Any, *, limit: int = 20) -> tuple[list[RestoreRef], bool]:
 
     visit(value)
     ordered = [refs[key] for key in sorted(refs)]
-    return ordered[:limit], len(ordered) > limit
+    return ordered[:limit], omitted or len(ordered) > limit
 
 
 def _public_artifact_type(value: str) -> str | None:
@@ -507,6 +640,7 @@ class OperatorRestoreService:
         self._capabilities: dict[str, tuple[RestorePreview, bool]] = {}
         self._consumed: set[str] = set()
         self._operations: list[RestoreOperation] = []
+        self._semantic_cache: tuple[int, str, int] | None = None
 
     def _fail(self, code: RestoreErrorCode) -> None:
         raise RestoreContractError(code)
@@ -552,114 +686,195 @@ class OperatorRestoreService:
             raise AssertionError
         return current
 
-    def _targets(
-        self, wal: list[Any], journal: list[Any]
-    ) -> list[tuple[Any, Any, str]]:
-        by_seq: dict[int, list[tuple[Any, str]]] = {}
-        for j in journal:
-            kind: str | None = None
-            if j.lifecycle == JournalLifecycle.COMPLETED:
-                kind = "journal_completed"
-            elif (
-                j.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
-                and j.failure_category == "committed_before_crash"
+    def _retention_floor(
+        self, wal: list[StateWalRecord], journal: list[JournalRecord]
+    ) -> int:
+        if not wal:
+            return 0
+        oldest = journal[0] if journal else None
+        if oldest is None or oldest.lifecycle != JournalLifecycle.CHECKPOINT:
+            return wal[0].processing_sequence
+        if oldest.snapshot_sequence is None or oldest.snapshot_hash is None:
+            self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+        assert oldest.snapshot_sequence is not None
+        return max(wal[0].processing_sequence, oldest.snapshot_sequence)
+
+    def _semantic_anchor(self, wal: list[StateWalRecord], start: int) -> int:
+        with self._lock:
+            cached = self._semantic_cache
+        if cached is not None:
+            sequence, record_hash, revision = cached
+            cached_index = bisect_left(
+                wal, sequence, key=lambda record: record.processing_sequence
+            )
+            if (
+                cached_index < len(wal)
+                and wal[cached_index].processing_sequence == sequence
+                and wal[cached_index].record_hash == record_hash
             ):
-                kind = "journal_recovered"
-            elif j.lifecycle == JournalLifecycle.CHECKPOINT:
-                kind = "checkpoint"
-            if kind and j.snapshot_sequence is not None and j.snapshot_hash:
-                by_seq.setdefault(j.snapshot_sequence, []).append((j, kind))
-        result: list[tuple[Any, Any, str]] = []
-        for record in wal:
+                return revision
+        read_only = {
+            "state_snapshot",
+            "state_export",
+            "backup_create",
+            "backup_verify",
+            "backup_rotate",
+            "behavioral_evaluate",
+        }
+        for index in range(start, 0, -1):
+            record = wal[index]
+            if record.event_type == "state_point_in_time_restore":
+                return record.processing_sequence
+            if record.event_type.endswith("_read") or record.event_type in read_only:
+                continue
+            if logical_state_digest(record.patch.value) != logical_state_digest(
+                wal[index - 1].patch.value
+            ):
+                return record.processing_sequence
+        return 0
+
+    def _analyze_evidence(
+        self,
+        wal: list[StateWalRecord],
+        journal: list[JournalRecord],
+        *,
+        target_limit: int | None = None,
+    ) -> _EvidenceIndex:
+        if not wal:
+            self._fail(RestoreErrorCode.WAL_INTEGRITY_INVALID)
+        limit = min(target_limit or self.max_targets, self.max_targets)
+        floor = self._retention_floor(wal, journal)
+        evidence: dict[int, _SequenceEvidence] = {}
+        for item in journal:
+            sequence = item.snapshot_sequence
+            if sequence is None or sequence < floor or item.snapshot_hash is None:
+                continue
+            entry = evidence.setdefault(sequence, _SequenceEvidence())
+            if item.lifecycle == JournalLifecycle.COMPLETED:
+                entry.eligible.append((item, "journal_completed"))
+            elif (
+                item.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+                and item.failure_category == "committed_before_crash"
+            ):
+                entry.eligible.append((item, "journal_recovered"))
+            elif item.lifecycle == JournalLifecycle.CHECKPOINT:
+                entry.eligible.append((item, "checkpoint"))
+            elif item.lifecycle == JournalLifecycle.FAILED or (
+                item.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+                and item.failure_category == "uncommitted_after_crash"
+                and item.processing_sequence == item.snapshot_sequence
+            ):
+                entry.non_target.append(item)
+
+        start = bisect_left(wal, floor, key=lambda record: record.processing_sequence)
+        if start >= len(wal) or wal[start].processing_sequence != floor:
+            self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+        targets: deque[_VerifiedTarget] = deque(maxlen=limit)
+        previous_digest: str | None = None
+        semantic_revision = self._semantic_anchor(wal, start)
+        semantic_count = 0
+        priority = {"journal_completed": 0, "journal_recovered": 1, "checkpoint": 2}
+        for record in wal[start:]:
+            digest = logical_state_digest(record.patch.value)
+            if previous_digest is not None and (
+                digest != previous_digest
+                or record.event_type == "state_point_in_time_restore"
+            ):
+                semantic_count += 1
+                semantic_revision = record.processing_sequence
+            previous_digest = digest
+
             if (
                 record.processing_sequence == 0
                 and record.event_type == "state_snapshot"
             ):
-                result.append((record, record, "bootstrap"))
-                continue
-            candidates = by_seq.get(record.processing_sequence, [])
-            if not candidates:
-                failed_evidence = [
-                    item
-                    for item in journal
+                bootstrap_evidence = evidence.pop(0) if 0 in evidence else None
+                journal_record: StateWalRecord | JournalRecord = record
+                if bootstrap_evidence is not None:
+                    hashes = {
+                        item.snapshot_hash
+                        for item, _kind in bootstrap_evidence.eligible
+                    } | {item.snapshot_hash for item in bootstrap_evidence.non_target}
                     if (
-                        item.lifecycle == JournalLifecycle.FAILED
-                        or (
-                            item.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
-                            and item.failure_category == "uncommitted_after_crash"
-                        )
+                        len(hashes) != 1
+                        or record.state_hash_after not in hashes
+                        or bootstrap_evidence.non_target
+                        or not bootstrap_evidence.eligible
+                    ):
+                        self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+                    journal_record, _checkpoint_kind = min(
+                        bootstrap_evidence.eligible,
+                        key=lambda candidate: priority[candidate[1]],
                     )
-                    and item.snapshot_sequence == record.processing_sequence
-                    and item.snapshot_hash == record.state_hash_after
-                ]
-                if failed_evidence:
-                    continue
-                self._fail(RestoreErrorCode.TARGET_UNVERIFIED)
-            if len({j.snapshot_hash for j, _ in candidates}) != 1:
-                self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
-            matches = [
-                (j, k)
-                for j, k in candidates
-                if j.snapshot_hash == record.state_hash_after
-            ]
-            if not matches:
-                self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
-            priority = {"journal_completed": 0, "journal_recovered": 1, "checkpoint": 2}
-            j, kind = min(matches, key=lambda item: priority[item[1]])
-            result.append((record, j, kind))
-        if any(
-            seq not in {r.processing_sequence for r, _, _ in result} for seq in by_seq
-        ):
-            self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
-        evidenced_minimum = min(by_seq, default=None)
-        terminal_sequences = {
-            item.snapshot_sequence
-            for item in journal
-            if item.snapshot_sequence is not None
-            and item.lifecycle
-            in {
-                JournalLifecycle.COMPLETED,
-                JournalLifecycle.FAILED,
-                JournalLifecycle.RECOVERY_CLASSIFIED,
-                JournalLifecycle.CHECKPOINT,
-            }
-        }
-        if evidenced_minimum is not None and any(
-            record.processing_sequence >= evidenced_minimum
-            and record.processing_sequence not in terminal_sequences
-            for record in wal
-        ):
-            self._fail(RestoreErrorCode.TARGET_UNVERIFIED)
-        return list(reversed(result))[: self.max_targets]
-
-    def _revision(self, wal: list[Any]) -> int:
-        previous: str | None = None
-        revision = 0
-        for record in wal:
-            digest = logical_state_digest(record.patch.value)
-            if previous is not None and (
-                digest != previous or record.event_type == "state_point_in_time_restore"
-            ):
-                revision += 1
-            previous = digest
-        return revision
-
-    def _semantic_events_after(self, wal: list[Any], target_sequence: int) -> int:
-        previous: str | None = None
-        count = 0
-        for record in wal:
-            digest = logical_state_digest(record.patch.value)
-            if (
-                record.processing_sequence > target_sequence
-                and previous is not None
-                and (
-                    digest != previous
-                    or record.event_type == "state_point_in_time_restore"
+                targets.append(
+                    _VerifiedTarget(
+                        wal=record,
+                        journal=journal_record,
+                        kind="bootstrap",
+                        semantic_count=semantic_count,
+                    )
                 )
+                continue
+            sequence_evidence = (
+                evidence.pop(record.processing_sequence)
+                if record.processing_sequence in evidence
+                else None
+            )
+            if sequence_evidence is None:
+                self._fail(RestoreErrorCode.TARGET_UNVERIFIED)
+            assert sequence_evidence is not None
+            hashes = {
+                item.snapshot_hash for item, _kind in sequence_evidence.eligible
+            } | {item.snapshot_hash for item in sequence_evidence.non_target}
+            if len(hashes) != 1 or record.state_hash_after not in hashes:
+                self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+            event_evidence = [
+                item
+                for item, kind in sequence_evidence.eligible
+                if kind != "checkpoint"
+            ] + sequence_evidence.non_target
+            if any(
+                item.event_id != record.event_id
+                or item.processing_sequence != record.processing_sequence
+                for item in event_evidence
             ):
-                count += 1
-            previous = digest
-        return count
+                self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+            restorable_evidence = [
+                item for item in sequence_evidence.eligible if item[1] != "checkpoint"
+            ]
+            if restorable_evidence and sequence_evidence.non_target:
+                self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+            if sequence_evidence.non_target:
+                continue
+            if not sequence_evidence.eligible:
+                self._fail(RestoreErrorCode.TARGET_UNVERIFIED)
+            journal_record, kind = min(
+                sequence_evidence.eligible,
+                key=lambda candidate: priority[candidate[1]],
+            )
+            targets.append(
+                _VerifiedTarget(
+                    wal=record,
+                    journal=journal_record,
+                    kind=kind,
+                    semantic_count=semantic_count,
+                )
+            )
+        if evidence:
+            self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+        with self._lock:
+            self._semantic_cache = (
+                wal[-1].processing_sequence,
+                wal[-1].record_hash,
+                semantic_revision,
+            )
+        return _EvidenceIndex(
+            floor=floor,
+            maximum=wal[-1].processing_sequence,
+            semantic_revision=semantic_revision,
+            semantic_transition_count=semantic_count,
+            targets=tuple(reversed(targets)),
+        )
 
     def _domains(
         self, before: AgentStateSnapshot, after: AgentStateSnapshot
@@ -677,12 +892,16 @@ class OperatorRestoreService:
                 getattr(before, name).model_dump(mode="json"),
                 getattr(after, name).model_dump(mode="json"),
             )
+            left_records = _core_domain_records(name, left)
+            right_records = _core_domain_records(name, right)
             b, a, added, removed, changed = _counts(
-                _core_domain_records(name, left),
-                _core_domain_records(name, right),
+                left_records,
+                right_records,
             )
             if changed or added or removed:
-                refs, truncated = _safe_refs([left, right])
+                refs, truncated = _safe_refs(
+                    _changed_record_values(left_records, right_records)
+                )
                 domains.append(
                     RestoreDomain(
                         domain=cast(Any, name),
@@ -743,13 +962,12 @@ class OperatorRestoreService:
                 for value in (before.extensions.get(key), after.extensions.get(key))
             ):
                 supported = False
-            b, a, added, removed, changed = _counts(
-                _extension_records(before.extensions.get(key)),
-                _extension_records(after.extensions.get(key)),
-            )
+            before_records = _extension_records(before.extensions.get(key))
+            after_records = _extension_records(after.extensions.get(key))
+            b, a, added, removed, changed = _counts(before_records, after_records)
             if changed or added or removed:
                 refs, truncated = _safe_refs(
-                    [before.extensions.get(key), after.extensions.get(key)]
+                    _changed_record_values(before_records, after_records)
                 )
                 domains.append(
                     RestoreDomain(
@@ -786,8 +1004,6 @@ class OperatorRestoreService:
             retryable = reconciliation.retryable
             invalid = any(
                 _public_artifact_type(r.artifact_type) is None
-                or not _SAFE.fullmatch(r.artifact_id)
-                or not _SAFE.fullmatch(r.transaction_id)
                 or not isinstance(r.status, ExternalTransactionStatus)
                 or (
                     r.status
@@ -813,7 +1029,7 @@ class OperatorRestoreService:
                 }
                 for kind in sorted(item for item in public_types if item is not None):
                     refs = [
-                        effect.artifact_id
+                        f"{kind}:{hashlib.sha256(effect.artifact_id.encode('utf-8')).hexdigest()}"
                         for effect in effects
                         if _public_artifact_type(effect.artifact_type) == kind
                     ]
@@ -844,20 +1060,23 @@ class OperatorRestoreService:
     ) -> RestorePreview:
         self._assert_authoritative(actor_id)
         wal, journal = self._evidence()
+        analysis = self._analyze_evidence(wal, journal)
         target = next(
             (
                 x
-                for x in self._targets(wal, journal)
-                if x[0].processing_sequence == target_sequence
+                for x in analysis.targets
+                if x.wal.processing_sequence == target_sequence
             ),
             None,
         )
         if target is None:
+            if target_sequence < analysis.floor:
+                self._fail(RestoreErrorCode.TARGET_NOT_RETAINED)
             if any(r.processing_sequence == target_sequence for r in wal):
                 self._fail(RestoreErrorCode.TARGET_UNVERIFIED)
             self._fail(RestoreErrorCode.TARGET_NOT_RETAINED)
         assert target is not None
-        record, _, _ = target
+        record = target.wal
         current = self._current()
         domains, supported = self._domains(current, record.patch.value)
         external = self._external(target_sequence)
@@ -876,12 +1095,12 @@ class OperatorRestoreService:
             "created_at": now.isoformat(),
             "expires_at": (now + timedelta(seconds=self.ttl_seconds)).isoformat(),
             "current_logical_digest": logical_state_digest(current),
-            "semantic_revision": self._revision(wal),
+            "semantic_revision": analysis.semantic_revision,
             "display_sequence": current.last_processed_event_sequence,
             "target_sequence": target_sequence,
             "target_snapshot_hash": record.state_hash_after,
-            "newer_authoritative_event_count": self._semantic_events_after(
-                wal, target_sequence
+            "newer_authoritative_event_count": (
+                analysis.semantic_transition_count - target.semantic_count
             ),
             "domains": domains,
             "external_effects": external,
@@ -937,11 +1156,12 @@ class OperatorRestoreService:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
         self._check_request(preview, request)
         wal, journal = self._evidence()
+        analysis = self._analyze_evidence(wal, journal)
         target = next(
             (
-                record
-                for record, _, _ in self._targets(wal, journal)
-                if record.processing_sequence == request.target_sequence
+                item.wal
+                for item in analysis.targets
+                if item.wal.processing_sequence == request.target_sequence
             ),
             None,
         )
@@ -953,7 +1173,7 @@ class OperatorRestoreService:
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
         if (
             logical_state_digest(current) != request.expected_current_logical_digest
-            or self._revision(wal) != request.expected_semantic_revision
+            or analysis.semantic_revision != request.expected_semantic_revision
             or current_external.effect_digest != request.expected_external_effect_digest
         ):
             self._fail(RestoreErrorCode.PREVIEW_STALE)
@@ -1001,11 +1221,12 @@ class OperatorRestoreService:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
         self._check_request(preview, request)
         wal, journal = self._evidence()
+        analysis = self._analyze_evidence(wal, journal)
         target_record = next(
             (
-                record
-                for record, _, _ in self._targets(wal, journal)
-                if record.processing_sequence == request.target_sequence
+                item.wal
+                for item in analysis.targets
+                if item.wal.processing_sequence == request.target_sequence
             ),
             None,
         )
@@ -1020,7 +1241,7 @@ class OperatorRestoreService:
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
         if (
             logical_state_digest(current) != request.expected_current_logical_digest
-            or self._revision(wal) != request.expected_semantic_revision
+            or analysis.semantic_revision != request.expected_semantic_revision
             or current_external.effect_digest != request.expected_external_effect_digest
         ):
             self._fail(RestoreErrorCode.PREVIEW_STALE)
@@ -1124,12 +1345,23 @@ class OperatorRestoreService:
     def _journal_operations(self, journal: list[Any]) -> list[RestoreOperation]:
         grouped: dict[str, list[Any]] = {}
         for item in journal:
-            if item.event_type == "state_point_in_time_restore":
+            if item.event_type == "state_point_in_time_restore" and re.fullmatch(
+                r"operator-restore-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                item.event_id,
+            ):
                 grouped.setdefault(item.event_id, []).append(item)
         operations: list[RestoreOperation] = []
         for event_id, records in grouped.items():
-            if not event_id.startswith("operator-restore-"):
+            if not any(
+                item.source == "api.state.operator_restore.commit" for item in records
+            ):
                 continue
+            if any(
+                item.source
+                not in {"api.state.operator_restore.commit", "journal.recovery"}
+                for item in records
+            ):
+                self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
             operation_id = event_id.removeprefix("operator-restore-")
             target_values = {item.target for item in records if item.target is not None}
             preview_values = {
@@ -1199,26 +1431,26 @@ class OperatorRestoreService:
     ) -> RestoreSummary:
         self._assert_authoritative(actor_id)
         wal, journal = self._evidence()
+        analysis = self._analyze_evidence(wal, journal, target_limit=limit)
         current = self._current()
         targets = [
             RestoreTarget(
-                target_sequence=r.processing_sequence,
-                target_snapshot_hash=r.state_hash_after,
-                checkpoint_kind=cast(Any, k),
-                timestamp=j.timestamp.isoformat(),
-                event_type=j.event_type,
+                target_sequence=item.wal.processing_sequence,
+                target_snapshot_hash=item.wal.state_hash_after,
+                checkpoint_kind=cast(Any, item.kind),
+                timestamp=item.journal.timestamp.isoformat(),
+                event_type=item.journal.event_type,
                 eligible=True,
                 reason_codes=[],
             )
-            for r, j, k in self._targets(wal, journal)[
-                : min(limit or self.max_targets, self.max_targets)
-            ]
+            for item in analysis.targets
         ]
         operations_by_id = {item.operation_id: item for item in self._operations}
         operations_by_id.update(
             {item.operation_id: item for item in self._journal_operations(journal)}
         )
         raw = current.extensions.get(_RESERVED, [])
+        persisted_operation_ids: set[str] = set()
         if raw is not None and not isinstance(raw, list):
             self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
         if isinstance(raw, list):
@@ -1226,6 +1458,7 @@ class OperatorRestoreService:
                 try:
                     operation = RestoreOperation.model_validate(item)
                     operations_by_id[operation.operation_id] = operation
+                    persisted_operation_ids.add(operation.operation_id)
                 except Exception as exc:
                     raise RestoreContractError(
                         RestoreErrorCode.JOURNAL_INTEGRITY_INVALID
@@ -1285,6 +1518,18 @@ class OperatorRestoreService:
                         }
                     )
                 )
+            elif (
+                operation.operation_id in persisted_operation_ids
+                and operation.processing_sequence is not None
+                and operation.processing_sequence < analysis.floor
+            ):
+                projected.append(
+                    operation.model_copy(
+                        update={"state": "completed", "error_code": None}
+                    )
+                    if operation.state == "finalizing"
+                    else operation
+                )
             else:
                 projected.append(
                     operation.model_copy(
@@ -1298,9 +1543,9 @@ class OperatorRestoreService:
             current_sequence=current.last_processed_event_sequence,
             current_snapshot_hash=hash_snapshot(current),
             current_logical_digest=logical_state_digest(current),
-            semantic_revision=self._revision(wal),
-            retained_min_sequence=min((r.processing_sequence for r in wal), default=0),
-            retained_max_sequence=max((r.processing_sequence for r in wal), default=0),
+            semantic_revision=analysis.semantic_revision,
+            retained_min_sequence=analysis.floor,
+            retained_max_sequence=analysis.maximum,
             targets=targets,
             latest_operation=projected[-1] if projected else None,
         )

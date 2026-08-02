@@ -273,6 +273,16 @@ describe("CockpitClient", () => {
     expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
   });
 
+  it("does not cache or render restore data rejected by the public-reference parser", async () => {
+    mockedApi.operatorRestoreSummary.mockRejectedValue(new ApiError("Backend returned an invalid public reference."));
+    const { queryClient } = renderCockpit();
+
+    expect(await screen.findByText("State replay / restore is unavailable.")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getQueryCache().getAll().filter((query) => JSON.stringify(query.queryKey).includes("restore")))).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getMutationCache().getAll())).not.toContain("PRIVATE_SENTINEL");
+  });
+
   it("shows action loading without hiding loaded sections", async () => {
     mockedApi.actionTrace.mockReturnValue(new Promise(() => undefined));
     renderCockpit();

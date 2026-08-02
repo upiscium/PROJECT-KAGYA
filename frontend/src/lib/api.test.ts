@@ -596,6 +596,53 @@ describe("api client", () => {
     }
   });
 
+  it.each([
+    ["goal", { refs: [{ kind: "goal", id: "PRIVATE_SENTINEL" }] }],
+    ["human-readable goal", { refs: [{ kind: "goal", id: "AliceSmith1" }] }],
+    ["prefixed human-readable goal", { refs: [{ kind: "goal", id: "goal-AliceSmith-1" }] }],
+    ["decision", { refs: [{ kind: "decision", id: "hidden_thought" }] }],
+    ["intent", { refs: [{ kind: "action", id: "credential_token" }] }],
+    ["message", { refs: [{ kind: "outbox", id: "api_secret" }] }],
+    ["memory", { refs: [{ kind: "memory", id: "password" }] }],
+    ["belief", { refs: [{ kind: "belief", id: "raw_prompt" }] }],
+    ["event", { refs: [{ kind: "journal", id: "event-prompt-1" }] }],
+    ["path", { refs: [{ kind: "outbox", id: "/var/lib/kagya/message-1" }] }],
+    ["control", { refs: [{ kind: "memory", id: "memory-1\u0000" }] }],
+    ["format", { refs: [{ kind: "journal", id: "event\u202e-1" }] }],
+  ])("rejects unsafe public restore %s references", async (_label, refs) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...operatorRestorePreviewPayload,
+      domains: [{ ...operatorRestorePreviewPayload.domains[0], refs }],
+    }));
+    await expect(api.previewOperatorRestore(7)).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it.each([
+    "artifact-transaction-1",
+    "transaction-1",
+    "a".repeat(64),
+  ])("preserves opaque external artifact references: %s", async (reference) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...operatorRestorePreviewPayload,
+      external_effects: {
+        ...operatorRestorePreviewPayload.external_effects,
+        artifacts: [{ ...operatorRestorePreviewPayload.external_effects.artifacts[0], refs: [reference] }],
+      },
+    }));
+    await expect(api.previewOperatorRestore(7)).resolves.toMatchObject({ external_effects: { artifacts: [{ refs: [reference] }] } });
+  });
+
+  it("rejects a raw private external artifact reference", async () => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...operatorRestorePreviewPayload,
+      external_effects: {
+        ...operatorRestorePreviewPayload.external_effects,
+        artifacts: [{ ...operatorRestorePreviewPayload.external_effects.artifacts[0], refs: ["PRIVATE_SENTINEL"] }],
+      },
+    }));
+    await expect(api.previewOperatorRestore(7)).rejects.toMatchObject({ name: "ApiError" });
+  });
+
   it("sanitizes governed restore HTTP errors", async () => {
     const secret = `PRIVATE_SENTINEL ${"x".repeat(2000)}`;
     fetchMock.mockReturnValue(errorResponse(409, "Conflict", { detail: secret, hidden_thought: secret }));

@@ -3203,6 +3203,55 @@ def test_governed_operator_restore_summary_preview_commit_and_retention(
         assert persisted.json()["latest_operation"]["state"] == "completed"
 
 
+def test_legacy_restore_event_does_not_block_new_governed_restore(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        outcome = client.app.state.agent_runtime.execute(
+            AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.point_in_time_restore",
+            handler=lambda: None,
+        )
+        legacy_event_id = outcome.event.event_id
+
+    with _client(tmp_path, settings=settings) as restarted:
+        headers = admin_headers()
+        summary = restarted.get(
+            "/api/state/operator-restore/summary", headers=headers
+        )
+        assert summary.status_code == 200, summary.text
+        assert summary.json()["latest_operation"] is None
+        preview = restarted.post(
+            "/api/state/operator-restore/preview/0", headers=headers
+        )
+        assert preview.status_code == 200, preview.text
+        payload = preview.json()
+        committed = restarted.post(
+            "/api/state/operator-restore/commit",
+            headers=headers,
+            json={
+                "target_sequence": payload["target_sequence"],
+                "expected_target_hash": payload["target_snapshot_hash"],
+                "expected_semantic_revision": payload["semantic_revision"],
+                "expected_current_logical_digest": payload[
+                    "current_logical_digest"
+                ],
+                "expected_preview_digest": payload["preview_digest"],
+                "expected_external_effect_digest": payload["external_effects"][
+                    "effect_digest"
+                ],
+                "confirmation_phrase": payload["confirmation_phrase"],
+            },
+        )
+        assert committed.status_code == 200, committed.text
+        latest = restarted.get(
+            "/api/state/operator-restore/summary", headers=headers
+        ).json()["latest_operation"]
+        assert latest["operation_id"] == committed.json()["operation_id"]
+        assert latest["event_id"] != legacy_event_id
+
+
 def test_governed_operator_restore_rejects_exact_bindings_safely_and_standby(
     tmp_path: Path,
 ) -> None:
