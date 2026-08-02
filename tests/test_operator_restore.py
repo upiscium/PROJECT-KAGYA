@@ -60,7 +60,11 @@ def _snapshot(
 
 
 def _service(
-    tmp_path: Any, *, clock: Clock | None = None, current: int = 2
+    tmp_path: Any,
+    *,
+    clock: Clock | None = None,
+    current: int = 2,
+    token_factory: Any = None,
 ) -> tuple[OperatorRestoreService, AgentStateStore, StateWAL, EventJournal]:
     base = default_agent_state_snapshot(0.2)
     snapshots = [
@@ -81,7 +85,12 @@ def _service(
         journal.completed(event, hash_snapshot(snapshots[sequence]))
     store.last_snapshot = snapshots[current]
     service = OperatorRestoreService(
-        store, wal, journal, ExternalTransactionCoordinator([]), clock=clock or Clock()
+        store,
+        wal,
+        journal,
+        ExternalTransactionCoordinator([]),
+        clock=clock or Clock(),
+        token_factory=token_factory,
     )
     return service, store, wal, journal
 
@@ -254,6 +263,20 @@ def test_reserved_capability_is_pinned_and_release_preserves_consumed_marker(
     assert preview.preview_digest in service._consumed
 
 
+def test_apply_claim_is_atomic_before_authoritative_work(tmp_path: Any) -> None:
+    service, _store, _wal, _journal = _service(tmp_path)
+    preview = service.preview(1)
+    request = _request(preview)
+    service.preflight(request, "operator")
+
+    with pytest.raises(RestoreContractError) as first:
+        service.apply_commit(object(), request, "operator")
+    assert first.value.code == RestoreErrorCode.NOT_AUTHORITATIVE.value
+    with pytest.raises(RestoreContractError) as second:
+        service.apply_commit(object(), request, "operator")
+    assert second.value.code == RestoreErrorCode.OPERATION_IN_PROGRESS.value
+
+
 def test_concurrent_reservation_allows_exactly_one_winner(tmp_path: Any) -> None:
     service, _store, _wal, _journal = _service(tmp_path)
     preview = service.preview(1)
@@ -413,7 +436,7 @@ def test_operation_projection_preserves_public_operation_shape(tmp_path: Any) ->
         "started_at": None,
         "completed_at": None,
         "event_id": f"operator-restore-{preview.operation_id}",
-        "processing_sequence": 3,
+        "processing_sequence": 2,
         "state": "finalizing",
         "error_code": None,
     }
@@ -527,6 +550,19 @@ def test_rotated_journal_restart_uses_only_retained_suffix_for_semantic_hashes(
     assert retained_operation is not None
     assert retained_operation.state == "failed"
     assert retained_operation.error_code == "restore_commit_failed"
+    persisted_completed = {
+        **persisted_failed,
+        "operation_id": "00000000-0000-0000-0000-000000000078",
+        "event_id": "operator-restore-00000000-0000-0000-0000-000000000078",
+        "state": "completed",
+        "error_code": None,
+    }
+    restarted_store.last_snapshot = previous.model_copy(
+        update={"extensions": {"operator_restore": [persisted_completed]}}
+    )
+    retained_operation = restarted.summary().latest_operation
+    assert retained_operation is not None
+    assert retained_operation.state == "completed"
 
 
 def test_read_only_rotation_keeps_retained_preview_semantically_valid(
@@ -875,6 +911,7 @@ def test_latest_operation_uses_authoritative_order_across_sources(
     tmp_path: Any,
 ) -> None:
     service, store, _wal, _journal = _service(tmp_path)
+    target_hash = service.preview(1).target_snapshot_hash
 
     def operation(
         identifier: str, sequence: int | None, requested: str
@@ -882,7 +919,7 @@ def test_latest_operation_uses_authoritative_order_across_sources(
         return RestoreOperation(
             operation_id=identifier,
             target_sequence=1,
-            target_snapshot_hash="a" * 64,
+            target_snapshot_hash=target_hash,
             preview_digest="b" * 64,
             requested_at=requested,
             started_at=requested,
@@ -894,18 +931,19 @@ def test_latest_operation_uses_authoritative_order_across_sources(
         )
 
     in_memory = operation(
-        "00000000-0000-0000-0000-000000000010", 4, "2026-01-01T00:00:04+00:00"
+        "00000000-0000-0000-0000-000000000010", 1, "2026-01-01T00:00:04+00:00"
     )
     journal = operation(
-        "00000000-0000-0000-0000-000000000011", 9, "2026-01-01T00:00:01+00:00"
+        "00000000-0000-0000-0000-000000000011", 2, "2026-01-01T00:00:01+00:00"
     )
     persisted = operation(
-        "00000000-0000-0000-0000-000000000012", 9, "2026-01-01T00:00:01+00:00"
+        "00000000-0000-0000-0000-000000000012", 2, "2026-01-01T00:00:01+00:00"
     )
     service._operations = [in_memory]
     service._journal_operations = lambda _records: [journal]
     current = store.last_snapshot
     assert current is not None
+    target_hash = service.preview(1).target_snapshot_hash
     store.last_snapshot = current.model_copy(
         update={"extensions": {"operator_restore": [persisted.model_dump(mode="json")]}}
     )
@@ -920,11 +958,12 @@ def test_newer_unsequenced_journal_operation_wins_with_clock_rollback(
     service, store, _wal, journal = _service(tmp_path)
     current = store.last_snapshot
     assert current is not None
+    target_hash = service.preview(1).target_snapshot_hash
     older_id = "00000000-0000-0000-0000-000000000012"
     older = RestoreOperation(
         operation_id=older_id,
         target_sequence=1,
-        target_snapshot_hash="a" * 64,
+        target_snapshot_hash=target_hash,
         preview_digest="b" * 64,
         requested_at="2027-01-01T00:00:00+00:00",
         started_at="2027-01-01T00:00:00+00:00",
@@ -945,7 +984,7 @@ def test_newer_unsequenced_journal_operation_wins_with_clock_rollback(
             event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
             source="api.state.operator_restore.commit",
             correlation_id="c" * 64,
-            payload={"journal_target": f"restore:1:{hash_snapshot(current)}"},
+            payload={"journal_target": f"restore:1:{target_hash}"},
         )
     )
     latest = service.summary().latest_operation
@@ -960,6 +999,7 @@ def test_operation_chronology_uses_acceptance_not_later_lifecycle(
     service, store, _wal, journal = _service(tmp_path)
     current = store.last_snapshot
     assert current is not None
+    target_hash = service.preview(1).target_snapshot_hash
 
     def restore_event(identifier: str) -> Event:
         return Event(
@@ -968,7 +1008,7 @@ def test_operation_chronology_uses_acceptance_not_later_lifecycle(
             event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
             source="api.state.operator_restore.commit",
             correlation_id="d" * 64,
-            payload={"journal_target": f"restore:1:{hash_snapshot(current)}"},
+            payload={"journal_target": f"restore:1:{target_hash}"},
         )
 
     older = restore_event("00000000-0000-0000-0000-000000000014")
@@ -1033,47 +1073,56 @@ def test_external_preview_tokens_are_opaque_per_preview_and_cross_preview_tokens
     assert exc.value.code == RestoreErrorCode.PREVIEW_STALE.value
 
 
-def _restore_action_intent(
-    status: str,
-    *,
-    approval_id: str | None = None,
-    receipt_id: str | None = None,
-) -> Any:
+def _restore_action_state(*, active: bool) -> dict[str, Any]:
     from kagya.actions.execution import (
         ActionBudget,
         ActionIntent,
         ActionPreview,
         ActionProvenance,
+        ActionState,
+        ActionValidationRecord,
+        ExecutionReceipt,
+        IntentStatus,
+        Observation,
+        OutcomeVerification,
         PolicyEvaluation,
+        ReceiptStatus,
         RiskClass,
+        _digest,
+        _TOOLS,
+        _validation_schema_revision,
     )
 
     timestamp = datetime(2026, 1, 1, tzinfo=UTC)
     budget = ActionBudget()
-    return ActionIntent(
+    arguments = {"namespace": "project", "key": "name"}
+    digest = _digest(arguments)
+    status = IntentStatus.RETRY_PENDING if active else IntentStatus.SUCCEEDED
+    receipt_status = ReceiptStatus.FAILED if active else ReceiptStatus.SUCCEEDED
+    intent = ActionIntent(
         intent_id="action-1",
         revision=1,
         idempotency_key="action-1",
-        tool_name="metadata_read",
-        arguments={"namespace": "project", "key": "name"},
+        tool_name="restricted_metadata_read",
+        arguments=arguments,
         risk_class=RiskClass.READ_ONLY,
         status=status,
         dry_run=False,
         policy=PolicyEvaluation(
             evaluation_id="policy-1",
-            tool_name="metadata_read",
+            tool_name="restricted_metadata_read",
             risk_class=RiskClass.READ_ONLY,
             allowed=True,
-            approval_required=approval_id is not None,
+            approval_required=False,
             reasons=("allowlisted_tool",),
-            argument_digest="a" * 64,
+            argument_digest=digest,
             evaluated_at=timestamp,
         ),
         preview=ActionPreview(
-            tool_name="metadata_read",
+            tool_name="restricted_metadata_read",
             risk_class=RiskClass.READ_ONLY,
-            arguments={"namespace": "project", "key": "name"},
-            effect="read metadata",
+            arguments=arguments,
+            effect=_TOOLS["restricted_metadata_read"].effect,
             bounded_by=budget,
             compensation_available=False,
         ),
@@ -1086,19 +1135,69 @@ def _restore_action_intent(
         created_at=timestamp,
         updated_at=timestamp,
         deadline_at=timestamp + timedelta(minutes=1),
-        approval_id=approval_id,
-        receipt_id=receipt_id,
+        receipt_id="receipt-1",
+        validation_record_id="validation-1",
     )
+    validation = ActionValidationRecord(
+        validation_id="validation-1",
+        idempotency_key="action-1",
+        request_digest="b" * 64,
+        decision_id="decision-1",
+        intent_id="action-1",
+        tool_name="restricted_metadata_read",
+        risk_class=RiskClass.READ_ONLY,
+        arguments_valid=True,
+        validation_schema_revision=_validation_schema_revision(
+            "restricted_metadata_read", _TOOLS["restricted_metadata_read"]
+        ),
+        validation_error_codes=(),
+        validated_event_id="event-1",
+        validated_event_sequence=1,
+        canonical_arguments_digest=digest,
+        validated_at=timestamp,
+    )
+    receipt = ExecutionReceipt(
+        receipt_id="receipt-1",
+        intent_id="action-1",
+        idempotency_key="action-1",
+        attempt=1,
+        status=receipt_status,
+        started_at=timestamp,
+        finished_at=timestamp,
+        duration_ms=0,
+        observation_id="observation-1",
+        verification_id="verification-1",
+        decision_id="decision-1",
+    )
+    observation = Observation(
+        observation_id="observation-1",
+        intent_id="action-1",
+        receipt_id="receipt-1",
+        observed_at=timestamp,
+        data={"namespace": "project", "key": "name", "value": "PROJECT-KAGYA"},
+        result_digest="c" * 64,
+        valid=True,
+    )
+    verification = OutcomeVerification(
+        verification_id="verification-1",
+        intent_id="action-1",
+        observation_id="observation-1",
+        success=not active,
+        reason="verified" if not active else "retryable_failure",
+        verified_at=timestamp,
+    )
+    return ActionState(
+        intents=(intent,),
+        validation_records=(validation,),
+        receipts=(receipt,),
+        observations=(observation,),
+        verifications=(verification,),
+    ).model_dump(mode="json")
 
 
 def _protected_state(domain: str, *, active: bool) -> dict[str, Any]:
     if domain == "action_execution":
-        from kagya.actions.execution import ActionState
-
-        status = "retry_pending" if active else "succeeded"
-        return ActionState(intents=(_restore_action_intent(status),)).model_dump(
-            mode="json"
-        )
+        return _restore_action_state(active=active)
     if domain == "proactive_outbox":
         from kagya.outbox import DeliveryStatus, OutboxMessage, OutboxState
 
@@ -1174,23 +1273,110 @@ def test_terminal_protected_histories_restore_but_pending_or_invalid_fail_closed
 
 
 def test_pending_approval_blocks_terminal_action_restore(tmp_path: Any) -> None:
-    from kagya.actions.execution import ActionState, ApprovalRecord
+    from kagya.actions.execution import (
+        ActionBudget,
+        ActionIntent,
+        ActionPreview,
+        ActionProvenance,
+        ActionState,
+        ActionValidationRecord,
+        ApprovalRecord,
+        IntentStatus,
+        NotificationArguments,
+        PolicyEvaluation,
+        RiskClass,
+        _digest,
+        _TOOLS,
+        _validation_schema_revision,
+        validate_action_state_semantics,
+    )
 
     service, store, _wal, _journal = _service(tmp_path)
     current = store.last_snapshot
     assert current is not None
     timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    arguments = NotificationArguments(
+        title="Reminder",
+        body="Review completed work",
+        public_preview={
+            "kind": "local_notification_enqueue",
+            "title": "Reminder",
+            "body": "Review completed work",
+        },
+    ).model_dump(mode="json")
+    digest = _digest(arguments)
+    budget = ActionBudget()
+    intent = ActionIntent(
+        intent_id="action-approval-1",
+        revision=1,
+        idempotency_key="action-approval-1",
+        tool_name="local_notification_enqueue",
+        arguments=arguments,
+        risk_class=RiskClass.REVERSIBLE_WRITE,
+        status=IntentStatus.AWAITING_APPROVAL,
+        dry_run=False,
+        policy=PolicyEvaluation(
+            evaluation_id="policy-approval-1",
+            tool_name="local_notification_enqueue",
+            risk_class=RiskClass.REVERSIBLE_WRITE,
+            allowed=True,
+            approval_required=True,
+            reasons=("human_approval_required",),
+            argument_digest=digest,
+            evaluated_at=timestamp,
+        ),
+        preview=ActionPreview(
+            tool_name="local_notification_enqueue",
+            risk_class=RiskClass.REVERSIBLE_WRITE,
+            arguments=arguments,
+            effect=_TOOLS["local_notification_enqueue"].effect,
+            bounded_by=budget,
+            compensation_available=True,
+        ),
+        provenance=ActionProvenance(
+            decision_id="decision-approval-1", candidate_id="candidate-approval-1"
+        ),
+        budget=budget,
+        attempts=0,
+        cost_units_used=0,
+        created_at=timestamp,
+        updated_at=timestamp,
+        deadline_at=timestamp + timedelta(minutes=1),
+        approval_id="approval-1",
+        validation_record_id="validation-approval-1",
+    )
     state = ActionState(
-        intents=(_restore_action_intent("succeeded", approval_id="approval-1"),),
+        intents=(intent,),
+        validation_records=(
+            ActionValidationRecord(
+                validation_id="validation-approval-1",
+                idempotency_key="action-approval-1",
+                request_digest="d" * 64,
+                decision_id="decision-approval-1",
+                intent_id="action-approval-1",
+                tool_name="local_notification_enqueue",
+                risk_class=RiskClass.REVERSIBLE_WRITE,
+                arguments_valid=True,
+                validation_schema_revision=_validation_schema_revision(
+                    "local_notification_enqueue",
+                    _TOOLS["local_notification_enqueue"],
+                ),
+                validated_event_id="event-approval-1",
+                validated_event_sequence=1,
+                canonical_arguments_digest=digest,
+                validated_at=timestamp,
+            ),
+        ),
         approvals=(
             ApprovalRecord(
                 approval_id="approval-1",
-                intent_id="action-1",
+                intent_id="action-approval-1",
                 status="pending",
                 requested_at=timestamp,
             ),
         ),
     )
+    validate_action_state_semantics(state)
     store.last_snapshot = current.model_copy(
         update={"extensions": {"action_execution": state.model_dump(mode="json")}}
     )
@@ -1198,28 +1384,420 @@ def test_pending_approval_blocks_terminal_action_restore(tmp_path: Any) -> None:
 
 
 def test_rebound_terminal_action_receipt_fails_closed(tmp_path: Any) -> None:
-    from kagya.actions.execution import ActionState, ExecutionReceipt
+    from kagya.actions.execution import ActionState
 
     service, store, _wal, _journal = _service(tmp_path)
     current = store.last_snapshot
     assert current is not None
-    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
-    receipt = ExecutionReceipt(
-        receipt_id="receipt-1",
-        intent_id="action-1",
-        idempotency_key="rebound-key",
-        attempt=1,
-        status="succeeded",
-        started_at=timestamp,
-        finished_at=timestamp,
-        duration_ms=0,
-        decision_id="decision-1",
-    )
-    state = ActionState(
-        intents=(_restore_action_intent("succeeded", receipt_id="receipt-1"),),
-        receipts=(receipt,),
+    valid = ActionState.model_validate(_restore_action_state(active=False))
+    state = valid.model_copy(
+        update={
+            "receipts": (
+                valid.receipts[0].model_copy(update={"idempotency_key": "rebound-key"}),
+            )
+        }
     )
     store.last_snapshot = current.model_copy(
         update={"extensions": {"action_execution": state.model_dump(mode="json")}}
     )
     assert not service.preview(1).restoreable
+
+
+def _operation_for_test(
+    operation_id: str,
+    target_hash: str,
+    *,
+    state: str = "finalizing",
+    sequence: int | None = 2,
+) -> RestoreOperation:
+    terminal = state in {"completed", "failed"}
+    return RestoreOperation(
+        operation_id=operation_id,
+        target_sequence=1,
+        target_snapshot_hash=target_hash,
+        preview_digest="b" * 64,
+        requested_at="2026-01-01T00:00:00+00:00",
+        started_at="2026-01-01T00:00:01+00:00",
+        completed_at="2026-01-01T00:00:02+00:00" if terminal else None,
+        event_id=f"operator-restore-{operation_id}",
+        processing_sequence=sequence,
+        state=state,  # type: ignore[arg-type]
+        error_code="restore_commit_failed" if state == "failed" else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "target_sequence",
+        "target_snapshot_hash",
+        "preview_digest",
+        "processing_sequence",
+    ],
+)
+def test_persisted_and_journal_same_uuid_mismatch_is_rejected(
+    tmp_path: Any, field: str
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000201"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    journal_operation = _operation_for_test(operation_id, target_hash, sequence=3)
+    persisted = journal_operation.model_dump(mode="json")
+    persisted[field] = {
+        "target_sequence": 2,
+        "target_snapshot_hash": "c" * 64,
+        "preview_digest": "d" * 64,
+        "processing_sequence": 4,
+    }[field]
+    if field == "target_sequence":
+        persisted["target_snapshot_hash"] = wal.reconstruct(2).snapshot_hash
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [persisted]}}
+    )
+    service._journal_operations = lambda _records: [journal_operation]
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_persisted_and_journal_same_uuid_event_identity_mismatch_is_rejected(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000202"
+    operation = _operation_for_test(operation_id, wal.reconstruct(1).snapshot_hash)
+    persisted = operation.model_dump(mode="json")
+    persisted["event_id"] = "operator-restore-00000000-0000-0000-0000-000000000203"
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [persisted]}}
+    )
+    service._journal_operations = lambda _records: [operation]
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_duplicate_persisted_operation_uuid_is_rejected(tmp_path: Any) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000204", wal.reconstruct(1).snapshot_hash
+    )
+    raw = operation.model_dump(mode="json")
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [raw, raw]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_invalid_persisted_operation_timestamp_order_is_rejected(tmp_path: Any) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    raw = _operation_for_test(
+        "00000000-0000-0000-0000-000000000205", wal.reconstruct(1).snapshot_hash
+    ).model_dump(mode="json")
+    raw["completed_at"] = "2025-12-31T23:59:59+00:00"
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [raw]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+@pytest.mark.parametrize(
+    "persisted_state,journal_state", [("completed", "failed"), ("failed", "completed")]
+)
+def test_persisted_terminal_state_conflicting_with_journal_is_rejected(
+    tmp_path: Any, persisted_state: str, journal_state: str
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000206"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    persisted = _operation_for_test(operation_id, target_hash, state=persisted_state)
+    journal = _operation_for_test(operation_id, target_hash, state="finalizing")
+    journal = journal.model_copy(update={"state": journal_state})
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [persisted.model_dump(mode="json")]}}
+    )
+    service._journal_operations = lambda _records: [journal]
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_finalizing_persisted_operation_with_completed_journal_projects_completed(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000207"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    operation = _operation_for_test(operation_id, target_hash, sequence=3)
+    event = Event(
+        operation.event_id,
+        3,
+        event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
+        source="api.state.operator_restore.commit",
+        correlation_id=operation.preview_digest,
+        payload={"journal_target": f"restore:1:{target_hash}"},
+    )
+    journal.accepted(
+        Event(
+            event.event_id,
+            None,  # type: ignore[arg-type]
+            event_type=event.event_type,
+            source=event.source,
+            correlation_id=event.correlation_id,
+            payload=event.payload,
+        )
+    )
+    journal.started(event)
+    current = store.last_snapshot
+    assert current is not None
+    post = _snapshot(current, 3, 0.6)
+    wal.append_transition(event, current, post)
+    journal.completed(event, hash_snapshot(post))
+    store.last_snapshot = post.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    projected = service.summary().latest_operation
+    assert projected is not None
+    assert projected.state == "completed"
+
+
+def test_corrupt_target_snapshot_operation_history_is_rejected_before_apply(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test("00000000-0000-0000-0000-000000000208", "e" * 64)
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    before = hash_snapshot(store.last_snapshot)
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+    assert hash_snapshot(store.last_snapshot) == before
+
+
+def test_apply_rejects_corrupted_reconstructed_target_history(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kagya.runtime.agent_runtime import _current_event
+
+    service, _store, wal, _journal = _service(tmp_path)
+    preview = service.preview(1)
+    request = _request(preview)
+    service.preflight(request, "operator")
+    reconstruction = wal.reconstruct(1)
+    corrupt_operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000209", "e" * 64, sequence=1
+    )
+    corrupt_snapshot = reconstruction.snapshot.model_copy(
+        update={
+            "extensions": {
+                **reconstruction.snapshot.extensions,
+                "operator_restore": [corrupt_operation.model_dump(mode="json")],
+            }
+        }
+    )
+    monkeypatch.setattr(
+        wal,
+        "reconstruct",
+        lambda _sequence: reconstruction.model_copy(
+            update={"snapshot": corrupt_snapshot}
+        ),
+    )
+    token = _current_event.set(
+        AgentEvent(
+            event_id=f"operator-restore-{preview.operation_id}",
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.operator_restore.commit",
+            processing_sequence=3,
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+    try:
+        with pytest.raises(RestoreContractError) as exc:
+            service.apply_commit(object(), request, "operator")
+    finally:
+        _current_event.reset(token)
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+    assert request.expected_preview_digest not in service._consumed
+
+
+@pytest.mark.parametrize(
+    ("journal_terminal", "persisted_state"),
+    [("completed", "failed"), ("failed", "completed")],
+)
+def test_apply_rejects_persisted_history_conflicting_with_journal_lifecycle(
+    tmp_path: Any, journal_terminal: str, persisted_state: str
+) -> None:
+    from kagya.runtime.agent_runtime import _current_event
+
+    service, store, wal, journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    target_hash = wal.reconstruct(1).snapshot_hash
+    historical_id = "00000000-0000-0000-0000-000000000210"
+    accepted_event = Event(
+        f"operator-restore-{historical_id}",
+        None,  # type: ignore[arg-type]
+        event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
+        source="api.state.operator_restore.commit",
+        correlation_id="e" * 64,
+        payload={"journal_target": f"restore:1:{target_hash}"},
+    )
+    journal.accepted(accepted_event)
+    historical_event = Event(
+        accepted_event.event_id,
+        3,
+        event_type=accepted_event.event_type,
+        source=accepted_event.source,
+        correlation_id=accepted_event.correlation_id,
+        payload=accepted_event.payload,
+    )
+    journal.started(historical_event)
+    post = _snapshot(current, 3, 0.6)
+    wal.append_transition(historical_event, current, post)
+    if journal_terminal == "completed":
+        terminal_record = journal.completed(historical_event, hash_snapshot(post))
+    else:
+        terminal_record = journal.failed(
+            historical_event, "injected_failure", hash_snapshot(post)
+        )
+    journal_operation = service._journal_operations(journal.verify())[-1]
+    persisted = RestoreOperation.model_validate(
+        {
+            **journal_operation.model_dump(mode="json"),
+            "state": persisted_state,
+            "completed_at": terminal_record.timestamp.isoformat(),
+            "error_code": (
+                "restore_commit_failed" if persisted_state == "failed" else None
+            ),
+        }
+    )
+    store.last_snapshot = post.model_copy(
+        update={
+            "extensions": {
+                **post.extensions,
+                "operator_restore": [persisted.model_dump(mode="json")],
+            }
+        }
+    )
+    preview = service.preview(1)
+    request = _request(preview)
+    service.preflight(request, "operator")
+    token = _current_event.set(
+        AgentEvent(
+            event_id=f"operator-restore-{preview.operation_id}",
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.operator_restore.commit",
+            processing_sequence=4,
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    )
+    try:
+        with pytest.raises(RestoreContractError) as exc:
+            service.apply_commit(object(), request, "operator")
+    finally:
+        _current_event.reset(token)
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+    assert request.expected_preview_digest not in service._consumed
+
+
+class _OpaqueRestoreStore:
+    def list_external_transactions(self) -> list[ExternalTransactionRecord]:
+        return [
+            ExternalTransactionRecord(
+                transaction_id="opaque-transaction",
+                revision=1,
+                artifact_type="episodic_chroma",
+                artifact_id="opaque-memory",
+                status=ExternalTransactionStatus.COMMITTED,
+                event_id="opaque-event",
+                processing_sequence=2,
+                source="test",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+                audit=[],
+            )
+        ]
+
+    def finalize_external_event(self, event_id: str, processing_sequence: int) -> int:
+        return 0
+
+    def orphan_external_event(self, event_id: str, reason: str) -> int:
+        return 0
+
+    def compensate_external_event(self, event_id: str, reason: str) -> int:
+        return 0
+
+
+def test_external_capability_uses_injected_256_bit_token_and_is_opaque(
+    tmp_path: Any,
+) -> None:
+    tokens = iter([bytes.fromhex("a" * 64), bytes.fromhex("b" * 64)])
+    seen: list[bytes] = []
+
+    def factory() -> bytes:
+        token = next(tokens)
+        seen.append(token)
+        return token
+
+    service, _store, _wal, _journal = _service(tmp_path, token_factory=factory)
+    service.external = ExternalTransactionCoordinator([_OpaqueRestoreStore()])
+    first = service.preview(1)
+    second = service.preview(1)
+    assert seen and all(len(value) == 32 for value in seen)
+    assert (
+        first.external_effects.artifacts[0].refs
+        != second.external_effects.artifacts[0].refs
+    )
+    assert "opaque-memory" not in first.model_dump_json()
+    assert (
+        __import__("hashlib").sha256(b"opaque-memory").hexdigest()
+        not in first.model_dump_json()
+    )
+
+
+@pytest.mark.parametrize("bad_token", [b"a" * 31, b"a" * 33, "a" * 64, 123])
+def test_external_capability_rejects_malformed_factory_output(
+    tmp_path: Any, bad_token: Any
+) -> None:
+    service, _store, _wal, _journal = _service(
+        tmp_path, token_factory=lambda: bad_token
+    )
+    service.external = ExternalTransactionCoordinator([_OpaqueRestoreStore()])
+    with pytest.raises(RestoreContractError) as exc:
+        service.preview(1)
+    assert exc.value.code == RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT.value
+
+
+def test_external_capability_stales_on_state_mutation_and_rejects_forged_token(
+    tmp_path: Any,
+) -> None:
+    tokens = iter([bytes.fromhex("b" * 64), bytes.fromhex("c" * 64)])
+    service, store, _wal, _journal = _service(
+        tmp_path, token_factory=lambda: next(tokens)
+    )
+    service.external = ExternalTransactionCoordinator([_OpaqueRestoreStore()])
+    first = service.preview(1)
+    second = service.preview(1)
+    assert first.external_effects.effect_digest != second.external_effects.effect_digest
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={
+            "emotion_state": store.last_snapshot.emotion_state.model_copy(
+                update={"valence": 0.8}
+            )
+        }
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.preflight(_request(first), "operator")
+    assert exc.value.code == RestoreErrorCode.PREVIEW_STALE.value
+    forged = _request(second, expected_external_effect_digest="d" * 64)
+    with pytest.raises(RestoreContractError) as exc:
+        service.preflight(forged, "operator")
+    assert exc.value.code == RestoreErrorCode.PREVIEW_STALE.value

@@ -18,7 +18,9 @@ from kagya.actions import (
     ExecutionReceipt,
     IntentStatus,
     OperatorCommand,
+    RiskClass,
     ReceiptStatus,
+    validate_action_state_semantics,
 )
 from kagya.decision import (
     ActionCandidate,
@@ -326,6 +328,18 @@ def test_notification_requires_approval_is_idempotent_and_compensates(
     )
     assert len(state.notifications) == 1
     assert state.notifications[0]["status"] == "queued"
+    validate_action_state_semantics(state)
+    from kagya.runtime.operator_restore import _protected_domain_has_active_work
+
+    assert _protected_domain_has_active_work(
+        "action_execution", state.model_dump(mode="json")
+    )
+    malformed_notification = dict(state.notifications[0])
+    malformed_notification.pop("created_at")
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(
+            state.model_copy(update={"notifications": (malformed_notification,)})
+        )
     assert len(loop.outbox.list_messages()) == 2
     assert (
         next(
@@ -462,6 +476,7 @@ def test_schema_v4_fixture_preview_binding_is_stable_across_independent_graphs(
     second_loop.persistent_state.extensions[ACTION_STATE_KEY] = json.loads(
         json.dumps(fixture)
     )
+
     def unexpected_save(_layer: ActionExecutionLayer, _state: ActionState) -> None:
         raise AssertionError("schema-v4 reads must not rewrite authoritative state")
 
@@ -730,7 +745,9 @@ def test_operator_snapshot_projects_large_history_without_per_intent_rescans(
     assert checked_calls == 1
     assert semantic_receipt_visits == len(receipts) * 3
     assert len(projected) == 300
-    assert all(item.available_commands == [OperatorCommand.CANCEL] for item in projected)
+    assert all(
+        item.available_commands == [OperatorCommand.CANCEL] for item in projected
+    )
 
 
 @pytest.mark.parametrize(
@@ -1917,9 +1934,7 @@ def test_corrupt_success_evidence_cannot_enable_compensation(
     )
     receipt = state.receipts[0]
     if corruption == "decision":
-        receipts = (
-            receipt.model_copy(update={"decision_id": "cross-bound"}),
-        )
+        receipts = (receipt.model_copy(update={"decision_id": "cross-bound"}),)
         corrupted = state.model_copy(update={"receipts": receipts})
     elif corruption == "plan_id":
         corrupted = state.model_copy(
@@ -1927,11 +1942,7 @@ def test_corrupt_success_evidence_cannot_enable_compensation(
         )
     elif corruption == "plan_revision":
         corrupted = state.model_copy(
-            update={
-                "receipts": (
-                    receipt.model_copy(update={"plan_revision": 99}),
-                )
-            }
+            update={"receipts": (receipt.model_copy(update={"plan_revision": 99}),)}
         )
     elif corruption == "step":
         corrupted = state.model_copy(
@@ -1981,10 +1992,279 @@ def test_corrupt_success_evidence_cannot_enable_compensation(
                 ),
             )
         corrupted = state.model_copy(update={"receipts": (receipt, *compensation)})
-    loop.persistent_state.extensions[ACTION_STATE_KEY] = corrupted.model_dump(mode="json")
-    before = json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+    loop.persistent_state.extensions[ACTION_STATE_KEY] = corrupted.model_dump(
+        mode="json"
+    )
+    before = json.dumps(
+        loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+    )
     assert layer.available_commands(completed.intent_id) == ()
     with pytest.raises(ActionPolicyError):
         layer.compensate(completed.intent_id)
-    assert json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True) == before
+    assert (
+        json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+        == before
+    )
     assert len(layer.list_receipts()) == len(corrupted.receipts)
+
+
+def _semantic_fixture(tmp_path: Path) -> tuple[ActionState, Any]:
+    """Build the valid graph through the normal intent and execution workflow."""
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-semantic-matrix",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.semantic-matrix.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-semantic-matrix", idempotency_key="semantic-matrix"
+            ),
+        ).value
+        completed = runtime.execute(
+            AgentEventType.ACTION_EXECUTE,
+            source="test.semantic-matrix.execute",
+            handler=lambda: layer.execute(intent.intent_id),
+        ).value
+    finally:
+        runtime.shutdown()
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    assert completed.status == IntentStatus.SUCCEEDED
+    assert (
+        len(state.receipts) == len(state.observations) == len(state.verifications) == 1
+    )
+    return state, completed
+
+
+@pytest.mark.parametrize(
+    ("intent_status", "receipt_status"),
+    [
+        (IntentStatus.SUCCEEDED, ReceiptStatus.SUCCEEDED),
+        (IntentStatus.FAILED, ReceiptStatus.FAILED),
+        (IntentStatus.FAILED, ReceiptStatus.TIMED_OUT),
+        (IntentStatus.CANCELLED, ReceiptStatus.CANCELLED),
+        (IntentStatus.REJECTED, ReceiptStatus.CANCELLED),
+    ],
+)
+def test_validate_action_state_semantics_accepts_terminal_histories(
+    tmp_path: Path, intent_status: IntentStatus, receipt_status: ReceiptStatus
+) -> None:
+    state, intent = _semantic_fixture(tmp_path)
+    receipt = state.receipts[0].model_copy(update={"status": receipt_status})
+    verification = state.verifications[0].model_copy(
+        update={"success": receipt_status == ReceiptStatus.SUCCEEDED}
+    )
+    state = state.model_copy(
+        update={
+            "intents": (intent.model_copy(update={"status": intent_status}),),
+            "receipts": (receipt,),
+            "verifications": (verification,),
+        }
+    )
+    snapshot = validate_action_state_semantics(state)
+    assert snapshot.intents[intent.intent_id].status == intent_status
+
+
+def test_validate_action_state_semantics_accepts_compensated_history(
+    tmp_path: Path,
+) -> None:
+    state, intent = _semantic_fixture(tmp_path)
+    original = state.receipts[0]
+    compensation = original.model_copy(
+        update={
+            "receipt_id": "semantic-compensation",
+            "status": ReceiptStatus.COMPENSATED,
+            "compensation_of": original.receipt_id,
+        }
+    )
+    compensated = intent.model_copy(
+        update={
+            "status": IntentStatus.COMPENSATED,
+            "receipt_id": compensation.receipt_id,
+        }
+    )
+    validate_action_state_semantics(
+        state.model_copy(
+            update={"intents": (compensated,), "receipts": (original, compensation)}
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_receipt",
+        "missing_observation",
+        "missing_verification",
+        "failed_verification",
+        "non_allowlisted_tool",
+        "risk_mismatch",
+        "policy_mismatch",
+        "preview_mismatch",
+        "budget_mismatch",
+        "missing_validation",
+        "rebound_validation",
+        "canonical_arguments_mismatch",
+        "dry_run_with_receipt",
+        "retry_without_receipt",
+        "self_compensation",
+        "duplicate_compensation",
+        "cross_intent_compensation",
+    ],
+)
+def test_validate_action_state_semantics_rejects_third_review_matrix(
+    tmp_path: Path, corruption: str
+) -> None:
+    state, intent = _semantic_fixture(tmp_path)
+    receipt = state.receipts[0]
+    if corruption == "missing_receipt":
+        corrupted = state.model_copy(
+            update={"intents": (intent.model_copy(update={"receipt_id": None}),)}
+        )
+    elif corruption == "missing_observation":
+        corrupted = state.model_copy(update={"observations": ()})
+    elif corruption == "missing_verification":
+        corrupted = state.model_copy(update={"verifications": ()})
+    elif corruption == "failed_verification":
+        corrupted = state.model_copy(
+            update={
+                "verifications": (
+                    state.verifications[0].model_copy(update={"success": False}),
+                )
+            }
+        )
+    elif corruption == "non_allowlisted_tool":
+        corrupted = state.model_copy(
+            update={"intents": (intent.model_copy(update={"tool_name": "shell"}),)}
+        )
+    elif corruption == "risk_mismatch":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={"risk_class": RiskClass.REVERSIBLE_WRITE}
+                    ),
+                )
+            }
+        )
+    elif corruption == "policy_mismatch":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={
+                            "policy": intent.policy.model_copy(
+                                update={"allowed": False}
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+    elif corruption == "preview_mismatch":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={
+                            "preview": intent.preview.model_copy(
+                                update={"effect": "other"}
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+    elif corruption == "budget_mismatch":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={
+                            "preview": intent.preview.model_copy(
+                                update={"bounded_by": ActionBudget(max_attempts=3)}
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+    elif corruption == "missing_validation":
+        corrupted = state.model_copy(
+            update={
+                "intents": (intent.model_copy(update={"validation_record_id": None}),)
+            }
+        )
+    elif corruption == "rebound_validation":
+        record = state.validation_records[0].model_copy(
+            update={"intent_id": "other-intent"}
+        )
+        corrupted = state.model_copy(update={"validation_records": (record,)})
+    elif corruption == "canonical_arguments_mismatch":
+        record = state.validation_records[0].model_copy(
+            update={"canonical_arguments_digest": "0" * 64}
+        )
+        corrupted = state.model_copy(update={"validation_records": (record,)})
+    elif corruption == "dry_run_with_receipt":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={"status": IntentStatus.DRY_RUN, "dry_run": True}
+                    ),
+                )
+            }
+        )
+    elif corruption == "retry_without_receipt":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(
+                        update={
+                            "status": IntentStatus.RETRY_PENDING,
+                            "receipt_id": None,
+                        }
+                    ),
+                ),
+                "receipts": (),
+                "observations": (),
+                "verifications": (),
+            }
+        )
+    else:
+        compensation = receipt.model_copy(
+            update={
+                "receipt_id": f"semantic-{corruption}",
+                "status": ReceiptStatus.COMPENSATED,
+                "compensation_of": receipt.receipt_id,
+            }
+        )
+        if corruption == "self_compensation":
+            compensation = compensation.model_copy(
+                update={"compensation_of": compensation.receipt_id}
+            )
+        elif corruption == "duplicate_compensation":
+            compensation = compensation.model_copy(
+                update={"receipt_id": "semantic-duplicate-2"}
+            )
+            corrupted = state.model_copy(
+                update={"receipts": (receipt, compensation, compensation)}
+            )
+        elif corruption == "cross_intent_compensation":
+            compensation = compensation.model_copy(update={"intent_id": "other-intent"})
+        if corruption != "duplicate_compensation":
+            corrupted = state.model_copy(update={"receipts": (receipt, compensation)})
+
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(corrupted)

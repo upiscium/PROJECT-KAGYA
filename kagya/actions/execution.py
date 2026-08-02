@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import time
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -487,83 +487,93 @@ class ActionOperatorSnapshot:
     @classmethod
     def build(cls, execution: "ActionExecutionLayer") -> "ActionOperatorSnapshot":
         state = execution._state_checked()
+        return _snapshot_from_state(state)
 
-        def index(
-            values: tuple[Any, ...],
-            identifier: Callable[[Any], str],
-            label: str,
-        ) -> Mapping[str, Any]:
-            result: dict[str, Any] = {}
-            for value in values:
-                key = identifier(value)
-                if key in result:
-                    raise ActionPolicyError(f"Duplicate or corrupt {label} records")
-                result[key] = value
-            return MappingProxyType(result)
 
-        approvals_by_intent_data: dict[str, ApprovalRecord] = {}
-        for approval in state.approvals:
-            if approval.intent_id in approvals_by_intent_data:
-                raise ActionPolicyError("Approval binding is not unique")
-            approvals_by_intent_data[approval.intent_id] = approval
-        receipts_by_intent_lists: dict[str, list[ExecutionReceipt]] = {}
-        for receipt in state.receipts:
-            receipts_by_intent_lists.setdefault(receipt.intent_id, []).append(receipt)
-        receipts_by_intent_data = {
-            intent_id: tuple(receipts)
-            for intent_id, receipts in receipts_by_intent_lists.items()
-        }
-        compensations_by_target_lists: dict[str, list[ExecutionReceipt]] = {}
-        for receipt in state.receipts:
-            if receipt.compensation_of is not None:
-                compensations_by_target_lists.setdefault(
-                    receipt.compensation_of, []
-                ).append(receipt)
-        compensations_by_target_data = {
-            receipt_id: tuple(receipts)
-            for receipt_id, receipts in compensations_by_target_lists.items()
-        }
-        observations_by_intent_lists: dict[str, list[Observation]] = {}
-        for observation in state.observations:
-            observations_by_intent_lists.setdefault(observation.intent_id, []).append(
-                observation
-            )
-        verifications_by_intent_lists: dict[str, list[OutcomeVerification]] = {}
-        for verification in state.verifications:
-            verifications_by_intent_lists.setdefault(
-                verification.intent_id, []
-            ).append(verification)
-        snapshot = cls(
-            intents=index(state.intents, lambda item: item.intent_id, "intent"),
-            approvals=index(state.approvals, lambda item: item.approval_id, "approval"),
-            approvals_by_intent=MappingProxyType(approvals_by_intent_data),
-            receipts=index(state.receipts, lambda item: item.receipt_id, "receipt"),
-            receipts_by_intent=MappingProxyType(receipts_by_intent_data),
-            compensations_by_target=MappingProxyType(compensations_by_target_data),
-            observations=index(state.observations, lambda item: item.observation_id, "observation"),
-            observations_by_intent=MappingProxyType(
-                {
-                    intent_id: tuple(observations)
-                    for intent_id, observations in observations_by_intent_lists.items()
-                }
-            ),
-            verifications=index(state.verifications, lambda item: item.verification_id, "verification"),
-            verifications_by_intent=MappingProxyType(
-                {
-                    intent_id: tuple(verifications)
-                    for intent_id, verifications in verifications_by_intent_lists.items()
-                }
-            ),
-            validations=index(state.validation_records, lambda item: item.validation_id, "validation"),
+def _snapshot_from_state(state: ActionState) -> ActionOperatorSnapshot:
+
+    def index(
+        values: tuple[Any, ...],
+        identifier: Callable[[Any], str],
+        label: str,
+    ) -> Mapping[str, Any]:
+        result: dict[str, Any] = {}
+        for value in values:
+            key = identifier(value)
+            if key in result:
+                raise ActionPolicyError(f"Duplicate or corrupt {label} records")
+            result[key] = value
+        return MappingProxyType(result)
+
+    approvals_by_intent_data: dict[str, ApprovalRecord] = {}
+    for approval in state.approvals:
+        if approval.intent_id in approvals_by_intent_data:
+            raise ActionPolicyError("Approval binding is not unique")
+        approvals_by_intent_data[approval.intent_id] = approval
+    receipts_by_intent_lists: dict[str, list[ExecutionReceipt]] = {}
+    for receipt in state.receipts:
+        receipts_by_intent_lists.setdefault(receipt.intent_id, []).append(receipt)
+    receipts_by_intent_data = {
+        intent_id: tuple(receipts)
+        for intent_id, receipts in receipts_by_intent_lists.items()
+    }
+    compensations_by_target_lists: dict[str, list[ExecutionReceipt]] = {}
+    for receipt in state.receipts:
+        if receipt.compensation_of is not None:
+            compensations_by_target_lists.setdefault(
+                receipt.compensation_of, []
+            ).append(receipt)
+    compensations_by_target_data = {
+        receipt_id: tuple(receipts)
+        for receipt_id, receipts in compensations_by_target_lists.items()
+    }
+    observations_by_intent_lists: dict[str, list[Observation]] = {}
+    for observation in state.observations:
+        observations_by_intent_lists.setdefault(observation.intent_id, []).append(
+            observation
         )
-        for intent in snapshot.intents.values():
-            bound_approval = snapshot.approvals_by_intent.get(intent.intent_id)
-            if (intent.approval_id is None) != (bound_approval is None) or (
-                bound_approval is not None
-                and bound_approval.approval_id != intent.approval_id
-            ):
-                raise ActionPolicyError("Approval binding is inconsistent")
-        return snapshot
+    verifications_by_intent_lists: dict[str, list[OutcomeVerification]] = {}
+    for verification in state.verifications:
+        verifications_by_intent_lists.setdefault(verification.intent_id, []).append(
+            verification
+        )
+    snapshot = ActionOperatorSnapshot(
+        intents=index(state.intents, lambda item: item.intent_id, "intent"),
+        approvals=index(state.approvals, lambda item: item.approval_id, "approval"),
+        approvals_by_intent=MappingProxyType(approvals_by_intent_data),
+        receipts=index(state.receipts, lambda item: item.receipt_id, "receipt"),
+        receipts_by_intent=MappingProxyType(receipts_by_intent_data),
+        compensations_by_target=MappingProxyType(compensations_by_target_data),
+        observations=index(
+            state.observations, lambda item: item.observation_id, "observation"
+        ),
+        observations_by_intent=MappingProxyType(
+            {
+                intent_id: tuple(observations)
+                for intent_id, observations in observations_by_intent_lists.items()
+            }
+        ),
+        verifications=index(
+            state.verifications, lambda item: item.verification_id, "verification"
+        ),
+        verifications_by_intent=MappingProxyType(
+            {
+                intent_id: tuple(verifications)
+                for intent_id, verifications in verifications_by_intent_lists.items()
+            }
+        ),
+        validations=index(
+            state.validation_records, lambda item: item.validation_id, "validation"
+        ),
+    )
+    for intent in snapshot.intents.values():
+        bound_approval = snapshot.approvals_by_intent.get(intent.intent_id)
+        if (intent.approval_id is None) != (bound_approval is None) or (
+            bound_approval is not None
+            and bound_approval.approval_id != intent.approval_id
+        ):
+            raise ActionPolicyError("Approval binding is inconsistent")
+    return snapshot
 
 
 class ActionPolicyError(ValueError):
@@ -707,6 +717,86 @@ _TOOLS = {
         effect="Enqueue one local-only notification in authoritative state",
     ),
 }
+
+
+def _intent_records_consistent_indexed(
+    snapshot: ActionOperatorSnapshot, intent: ActionIntent
+) -> bool:
+    """Pure semantic validation for one indexed persisted intent graph."""
+    try:
+        if intent.approval_id is not None:
+            approval = snapshot.approvals.get(intent.approval_id)
+            if approval is None or approval.intent_id != intent.intent_id:
+                return False
+        elif intent.intent_id in snapshot.approvals_by_intent:
+            return False
+        spec = _TOOLS.get(intent.tool_name)
+        if spec is None or intent.risk_class != spec.risk:
+            return False
+        if (
+            intent.policy.tool_name != intent.tool_name
+            or intent.policy.risk_class != intent.risk_class
+            or intent.policy.allowed is not True
+            or intent.policy.approval_required != spec.approval_required
+            or intent.preview.tool_name != intent.tool_name
+            or intent.preview.risk_class != intent.risk_class
+            or intent.preview.effect != spec.effect
+            or intent.preview.compensation_available != spec.reversible
+            or intent.preview.bounded_by != intent.budget
+            or (
+                intent.budget.max_risk_class == "read_only"
+                and intent.risk_class != RiskClass.READ_ONLY
+            )
+        ):
+            return False
+        validated = spec.arguments.model_validate(intent.arguments).model_dump(
+            mode="json"
+        )
+        legacy_notification = (
+            intent.tool_name == "local_notification_enqueue"
+            and intent.arguments.get("public_preview") is None
+        )
+        if legacy_notification:
+            validated.pop("public_preview", None)
+        if validated != intent.arguments or validated != intent.preview.arguments:
+            return False
+        associated_receipts = snapshot.receipts_by_intent.get(intent.intent_id, ())
+        if not _intent_receipts_semantically_valid(
+            intent,
+            associated_receipts,
+            snapshot.observations,
+            snapshot.verifications,
+            tuple(
+                compensation
+                for receipt in associated_receipts
+                for compensation in snapshot.compensations_by_target.get(
+                    receipt.receipt_id, ()
+                )
+            ),
+        ):
+            return False
+        if intent.validation_record_id is None:
+            return False
+        record = snapshot.validations.get(intent.validation_record_id)
+        return bool(
+            record is not None
+            and record.intent_id == intent.intent_id
+            and record.decision_id == intent.provenance.decision_id
+            and record.tool_name == intent.tool_name
+            and record.risk_class == intent.risk_class
+            and record.arguments_valid
+            and not record.validation_error_codes
+            and record.idempotency_key == intent.idempotency_key
+            and record.canonical_arguments_digest == _digest(validated)
+            and (
+                legacy_notification
+                or record.validation_schema_revision
+                == _validation_schema_revision(intent.tool_name, spec)
+            )
+            and intent.policy.argument_digest == _digest(validated)
+        )
+    except (ActionPolicyError, ValidationError, ValueError, TypeError):
+        return False
 
 
 def public_tool_name(value: str) -> str | None:
@@ -918,7 +1008,9 @@ class ActionExecutionLayer:
             IntentStatus.RETRY_PENDING,
         }:
             commands.append(OperatorCommand.CANCEL)
-        if intent.status == IntentStatus.RETRY_PENDING and self._retry_executable(intent):
+        if intent.status == IntentStatus.RETRY_PENDING and self._retry_executable(
+            intent
+        ):
             commands.append(OperatorCommand.RETRY_NOW)
         if (
             intent.status == IntentStatus.SUCCEEDED
@@ -961,7 +1053,9 @@ class ActionExecutionLayer:
         ):
             reason = "approval binding is stale"
         elif intent.risk_class in {RiskClass.DESTRUCTIVE, RiskClass.HIGH_IMPACT}:
-            expected = f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}"
+            expected = (
+                f"CONFIRM {intent.intent_id} {intent.revision} {preview.preview_digest}"
+            )
             if request.confirmation != expected:
                 reason = "confirmation phrase is invalid"
         return OperatorCommandValidation(
@@ -1983,79 +2077,6 @@ class ActionExecutionLayer:
             return _raise_corrupt("Approval binding is not unique")
         return matches[0]
 
-    def _intent_records_consistent(
-        self, state: ActionState, intent: ActionIntent
-    ) -> bool:
-        try:
-            self._unique_approval(state, intent)
-            spec = _TOOLS.get(intent.tool_name)
-            if spec is None or intent.risk_class != spec.risk:
-                return False
-            if (
-                intent.policy.tool_name != intent.tool_name
-                or intent.policy.risk_class != intent.risk_class
-                or intent.policy.allowed is not True
-                or intent.policy.approval_required != spec.approval_required
-                or intent.preview.tool_name != intent.tool_name
-                or intent.preview.risk_class != intent.risk_class
-                or intent.preview.effect != spec.effect
-                or intent.preview.compensation_available != spec.reversible
-                or intent.preview.bounded_by != intent.budget
-            ):
-                return False
-            validated = spec.arguments.model_validate(intent.arguments).model_dump(
-                mode="json"
-            )
-            legacy_notification = (
-                intent.tool_name == "local_notification_enqueue"
-                and intent.arguments.get("public_preview") is None
-            )
-            if legacy_notification:
-                validated.pop("public_preview", None)
-            if validated != intent.arguments or validated != intent.preview.arguments:
-                return False
-            associated_receipts = tuple(
-                item for item in state.receipts if item.intent_id == intent.intent_id
-            )
-            associated_receipt_ids = {
-                item.receipt_id for item in associated_receipts
-            }
-            if not _intent_receipts_semantically_valid(
-                intent,
-                associated_receipts,
-                {item.observation_id: item for item in state.observations},
-                {item.verification_id: item for item in state.verifications},
-                tuple(
-                    item
-                    for item in state.receipts
-                    if item.compensation_of in associated_receipt_ids
-                ),
-            ):
-                return False
-            validation = [
-                item
-                for item in state.validation_records
-                if item.validation_id == intent.validation_record_id
-                and item.intent_id == intent.intent_id
-                and item.decision_id == intent.provenance.decision_id
-                and item.tool_name == intent.tool_name
-                and item.risk_class == intent.risk_class
-                and item.arguments_valid
-            ]
-            return bool(
-                len(validation) == 1
-                and validation[0].idempotency_key == intent.idempotency_key
-                and validation[0].canonical_arguments_digest == _digest(validated)
-                and (
-                    legacy_notification
-                    or validation[0].validation_schema_revision
-                    == _validation_schema_revision(intent.tool_name, spec)
-                )
-                and intent.policy.argument_digest == _digest(validated)
-            )
-        except (ActionPolicyError, ValidationError, ValueError, TypeError):
-            return False
-
     @staticmethod
     def _snapshot_ownership_valid(
         snapshot: ActionOperatorSnapshot, intent: ActionIntent
@@ -2079,77 +2100,7 @@ class ActionExecutionLayer:
     def _intent_records_consistent_indexed(
         self, snapshot: ActionOperatorSnapshot, intent: ActionIntent
     ) -> bool:
-        try:
-            if intent.approval_id is not None:
-                approval = snapshot.approvals.get(intent.approval_id)
-                if approval is None or approval.intent_id != intent.intent_id:
-                    return False
-            elif intent.intent_id in snapshot.approvals_by_intent:
-                return False
-            spec = _TOOLS.get(intent.tool_name)
-            if spec is None or intent.risk_class != spec.risk:
-                return False
-            if (
-                intent.policy.tool_name != intent.tool_name
-                or intent.policy.risk_class != intent.risk_class
-                or intent.policy.allowed is not True
-                or intent.policy.approval_required != spec.approval_required
-                or intent.preview.tool_name != intent.tool_name
-                or intent.preview.risk_class != intent.risk_class
-                or intent.preview.effect != spec.effect
-                or intent.preview.compensation_available != spec.reversible
-                or intent.preview.bounded_by != intent.budget
-            ):
-                return False
-            validated = spec.arguments.model_validate(intent.arguments).model_dump(
-                mode="json"
-            )
-            legacy_notification = (
-                intent.tool_name == "local_notification_enqueue"
-                and intent.arguments.get("public_preview") is None
-            )
-            if legacy_notification:
-                validated.pop("public_preview", None)
-            if validated != intent.arguments or validated != intent.preview.arguments:
-                return False
-            associated_receipts = snapshot.receipts_by_intent.get(
-                intent.intent_id, ()
-            )
-            if not _intent_receipts_semantically_valid(
-                intent,
-                associated_receipts,
-                snapshot.observations,
-                snapshot.verifications,
-                tuple(
-                    compensation
-                    for receipt in associated_receipts
-                    for compensation in snapshot.compensations_by_target.get(
-                        receipt.receipt_id, ()
-                    )
-                ),
-            ):
-                return False
-            if intent.validation_record_id is None:
-                return False
-            record = snapshot.validations.get(intent.validation_record_id)
-            return bool(
-                record is not None
-                and record.intent_id == intent.intent_id
-                and record.decision_id == intent.provenance.decision_id
-                and record.tool_name == intent.tool_name
-                and record.risk_class == intent.risk_class
-                and record.arguments_valid
-                and record.idempotency_key == intent.idempotency_key
-                and record.canonical_arguments_digest == _digest(validated)
-                and (
-                    legacy_notification
-                    or record.validation_schema_revision
-                    == _validation_schema_revision(intent.tool_name, spec)
-                )
-                and intent.policy.argument_digest == _digest(validated)
-            )
-        except (ActionPolicyError, ValidationError, ValueError, TypeError):
-            return False
+        return _intent_records_consistent_indexed(snapshot, intent)
 
     @staticmethod
     def _has_public_preview(intent: ActionIntent) -> bool:
@@ -2867,6 +2818,200 @@ def _validation_schema_revision(tool_name: str, spec: _ToolSpec | None) -> str:
         )
     )
     return _digest(schema)
+
+
+ValidatedActionState = ActionOperatorSnapshot
+
+
+def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
+    """Validate a persisted action graph without accessing runtime services.
+
+    The returned snapshot is an immutable, indexed view of *state*.  A
+    ``ValueError`` (normally ``ActionPolicyError``) means that no part of the
+    graph is trusted; callers must not use a partially validated projection.
+    """
+    snapshot = _snapshot_from_state(state)
+    intents = snapshot.intents
+
+    def reject(message: str) -> NoReturn:
+        raise ActionPolicyError(message)
+
+    rejection_ids = [item.rejection_id for item in state.policy_rejections]
+    if len(rejection_ids) != len(set(rejection_ids)):
+        reject("Policy rejection identifiers are not unique")
+    intent_keys = [item.idempotency_key for item in state.intents]
+    if len(intent_keys) != len(set(intent_keys)):
+        reject("Action idempotency keys are not unique")
+    validation_owners: dict[str, int] = {
+        item.validation_id: 0 for item in state.validation_records
+    }
+    for intent in state.intents:
+        if intent.validation_record_id is not None:
+            validation_owners[intent.validation_record_id] = (
+                validation_owners.get(intent.validation_record_id, 0) + 1
+            )
+    for rejection in state.policy_rejections:
+        validation_owners[rejection.validation_id] = (
+            validation_owners.get(rejection.validation_id, 0) + 1
+        )
+    for record in state.validation_records:
+        expected_owners = 1 if record.arguments_valid else 0
+        if validation_owners.get(record.validation_id, 0) != expected_owners:
+            reject("Action validation ownership is invalid")
+        if not record.arguments_valid and record.intent_id is not None:
+            reject("Invalid validation cannot bind an intent")
+
+    # Every cross-record reference is owned by the intent named by the record.
+    for approval in state.approvals:
+        if approval.intent_id not in intents:
+            reject("Approval record has an invalid intent binding")
+    for receipt in state.receipts:
+        bound_intent = intents.get(receipt.intent_id)
+        if bound_intent is None or not receipt_matches_intent(receipt, bound_intent):
+            reject("Receipt record has an invalid intent binding")
+        if (receipt.status == ReceiptStatus.COMPENSATED) != (
+            receipt.compensation_of is not None
+        ):
+            reject("Compensation receipt status and target disagree")
+        if receipt.compensation_of is not None:
+            target = snapshot.receipts.get(receipt.compensation_of)
+            if target is None or target.intent_id != receipt.intent_id:
+                reject("Compensation receipt has an invalid target binding")
+            if target.receipt_id == receipt.receipt_id:
+                reject("Compensation receipt cannot target itself")
+        else:
+            observation = snapshot.observations.get(receipt.observation_id or "")
+            verification = snapshot.verifications.get(receipt.verification_id or "")
+            if (
+                observation is None
+                or verification is None
+                or observation.receipt_id != receipt.receipt_id
+                or verification.observation_id != observation.observation_id
+                or observation.valid is not True
+                or verification.success != (receipt.status == ReceiptStatus.SUCCEEDED)
+            ):
+                reject("Receipt evidence is missing or has an invalid status binding")
+    for observation in state.observations:
+        bound_receipt = snapshot.receipts.get(observation.receipt_id)
+        if observation.intent_id not in intents or bound_receipt is None:
+            reject("Observation record has an invalid binding")
+        if bound_receipt.intent_id != observation.intent_id:
+            reject("Observation record has an invalid receipt binding")
+    for verification in state.verifications:
+        if verification.intent_id not in intents:
+            reject("Verification record has an invalid intent binding")
+        if verification.observation_id is not None:
+            observation = snapshot.observations.get(verification.observation_id)
+            if observation is None or observation.intent_id != verification.intent_id:
+                reject("Verification record has an invalid observation binding")
+
+    for intent in intents.values():
+        if not _intent_records_consistent_indexed(snapshot, intent):
+            reject("Action intent semantic binding is invalid")
+        intent_receipts = snapshot.receipts_by_intent.get(intent.intent_id, ())
+        if (intent.status == IntentStatus.DRY_RUN) != intent.dry_run:
+            reject("Action dry-run status is inconsistent")
+        if intent.status in {
+            IntentStatus.AWAITING_APPROVAL,
+            IntentStatus.APPROVED,
+            IntentStatus.EXECUTING,
+            IntentStatus.DRY_RUN,
+        } and (intent.receipt_id is not None or intent_receipts):
+            reject("Unexecuted action cannot contain receipt evidence")
+        terminal = {
+            IntentStatus.SUCCEEDED,
+            IntentStatus.FAILED,
+            IntentStatus.CANCELLED,
+            IntentStatus.REJECTED,
+            IntentStatus.COMPENSATED,
+        }
+        if intent.status in terminal and intent.receipt_id is None:
+            reject("Terminal action requires a linked receipt")
+        if intent.status == IntentStatus.RETRY_PENDING and intent.receipt_id is None:
+            reject("Retry-pending action requires failed receipt evidence")
+        if intent.receipt_id is not None:
+            linked_receipt = snapshot.receipts.get(intent.receipt_id)
+            if linked_receipt is None or linked_receipt.intent_id != intent.intent_id:
+                reject("Action intent receipt binding is invalid")
+            expected = {
+                IntentStatus.SUCCEEDED: ReceiptStatus.SUCCEEDED,
+                IntentStatus.FAILED: {ReceiptStatus.FAILED, ReceiptStatus.TIMED_OUT},
+                IntentStatus.CANCELLED: ReceiptStatus.CANCELLED,
+                IntentStatus.REJECTED: ReceiptStatus.CANCELLED,
+                IntentStatus.COMPENSATED: ReceiptStatus.COMPENSATED,
+            }.get(intent.status)
+            if expected is not None and linked_receipt.status not in (
+                expected if isinstance(expected, set) else {expected}
+            ):
+                reject("Action status does not match receipt status")
+            if (
+                intent.status == IntentStatus.RETRY_PENDING
+                and linked_receipt.status
+                not in {
+                    ReceiptStatus.FAILED,
+                    ReceiptStatus.TIMED_OUT,
+                }
+            ):
+                reject("Retry-pending action must link failed receipt evidence")
+
+    for rejection in state.policy_rejections:
+        bound_record = snapshot.validations.get(rejection.validation_id)
+        if (
+            bound_record is None
+            or bound_record.arguments_valid is not True
+            or bound_record.decision_id != rejection.decision_id
+            or bound_record.idempotency_key != rejection.idempotency_key
+            or bound_record.risk_class != rejection.risk_class
+            or bound_record.intent_id in intents
+            or any(
+                item.idempotency_key == rejection.idempotency_key
+                for item in state.intents
+            )
+        ):
+            reject("Policy rejection binding is invalid")
+
+    notification_keys: set[str] = set()
+    notification_ids: set[str] = set()
+    for notification in state.notifications:
+        key = notification.get("idempotency_key")
+        notification_id = notification.get("notification_id")
+        notification_intent = next(
+            (item for item in state.intents if item.idempotency_key == key), None
+        )
+        if (
+            not isinstance(key, str)
+            or key in notification_keys
+            or not isinstance(notification_id, str)
+            or notification_id in notification_ids
+            or set(notification)
+            != {
+                "notification_id",
+                "idempotency_key",
+                "channel",
+                "title",
+                "body",
+                "status",
+                "created_at",
+            }
+            or notification_intent is None
+            or notification_intent.tool_name != "local_notification_enqueue"
+            or notification.get("channel") != "local"
+            or notification.get("status") not in {"queued", "cancelled"}
+            or notification.get("title") != notification_intent.arguments.get("title")
+            or notification.get("body") != notification_intent.arguments.get("body")
+        ):
+            reject("Notification idempotency binding is invalid")
+        try:
+            created_at = datetime.fromisoformat(str(notification.get("created_at")))
+        except ValueError as exc:
+            raise ActionPolicyError("Notification timestamp is invalid") from exc
+        if created_at.tzinfo is None:
+            reject("Notification timestamp is invalid")
+        if isinstance(key, str):
+            notification_keys.add(key)
+        if isinstance(notification_id, str):
+            notification_ids.add(notification_id)
+    return snapshot
 
 
 def _validation_error_codes(

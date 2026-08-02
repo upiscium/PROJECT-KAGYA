@@ -9,6 +9,7 @@ from enum import StrEnum
 import hashlib
 import json
 import re
+import secrets
 from threading import Lock
 from typing import Any, Callable, Literal, cast
 from uuid import uuid4
@@ -185,6 +186,34 @@ class RestoreOperation(_Strict):
             self.operation_id,
         ) or self.event_id != event_id_for_operation(self.operation_id):
             raise ValueError("restore operation identity binding is invalid")
+        requested = datetime.fromisoformat(self.requested_at)
+        started = (
+            None if self.started_at is None else datetime.fromisoformat(self.started_at)
+        )
+        completed = (
+            None
+            if self.completed_at is None
+            else datetime.fromisoformat(self.completed_at)
+        )
+        if (started is not None and started < requested) or (
+            completed is not None
+            and completed < (started if started is not None else requested)
+        ):
+            raise ValueError("restore operation timestamp ordering is invalid")
+        if self.state in {"previewed", "finalizing"} and (
+            completed is not None or self.error_code is not None
+        ):
+            raise ValueError("nonterminal restore operation has terminal metadata")
+        if self.state == "completed" and (
+            completed is None or self.error_code is not None
+        ):
+            raise ValueError("completed restore operation metadata is invalid")
+        if self.state == "failed" and (completed is None or self.error_code is None):
+            raise ValueError("failed restore operation metadata is invalid")
+        if self.state == "commit_indeterminate" and self.error_code != str(
+            RestoreErrorCode.COMMIT_INDETERMINATE
+        ):
+            raise ValueError("indeterminate restore operation metadata is invalid")
         return self
 
     @field_validator("requested_at", "started_at", "completed_at")
@@ -388,6 +417,7 @@ class _PreviewCapability:
     preview: RestorePreview
     canonical_external_digest: str
     reserved: bool = False
+    applying: bool = False
 
 
 def public_reference(value: str, kind: str | None = None) -> bool:
@@ -588,182 +618,24 @@ def _protected_domain_has_active_work(key: str, value: Any) -> bool:
         from kagya.actions.execution import (
             ActionState,
             IntentStatus,
-            receipt_matches_intent,
+            validate_action_state_semantics,
         )
 
         if value.get("schema_version") != 4:
             raise ValueError("protected action state version is invalid")
         action_state = ActionState.model_validate(value)
-        intents = {item.intent_id: item for item in action_state.intents}
-        validations = {
-            item.validation_id: item for item in action_state.validation_records
-        }
-        approvals = {item.approval_id: item for item in action_state.approvals}
-        receipts = {item.receipt_id: item for item in action_state.receipts}
-        observations = {item.observation_id: item for item in action_state.observations}
-        verifications = {
-            item.verification_id: item for item in action_state.verifications
-        }
-        collections = (
-            (intents, action_state.intents),
-            (validations, action_state.validation_records),
-            (approvals, action_state.approvals),
-            (receipts, action_state.receipts),
-            (observations, action_state.observations),
-            (verifications, action_state.verifications),
-        )
-        if any(len(index) != len(records) for index, records in collections):
-            raise ValueError("protected action identifiers must be unique")
-        if any(
-            item.intent_id is not None and item.intent_id not in intents
-            for item in action_state.validation_records
-        ) or any(
-            item.validation_id not in validations
-            for item in action_state.policy_rejections
-        ):
-            raise ValueError("protected action validation binding is invalid")
-        for intent in action_state.intents:
-            if (
-                intent.validation_record_id is not None
-                and intent.validation_record_id not in validations
-            ):
-                raise ValueError("protected action intent validation is invalid")
-            if intent.approval_id is not None and intent.approval_id not in approvals:
-                raise ValueError("protected action approval binding is invalid")
-            if intent.receipt_id is not None and intent.receipt_id not in receipts:
-                raise ValueError("protected action receipt binding is invalid")
-            if (
-                intent.receipt_id is not None
-                and receipts[intent.receipt_id].intent_id != intent.intent_id
-            ):
-                raise ValueError("protected action receipt ownership is invalid")
-        for validation in action_state.validation_records:
-            if validation.intent_id is not None and (
-                intents[validation.intent_id].validation_record_id
-                != validation.validation_id
-            ):
-                raise ValueError("protected action validation ownership is invalid")
-        approvals_by_intent: dict[str, Any] = {}
-        for approval_record in action_state.approvals:
-            if (
-                approval_record.intent_id not in intents
-                or approval_record.intent_id in approvals_by_intent
-            ):
-                raise ValueError("protected approval intent binding is invalid")
-            approvals_by_intent[approval_record.intent_id] = approval_record
-        for intent in action_state.intents:
-            bound_approval = approvals_by_intent.get(intent.intent_id)
-            if (intent.approval_id is None) != (bound_approval is None) or (
-                bound_approval is not None
-                and bound_approval.approval_id != intent.approval_id
-            ):
-                raise ValueError("protected approval binding is inconsistent")
-        for receipt_record in action_state.receipts:
-            bound_intent = intents.get(receipt_record.intent_id)
-            if (
-                bound_intent is None
-                or not receipt_matches_intent(receipt_record, bound_intent)
-                or (
-                    receipt_record.compensation_of is not None
-                    and receipt_record.compensation_of not in receipts
-                )
-            ):
-                raise ValueError("protected receipt binding is invalid")
-            if receipt_record.observation_id is not None and (
-                receipt_record.observation_id not in observations
-                or observations[receipt_record.observation_id].receipt_id
-                != receipt_record.receipt_id
-                or observations[receipt_record.observation_id].intent_id
-                != receipt_record.intent_id
-            ):
-                raise ValueError("protected receipt observation binding is invalid")
-            if receipt_record.verification_id is not None and (
-                receipt_record.verification_id not in verifications
-                or verifications[receipt_record.verification_id].intent_id
-                != receipt_record.intent_id
-            ):
-                raise ValueError("protected receipt verification binding is invalid")
-        for observation_record in action_state.observations:
-            bound_receipt = receipts.get(observation_record.receipt_id)
-            if (
-                observation_record.intent_id not in intents
-                or bound_receipt is None
-                or bound_receipt.intent_id != observation_record.intent_id
-            ):
-                raise ValueError("protected observation binding is invalid")
-        for verification_record in action_state.verifications:
-            bound_observation = (
-                None
-                if verification_record.observation_id is None
-                else observations.get(verification_record.observation_id)
-            )
-            if verification_record.intent_id not in intents or (
-                verification_record.observation_id is not None
-                and (
-                    bound_observation is None
-                    or bound_observation.intent_id != verification_record.intent_id
-                )
-            ):
-                raise ValueError("protected verification binding is invalid")
+        validate_action_state_semantics(action_state)
         active_statuses = {
             IntentStatus.AWAITING_APPROVAL,
             IntentStatus.APPROVED,
             IntentStatus.EXECUTING,
             IntentStatus.RETRY_PENDING,
         }
-        notification_statuses = {
-            "queued",
-            "pending",
-            "delivering",
-            "retry_pending",
-            "executing",
-            "delivered",
-            "cancelled",
-            "expired",
-            "failed",
-        }
-        notification_ids: set[Any] = set()
-        notification_keys: set[Any] = set()
-        for notification in action_state.notifications:
-            if (
-                set(notification)
-                != {
-                    "notification_id",
-                    "idempotency_key",
-                    "channel",
-                    "title",
-                    "body",
-                    "status",
-                    "created_at",
-                }
-                or notification.get("status") not in notification_statuses
-                or notification.get("channel") != "local"
-                or not isinstance(notification.get("notification_id"), str)
-                or not isinstance(notification.get("idempotency_key"), str)
-            ):
-                raise ValueError("protected action notification is invalid")
-            notification_id = notification["notification_id"]
-            idempotency_key = notification["idempotency_key"]
-            if (
-                notification_id in notification_ids
-                or idempotency_key in notification_keys
-                or sum(
-                    intent.idempotency_key == idempotency_key
-                    and intent.tool_name == "local_notification_enqueue"
-                    for intent in action_state.intents
-                )
-                != 1
-            ):
-                raise ValueError("protected action notification binding is invalid")
-            notification_ids.add(notification_id)
-            notification_keys.add(idempotency_key)
         return (
             any(item.status in active_statuses for item in action_state.intents)
             or any(item.status == "pending" for item in action_state.approvals)
             or any(
-                item["status"]
-                in {"queued", "pending", "delivering", "retry_pending", "executing"}
-                for item in action_state.notifications
+                item.get("status") == "queued" for item in action_state.notifications
             )
         )
     if key == "proactive_outbox":
@@ -832,6 +704,7 @@ class OperatorRestoreService:
         max_targets: int = 100,
         clock: Callable[[], datetime] | None = None,
         external_heads: Callable[[], Any] | None = None,
+        token_factory: Callable[[], bytes] | None = None,
     ) -> None:
         self.state_store, self.wal, self.journal, self.external = (
             state_store,
@@ -846,6 +719,7 @@ class OperatorRestoreService:
             clock or (lambda: datetime.now(UTC)),
         )
         self.external_heads = external_heads or (lambda: {})
+        self.token_factory = token_factory or (lambda: secrets.token_bytes(32))
         self._lock = Lock()
         self._capabilities: dict[str, _PreviewCapability] = {}
         self._consumed: set[str] = set()
@@ -858,6 +732,12 @@ class OperatorRestoreService:
     def _assert_authoritative(self, actor_id: str) -> None:
         if self.authority and not self.authority(actor_id):
             self._fail(RestoreErrorCode.NOT_AUTHORITATIVE)
+
+    def _capability_token(self) -> str:
+        token = self.token_factory()
+        if not isinstance(token, bytes) or len(token) != 32:
+            raise RestoreContractError(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
+        return token.hex()
 
     def _evict_capabilities_locked(self) -> None:
         now = self.clock()
@@ -900,6 +780,198 @@ class OperatorRestoreService:
             self._fail(RestoreErrorCode.WAL_INTEGRITY_INVALID)
             raise AssertionError
         return current
+
+    def _parse_operation_source(
+        self, raw: Any, *, source: str
+    ) -> list[RestoreOperation]:
+        if raw is None:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+        operations: list[RestoreOperation] = []
+        identifiers: set[str] = set()
+        event_ids: set[str] = set()
+        try:
+            for item in raw:
+                operation = RestoreOperation.model_validate(
+                    item.model_dump(mode="json")
+                    if isinstance(item, RestoreOperation)
+                    else item
+                )
+                if (
+                    operation.operation_id in identifiers
+                    or operation.event_id in event_ids
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                identifiers.add(operation.operation_id)
+                event_ids.add(operation.event_id)
+                operations.append(operation)
+        except RestoreContractError:
+            raise
+        except Exception as exc:
+            raise RestoreContractError(
+                RestoreErrorCode.JOURNAL_INTEGRITY_INVALID
+            ) from exc
+        return operations
+
+    def _merge_operation_sources(
+        self,
+        sources: list[tuple[str, list[RestoreOperation]]],
+        analysis: _EvidenceIndex,
+    ) -> tuple[list[RestoreOperation], set[str]]:
+        merged: dict[str, tuple[RestoreOperation, set[str]]] = {}
+        persisted_ids: set[str] = set()
+        for source, operations in sources:
+            if source.startswith("persisted"):
+                persisted_ids.update(item.operation_id for item in operations)
+            for operation in operations:
+                if operation.target_sequence >= analysis.floor:
+                    target = analysis.restorable_by_sequence.get(
+                        operation.target_sequence
+                    )
+                    if (
+                        target is None
+                        or target.wal.state_hash_after != operation.target_snapshot_hash
+                    ):
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                prior_entry = merged.get(operation.operation_id)
+                if prior_entry is None:
+                    merged[operation.operation_id] = (operation, {source})
+                    continue
+                prior, prior_sources = prior_entry
+                if (
+                    prior.event_id != operation.event_id
+                    or prior.target_sequence != operation.target_sequence
+                    or prior.target_snapshot_hash != operation.target_snapshot_hash
+                    or prior.preview_digest != operation.preview_digest
+                    or prior.external_side_effects_replayed
+                    != operation.external_side_effects_replayed
+                    or (
+                        prior.processing_sequence is not None
+                        and operation.processing_sequence is not None
+                        and prior.processing_sequence != operation.processing_sequence
+                    )
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                prior_is_journal = "journal" in prior_sources
+                incoming_is_journal = source == "journal"
+                prior_requested = datetime.fromisoformat(prior.requested_at).astimezone(
+                    UTC
+                )
+                incoming_requested = datetime.fromisoformat(
+                    operation.requested_at
+                ).astimezone(UTC)
+                if prior_is_journal == incoming_is_journal:
+                    if prior_requested != incoming_requested:
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                else:
+                    journal_requested = (
+                        prior_requested if prior_is_journal else incoming_requested
+                    )
+                    preview_requested = (
+                        incoming_requested if prior_is_journal else prior_requested
+                    )
+                    if preview_requested > journal_requested:
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                if (
+                    not prior_is_journal
+                    and not incoming_is_journal
+                    and prior.started_at is not None
+                    and operation.started_at is not None
+                    and datetime.fromisoformat(prior.started_at).astimezone(UTC)
+                    != datetime.fromisoformat(operation.started_at).astimezone(UTC)
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                terminal = {"completed", "failed"}
+                if (
+                    prior.state in terminal
+                    and operation.state in terminal
+                    and prior.state != operation.state
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                if (
+                    prior.completed_at is not None
+                    and operation.completed_at is not None
+                    and datetime.fromisoformat(prior.completed_at).astimezone(UTC)
+                    != datetime.fromisoformat(operation.completed_at).astimezone(UTC)
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                if prior_is_journal and not incoming_is_journal:
+                    base, supplement = operation, prior
+                else:
+                    base, supplement = prior, operation
+                authoritative_started = (
+                    prior.started_at
+                    if prior_is_journal and prior.started_at is not None
+                    else operation.started_at
+                    if incoming_is_journal and operation.started_at is not None
+                    else base.started_at or supplement.started_at
+                )
+                state_rank = {
+                    "previewed": 0,
+                    "finalizing": 1,
+                    "commit_indeterminate": 2,
+                    "failed": 3,
+                    "completed": 3,
+                }
+                if state_rank[supplement.state] > state_rank[base.state]:
+                    base = base.model_copy(
+                        update={
+                            "state": supplement.state,
+                            "error_code": supplement.error_code,
+                            "completed_at": supplement.completed_at,
+                        }
+                    )
+                base = RestoreOperation.model_validate(
+                    {
+                        **base.model_dump(mode="json"),
+                        "processing_sequence": base.processing_sequence
+                        if base.processing_sequence is not None
+                        else supplement.processing_sequence,
+                        "started_at": authoritative_started,
+                        "completed_at": base.completed_at or supplement.completed_at,
+                    }
+                )
+                merged[operation.operation_id] = (
+                    base,
+                    {*prior_sources, source},
+                )
+        return [item[0] for item in merged.values()], persisted_ids
+
+    def _validate_operation_lifecycle_conflicts(
+        self,
+        operations: list[RestoreOperation],
+        journal: list[JournalRecord],
+    ) -> None:
+        by_event = {item.event_id: item for item in journal}
+        failed_recoveries = {
+            "uncommitted_after_crash",
+            "started_without_sequence",
+            "accepted_not_started",
+        }
+        for operation in operations:
+            evidence = by_event.get(operation.event_id)
+            if evidence is None:
+                continue
+            journal_completed = evidence.lifecycle == JournalLifecycle.COMPLETED or (
+                evidence.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+                and evidence.failure_category == "committed_before_crash"
+            )
+            journal_failed = evidence.lifecycle == JournalLifecycle.FAILED or (
+                evidence.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+                and evidence.failure_category in failed_recoveries
+            )
+            if (journal_completed and operation.state == "failed") or (
+                journal_failed and operation.state == "completed"
+            ):
+                self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+            if (
+                (journal_completed or journal_failed)
+                and operation.completed_at is not None
+                and datetime.fromisoformat(operation.completed_at).astimezone(UTC)
+                != evidence.timestamp.astimezone(UTC)
+            ):
+                self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
 
     def _retention_floor(
         self, wal: list[StateWalRecord], journal: list[JournalRecord]
@@ -1309,7 +1381,7 @@ class OperatorRestoreService:
         record = target.wal
         current = self._current()
         domains, supported = self._domains(current, record.patch.value)
-        nonce = str(uuid4())
+        nonce = self._capability_token()
         external, canonical_external_digest = self._external(
             target_sequence, nonce=nonce
         )
@@ -1407,7 +1479,8 @@ class OperatorRestoreService:
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         current = self._current()
         current_external, canonical_external_digest = self._external(
-            request.target_sequence, nonce=str(uuid4())
+            request.target_sequence,
+            nonce=entry.preview.external_effects.effect_digest,
         )
         if current_external.consistency_status != "consistent":
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
@@ -1460,8 +1533,14 @@ class OperatorRestoreService:
                 self._fail(RestoreErrorCode.PREVIEW_STALE)
             assert entry is not None
             preview = entry.preview
-            if not entry.reserved:
+            if not entry.reserved or entry.applying:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
+            self._capabilities[request.expected_preview_digest] = _PreviewCapability(
+                preview=entry.preview,
+                canonical_external_digest=entry.canonical_external_digest,
+                reserved=True,
+                applying=True,
+            )
         self._check_request(preview, request, allow_expired=True)
         wal, journal = self._evidence()
         analysis = self._analyze_evidence(wal, journal)
@@ -1474,7 +1553,8 @@ class OperatorRestoreService:
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         current = self._current()
         current_external, canonical_external_digest = self._external(
-            request.target_sequence, nonce=str(uuid4())
+            request.target_sequence,
+            nonce=entry.preview.external_effects.effect_digest,
         )
         if current_external.consistency_status != "consistent":
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
@@ -1492,11 +1572,6 @@ class OperatorRestoreService:
         ):
             self._fail(RestoreErrorCode.NOT_AUTHORITATIVE)
         assert event is not None and event.processing_sequence is not None
-        with self._lock:
-            self._consumed.add(request.expected_preview_digest)
-            self._capabilities.pop(request.expected_preview_digest, None)
-            self._evict_capabilities_locked()
-        wal, _ = self._evidence()
         current = self._current()
         target = self.wal.reconstruct(request.target_sequence).snapshot
         operation = RestoreOperation(
@@ -1512,30 +1587,59 @@ class OperatorRestoreService:
             state="finalizing",
             error_code=None,
         )
+        target_history = self._parse_operation_source(
+            target.extensions.get(_RESERVED, []), source="persisted_target"
+        )
+        current_history = self._parse_operation_source(
+            current.extensions.get(_RESERVED, []), source="persisted_current"
+        )
+        if any(
+            item.processing_sequence is not None
+            and item.processing_sequence > target.last_processed_event_sequence
+            for item in target_history
+        ) or any(
+            item.processing_sequence is not None
+            and item.processing_sequence > current.last_processed_event_sequence
+            for item in current_history
+        ):
+            self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+        in_memory = self._parse_operation_source(
+            list(self._operations), source="memory"
+        )
+        journal_operations = self._parse_operation_source(
+            self._journal_operations(journal), source="journal"
+        )
+        history, _persisted_ids = self._merge_operation_sources(
+            [
+                ("persisted_target", target_history),
+                ("persisted_current", current_history),
+                ("memory", in_memory),
+                ("journal", journal_operations),
+                ("new", [operation]),
+            ],
+            analysis,
+        )
+        self._validate_operation_lifecycle_conflicts(history, journal)
+        history.sort(
+            key=lambda item: (
+                item.processing_sequence or -1,
+                datetime.fromisoformat(item.requested_at).astimezone(UTC),
+                item.operation_id,
+            )
+        )
         with self._lock:
+            self._consumed.add(request.expected_preview_digest)
+            self._capabilities.pop(request.expected_preview_digest, None)
+            self._evict_capabilities_locked()
             self._operations.append(operation)
             self._operations = self._operations[-50:]
         prior = current
         register_event_rollback(lambda: self.state_store.restore_into(main_loop, prior))
-        old = (
-            target.extensions.get(_RESERVED, [])
-            if isinstance(target.extensions.get(_RESERVED, []), list)
-            else []
-        )
-        current_history = (
-            current.extensions.get(_RESERVED, [])
-            if isinstance(current.extensions.get(_RESERVED, []), list)
-            else []
-        )
-        merged: dict[str, dict[str, Any]] = {}
-        for item in [*old, *current_history, operation.model_dump(mode="json")]:
-            if isinstance(item, dict) and isinstance(item.get("operation_id"), str):
-                merged[item["operation_id"]] = item
         target = target.model_copy(
             update={
                 "extensions": {
                     **target.extensions,
-                    _RESERVED: list(merged.values())[-50:],
+                    _RESERVED: [item.model_dump(mode="json") for item in history[-50:]],
                 }
             }
         )
@@ -1685,25 +1789,29 @@ class OperatorRestoreService:
             )
             for item in analysis.semantic_targets[:display_limit]
         ]
-        operations_by_id = {item.operation_id: item for item in self._operations}
-        operations_by_id.update(
-            {item.operation_id: item for item in self._journal_operations(journal)}
-        )
         raw = current.extensions.get(_RESERVED, [])
-        persisted_operation_ids: set[str] = set()
-        if raw is not None and not isinstance(raw, list):
+        in_memory = self._parse_operation_source(
+            list(self._operations), source="memory"
+        )
+        journal_operations = self._parse_operation_source(
+            self._journal_operations(journal), source="journal"
+        )
+        persisted = self._parse_operation_source(raw, source="persisted_current")
+        if any(
+            item.processing_sequence is not None
+            and item.processing_sequence > current.last_processed_event_sequence
+            for item in persisted
+        ):
             self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
-        if isinstance(raw, list):
-            for item in raw:
-                try:
-                    operation = RestoreOperation.model_validate(item)
-                    operations_by_id[operation.operation_id] = operation
-                    persisted_operation_ids.add(operation.operation_id)
-                except Exception as exc:
-                    raise RestoreContractError(
-                        RestoreErrorCode.JOURNAL_INTEGRITY_INVALID
-                    ) from exc
-        operations = list(operations_by_id.values())
+        operations, persisted_operation_ids = self._merge_operation_sources(
+            [
+                ("memory", in_memory),
+                ("journal", journal_operations),
+                ("persisted_current", persisted),
+            ],
+            analysis,
+        )
+        self._validate_operation_lifecycle_conflicts(operations, journal)
         by_event = {j.event_id: j for j in journal}
         journal_anchor: dict[str, tuple[int, int]] = {}
         latest_journal_sequence = -1
@@ -1721,11 +1829,20 @@ class OperatorRestoreService:
         for operation in operations:
             evidence = by_event.get(operation.event_id)
             if evidence and evidence.lifecycle == JournalLifecycle.COMPLETED:
+                if operation.state == "failed":
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                terminal_timestamp = evidence.timestamp.isoformat()
+                if operation.completed_at is not None and datetime.fromisoformat(
+                    operation.completed_at
+                ).astimezone(UTC) != evidence.timestamp.astimezone(UTC):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 projected.append(
-                    operation.model_copy(
-                        update={
+                    RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
                             "state": "completed",
-                            "completed_at": evidence.timestamp.isoformat(),
+                            "completed_at": terminal_timestamp,
+                            "error_code": None,
                         }
                     )
                 )
@@ -1734,19 +1851,27 @@ class OperatorRestoreService:
                 and evidence.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
                 and evidence.failure_category == "committed_before_crash"
             ):
+                if operation.state == "failed":
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 projected.append(
-                    operation.model_copy(
-                        update={
+                    RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
                             "state": "completed",
                             "completed_at": evidence.timestamp.isoformat(),
+                            "error_code": None,
                         }
                     )
                 )
             elif evidence and evidence.lifecycle == JournalLifecycle.FAILED:
+                if operation.state == "completed":
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 projected.append(
-                    operation.model_copy(
-                        update={
+                    RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
                             "state": "failed",
+                            "completed_at": evidence.timestamp.isoformat(),
                             "error_code": "restore_commit_failed",
                         }
                     )
@@ -1761,9 +1886,12 @@ class OperatorRestoreService:
                     "accepted_not_started",
                 }
             ):
+                if operation.state == "completed":
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 projected.append(
-                    operation.model_copy(
-                        update={
+                    RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
                             "state": "failed",
                             "completed_at": evidence.timestamp.isoformat(),
                             "error_code": "restore_commit_failed",
@@ -1776,16 +1904,21 @@ class OperatorRestoreService:
                 and operation.processing_sequence < analysis.floor
             ):
                 projected.append(
-                    operation.model_copy(
-                        update={"state": "completed", "error_code": None}
+                    operation
+                    if operation.state in {"completed", "failed"}
+                    else RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
+                            "state": "commit_indeterminate",
+                            "error_code": RestoreErrorCode.COMMIT_INDETERMINATE.value,
+                        }
                     )
-                    if operation.state == "finalizing"
-                    else operation
                 )
             else:
                 projected.append(
-                    operation.model_copy(
-                        update={
+                    RestoreOperation.model_validate(
+                        {
+                            **operation.model_dump(mode="json"),
                             "state": "commit_indeterminate",
                             "error_code": RestoreErrorCode.COMMIT_INDETERMINATE.value,
                         }
