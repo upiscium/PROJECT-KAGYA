@@ -565,6 +565,64 @@ def test_rotated_journal_restart_uses_only_retained_suffix_for_semantic_hashes(
     assert retained_operation.state == "completed"
 
 
+def test_started_only_restore_is_not_completed_after_retention_rotation(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000079",
+        wal.reconstruct(1).snapshot_hash,
+        sequence=2,
+    )
+    accepted = AgentEvent(
+        event_id=operation.event_id,
+        event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+        source="api.state.operator_restore.commit",
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+        correlation_id=operation.preview_digest,
+        payload={"journal_target": f"restore:1:{operation.target_snapshot_hash}"},
+    )
+    journal.accepted(accepted)
+    journal.started(
+        Event(
+            operation.event_id,
+            2,
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
+            source="api.state.operator_restore.commit",
+            correlation_id=operation.preview_digest,
+            payload=accepted.payload,
+        )
+    )
+    previous = wal.reconstruct(2).snapshot
+    journal.max_bytes = 1
+    journal.retained_files = 1
+    for sequence in range(3, 10):
+        current = previous.model_copy(
+            update={
+                "saved_at": previous.saved_at + timedelta(seconds=1),
+                "last_processed_event_sequence": sequence,
+                "extensions": {
+                    **previous.extensions,
+                    "operator_restore": [operation.model_dump(mode="json")],
+                },
+            }
+        )
+        event = Event(f"post-started-{sequence}", sequence)
+        journal.started(event)
+        wal.append_transition(event, previous, current)
+        journal.completed(event, hash_snapshot(current))
+        previous = current
+    store.save(previous)
+    retained = journal.verify()
+    assert not any(item.event_id == operation.event_id for item in retained)
+    assert retained[0].snapshot_sequence is not None
+    assert retained[0].snapshot_sequence > operation.processing_sequence
+    projected = service.summary().latest_operation
+    assert projected is not None
+    assert projected.state == "commit_indeterminate"
+
+
 def test_read_only_rotation_keeps_retained_preview_semantically_valid(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1131,7 +1189,7 @@ def _restore_action_state(*, active: bool) -> dict[str, Any]:
         ),
         budget=budget,
         attempts=1,
-        cost_units_used=0,
+        cost_units_used=1,
         created_at=timestamp,
         updated_at=timestamp,
         deadline_at=timestamp + timedelta(minutes=1),
@@ -1175,7 +1233,9 @@ def _restore_action_state(*, active: bool) -> dict[str, Any]:
         receipt_id="receipt-1",
         observed_at=timestamp,
         data={"namespace": "project", "key": "name", "value": "PROJECT-KAGYA"},
-        result_digest="c" * 64,
+        result_digest=_digest(
+            {"namespace": "project", "key": "name", "value": "PROJECT-KAGYA"}
+        ),
         valid=True,
     )
     verification = OutcomeVerification(
@@ -1401,6 +1461,22 @@ def test_rebound_terminal_action_receipt_fails_closed(tmp_path: Any) -> None:
         update={"extensions": {"action_execution": state.model_dump(mode="json")}}
     )
     assert not service.preview(1).restoreable
+
+
+def test_forged_observation_digest_is_publicly_classified_as_unsupported(
+    tmp_path: Any,
+) -> None:
+    service, store, _wal, _journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    state = _restore_action_state(active=False)
+    state["observations"][0]["result_digest"] = "0" * 64
+    store.last_snapshot = current.model_copy(
+        update={"extensions": {"action_execution": state}}
+    )
+    preview = service.preview(1)
+    assert not preview.restoreable
+    assert preview.reason_codes == [RestoreErrorCode.UNSUPPORTED_DOMAIN.value]
 
 
 def _operation_for_test(

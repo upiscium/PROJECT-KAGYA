@@ -3203,6 +3203,79 @@ def test_governed_operator_restore_summary_preview_commit_and_retention(
         assert persisted.json()["latest_operation"]["state"] == "completed"
 
 
+def test_completed_restore_remains_completed_after_terminal_journal_rotation(
+    tmp_path: Path,
+) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "agent_journal": base_settings.agent_journal.model_copy(
+                update={"retained_files": 1}
+            )
+        }
+    )
+    headers = admin_headers()
+    with _client(tmp_path, settings=settings) as client:
+        assert (
+            client.post(
+                "/api/chat", json={"text": "rotation baseline", "attachments": []}
+            ).status_code
+            == 200
+        )
+        preview = client.post(
+            "/api/state/operator-restore/preview/0", headers=headers
+        ).json()
+        committed = client.post(
+            "/api/state/operator-restore/commit",
+            headers=headers,
+            json={
+                "target_sequence": preview["target_sequence"],
+                "expected_target_hash": preview["target_snapshot_hash"],
+                "expected_semantic_revision": preview["semantic_revision"],
+                "expected_current_logical_digest": preview["current_logical_digest"],
+                "expected_preview_digest": preview["preview_digest"],
+                "expected_external_effect_digest": preview["external_effects"][
+                    "effect_digest"
+                ],
+                "confirmation_phrase": preview["confirmation_phrase"],
+            },
+        )
+        assert committed.status_code == 200, committed.text
+        operation = committed.json()
+        restore_sequence = operation["processing_sequence"]
+        restore_wal = next(
+            record
+            for record in client.app.state.state_wal.verify()
+            if record.processing_sequence == restore_sequence
+        )
+        embedded = restore_wal.patch.value.extensions["operator_restore"]
+        assert embedded[-1]["state"] == "finalizing"
+
+        client.app.state.event_journal.max_bytes = 1
+        for _ in range(12):
+            assert (
+                client.get("/api/state/working-memory", headers=headers).status_code
+                == 200
+            )
+            retained = client.app.state.event_journal.verify()
+            if not any(record.event_id == operation["event_id"] for record in retained):
+                break
+        assert not any(record.event_id == operation["event_id"] for record in retained)
+        assert retained[0].snapshot_sequence is not None
+        assert retained[0].snapshot_sequence >= restore_sequence
+
+    with _client(tmp_path, settings=settings) as restarted:
+        summary = restarted.get(
+            "/api/state/operator-restore/summary", headers=headers
+        )
+        assert summary.status_code == 200, summary.text
+        latest = summary.json()["latest_operation"]
+        assert latest["operation_id"] == operation["operation_id"]
+        assert latest["state"] == "completed"
+        assert latest["completed_at"] is None
+        assert latest["error_code"] is None
+
+
 def test_legacy_restore_event_does_not_block_new_governed_restore(
     tmp_path: Path,
 ) -> None:
@@ -3217,9 +3290,7 @@ def test_legacy_restore_event_does_not_block_new_governed_restore(
 
     with _client(tmp_path, settings=settings) as restarted:
         headers = admin_headers()
-        summary = restarted.get(
-            "/api/state/operator-restore/summary", headers=headers
-        )
+        summary = restarted.get("/api/state/operator-restore/summary", headers=headers)
         assert summary.status_code == 200, summary.text
         assert summary.json()["latest_operation"] is None
         preview = restarted.post(

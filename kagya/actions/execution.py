@@ -614,6 +614,7 @@ def _semantic_binding(
         or verification is None
         or not observation.valid
         or not verification.success
+        or observation.result_digest != _digest(observation.data)
     ):
         return False
     return bool(
@@ -667,6 +668,134 @@ def _intent_receipts_semantically_valid(
         ):
             return False
         compensation_targets.add(target_id)
+    return True
+
+
+def _receipt_history_valid(
+    intent: ActionIntent,
+    receipts: tuple[ExecutionReceipt, ...],
+    observations: Mapping[str, Observation],
+    verifications: Mapping[str, OutcomeVerification],
+) -> bool:
+    """Validate the complete receipt state machine for one intent."""
+    terminal = {
+        IntentStatus.SUCCEEDED,
+        IntentStatus.FAILED,
+        IntentStatus.CANCELLED,
+        IntentStatus.REJECTED,
+        IntentStatus.COMPENSATED,
+    }
+    if len({item.attempt for item in receipts}) != len(receipts):
+        return False
+    if (
+        any(
+            timestamp.tzinfo is None
+            for timestamp in (intent.created_at, intent.updated_at, intent.deadline_at)
+        )
+        or intent.updated_at < intent.created_at
+    ):
+        return False
+    previous_finished: datetime | None = None
+    ordinary: list[ExecutionReceipt] = []
+    compensations: list[ExecutionReceipt] = []
+    for receipt in receipts:
+        if any(
+            timestamp.tzinfo is None
+            for timestamp in (receipt.started_at, receipt.finished_at)
+        ) or not (
+            intent.created_at
+            <= receipt.started_at
+            <= receipt.finished_at
+            <= intent.updated_at
+        ):
+            return False
+        if previous_finished is not None and receipt.started_at < previous_finished:
+            return False
+        previous_finished = receipt.finished_at
+        if receipt.compensation_of is None:
+            ordinary.append(receipt)
+        else:
+            compensations.append(receipt)
+        observation = observations.get(receipt.observation_id or "")
+        verification = verifications.get(receipt.verification_id or "")
+        if receipt.compensation_of is None:
+            if (
+                observation is None
+                or verification is None
+                or observation.result_digest != _digest(observation.data)
+                or observation.observed_at.tzinfo is None
+                or verification.verified_at.tzinfo is None
+                or observation.observed_at < receipt.finished_at
+                or verification.verified_at < observation.observed_at
+            ):
+                return False
+        elif receipt.observation_id is not None or receipt.verification_id is not None:
+            return False
+    if any(
+        ordinary[index].attempt >= ordinary[index + 1].attempt
+        for index in range(len(ordinary) - 1)
+    ):
+        return False
+    execution_attempts = [
+        item.attempt
+        for item in ordinary
+        if item.status
+        in {ReceiptStatus.SUCCEEDED, ReceiptStatus.FAILED, ReceiptStatus.TIMED_OUT}
+        and item.attempt > 0
+    ]
+    if execution_attempts != list(range(1, len(execution_attempts) + 1)):
+        return False
+    if intent.attempts != len(execution_attempts):
+        return False
+    if (
+        intent.attempts > intent.budget.max_attempts
+        or intent.cost_units_used > intent.budget.max_cost_units
+    ):
+        return False
+    if intent.cost_units_used != len(execution_attempts):
+        return False
+    if intent.status in terminal and not receipts:
+        return False
+    if intent.status == IntentStatus.COMPENSATED:
+        if (
+            len(ordinary) != 1
+            or len(compensations) != 1
+            or ordinary[0].status != ReceiptStatus.SUCCEEDED
+        ):
+            return False
+        if compensations[0].compensation_of != ordinary[0].receipt_id:
+            return False
+    elif intent.status == IntentStatus.SUCCEEDED:
+        if (
+            len(ordinary) != 1
+            or ordinary[0].status != ReceiptStatus.SUCCEEDED
+            or compensations
+        ):
+            return False
+    elif intent.status in {
+        IntentStatus.FAILED,
+        IntentStatus.CANCELLED,
+        IntentStatus.REJECTED,
+    }:
+        if compensations or any(
+            item.status == ReceiptStatus.SUCCEEDED for item in ordinary
+        ):
+            return False
+    elif intent.status == IntentStatus.RETRY_PENDING:
+        if (
+            compensations
+            or not ordinary
+            or ordinary[-1].status
+            not in {ReceiptStatus.FAILED, ReceiptStatus.TIMED_OUT}
+        ):
+            return False
+    elif receipts:
+        return False
+    if (
+        intent.status in terminal | {IntentStatus.RETRY_PENDING}
+        and intent.receipt_id != receipts[-1].receipt_id
+    ):
+        return False
     return True
 
 
@@ -1691,8 +1820,40 @@ class ActionExecutionLayer:
                 f"Action intent is not executable: {intent.status.value}"
             )
         if intent.cost_units_used >= intent.budget.max_cost_units:
+            if (
+                intent.status == IntentStatus.RETRY_PENDING
+                and intent.receipt_id is not None
+            ):
+                now = self.clock()
+                updated = intent.model_copy(
+                    update={
+                        "revision": intent.revision + 1,
+                        "status": IntentStatus.FAILED,
+                        "updated_at": now,
+                        "retry_at": None,
+                    }
+                )
+                self._replace(self._state(), updated)
+                self._resolve_decision(updated, False, "action_cost_budget_exhausted")
+                return updated
             return self._fail(intent, "cost_budget_exhausted", ReceiptStatus.FAILED)
         if intent.attempts >= intent.budget.max_attempts:
+            if (
+                intent.status == IntentStatus.RETRY_PENDING
+                and intent.receipt_id is not None
+            ):
+                now = self.clock()
+                updated = intent.model_copy(
+                    update={
+                        "revision": intent.revision + 1,
+                        "status": IntentStatus.FAILED,
+                        "updated_at": now,
+                        "retry_at": None,
+                    }
+                )
+                self._replace(self._state(), updated)
+                self._resolve_decision(updated, False, "action_retry_budget_exhausted")
+                return updated
             return self._fail(intent, "retry_budget_exhausted", ReceiptStatus.FAILED)
         spec = _TOOLS.get(intent.tool_name)
         if spec is None:
@@ -1919,7 +2080,15 @@ class ActionExecutionLayer:
         receipt = self._receipt(
             intent,
             receipt_id,
-            intent.attempts,
+            max(
+                (
+                    item.attempt
+                    for item in state.receipts
+                    if item.intent_id == intent.intent_id
+                ),
+                default=-1,
+            )
+            + 1,
             ReceiptStatus.CANCELLED,
             now,
             now,
@@ -1996,7 +2165,15 @@ class ActionExecutionLayer:
         receipt = self._receipt(
             intent,
             receipt_id,
-            intent.attempts,
+            max(
+                (
+                    item.attempt
+                    for item in state.receipts
+                    if item.intent_id == intent.intent_id
+                ),
+                default=-1,
+            )
+            + 1,
             ReceiptStatus.COMPENSATED,
             now,
             now,
@@ -3009,7 +3186,11 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
                 reject("Receipt evidence is missing or has an invalid status binding")
     for observation in state.observations:
         bound_receipt = snapshot.receipts.get(observation.receipt_id)
-        if observation.intent_id not in intents or bound_receipt is None:
+        if (
+            observation.intent_id not in intents
+            or bound_receipt is None
+            or observation.result_digest != _digest(observation.data)
+        ):
             reject("Observation record has an invalid binding")
         if bound_receipt.intent_id != observation.intent_id:
             reject("Observation record has an invalid receipt binding")
@@ -3048,6 +3229,10 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
         if requires_approval != (intent.approval_id is not None):
             reject("Approval requirement and action lifecycle binding disagree")
         intent_receipts = snapshot.receipts_by_intent.get(intent.intent_id, ())
+        if not _receipt_history_valid(
+            intent, intent_receipts, snapshot.observations, snapshot.verifications
+        ):
+            reject("Receipt history state machine is invalid")
         if (intent.status == IntentStatus.DRY_RUN) != intent.dry_run:
             reject("Action dry-run status is inconsistent")
         if intent.status in {

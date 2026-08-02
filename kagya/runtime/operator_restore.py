@@ -204,9 +204,7 @@ class RestoreOperation(_Strict):
             completed is not None or self.error_code is not None
         ):
             raise ValueError("nonterminal restore operation has terminal metadata")
-        if self.state == "completed" and (
-            completed is None or self.error_code is not None
-        ):
+        if self.state == "completed" and self.error_code is not None:
             raise ValueError("completed restore operation metadata is invalid")
         if self.state == "failed" and (completed is None or self.error_code is None):
             raise ValueError("failed restore operation metadata is invalid")
@@ -802,6 +800,8 @@ class OperatorRestoreService:
                     if isinstance(item, RestoreOperation)
                     else item
                 )
+                if operation.state == "completed" and operation.completed_at is None:
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 if operation.processing_sequence is None:
                     if source != "journal":
                         self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
@@ -825,6 +825,51 @@ class OperatorRestoreService:
                 RestoreErrorCode.JOURNAL_INTEGRITY_INVALID
             ) from exc
         return operations
+
+    def _committed_operation_below_retention_floor(
+        self,
+        operation: RestoreOperation,
+        wal: list[StateWalRecord],
+        analysis: _EvidenceIndex,
+    ) -> bool:
+        """Prove a persisted finalizing restore committed after terminal rotation."""
+        sequence = operation.processing_sequence
+        if (
+            operation.state != "finalizing"
+            or sequence is None
+            or sequence > analysis.floor
+        ):
+            return False
+        operation_index = bisect_left(
+            wal, sequence, key=lambda record: record.processing_sequence
+        )
+        target_index = bisect_left(
+            wal,
+            operation.target_sequence,
+            key=lambda record: record.processing_sequence,
+        )
+        if operation_index >= len(wal) or target_index >= len(wal):
+            return False
+        record = wal[operation_index]
+        target = wal[target_index]
+        if (
+            record.processing_sequence != sequence
+            or record.event_id != operation.event_id
+            or record.event_type != "state_point_in_time_restore"
+            or record.source != "api.state.operator_restore.commit"
+            or target.processing_sequence != operation.target_sequence
+            or target.state_hash_after != operation.target_snapshot_hash
+        ):
+            return False
+        embedded = self._parse_operation_source(
+            record.patch.value.extensions.get(_RESERVED, []),
+            source="persisted_wal",
+            container_sequence=record.processing_sequence,
+        )
+        matches = [
+            item for item in embedded if item.operation_id == operation.operation_id
+        ]
+        return len(matches) == 1 and matches[0] == operation
 
     def _merge_operation_sources(
         self,
@@ -1937,19 +1982,33 @@ class OperatorRestoreService:
             elif (
                 operation.operation_id in persisted_operation_ids
                 and operation.processing_sequence is not None
-                and operation.processing_sequence < analysis.floor
+                and operation.processing_sequence <= analysis.floor
             ):
-                projected.append(
-                    operation
-                    if operation.state in {"completed", "failed"}
-                    else RestoreOperation.model_validate(
-                        {
-                            **operation.model_dump(mode="json"),
-                            "state": "commit_indeterminate",
-                            "error_code": RestoreErrorCode.COMMIT_INDETERMINATE.value,
-                        }
+                if operation.state in {"completed", "failed"}:
+                    projected.append(operation)
+                elif self._committed_operation_below_retention_floor(
+                    operation, wal, analysis
+                ):
+                    projected.append(
+                        RestoreOperation.model_validate(
+                            {
+                                **operation.model_dump(mode="json"),
+                                "state": "completed",
+                                "completed_at": None,
+                                "error_code": None,
+                            }
+                        )
                     )
-                )
+                else:
+                    projected.append(
+                        RestoreOperation.model_validate(
+                            {
+                                **operation.model_dump(mode="json"),
+                                "state": "commit_indeterminate",
+                                "error_code": RestoreErrorCode.COMMIT_INDETERMINATE.value,
+                            }
+                        )
+                    )
             else:
                 projected.append(
                     RestoreOperation.model_validate(

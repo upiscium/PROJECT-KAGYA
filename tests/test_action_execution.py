@@ -996,8 +996,14 @@ def test_retry_is_bounded_and_cancellable(tmp_path: Path) -> None:
     ).value
     assert retrying.status == IntentStatus.RETRY_PENDING
     assert retrying.attempts == 1
+    validate_action_state_semantics(
+        ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
     cancelled = layer.cancel(intent.intent_id)
     assert cancelled.status == IntentStatus.CANCELLED
+    validate_action_state_semantics(
+        ActionState.model_validate(loop.persistent_state.extensions[ACTION_STATE_KEY])
+    )
     assert loop.decision_store.get("decision-retry").actual_outcome is not None
     with pytest.raises(ActionPolicyError, match="not executable"):
         runtime.execute(
@@ -2265,9 +2271,21 @@ def test_validate_action_state_semantics_accepts_terminal_histories(
     verification = state.verifications[0].model_copy(
         update={"success": receipt_status == ReceiptStatus.SUCCEEDED}
     )
+    adjusted_intent = intent.model_copy(
+        update={
+            "attempts": (
+                0 if receipt_status == ReceiptStatus.CANCELLED else intent.attempts
+            ),
+            "cost_units_used": (
+                0
+                if receipt_status == ReceiptStatus.CANCELLED
+                else intent.cost_units_used
+            ),
+        }
+    )
     state = state.model_copy(
         update={
-            "intents": (intent.model_copy(update={"status": intent_status}),),
+            "intents": (adjusted_intent.model_copy(update={"status": intent_status}),),
             "receipts": (receipt,),
             "verifications": (verification,),
         }
@@ -2284,6 +2302,9 @@ def test_validate_action_state_semantics_accepts_compensated_history(
     compensation = original.model_copy(
         update={
             "receipt_id": "semantic-compensation",
+            "attempt": 2,
+            "started_at": original.finished_at,
+            "finished_at": original.finished_at,
             "status": ReceiptStatus.COMPENSATED,
             "compensation_of": original.receipt_id,
             "observation_id": None,
@@ -2301,6 +2322,109 @@ def test_validate_action_state_semantics_accepts_compensated_history(
             update={"intents": (compensated,), "receipts": (original, compensation)}
         )
     )
+
+
+def test_observation_digest_is_canonical_and_key_order_independent(
+    tmp_path: Path,
+) -> None:
+    state, _intent = _semantic_fixture(tmp_path)
+    first = {
+        "namespace": "project",
+        "key": "name",
+        "value": {"outer": {"alpha": 1, "beta": 2}},
+    }
+    reordered = {
+        "value": {"outer": {"beta": 2, "alpha": 1}},
+        "key": "name",
+        "namespace": "project",
+    }
+    assert action_execution._digest(first) == action_execution._digest(reordered)
+    observation = state.observations[0].model_copy(
+        update={
+            "data": reordered,
+            "result_digest": action_execution._digest(first),
+        }
+    )
+    validate_action_state_semantics(
+        state.model_copy(update={"observations": (observation,)})
+    )
+
+
+def test_validate_action_state_semantics_rejects_forged_observation_digest(
+    tmp_path: Path,
+) -> None:
+    state, _intent = _semantic_fixture(tmp_path)
+    observation = state.observations[0].model_copy(update={"result_digest": "0" * 64})
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(
+            state.model_copy(update={"observations": (observation,)})
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "duplicate_attempt",
+        "out_of_order_timestamp",
+        "succeeded_with_extra_receipt",
+        "retry_pending_with_success",
+    ],
+)
+def test_validate_action_state_semantics_rejects_receipt_history_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    state, intent = _semantic_fixture(tmp_path)
+    original = state.receipts[0]
+    if corruption == "out_of_order_timestamp":
+        receipt = original.model_copy(
+            update={
+                "started_at": original.finished_at,
+                "finished_at": original.started_at,
+            }
+        )
+        corrupted = state.model_copy(update={"receipts": (receipt,)})
+    elif corruption == "retry_pending_with_success":
+        corrupted = state.model_copy(
+            update={
+                "intents": (
+                    intent.model_copy(update={"status": IntentStatus.RETRY_PENDING}),
+                )
+            }
+        )
+    else:
+        second_observation = state.observations[0].model_copy(
+            update={
+                "observation_id": "semantic-history-observation",
+                "receipt_id": "semantic-history-receipt",
+            }
+        )
+        second_verification = state.verifications[0].model_copy(
+            update={
+                "verification_id": "semantic-history-verification",
+                "observation_id": second_observation.observation_id,
+            }
+        )
+        second = original.model_copy(
+            update={
+                "receipt_id": "semantic-history-receipt",
+                "attempt": original.attempt
+                if corruption == "duplicate_attempt"
+                else original.attempt + 1,
+                "started_at": original.finished_at,
+                "finished_at": original.finished_at,
+                "observation_id": second_observation.observation_id,
+                "verification_id": second_verification.verification_id,
+            }
+        )
+        corrupted = state.model_copy(
+            update={
+                "receipts": (original, second),
+                "observations": (*state.observations, second_observation),
+                "verifications": (*state.verifications, second_verification),
+            }
+        )
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(corrupted)
 
 
 @pytest.mark.parametrize(
