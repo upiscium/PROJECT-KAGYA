@@ -45,6 +45,7 @@ from kagya.runtime import (
     KagyaMainLoop,
     EmotionTimer,
     ExternalTransactionCoordinator,
+    OperatorRestoreService,
     StateWAL,
     hash_snapshot,
     SchedulerBudget,
@@ -263,6 +264,7 @@ def execute_agent_event(
     payload: dict[str, object] | None = None,
     correlation_id: str | None = None,
     causation_id: str | None = None,
+    event_id: str | None = None,
 ) -> AgentEventOutcome[T]:
     try:
         return runtime.execute(
@@ -272,6 +274,7 @@ def execute_agent_event(
             payload=payload,
             correlation_id=correlation_id,
             causation_id=causation_id,
+            event_id=event_id,
         )
     except AgentRuntimeQueueFull as exc:
         raise HTTPException(
@@ -502,6 +505,51 @@ def get_external_transaction_coordinator(
         coordinator = ExternalTransactionCoordinator([get_memory_system(request)])
         request.app.state.external_transaction_coordinator = coordinator
     return coordinator
+
+
+def get_operator_restore_service(request: Request) -> OperatorRestoreService:
+    service = getattr(request.app.state, "operator_restore_service", None)
+    if service is not None:
+        return service
+    with _dependency_lock:
+        service = getattr(request.app.state, "operator_restore_service", None)
+        if service is None:
+            app = request.app
+            settings = get_api_settings(request)
+
+            def authoritative(_actor_id: str) -> bool:
+                if getattr(app.state, "subject_role", "active") != "active":
+                    return False
+                if not settings.failover.enabled:
+                    return True
+                authority = getattr(app.state, "fencing_authority", None)
+                if authority is None:
+                    return False
+                try:
+                    authority.assert_authoritative()
+                except Exception:
+                    return False
+                return True
+
+            journal = getattr(request.app.state, "event_journal", None)
+            if journal is None:
+                raise RuntimeError("Event Journal is unavailable")
+            service = OperatorRestoreService(
+                get_agent_state_store(request),
+                get_state_wal(request),
+                journal,
+                get_external_transaction_coordinator(request),
+                authority=authoritative,
+                external_heads=lambda: {
+                    "adapters": [
+                        item.to_json()
+                        for item in get_adapter_registry(request).list()
+                    ],
+                    "datasets": get_dataset_governance(request).list_revisions(),
+                },
+            )
+            request.app.state.operator_restore_service = service
+    return service
 
 
 def get_adapter_registry(request: Request) -> AdapterRegistry:

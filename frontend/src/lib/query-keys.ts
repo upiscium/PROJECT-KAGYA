@@ -15,6 +15,8 @@ export const queryKeys = {
     journal: ["cockpit", "journal"] as const,
     adapters: ["cockpit", "adapters"] as const,
     actionOperator: ["cockpit", "action-operator"] as const,
+    restoreSummary: ["cockpit", "restore-summary"] as const,
+    restorePreview: (targetSequence: number) => ["cockpit", "restore-preview", targetSequence] as const,
   },
   decisionExplanations: ["decision-explanations"] as const,
   outbox: ["outbox"] as const,
@@ -27,6 +29,12 @@ export const actionMutationInvalidationKeys = [
   queryKeys.cockpit.plans,
   queryKeys.cockpit.outbox,
   queryKeys.cockpit.journal,
+  queryKeys.decisionExplanations,
+  queryKeys.outbox,
+] as const;
+
+export const operatorRestoreInvalidationKeys = [
+  ...Object.values(queryKeys.cockpit).filter((key) => Array.isArray(key)),
   queryKeys.decisionExplanations,
   queryKeys.outbox,
 ] as const;

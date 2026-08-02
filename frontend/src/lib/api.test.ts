@@ -536,6 +536,84 @@ describe("api client", () => {
       expected_preview_digest: "a".repeat(64),
     })).rejects.toMatchObject({ name: "ApiError" });
   });
+
+  it("calls governed restore summary and preview endpoints and parses their public responses", async () => {
+    fetchMock.mockReturnValueOnce(jsonResponse(operatorRestoreSummaryPayload));
+    const summary = await api.operatorRestoreSummary(25);
+    expect(fetchMock).toHaveBeenLastCalledWith("/admin-proxy/state/operator-restore/summary?limit=25", expect.anything());
+    expect(summary.targets[0]).toEqual(operatorRestoreSummaryPayload.targets[0]);
+    expect(summary.latest_operation?.external_side_effects_replayed).toBe(false);
+    expect(JSON.stringify(summary)).not.toContain("PRIVATE_SENTINEL");
+
+    fetchMock.mockReturnValueOnce(jsonResponse(operatorRestorePreviewPayload));
+    const preview = await api.previewOperatorRestore(7);
+    expect(fetchMock).toHaveBeenLastCalledWith("/admin-proxy/state/operator-restore/preview/7", expect.anything());
+    expect(preview.external_effects.artifacts[0].refs).toEqual(["artifact-1"]);
+    expect(preview.confirmation_phrase).toBe("RESTORE TARGET 7");
+    expect(preview.external_side_effects_replayed).toBe(false);
+  });
+
+  it("serializes the exact governed restore commit body and parses the response", async () => {
+    fetchMock.mockReturnValue(jsonResponse(operatorRestoreCommitPayload));
+    const body = {
+      target_sequence: 7,
+      expected_target_hash: "a".repeat(64),
+      expected_semantic_revision: 12,
+      expected_current_logical_digest: "b".repeat(64),
+      expected_preview_digest: "c".repeat(64),
+      expected_external_effect_digest: "d".repeat(64),
+      confirmation_phrase: "RESTORE TARGET 7",
+    };
+
+    const response = await api.commitOperatorRestore(body);
+    const [, options] = fetchMock.mock.calls[0];
+    expect(fetchMock.mock.calls[0][0]).toBe("/admin-proxy/state/operator-restore/commit");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual(body);
+    expect(response).toEqual(operatorRestoreCommitPayload);
+    expect(response.external_side_effects_replayed).toBe(false);
+  });
+
+  it.each([
+    ["unknown summary field", { ...operatorRestoreSummaryPayload, private: "PRIVATE_SENTINEL" }, api.operatorRestoreSummary],
+    ["unknown preview field", { ...operatorRestorePreviewPayload, private: "PRIVATE_SENTINEL" }, () => api.previewOperatorRestore(7)],
+    ["unknown commit response field", { ...operatorRestoreCommitPayload, private: "PRIVATE_SENTINEL" }, () => api.commitOperatorRestore(restoreCommitRequest)],
+  ])("rejects %s", async (_label, payload, client) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(client()).rejects.toMatchObject({ name: "ApiError" });
+  });
+
+  it("rejects bounded and private restore fields", async () => {
+    const cases: Array<[unknown, () => Promise<unknown>]> = [
+      [{ ...operatorRestoreSummaryPayload, targets: [{ ...operatorRestoreSummaryPayload.targets[0], reason_codes: ["x".repeat(129)] }] }, () => api.operatorRestoreSummary()],
+      [{ ...operatorRestorePreviewPayload, confirmation_phrase: "PRIVATE_SENTINEL" }, () => api.previewOperatorRestore(7)],
+      [{ ...operatorRestorePreviewPayload, domains: [{ ...operatorRestorePreviewPayload.domains[0], domain: "x".repeat(129) }] }, () => api.previewOperatorRestore(7)],
+      [{ ...operatorRestoreCommitPayload, error_code: "not a bounded code" }, () => api.commitOperatorRestore(restoreCommitRequest)],
+    ];
+    for (const [payload, client] of cases) {
+      fetchMock.mockReturnValue(jsonResponse(payload));
+      await expect(client()).rejects.toMatchObject({ name: "ApiError" });
+    }
+  });
+
+  it("sanitizes governed restore HTTP errors", async () => {
+    const secret = `PRIVATE_SENTINEL ${"x".repeat(2000)}`;
+    fetchMock.mockReturnValue(errorResponse(409, "Conflict", { detail: secret, hidden_thought: secret }));
+
+    const error = await api.commitOperatorRestore(restoreCommitRequest).catch((value) => value);
+    expect(error).toMatchObject({ name: "ApiError", status: 409, detail: "conflict" });
+    expect(String(error)).toBe("ApiError: Restore request failed (409).");
+    expect(JSON.stringify(error)).not.toContain("PRIVATE_SENTINEL");
+  });
+
+  it("preserves only allowlisted governed restore error codes", async () => {
+    fetchMock.mockReturnValue(errorResponse(503, "Unavailable", { detail: { code: "commit_indeterminate" } }));
+    await expect(api.commitOperatorRestore(restoreCommitRequest)).rejects.toMatchObject({
+      name: "ApiError",
+      status: 503,
+      detail: "commit_indeterminate",
+    });
+  });
 });
 
 const actionOperatorPayload = {
@@ -694,6 +772,110 @@ const cockpitTrainingPayload = {
     rollback_event_id: null,
     rollback_event_sequence: null,
   }],
+};
+
+const restoreDigestA = "a".repeat(64);
+const restoreDigestB = "b".repeat(64);
+const restoreDigestC = "c".repeat(64);
+const restoreDigestD = "d".repeat(64);
+const restoreCommitRequest = {
+  target_sequence: 7,
+  expected_target_hash: restoreDigestA,
+  expected_semantic_revision: 12,
+  expected_current_logical_digest: restoreDigestB,
+  expected_preview_digest: restoreDigestC,
+  expected_external_effect_digest: restoreDigestD,
+  confirmation_phrase: "RESTORE TARGET 7",
+};
+
+const operatorRestoreSummaryPayload = {
+  schema_version: 1,
+  current_sequence: 10,
+  current_snapshot_hash: restoreDigestA,
+  current_logical_digest: restoreDigestB,
+  semantic_revision: 12,
+  retained_min_sequence: 1,
+  retained_max_sequence: 10,
+  targets: [{
+    target_sequence: 7,
+    target_snapshot_hash: restoreDigestC,
+    checkpoint_kind: "checkpoint",
+    timestamp: "2026-01-01T00:00:00Z",
+    event_type: "checkpoint_created",
+    eligible: true,
+    reason_codes: ["eligible"],
+  }],
+  latest_operation: {
+    operation_id: "restore-op-1",
+    target_sequence: 7,
+    target_snapshot_hash: restoreDigestC,
+    preview_digest: restoreDigestD,
+    requested_at: "2026-01-01T00:00:00Z",
+    started_at: null,
+    completed_at: null,
+    event_id: "event-restore-1",
+    processing_sequence: 11,
+    state: "previewed",
+    error_code: null,
+    external_side_effects_replayed: false,
+  },
+  external_side_effects_replayed: false,
+};
+
+const operatorRestorePreviewPayload = {
+  schema_version: 1,
+  operation_id: "restore-op-1",
+  preview_digest: restoreDigestD,
+  created_at: "2026-01-01T00:00:00Z",
+  expires_at: "2026-01-01T01:00:00Z",
+  current_logical_digest: restoreDigestB,
+  semantic_revision: 12,
+  display_sequence: 10,
+  target_sequence: 7,
+  target_snapshot_hash: restoreDigestC,
+  newer_authoritative_event_count: 3,
+  domains: [{
+    domain: "motivation",
+    before_count: 2,
+    after_count: 1,
+    added_count: 0,
+    removed_count: 1,
+    changed_count: 1,
+    changed_revision_count: 1,
+    newer_state_loss_count: 1,
+    refs: [{ kind: "goal", id: "goal-1" }],
+    truncated: false,
+    reason_code: null,
+  }],
+  external_effects: {
+    consistency_status: "consistent",
+    artifacts: [{ artifact_type: "outbox", count: 1, refs: ["artifact-1"], truncated: false }],
+    retained_not_replayed_count: 1,
+    pending_count: 0,
+    orphaned_count: 0,
+    retryable_count: 0,
+    effect_digest: restoreDigestA,
+    external_side_effects_replayed: false,
+  },
+  restoreable: true,
+  reason_codes: ["eligible"],
+  external_side_effects_replayed: false,
+  confirmation_phrase: "RESTORE TARGET 7",
+};
+
+const operatorRestoreCommitPayload = {
+  command: "restore",
+  disposition: "completed",
+  operation_id: "restore-op-1",
+  event_id: "event-restore-2",
+  processing_sequence: 12,
+  restored_target_sequence: 7,
+  restored_target_hash: restoreDigestC,
+  post_restore_sequence: 13,
+  post_restore_hash: restoreDigestA,
+  operation_status: "completed",
+  error_code: null,
+  external_side_effects_replayed: false,
 };
 
 function actionTraceWith(update: Record<string, unknown>) {

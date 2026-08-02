@@ -1,19 +1,17 @@
 """Administrative agent-state snapshot operations."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.api.dependencies import (
     execute_agent_event,
     get_agent_runtime,
-    get_agent_state_store,
     get_api_settings,
-    get_external_transaction_coordinator,
     get_adapter_runtime_manager,
     get_dataset_governance,
     get_main_loop,
+    get_operator_restore_service,
     get_sleep_coordinator,
-    get_state_wal,
     get_tool_executor,
     get_tool_registry,
 )
@@ -21,18 +19,15 @@ from kagya.config import Settings
 from kagya.runtime import (
     AgentEventType,
     AgentRuntime,
-    AgentStateSnapshot,
-    AgentStateStore,
-    ExternalReconciliationReport,
-    ExternalRestoreDiff,
-    ExternalTransactionCoordinator,
-    ExternalTransactionRecord,
-    StateDryRun,
-    StateReconstruction,
-    StateWAL,
-    StateWalIntegrityError,
+    OperatorRestoreService,
+    RestoreCommitRequest,
+    RestoreCommitResponse,
+    RestoreContractError,
+    RestoreErrorCode,
+    RestorePreview as OperatorRestorePreview,
+    RestoreSummary,
+    event_id_for_operation,
 )
-from kagya.runtime.agent_state import default_agent_state_snapshot
 from kagya.security.backup import (
     BackupError,
     BackupManager,
@@ -43,6 +38,7 @@ from kagya.security.crypto import EncryptionError
 
 
 router = APIRouter(prefix="/api/state", tags=["state"])
+_OPERATOR_ACTOR = "subject-cockpit-operator"
 
 
 class BackupCreateRequest(BaseModel):
@@ -65,6 +61,100 @@ class WorkingMemorySummaryResponse(BaseModel):
     token_capacity: int = Field(gt=0)
 
 
+def _restore_error(error: RestoreContractError) -> HTTPException:
+    status_code = (
+        status.HTTP_404_NOT_FOUND
+        if error.code == RestoreErrorCode.TARGET_NOT_RETAINED.value
+        else status.HTTP_409_CONFLICT
+    )
+    return HTTPException(status_code=status_code, detail={"code": error.code})
+
+
+def _restore_lock(request: Request):
+    lock = getattr(request.app.state, "operator_restore_lock", None)
+    if lock is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": RestoreErrorCode.NOT_AUTHORITATIVE.value},
+        )
+    return lock
+
+
+@router.get("/operator-restore/summary", response_model=RestoreSummary)
+def operator_restore_summary(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=100),
+    service: OperatorRestoreService = Depends(get_operator_restore_service),
+) -> RestoreSummary:
+    try:
+        with _restore_lock(request):
+            return service.summary(limit, _OPERATOR_ACTOR)
+    except RestoreContractError as exc:
+        raise _restore_error(exc) from exc
+
+
+@router.post(
+    "/operator-restore/preview/{target_sequence}",
+    response_model=OperatorRestorePreview,
+)
+def preview_operator_restore(
+    target_sequence: int,
+    request: Request,
+    service: OperatorRestoreService = Depends(get_operator_restore_service),
+) -> OperatorRestorePreview:
+    try:
+        with _restore_lock(request):
+            return service.preview(target_sequence, _OPERATOR_ACTOR)
+    except RestoreContractError as exc:
+        raise _restore_error(exc) from exc
+
+
+@router.post("/operator-restore/commit", response_model=RestoreCommitResponse)
+def commit_operator_restore(
+    body: RestoreCommitRequest,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    service: OperatorRestoreService = Depends(get_operator_restore_service),
+) -> RestoreCommitResponse:
+    reserved_preview: OperatorRestorePreview | None = None
+    try:
+        reserved_preview = service.preflight(body, _OPERATOR_ACTOR)
+        outcome = execute_agent_event(
+            runtime,
+            AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.operator_restore.commit",
+            handler=lambda: service.apply_commit(
+                get_main_loop(request), body, _OPERATOR_ACTOR
+            ),
+            event_id=event_id_for_operation(reserved_preview.operation_id),
+            correlation_id=reserved_preview.preview_digest,
+            payload={
+                "operation_id": reserved_preview.operation_id,
+                "target_sequence": reserved_preview.target_sequence,
+                "journal_target": (
+                    f"restore:{reserved_preview.target_sequence}:"
+                    f"{reserved_preview.target_snapshot_hash}"
+                ),
+            },
+        )
+        with _restore_lock(request):
+            response = service.build_completion_response(outcome.value.operation_id)
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": RestoreErrorCode.COMMIT_INDETERMINATE.value},
+            )
+        return response
+    except RestoreContractError as exc:
+        if reserved_preview is not None:
+            service.release(reserved_preview.preview_digest)
+        raise _restore_error(exc) from exc
+    except HTTPException:
+        if reserved_preview is not None:
+            service.release(reserved_preview.preview_digest)
+        raise
+
+
 @router.get("/working-memory", response_model=WorkingMemorySummaryResponse)
 def working_memory_summary(
     request: Request,
@@ -84,166 +174,92 @@ def working_memory_summary(
     ).value
 
 
-@router.post("/snapshot", response_model=AgentStateSnapshot)
-def create_snapshot(
-    runtime: AgentRuntime = Depends(get_agent_runtime),
-    store: AgentStateStore = Depends(get_agent_state_store),
-) -> AgentStateSnapshot:
-    execute_agent_event(
-        runtime,
-        AgentEventType.STATE_SNAPSHOT,
-        source="api.state.snapshot",
-        handler=lambda: None,
+@router.post("/snapshot")
+def create_snapshot() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "private_state_projection_unavailable"},
     )
-    return _current_snapshot(store)
 
 
-@router.get("/export", response_model=AgentStateSnapshot)
-def export_snapshot(
-    runtime: AgentRuntime = Depends(get_agent_runtime),
-    store: AgentStateStore = Depends(get_agent_state_store),
-) -> AgentStateSnapshot:
-    execute_agent_event(
-        runtime,
-        AgentEventType.STATE_EXPORT,
-        source="api.state.export",
-        handler=lambda: None,
+@router.get("/export")
+def export_snapshot() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "private_state_projection_unavailable"},
     )
-    return _current_snapshot(store)
 
 
-@router.post("/restore", response_model=AgentStateSnapshot)
-def restore_snapshot(
-    snapshot: AgentStateSnapshot,
-    request: Request,
-    runtime: AgentRuntime = Depends(get_agent_runtime),
-    store: AgentStateStore = Depends(get_agent_state_store),
-) -> AgentStateSnapshot:
-    execute_agent_event(
-        runtime,
-        AgentEventType.STATE_RESTORE,
-        source="api.state.restore",
-        handler=lambda: store.restore_into(get_main_loop(request), snapshot),
+@router.post("/restore")
+def restore_snapshot() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "operator_restore_contract_required"},
     )
-    return _current_snapshot(store)
 
 
-@router.post("/reset", response_model=AgentStateSnapshot)
-def reset_snapshot(
-    request: Request,
-    runtime: AgentRuntime = Depends(get_agent_runtime),
-    store: AgentStateStore = Depends(get_agent_state_store),
-    settings: Settings = Depends(get_api_settings),
-) -> AgentStateSnapshot:
-    def reset() -> None:
-        main_loop = get_main_loop(request)
-        store.restore_into(
-            main_loop,
-            default_agent_state_snapshot(settings.emotion.baseline_surprisal),
-        )
-        main_loop.session_state.turns.clear()
-        main_loop.working_memory.clear()
-        main_loop.context_registry.clear()
-
-    execute_agent_event(
-        runtime,
-        AgentEventType.STATE_RESET,
-        source="api.state.reset",
-        handler=reset,
+@router.post("/reset")
+def reset_snapshot() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "operator_restore_contract_required"},
     )
-    return _current_snapshot(store)
 
 
-@router.get("/reconstruct/{sequence}", response_model=StateReconstruction)
-def reconstruct_snapshot(
-    sequence: int,
-    wal: StateWAL = Depends(get_state_wal),
-) -> StateReconstruction:
-    try:
-        return wal.reconstruct(sequence)
-    except StateWalIntegrityError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-        ) from exc
+@router.get("/reconstruct/{sequence}")
+def reconstruct_snapshot(sequence: int) -> None:
+    del sequence
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_replay_disabled"},
+    )
 
 
-@router.post("/restore/{sequence}/dry-run", response_model=StateDryRun)
-def dry_run_restore(
-    sequence: int,
-    store: AgentStateStore = Depends(get_agent_state_store),
-    wal: StateWAL = Depends(get_state_wal),
-) -> StateDryRun:
-    try:
-        return wal.dry_run(_current_snapshot(store), sequence)
-    except StateWalIntegrityError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-        ) from exc
+@router.post("/restore/{sequence}/dry-run")
+def dry_run_restore(sequence: int) -> None:
+    del sequence
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_replay_disabled"},
+    )
 
 
-@router.get("/external-transactions", response_model=list[ExternalTransactionRecord])
-def external_transaction_audit(
-    coordinator: ExternalTransactionCoordinator = Depends(
-        get_external_transaction_coordinator
-    ),
-) -> list[ExternalTransactionRecord]:
-    return coordinator.records()
+@router.get("/external-transactions")
+def external_transaction_audit() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_replay_disabled"},
+    )
 
 
-@router.post(
-    "/external-transactions/reconcile",
-    response_model=ExternalReconciliationReport,
-)
-def reconcile_external_transactions(
-    request: Request,
-    coordinator: ExternalTransactionCoordinator = Depends(
-        get_external_transaction_coordinator
-    ),
-) -> ExternalReconciliationReport:
-    return coordinator.reconcile(request.app.state.event_journal.verify())
+@router.post("/external-transactions/reconcile")
+def reconcile_external_transactions() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_replay_disabled"},
+    )
 
 
-@router.get("/restore/{sequence}/external-diff", response_model=ExternalRestoreDiff)
+@router.get("/restore/{sequence}/external-diff")
 def external_restore_diff(
     sequence: int,
-    wal: StateWAL = Depends(get_state_wal),
-    coordinator: ExternalTransactionCoordinator = Depends(
-        get_external_transaction_coordinator
-    ),
-) -> ExternalRestoreDiff:
-    try:
-        wal.reconstruct(sequence)
-    except StateWalIntegrityError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-        ) from exc
-    return coordinator.restore_diff(sequence)
+) -> None:
+    del sequence
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_replay_disabled"},
+    )
 
 
-@router.post("/restore/{sequence}", response_model=AgentStateSnapshot)
+@router.post("/restore/{sequence}")
 def restore_point_in_time(
     sequence: int,
-    request: Request,
-    runtime: AgentRuntime = Depends(get_agent_runtime),
-    store: AgentStateStore = Depends(get_agent_state_store),
-    wal: StateWAL = Depends(get_state_wal),
-) -> AgentStateSnapshot:
-    def restore() -> None:
-        target = wal.reconstruct(sequence)
-        store.restore_into(get_main_loop(request), target.snapshot)
-
-    try:
-        execute_agent_event(
-            runtime,
-            AgentEventType.STATE_POINT_IN_TIME_RESTORE,
-            source="api.state.point_in_time_restore",
-            handler=restore,
-        )
-    except StateWalIntegrityError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-        ) from exc
-    return _current_snapshot(store)
+) -> None:
+    del sequence
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "raw_state_restore_disabled"},
+    )
 
 
 @router.post("/backups", response_model=RestorePreview)
@@ -420,9 +436,3 @@ def _reset_build_and_activate_subject_runtime(
     _teardown_subject_runtime(request)
     _build_subject_runtime_offline(request, settings, initialized_caches)
     _activate_subject_runtime(request)
-
-
-def _current_snapshot(store: AgentStateStore) -> AgentStateSnapshot:
-    if store.last_snapshot is None:
-        raise RuntimeError("Agent state snapshot is unavailable")
-    return store.last_snapshot

@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { EmotionMeter } from "@/components/emotion-meter";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -25,9 +25,13 @@ import {
   type OperatorAction,
   type ActionTool,
   type RegistryTool,
+  type OperatorRestorePreview,
+  type OperatorRestoreSummary,
+  type OperatorRestoreCommitRequest,
+  ApiError,
 } from "@/lib/api";
 import { evaluationHref } from "@/lib/anchors";
-import { actionMutationInvalidationKeys, queryKeys } from "@/lib/query-keys";
+import { actionMutationInvalidationKeys, operatorRestoreInvalidationKeys, queryKeys } from "@/lib/query-keys";
 
 type OperatorCommand = OperatorAction["available_commands"][number];
 type OperatorMutationVariables = { command: OperatorCommand; action: OperatorAction; reason?: string; phrase?: string };
@@ -88,6 +92,60 @@ export function CockpitClient() {
       }
     },
   });
+  const [restoreTargetSequence, setRestoreTargetSequence] = useState("");
+  const [restorePreview, setRestorePreview] = useState<OperatorRestorePreview | null>(null);
+  const [restoreOutcome, setRestoreOutcome] = useState<string | null>(null);
+  const [restoreUnresolvedOperationId, setRestoreUnresolvedOperationId] = useState<string | null>(null);
+  const restorePreviewPending = useRef(false);
+  const restoreCommitPending = useRef(false);
+  const restoreSummary = useQuery({ queryKey: queryKeys.cockpit.restoreSummary, queryFn: () => api.operatorRestoreSummary() });
+  const restorePreviewMutation = useMutation({
+    mutationFn: (targetSequence: number) => api.previewOperatorRestore(targetSequence),
+    onSuccess: (preview) => {
+      setRestorePreview(preview);
+      setRestoreOutcome(null);
+      queryClient.setQueryData(queryKeys.cockpit.restorePreview(preview.target_sequence), preview);
+    },
+    onError: () => { setRestoreOutcome("Restore preview could not be created."); },
+    onSettled: () => { restorePreviewPending.current = false; },
+  });
+  const restoreCommitMutation = useMutation({
+    mutationFn: (request: OperatorRestoreCommitRequest) => api.commitOperatorRestore(request),
+    onSuccess: (result) => {
+      setRestoreUnresolvedOperationId(result.operation_status === "finalizing" || result.disposition === "commit_indeterminate" ? result.operation_id : null);
+      setRestoreOutcome(result.disposition === "commit_indeterminate" ? "Restore commit outcome is indeterminate; authoritative state was refreshed." : "Restore completed; authoritative state was refreshed.");
+      setRestorePreview(null);
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.detail === "restore_preview_stale") {
+        setRestorePreview(null);
+        setRestoreOutcome("Restore preview is stale. Select a target and preview again.");
+      } else if (error instanceof ApiError && error.detail === "commit_indeterminate") {
+        setRestorePreview(null);
+        setRestoreUnresolvedOperationId(restorePreview?.operation_id ?? "unknown");
+        setRestoreOutcome("Restore commit outcome is indeterminate. It was not retried; inspect the latest operation after refresh.");
+      } else {
+        if (error instanceof ApiError && error.status !== null && error.status >= 500) setRestoreUnresolvedOperationId(restorePreview?.operation_id ?? "unknown");
+        setRestoreOutcome("Restore could not be completed; authoritative state was refreshed.");
+      }
+    },
+    onSettled: async () => {
+      try {
+        await Promise.all([
+          ...operatorRestoreInvalidationKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey, refetchType: "all" })),
+          queryClient.invalidateQueries({ queryKey: ["cockpit", "restore-preview"], refetchType: "all" }),
+        ]);
+      } finally {
+        restoreCommitPending.current = false;
+      }
+    },
+  });
+  useEffect(() => {
+    const state = restoreSummary.data?.latest_operation?.state;
+    if (restoreSummary.data?.latest_operation?.operation_id === restoreUnresolvedOperationId && (state === "completed" || state === "failed")) {
+      setRestoreUnresolvedOperationId(null);
+    }
+  }, [restoreSummary.data?.latest_operation?.operation_id, restoreSummary.data?.latest_operation?.state, restoreUnresolvedOperationId]);
 
   const currentGoals = goals.data?.goals.filter(isCurrentGoal) ?? [];
   const currentCommitments = commitments.data?.commitments.filter(isCurrentCommitment) ?? [];
@@ -115,6 +173,7 @@ export function CockpitClient() {
   const activeAdapter = adapters.data?.adapters.find((adapter) => adapter.status === "active");
   const operatorActions = operator.data?.actions ?? [];
   const approvalInbox = operatorActions.filter((item) => item.status === "awaiting_approval");
+  const restoreOperationUnresolved = restoreSummary.data?.latest_operation?.state === "finalizing" || restoreSummary.data?.latest_operation?.state === "commit_indeterminate";
 
   return (
     <div className="page cockpit-page">
@@ -171,9 +230,34 @@ export function CockpitClient() {
           <div className="stack">{actions.data?.traces.map((trace) => <ActionTraceRecord key={trace.intent_id} trace={trace} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} />)}</div>
          </Section>
 
-         <Section title="Action Operator" query={operator} empty={operator.data ? operatorActions.length === 0 : false} emptyText="No operator actions.">
+          <Section title="Action Operator" query={operator} empty={operator.data ? operatorActions.length === 0 : false} emptyText="No operator actions.">
            {operator.data ? <ActionOperator actions={operatorActions} approvalInbox={approvalInbox} actionTools={operator.data.action_tools} registryTools={operator.data.registry_tools} pendingIntentIds={pendingIntentIds} onRun={(action, command, reason, phrase) => { if (pendingIntents.current.has(action.intent_id)) return; pendingIntents.current.add(action.intent_id); setPendingIntentIds(new Set(pendingIntents.current)); operatorMutation.mutate({ command, action, reason, phrase }); }} loadedDecisions={loadedDecisions} loadedPlans={loadedPlans} loadedJournal={loadedJournal} loadedReceipts={loadedReceipts} /> : null}
-         </Section>
+          </Section>
+
+          <Card><CardTitle>State Replay / Restore</CardTitle>
+            {restoreSummary.isPending ? <p className="muted">Loading state replay / restore...</p> : null}
+            {restoreSummary.error ? <p className="error">State replay / restore is unavailable.</p> : null}
+            {restoreSummary.data ? <StateRestoreSection
+              summary={restoreSummary.data}
+              preview={restorePreview}
+              targetSequence={restoreTargetSequence}
+              outcome={restoreOutcome}
+              previewPending={restorePreviewMutation.isPending || restorePreviewPending.current}
+              commitPending={restoreCommitMutation.isPending || restoreCommitPending.current || restoreUnresolvedOperationId !== null || restoreOperationUnresolved}
+              onTargetChange={(value) => { setRestoreTargetSequence(value); setRestorePreview(null); setRestoreOutcome(null); }}
+              onPreview={() => {
+                const target = Number(restoreTargetSequence);
+                if (!Number.isSafeInteger(target) || restorePreviewPending.current) return;
+                restorePreviewPending.current = true;
+                restorePreviewMutation.mutate(target);
+              }}
+              onCommit={(request) => {
+                if (restoreCommitPending.current) return;
+                restoreCommitPending.current = true;
+                restoreCommitMutation.mutate(request);
+              }}
+            /> : null}
+          </Card>
 
         <Section title="Training / Adapters" query={training} empty={training.data ? training.data.nodes.length === 0 && training.data.jobs.length === 0 && training.data.adapters.length === 0 : false} emptyText="No training nodes, jobs, or adapter lineage records.">
           {training.data ? <TrainingAdaptersSummary nodes={training.data.node_count} online={training.data.online_node_count} running={training.data.running_job_count} failed={training.data.failed_job_count} importing={training.data.importing_job_count} activeAdapters={training.data.active_adapter_count} candidateAdapters={training.data.candidate_adapter_count} /> : null}
@@ -301,6 +385,73 @@ function ActionToolCatalog({ tools }: { tools: ActionTool[] }) {
 
 function RegistryToolCatalog({ tools }: { tools: RegistryTool[] }) {
   return tools.length ? <div className="stack">{tools.map((tool) => <div className="record" key={tool.name}><strong>{tool.name}</strong><p>{tool.description ?? "Description unavailable."} · {tool.tool_type} · {tool.status} · registry only</p></div>)}</div> : <p className="muted">No registry tools.</p>;
+}
+
+function StateRestoreSection({ summary, preview, targetSequence, outcome, previewPending, commitPending, onTargetChange, onPreview, onCommit }: {
+  summary: OperatorRestoreSummary;
+  preview: OperatorRestorePreview | null;
+  targetSequence: string;
+  outcome: string | null;
+  previewPending: boolean;
+  commitPending: boolean;
+  onTargetChange: (value: string) => void;
+  onPreview: () => void;
+  onCommit: (request: OperatorRestoreCommitRequest) => void;
+}) {
+  const eligibleTargets = summary.targets.filter((target) => target.eligible);
+  const selectedTarget = eligibleTargets.find((target) => String(target.target_sequence) === targetSequence) ?? null;
+  const confirmation = preview?.confirmation_phrase ?? "";
+  const [phrase, setPhrase] = useState("");
+  const locked = previewPending || commitPending;
+  const canRestore = Boolean(preview?.restoreable && selectedTarget && phrase === confirmation && !locked);
+
+  return <div className="stack">
+    <div className="metric-grid">
+      <Metric label="Current sequence" value={String(summary.current_sequence)} />
+      <Metric label="Current logical digest" value={shortDigest(summary.current_logical_digest)} />
+      <Metric label="Semantic revision" value={String(summary.semantic_revision)} />
+      <Metric label="Retained range" value={`${summary.retained_min_sequence}–${summary.retained_max_sequence}`} />
+    </div>
+    <p className="muted">External side effects are never replayed.</p>
+    <label>Safe eligible target<select aria-label="Safe eligible restore target" value={selectedTarget ? String(selectedTarget.target_sequence) : ""} disabled={locked} onChange={(event) => onTargetChange(event.target.value)}>
+      <option value="">Select a safe target</option>
+      {eligibleTargets.map((target) => <option key={target.target_sequence} value={target.target_sequence}>Sequence {target.target_sequence} · {target.checkpoint_kind}</option>)}
+    </select></label>
+    {selectedTarget ? <p>Target reason codes: <span className="mono">{selectedTarget.reason_codes.join(", ") || "none"}</span></p> : null}
+    <Button disabled={!selectedTarget || locked} onClick={onPreview}>{previewPending ? "Previewing…" : "Preview"}</Button>
+    {preview ? <RestorePreviewDetails key={preview.preview_digest} preview={preview} phrase={phrase} setPhrase={setPhrase} locked={locked} canRestore={canRestore} onCommit={() => onCommit({
+      target_sequence: preview.target_sequence,
+      expected_target_hash: preview.target_snapshot_hash,
+      expected_semantic_revision: preview.semantic_revision,
+      expected_current_logical_digest: preview.current_logical_digest,
+      expected_preview_digest: preview.preview_digest,
+      expected_external_effect_digest: preview.external_effects.effect_digest,
+      confirmation_phrase: phrase,
+    })} /> : null}
+    {summary.latest_operation ? <p>Latest operation: <span className="mono">{summary.latest_operation.operation_id}</span> · {summary.latest_operation.state} · target {summary.latest_operation.target_sequence}{summary.latest_operation.error_code ? ` · ${summary.latest_operation.error_code}` : ""}</p> : <p className="muted">No restore operation recorded.</p>}
+    {outcome ? <p role="status" className="muted">{outcome}</p> : null}
+    {locked ? <p className="muted">Restore is pending/finalizing or indeterminate and cannot be canceled.</p> : null}
+  </div>;
+}
+
+function RestorePreviewDetails({ preview, phrase, setPhrase, locked, canRestore, onCommit }: { preview: OperatorRestorePreview; phrase: string; setPhrase: (value: string) => void; locked: boolean; canRestore: boolean; onCommit: () => void }) {
+  return <div className="stack">
+    <p>Preview digest: <span className="mono">{shortDigest(preview.preview_digest)}</span> · target sequence {preview.target_sequence}</p>
+    <p>Newer authoritative events: {preview.newer_authoritative_event_count} · preview expires {new Date(preview.expires_at).toLocaleString()}</p>
+    <p>Preview reason codes: <span className="mono">{preview.reason_codes.join(", ") || "none"}</span></p>
+    <div className="stack">{preview.domains.map((domain) => <div className="record" key={domain.domain}><strong>{domain.domain}</strong><p>Public counts: {domain.before_count} before · {domain.after_count} after · {domain.added_count} added · {domain.removed_count} removed · {domain.changed_count} changed · {domain.newer_state_loss_count} newer-state loss</p><p>Safe refs: {domain.refs.length ? domain.refs.map((ref, index) => <span key={`${ref.kind}:${ref.id}`}>{index ? ", " : ""}<RestoreReference kind={ref.kind} id={ref.id} /></span>) : "none"}</p>{domain.reason_code ? <p>Reason: <span className="mono">{domain.reason_code}</span></p> : null}</div>)}</div>
+    <p>External effects: {preview.external_effects.consistency_status} · retained {preview.external_effects.retained_not_replayed_count} · pending {preview.external_effects.pending_count} · orphaned {preview.external_effects.orphaned_count} · retryable {preview.external_effects.retryable_count}</p>
+    {preview.external_effects.artifacts.length ? <div className="stack">{preview.external_effects.artifacts.map((artifact) => <p key={artifact.artifact_type}>{artifact.artifact_type}: {artifact.count} retained{artifact.refs.length ? <> · {artifact.refs.map((id, index) => <span className="mono" key={id}>{index ? ", " : ""}{id}</span>)}</> : null}{artifact.truncated ? " · truncated" : ""}</p>)}</div> : null}
+    <p>External effect digest: <span className="mono">{shortDigest(preview.external_effects.effect_digest)}</span></p>
+    <p>Enter exactly: <code>{preview.confirmation_phrase}</code></p>
+    <label>Exact server confirmation<input aria-label="Exact restore confirmation" value={phrase} disabled={locked} onChange={(event) => setPhrase(event.target.value)} placeholder="Enter the exact server phrase" /></label>
+    <Button disabled={!canRestore} onClick={onCommit}>{locked ? "Restoring…" : "Restore"}</Button>
+  </div>;
+}
+
+function RestoreReference({ kind, id }: { kind: string; id: string }) {
+  const anchoredKinds = new Set(["goal", "commitment", "decision", "plan", "action", "outbox", "journal"]);
+  return anchoredKinds.has(kind) ? <Link className="entity-link mono" href={`#${anchor(kind, id)}`}>{kind}:{id}</Link> : <span className="mono muted">{kind}:{id}</span>;
 }
 
 function formatArgumentSummary(action: OperatorAction): string {

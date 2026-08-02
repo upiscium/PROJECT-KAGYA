@@ -808,6 +808,53 @@ export type WorkingMemorySummary = {
   token_capacity: number;
 };
 
+export type OperatorRestoreTarget = {
+  target_sequence: number;
+  target_snapshot_hash: string;
+  checkpoint_kind: "bootstrap" | "journal_completed" | "journal_recovered" | "checkpoint";
+  timestamp: string;
+  event_type: string | null;
+  eligible: boolean;
+  reason_codes: string[];
+};
+export type OperatorRestoreOperation = {
+  operation_id: string; target_sequence: number; target_snapshot_hash: string; preview_digest: string;
+  requested_at: string; started_at: string | null; completed_at: string | null; event_id: string;
+  processing_sequence: number | null; state: "previewed" | "finalizing" | "completed" | "failed" | "commit_indeterminate";
+  error_code: string | null; external_side_effects_replayed: false;
+};
+export type OperatorRestoreSummary = {
+  schema_version: 1; current_sequence: number; current_snapshot_hash: string; current_logical_digest: string;
+  semantic_revision: number; retained_min_sequence: number; retained_max_sequence: number;
+  targets: OperatorRestoreTarget[]; latest_operation: OperatorRestoreOperation | null;
+  external_side_effects_replayed: false;
+};
+export type OperatorRestorePreviewDomain = {
+  domain: "emotion_state" | "working_memory" | "motivation" | "identity" | "context_state" | "appraisal" | "experience" | "belief" | "attention" | "decision" | "decision_explanation" | "agency_attribution" | "counterfactual" | "feedback" | "metacognition" | "action_execution" | "proactive_outbox" | "subject_scheduler" | "extensions"; before_count: number; after_count: number; added_count: number; removed_count: number;
+  changed_count: number; changed_revision_count: number; newer_state_loss_count: number;
+  refs: Array<{ kind: "goal" | "commitment" | "decision" | "plan" | "action" | "outbox" | "journal" | "experience" | "memory" | "belief"; id: string }>; truncated: boolean; reason_code: string | null;
+};
+export type OperatorRestorePreview = {
+  schema_version: 1; operation_id: string; preview_digest: string; created_at: string; expires_at: string;
+  current_logical_digest: string; semantic_revision: number; display_sequence: number; target_sequence: number;
+  target_snapshot_hash: string; newer_authoritative_event_count: number; domains: OperatorRestorePreviewDomain[];
+  external_effects: { consistency_status: "consistent" | "inconsistent"; artifacts: Array<{ artifact_type: "memory" | "dataset" | "adapter" | "outbox" | "unknown"; count: number; refs: string[]; truncated: boolean }>;
+    retained_not_replayed_count: number; pending_count: number; orphaned_count: number; retryable_count: number;
+    effect_digest: string; external_side_effects_replayed: false };
+  restoreable: boolean; reason_codes: string[]; external_side_effects_replayed: false; confirmation_phrase: string;
+};
+export type OperatorRestoreCommitRequest = {
+  target_sequence: number; expected_target_hash: string; expected_semantic_revision: number;
+  expected_current_logical_digest: string; expected_preview_digest: string;
+  expected_external_effect_digest: string; confirmation_phrase: string;
+};
+export type OperatorRestoreCommitResponse = {
+  command: "restore"; disposition: "completed" | "commit_indeterminate"; operation_id: string; event_id: string;
+  processing_sequence: number; restored_target_sequence: number; restored_target_hash: string; post_restore_sequence: number;
+  post_restore_hash: string; operation_status: "previewed" | "finalizing" | "completed" | "failed" | "commit_indeterminate";
+  error_code: string | null; external_side_effects_replayed: false;
+};
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -1133,6 +1180,81 @@ function parseWorkingMemory(value: unknown): WorkingMemorySummary {
     item_capacity: nonnegativeInteger(value.item_capacity, "working-memory summary"),
     token_capacity: nonnegativeInteger(value.token_capacity, "working-memory summary"),
   };
+}
+
+function boundedRestoreCodes(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > 64) invalid(label);
+  return value.map((item) => boundedCode(item, label));
+}
+function restoreDigest(value: unknown, label: string): string { return digest(value, label); }
+function restoreId(value: unknown, label: string): string { return safeId(value, label); }
+function restoreCount(value: unknown, label: string): number { const result = nonnegativeInteger(value, label); if (result > 1_000_000) invalid(label); return result; }
+function restoreSequence(value: unknown, label: string): number { return restoreCount(value, label); }
+function restoreLimit(value: unknown): number { const result = nonnegativeInteger(value, "restore limit"); if (result > 1000) invalid("restore limit"); return result; }
+function parseRestoreTarget(value: unknown): OperatorRestoreTarget {
+  exactRecord(value, ["target_sequence", "target_snapshot_hash", "checkpoint_kind", "timestamp", "event_type", "eligible", "reason_codes"], "restore target");
+  return { target_sequence: restoreSequence(value.target_sequence, "restore target sequence"), target_snapshot_hash: restoreDigest(value.target_snapshot_hash, "restore target hash"), checkpoint_kind: enumValue(value.checkpoint_kind, ["bootstrap", "journal_completed", "journal_recovered", "checkpoint"] as const, "restore checkpoint"), timestamp: isoTimestamp(value.timestamp, "restore timestamp"), event_type: value.event_type === null ? null : boundedCode(value.event_type, "restore event type"), eligible: booleanValue(value.eligible, "restore eligibility"), reason_codes: boundedRestoreCodes(value.reason_codes, "restore reason codes") };
+}
+function parseRestoreOperation(value: unknown): OperatorRestoreOperation {
+  exactRecord(value, ["operation_id", "target_sequence", "target_snapshot_hash", "preview_digest", "requested_at", "started_at", "completed_at", "event_id", "processing_sequence", "state", "error_code", "external_side_effects_replayed"], "restore operation");
+  if (value.external_side_effects_replayed !== false) invalid("restore operation replay flag");
+  return { operation_id: restoreId(value.operation_id, "restore operation"), target_sequence: restoreSequence(value.target_sequence, "restore operation target"), target_snapshot_hash: restoreDigest(value.target_snapshot_hash, "restore operation target hash"), preview_digest: restoreDigest(value.preview_digest, "restore operation digest"), requested_at: isoTimestamp(value.requested_at, "restore requested timestamp"), started_at: optionalIsoTimestamp(value.started_at, "restore started timestamp"), completed_at: optionalIsoTimestamp(value.completed_at, "restore completed timestamp"), event_id: restoreId(value.event_id, "restore operation event"), processing_sequence: value.processing_sequence === null ? null : positiveInteger(value.processing_sequence, "restore processing sequence"), state: enumValue(value.state, ["previewed", "finalizing", "completed", "failed", "commit_indeterminate"] as const, "restore operation state"), error_code: value.error_code === null ? null : boundedCode(value.error_code, "restore operation error"), external_side_effects_replayed: false };
+}
+function parseOperatorRestoreSummary(value: unknown): OperatorRestoreSummary {
+  exactRecord(value, ["schema_version", "current_sequence", "current_snapshot_hash", "current_logical_digest", "semantic_revision", "retained_min_sequence", "retained_max_sequence", "targets", "latest_operation", "external_side_effects_replayed"], "restore summary");
+  if (value.schema_version !== 1 || value.external_side_effects_replayed !== false) invalid("restore summary");
+  if (!Array.isArray(value.targets) || value.targets.length > 1000) invalid("restore targets");
+  return { schema_version: 1, current_sequence: restoreSequence(value.current_sequence, "restore current sequence"), current_snapshot_hash: restoreDigest(value.current_snapshot_hash, "restore current hash"), current_logical_digest: restoreDigest(value.current_logical_digest, "restore logical digest"), semantic_revision: restoreSequence(value.semantic_revision, "restore semantic revision"), retained_min_sequence: restoreSequence(value.retained_min_sequence, "restore retained minimum"), retained_max_sequence: restoreSequence(value.retained_max_sequence, "restore retained maximum"), targets: value.targets.map(parseRestoreTarget), latest_operation: value.latest_operation === null ? null : parseRestoreOperation(value.latest_operation), external_side_effects_replayed: false };
+}
+function parseOperatorRestorePreview(value: unknown): OperatorRestorePreview {
+  exactRecord(value, ["schema_version", "operation_id", "preview_digest", "created_at", "expires_at", "current_logical_digest", "semantic_revision", "display_sequence", "target_sequence", "target_snapshot_hash", "newer_authoritative_event_count", "domains", "external_effects", "restoreable", "reason_codes", "external_side_effects_replayed", "confirmation_phrase"], "restore preview");
+  if (value.schema_version !== 1 || value.external_side_effects_replayed !== false) invalid("restore preview");
+  if (!Array.isArray(value.domains) || value.domains.length > 256) invalid("restore domains");
+  const domains = value.domains.map((raw) => { exactRecord(raw, ["domain", "before_count", "after_count", "added_count", "removed_count", "changed_count", "changed_revision_count", "newer_state_loss_count", "refs", "truncated", "reason_code"], "restore domain"); if (!Array.isArray(raw.refs) || raw.refs.length > 256) invalid("restore references"); return { domain: enumValue(raw.domain, ["emotion_state", "working_memory", "motivation", "identity", "context_state", "appraisal", "experience", "belief", "attention", "decision", "decision_explanation", "agency_attribution", "counterfactual", "feedback", "metacognition", "action_execution", "proactive_outbox", "subject_scheduler", "extensions"] as const, "restore domain name"), before_count: restoreCount(raw.before_count, "restore before count"), after_count: restoreCount(raw.after_count, "restore after count"), added_count: restoreCount(raw.added_count, "restore added count"), removed_count: restoreCount(raw.removed_count, "restore removed count"), changed_count: restoreCount(raw.changed_count, "restore changed count"), changed_revision_count: restoreCount(raw.changed_revision_count, "restore changed revision count"), newer_state_loss_count: restoreCount(raw.newer_state_loss_count, "restore loss count"), refs: raw.refs.map((ref) => { exactRecord(ref, ["kind", "id"], "restore reference"); return { kind: enumValue(ref.kind, ["goal", "commitment", "decision", "plan", "action", "outbox", "journal", "experience", "memory", "belief"] as const, "restore reference kind"), id: restoreId(ref.id, "restore reference") }; }), truncated: booleanValue(raw.truncated, "restore domain truncation"), reason_code: raw.reason_code === null ? null : boundedCode(raw.reason_code, "restore domain reason") }; });
+  const effects = value.external_effects; exactRecord(effects, ["consistency_status", "artifacts", "retained_not_replayed_count", "pending_count", "orphaned_count", "retryable_count", "effect_digest", "external_side_effects_replayed"], "restore external effects");
+  if (effects.external_side_effects_replayed !== false || !Array.isArray(effects.artifacts) || effects.artifacts.length > 256) invalid("restore external effects");
+  const artifacts = effects.artifacts.map((raw) => { exactRecord(raw, ["artifact_type", "count", "refs", "truncated"], "restore artifact"); if (!Array.isArray(raw.refs) || raw.refs.length > 256) invalid("restore artifact references"); return { artifact_type: enumValue(raw.artifact_type, ["memory", "dataset", "adapter", "outbox", "unknown"] as const, "restore artifact type"), count: restoreCount(raw.count, "restore artifact count"), refs: raw.refs.map((ref) => restoreId(ref, "restore artifact reference")), truncated: booleanValue(raw.truncated, "restore artifact truncation") }; });
+  return { schema_version: 1, operation_id: restoreId(value.operation_id, "restore preview operation"), preview_digest: restoreDigest(value.preview_digest, "restore preview digest"), created_at: isoTimestamp(value.created_at, "restore preview created timestamp"), expires_at: isoTimestamp(value.expires_at, "restore preview expiry"), current_logical_digest: restoreDigest(value.current_logical_digest, "restore preview logical digest"), semantic_revision: restoreSequence(value.semantic_revision, "restore preview semantic revision"), display_sequence: restoreSequence(value.display_sequence, "restore display sequence"), target_sequence: restoreSequence(value.target_sequence, "restore target sequence"), target_snapshot_hash: restoreDigest(value.target_snapshot_hash, "restore target hash"), newer_authoritative_event_count: restoreCount(value.newer_authoritative_event_count, "restore newer event count"), domains, external_effects: { consistency_status: enumValue(effects.consistency_status, ["consistent", "inconsistent"] as const, "restore consistency"), artifacts, retained_not_replayed_count: restoreCount(effects.retained_not_replayed_count, "restore retained effects"), pending_count: restoreCount(effects.pending_count, "restore pending effects"), orphaned_count: restoreCount(effects.orphaned_count, "restore orphaned effects"), retryable_count: restoreCount(effects.retryable_count, "restore retryable effects"), effect_digest: restoreDigest(effects.effect_digest, "restore effect digest"), external_side_effects_replayed: false }, restoreable: booleanValue(value.restoreable, "restoreable"), reason_codes: boundedRestoreCodes(value.reason_codes, "restore reason codes"), external_side_effects_replayed: false, confirmation_phrase: publicPreviewText(value.confirmation_phrase, "restore confirmation phrase", 200) };
+}
+function parseOperatorRestoreCommit(value: unknown): OperatorRestoreCommitResponse {
+  exactRecord(value, ["command", "disposition", "operation_id", "event_id", "processing_sequence", "restored_target_sequence", "restored_target_hash", "post_restore_sequence", "post_restore_hash", "operation_status", "error_code", "external_side_effects_replayed"], "restore commit");
+  if (value.external_side_effects_replayed !== false) invalid("restore commit replay flag");
+  return { command: enumValue(value.command, ["restore"] as const, "restore command"), disposition: enumValue(value.disposition, ["completed", "commit_indeterminate"] as const, "restore disposition"), operation_id: restoreId(value.operation_id, "restore commit operation"), event_id: restoreId(value.event_id, "restore commit event"), processing_sequence: positiveInteger(value.processing_sequence, "restore commit sequence"), restored_target_sequence: restoreSequence(value.restored_target_sequence, "restored target sequence"), restored_target_hash: restoreDigest(value.restored_target_hash, "restored target hash"), post_restore_sequence: restoreSequence(value.post_restore_sequence, "post restore sequence"), post_restore_hash: restoreDigest(value.post_restore_hash, "post restore hash"), operation_status: enumValue(value.operation_status, ["previewed", "finalizing", "completed", "failed", "commit_indeterminate"] as const, "restore operation status"), error_code: value.error_code === null ? null : boundedCode(value.error_code, "restore commit error"), external_side_effects_replayed: false };
+}
+
+function prepareOperatorRestoreCommit(value: OperatorRestoreCommitRequest): OperatorRestoreCommitRequest {
+  exactRecord(value, ["target_sequence", "expected_target_hash", "expected_semantic_revision", "expected_current_logical_digest", "expected_preview_digest", "expected_external_effect_digest", "confirmation_phrase"], "restore commit request");
+  return { target_sequence: restoreSequence(value.target_sequence, "restore target sequence"), expected_target_hash: restoreDigest(value.expected_target_hash, "restore expected target hash"), expected_semantic_revision: restoreSequence(value.expected_semantic_revision, "restore expected semantic revision"), expected_current_logical_digest: restoreDigest(value.expected_current_logical_digest, "restore expected logical digest"), expected_preview_digest: restoreDigest(value.expected_preview_digest, "restore expected preview digest"), expected_external_effect_digest: restoreDigest(value.expected_external_effect_digest, "restore expected external effect digest"), confirmation_phrase: publicPreviewText(value.confirmation_phrase, "restore confirmation phrase", 200) };
+}
+
+async function restoreRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  try { return await privateApiRequest<T>(path, init); }
+  catch (error) {
+    if (error instanceof ApiError && error.status !== null) {
+      const code = restoreErrorCode(error.detail) ?? (error.status === 409 ? "conflict" : error.status === 404 ? "not_found" : error.status === 422 ? "invalid_request" : error.status >= 500 ? "backend_failure" : "request_failed");
+      throw new ApiError(`Restore request failed (${error.status}).`, error.status, null, code);
+    }
+    throw error;
+  }
+}
+
+const RESTORE_ERROR_CODES = new Set([
+  "restore_target_not_retained", "restore_target_unverified", "restore_wal_integrity_invalid",
+  "restore_journal_integrity_invalid", "restore_checkpoint_mismatch", "restore_preview_stale",
+  "restore_preview_expired", "restore_confirmation_required", "restore_external_state_inconsistent",
+  "restore_unsupported_domain", "restore_operation_in_progress", "restore_not_authoritative",
+  "commit_indeterminate", "operator_restore_contract_required", "private_state_projection_unavailable",
+]);
+
+function restoreErrorCode(detail: string | null): string | null {
+  if (!detail) return null;
+  try {
+    const value = JSON.parse(detail) as unknown;
+    if (!isRecord(value) || !isRecord(value.detail) || typeof value.detail.code !== "string") return null;
+    return RESTORE_ERROR_CODES.has(value.detail.code) ? value.detail.code : null;
+  } catch {
+    return RESTORE_ERROR_CODES.has(detail) ? detail : null;
+  }
 }
 
 const ACTION_STATUSES = ["awaiting_approval", "approved", "dry_run", "executing", "retry_pending", "succeeded", "failed", "cancelled", "rejected", "compensated"] as const;
@@ -1638,6 +1760,9 @@ export const api = {
   debugChat: (body: ChatRequest) => privateApiRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => privateApiRequest<Emotion>("/state/emotion"),
   workingMemory: async () => parseWorkingMemory(await privateApiRequest<unknown>("/state/working-memory")),
+  operatorRestoreSummary: async (limit?: number) => parseOperatorRestoreSummary(await restoreRequest<unknown>(`/state/operator-restore/summary${limit === undefined ? "" : `?limit=${encodeURIComponent(String(restoreLimit(limit)))}`}`)),
+  previewOperatorRestore: async (targetSequence: number) => parseOperatorRestorePreview(await restoreRequest<unknown>(`/state/operator-restore/preview/${encodeURIComponent(String(restoreSequence(targetSequence, "restore target sequence")))}`)),
+  commitOperatorRestore: async (body: OperatorRestoreCommitRequest) => parseOperatorRestoreCommit(await restoreRequest<unknown>("/state/operator-restore/commit", { method: "POST", body: JSON.stringify(prepareOperatorRestoreCommit(body)) })),
   contexts: async () => parseContexts(await privateApiRequest<unknown>("/contexts")),
   goals: async () => parseGoals(await privateApiRequest<unknown>("/goals")),
   commitments: async () => parseCommitments(await privateApiRequest<unknown>("/commitments")),

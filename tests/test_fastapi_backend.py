@@ -670,9 +670,7 @@ def test_admin_working_memory_summary_is_count_only_non_mutating_and_runtime_rea
         )
 
         assert client.get("/api/state/working-memory").status_code == 200
-        response = client.get(
-            "/api/state/working-memory", headers=admin_headers()
-        )
+        response = client.get("/api/state/working-memory", headers=admin_headers())
 
         assert response.status_code == 200
         assert response.json() == {
@@ -707,9 +705,11 @@ def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access
 ) -> None:
     with _client(tmp_path) as client:
         assert client.get("/api/outbox/summary").status_code == 200
-        assert client.get(
-            "/api/outbox/summary", headers=admin_headers()
-        ).json() == {"pending_count": 0, "critical_count": 0, "messages": []}
+        assert client.get("/api/outbox/summary", headers=admin_headers()).json() == {
+            "pending_count": 0,
+            "critical_count": 0,
+            "messages": [],
+        }
         outbox = client.app.state.outbox
         for index in range(3):
             outbox.enqueue(
@@ -725,12 +725,18 @@ def test_admin_cockpit_outbox_summary_is_empty_bounded_and_rejects_public_access
 
         assert bounded.status_code == 200
         assert len(bounded.json()["messages"]) == 2
-        assert client.get(
-            "/api/outbox/summary", headers=admin_headers(), params={"limit": 0}
-        ).status_code == 422
-        assert client.get(
-            "/api/outbox/summary", headers=admin_headers(), params={"limit": 201}
-        ).status_code == 422
+        assert (
+            client.get(
+                "/api/outbox/summary", headers=admin_headers(), params={"limit": 0}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/api/outbox/summary", headers=admin_headers(), params={"limit": 201}
+            ).status_code
+            == 422
+        )
 
 
 def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
@@ -785,7 +791,7 @@ def test_admin_cockpit_outbox_summary_is_safe_and_records_runtime_read(
                         "commitment_id": "commitment-1",
                     },
                 }
-            ]
+            ],
         }
         for field in (
             "body",
@@ -829,9 +835,7 @@ def test_admin_cockpit_outbox_summary_counts_all_and_returns_newest_first(
                 title=f"Message {index}",
                 body=f"Body {index}",
                 deduplication_key=f"ordered-summary-{index}",
-                urgency=(
-                    OutboxUrgency.CRITICAL if index < 2 else OutboxUrgency.NORMAL
-                ),
+                urgency=(OutboxUrgency.CRITICAL if index < 2 else OutboxUrgency.NORMAL),
             )
             created_ids.append(message.message_id)
 
@@ -951,8 +955,14 @@ def test_action_operator_summary_caps_registry_tools_independently(
 
         assert response.status_code == 200
         assert len(response.json()["registry_tools"]) == 100
-        assert response.json()["registry_tools"][0]["description"] == "Reads public metadata."
-        assert response.json()["registry_tools"][0]["execution_authority"] == "registry_only"
+        assert (
+            response.json()["registry_tools"][0]["description"]
+            == "Reads public metadata."
+        )
+        assert (
+            response.json()["registry_tools"][0]["execution_authority"]
+            == "registry_only"
+        )
         assert "executable" not in response.json()["registry_tools"][0]
 
 
@@ -1073,10 +1083,15 @@ def test_compensation_endpoint_fails_closed_on_corrupt_semantic_bindings(
         )
 
         assert rejected.status_code == 409
-        assert json.dumps(
-            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
-            sort_keys=True,
-        ) == state_before
+        assert (
+            json.dumps(
+                client.app.state.main_loop.persistent_state.extensions[
+                    ACTION_STATE_KEY
+                ],
+                sort_keys=True,
+            )
+            == state_before
+        )
         after = ActionState.model_validate(
             client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY]
         )
@@ -1084,13 +1099,19 @@ def test_compensation_endpoint_fails_closed_on_corrupt_semantic_bindings(
         assert tuple(item["status"] for item in after.notifications) == tuple(
             item["status"] for item in corrupted.notifications
         )
-        assert client.app.state.main_loop.decision_store.get(
-            f"decision-compensation-{corruption}"
-        ) == decision_before
-        assert tuple(
-            item.model_dump_json()
-            for item in client.app.state.main_loop.outbox.list_messages()
-        ) == outbox_before
+        assert (
+            client.app.state.main_loop.decision_store.get(
+                f"decision-compensation-{corruption}"
+            )
+            == decision_before
+        )
+        assert (
+            tuple(
+                item.model_dump_json()
+                for item in client.app.state.main_loop.outbox.list_messages()
+            )
+            == outbox_before
+        )
         assert len(EventJournal(settings.agent_journal.path).verify()) == journal_before
 
 
@@ -1126,7 +1147,10 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
         "intent-pending", IntentStatus.AWAITING_APPROVAL, now, approval_id="approval-1"
     )
     succeeded = _cockpit_action_intent(
-        "intent-success", IntentStatus.SUCCEEDED, now + timedelta(seconds=1), receipt_id="receipt-success"
+        "intent-success",
+        IntentStatus.SUCCEEDED,
+        now + timedelta(seconds=1),
+        receipt_id="receipt-success",
     )
     failed = _cockpit_action_intent(
         "intent-failed",
@@ -1149,31 +1173,91 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
     )
     state = ActionState(
         intents=(pending, succeeded, failed, compensated, missing),
-        approvals=(ApprovalRecord(
-            approval_id="approval-1",
-            intent_id=pending.intent_id,
-            status="pending",
-            requested_at=now,
-            reason="PRIVATE_SENTINEL",
-        ),),
+        approvals=(
+            ApprovalRecord(
+                approval_id="approval-1",
+                intent_id=pending.intent_id,
+                status="pending",
+                requested_at=now,
+                reason="PRIVATE_SENTINEL",
+            ),
+        ),
         receipts=(
-            _cockpit_receipt(succeeded, "receipt-success", ReceiptStatus.SUCCEEDED, "observation-success", "verification-success", now),
-            _cockpit_receipt(failed, "receipt-timeout", ReceiptStatus.TIMED_OUT, "observation-timeout", "verification-timeout", now, error_code="timeout"),
-            _cockpit_receipt(compensated, "receipt-original", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
-            _cockpit_receipt(compensated, "receipt-compensated", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-original"),
+            _cockpit_receipt(
+                succeeded,
+                "receipt-success",
+                ReceiptStatus.SUCCEEDED,
+                "observation-success",
+                "verification-success",
+                now,
+            ),
+            _cockpit_receipt(
+                failed,
+                "receipt-timeout",
+                ReceiptStatus.TIMED_OUT,
+                "observation-timeout",
+                "verification-timeout",
+                now,
+                error_code="timeout",
+            ),
+            _cockpit_receipt(
+                compensated,
+                "receipt-original",
+                ReceiptStatus.SUCCEEDED,
+                None,
+                None,
+                now - timedelta(seconds=1),
+            ),
+            _cockpit_receipt(
+                compensated,
+                "receipt-compensated",
+                ReceiptStatus.COMPENSATED,
+                None,
+                None,
+                now,
+                compensation_of="receipt-original",
+            ),
         ),
         observations=(
-            _cockpit_observation(succeeded, "receipt-success", "observation-success", True, now),
-            _cockpit_observation(failed, "receipt-timeout", "observation-timeout", False, now, errors=("result_fields_invalid",)),
+            _cockpit_observation(
+                succeeded, "receipt-success", "observation-success", True, now
+            ),
+            _cockpit_observation(
+                failed,
+                "receipt-timeout",
+                "observation-timeout",
+                False,
+                now,
+                errors=("result_fields_invalid",),
+            ),
         ),
         verifications=(
-            OutcomeVerification(verification_id="verification-success", intent_id=succeeded.intent_id, observation_id="observation-success", success=True, reason="observation_schema_valid", verified_at=now),
-            OutcomeVerification(verification_id="verification-timeout", intent_id=failed.intent_id, observation_id="observation-timeout", success=False, reason="execution_timeout", verified_at=now),
+            OutcomeVerification(
+                verification_id="verification-success",
+                intent_id=succeeded.intent_id,
+                observation_id="observation-success",
+                success=True,
+                reason="observation_schema_valid",
+                verified_at=now,
+            ),
+            OutcomeVerification(
+                verification_id="verification-timeout",
+                intent_id=failed.intent_id,
+                observation_id="observation-timeout",
+                success=False,
+                reason="execution_timeout",
+                verified_at=now,
+            ),
         ),
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
-        before = json.dumps(client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
+        before = json.dumps(
+            client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY],
+            sort_keys=True,
+        )
 
         response = client.get("/api/actions/trace", headers=admin_headers())
 
@@ -1183,18 +1267,29 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
         assert payload["retry_pending_count"] == 0
         assert payload["failed_count"] == 1
         assert [item["intent_id"] for item in payload["traces"]] == [
-            "intent-missing", "intent-compensated", "intent-failed", "intent-success", "intent-pending"
+            "intent-missing",
+            "intent-compensated",
+            "intent-failed",
+            "intent-success",
+            "intent-pending",
         ]
         by_id = {item["intent_id"]: item for item in payload["traces"]}
         assert by_id["intent-pending"]["approval"] == {
-            "approval_id": "approval-1", "status": "pending", "requested_at": now.isoformat().replace("+00:00", "Z"), "resolved_at": None, "resolved_by_operator": False
+            "approval_id": "approval-1",
+            "status": "pending",
+            "requested_at": now.isoformat().replace("+00:00", "Z"),
+            "resolved_at": None,
+            "resolved_by_operator": False,
         }
         assert by_id["intent-success"]["receipt"]["status"] == "succeeded"
         assert by_id["intent-success"]["observation"]["valid"] is True
         assert by_id["intent-success"]["verification"]["success"] is True
         assert by_id["intent-failed"]["receipt"]["status"] == "timed_out"
         assert by_id["intent-compensated"]["receipt"]["status"] == "compensated"
-        assert by_id["intent-compensated"]["receipt"]["compensation_of"] == "receipt-original"
+        assert (
+            by_id["intent-compensated"]["receipt"]["compensation_of"]
+            == "receipt-original"
+        )
         assert by_id["intent-compensated"]["related_receipts"] == [
             {"receipt_id": "receipt-original", "status": "succeeded"}
         ]
@@ -1204,7 +1299,15 @@ def test_admin_cockpit_action_trace_projects_related_records_without_private_dat
         assert "PRIVATE_SENTINEL" not in response.text
         for field in ("arguments", "preview", "idempotency_key", "data"):
             assert f'"{field}"' not in response.text
-        assert json.dumps(client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True) == before
+        assert (
+            json.dumps(
+                client.app.state.main_loop.persistent_state.extensions[
+                    ACTION_STATE_KEY
+                ],
+                sort_keys=True,
+            )
+            == before
+        )
 
 
 def test_admin_cockpit_action_trace_counts_before_limit_and_orders_ties(
@@ -1225,9 +1328,13 @@ def test_admin_cockpit_action_trace_counts_before_limit_and_orders_ties(
         for index in range(55)
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = ActionState(intents=intents).model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            ActionState(intents=intents).model_dump(mode="json")
+        )
 
-        response = client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 5})
+        response = client.get(
+            "/api/actions/trace", headers=admin_headers(), params={"limit": 5}
+        )
 
         assert response.status_code == 200
         payload = response.json()
@@ -1235,10 +1342,24 @@ def test_admin_cockpit_action_trace_counts_before_limit_and_orders_ties(
         assert payload["retry_pending_count"] == 1
         assert payload["failed_count"] == 3
         assert [item["intent_id"] for item in payload["traces"]] == [
-            "intent-054", "intent-053", "intent-052", "intent-051", "intent-050"
+            "intent-054",
+            "intent-053",
+            "intent-052",
+            "intent-051",
+            "intent-050",
         ]
-        assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 0}).status_code == 422
-        assert client.get("/api/actions/trace", headers=admin_headers(), params={"limit": 201}).status_code == 422
+        assert (
+            client.get(
+                "/api/actions/trace", headers=admin_headers(), params={"limit": 0}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/api/actions/trace", headers=admin_headers(), params={"limit": 201}
+            ).status_code
+            == 422
+        )
 
 
 def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplicates(
@@ -1289,7 +1410,10 @@ def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplica
         rejected_at=now + timedelta(seconds=1),
     )
     terminal = _cockpit_action_intent(
-        "intent-terminal", IntentStatus.FAILED, now - timedelta(seconds=1), failure_code="timeout"
+        "intent-terminal",
+        IntentStatus.FAILED,
+        now - timedelta(seconds=1),
+        failure_code="timeout",
     )
     state = ActionState(
         intents=(terminal,),
@@ -1297,7 +1421,9 @@ def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplica
         policy_rejections=(rejection,),
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
 
         response = client.get(
             "/api/actions/trace", headers=admin_headers(), params={"limit": 1}
@@ -1325,12 +1451,17 @@ def test_admin_cockpit_action_trace_projects_pre_intent_failures_without_duplica
             "/api/actions/trace", headers=admin_headers(), params={"limit": 2}
         ).json()["pre_intent_failures"]
         assert [item["failure_id"] for item in all_failures] == [
-            "rejection-policy", "validation-failed"
+            "rejection-policy",
+            "validation-failed",
         ]
         assert all_failures[1]["decision_id"] == "decision-validation"
         assert all_failures[1]["error_codes"] == ["arguments_schema_invalid"]
         assert "PRIVATE_SENTINEL" not in response.text
-        for field in ("idempotency_key", "request_digest", "canonical_arguments_digest"):
+        for field in (
+            "idempotency_key",
+            "request_digest",
+            "canonical_arguments_digest",
+        ):
             assert f'"{field}"' not in response.text
 
 
@@ -1383,7 +1514,9 @@ def test_admin_cockpit_action_trace_only_projects_allowlisted_tool_names(
         policy_rejections=(rejection,),
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
 
         response = client.get("/api/actions/trace", headers=admin_headers())
 
@@ -1404,40 +1537,146 @@ def test_admin_cockpit_action_trace_fails_closed_on_cross_record_bindings(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 30, tzinfo=UTC)
-    cross_decision = _cockpit_action_intent("intent-cross-decision", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-decision")
-    cross_idempotency = _cockpit_action_intent("intent-cross-idempotency", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-idempotency")
-    cross_plan = _cockpit_action_intent("intent-cross-plan", IntentStatus.SUCCEEDED, now, receipt_id="receipt-cross-plan")
-    duplicate_current = _cockpit_action_intent("intent-duplicate-current", IntentStatus.SUCCEEDED, now, receipt_id="receipt-duplicate-current")
-    ambiguous = _cockpit_action_intent("intent-ambiguous-related", IntentStatus.SUCCEEDED, now, approval_id="approval-duplicate", receipt_id="receipt-ambiguous")
+    cross_decision = _cockpit_action_intent(
+        "intent-cross-decision",
+        IntentStatus.SUCCEEDED,
+        now,
+        receipt_id="receipt-cross-decision",
+    )
+    cross_idempotency = _cockpit_action_intent(
+        "intent-cross-idempotency",
+        IntentStatus.SUCCEEDED,
+        now,
+        receipt_id="receipt-cross-idempotency",
+    )
+    cross_plan = _cockpit_action_intent(
+        "intent-cross-plan",
+        IntentStatus.SUCCEEDED,
+        now,
+        receipt_id="receipt-cross-plan",
+    )
+    duplicate_current = _cockpit_action_intent(
+        "intent-duplicate-current",
+        IntentStatus.SUCCEEDED,
+        now,
+        receipt_id="receipt-duplicate-current",
+    )
+    ambiguous = _cockpit_action_intent(
+        "intent-ambiguous-related",
+        IntentStatus.SUCCEEDED,
+        now,
+        approval_id="approval-duplicate",
+        receipt_id="receipt-ambiguous",
+    )
     receipts = (
-        _cockpit_receipt(cross_decision, "receipt-cross-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "decision-other"}),
-        _cockpit_receipt(cross_idempotency, "receipt-cross-idempotency", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"idempotency_key": "different-key"}),
-        _cockpit_receipt(cross_plan, "receipt-cross-plan", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"plan_revision": 2}),
-        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.SUCCEEDED, None, None, now),
-        _cockpit_receipt(duplicate_current, "receipt-duplicate-current", ReceiptStatus.FAILED, None, None, now),
-        _cockpit_receipt(ambiguous, "receipt-ambiguous", ReceiptStatus.SUCCEEDED, "observation-duplicate", "verification-duplicate", now),
+        _cockpit_receipt(
+            cross_decision,
+            "receipt-cross-decision",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ).model_copy(update={"decision_id": "decision-other"}),
+        _cockpit_receipt(
+            cross_idempotency,
+            "receipt-cross-idempotency",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ).model_copy(update={"idempotency_key": "different-key"}),
+        _cockpit_receipt(
+            cross_plan, "receipt-cross-plan", ReceiptStatus.SUCCEEDED, None, None, now
+        ).model_copy(update={"plan_revision": 2}),
+        _cockpit_receipt(
+            duplicate_current,
+            "receipt-duplicate-current",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ),
+        _cockpit_receipt(
+            duplicate_current,
+            "receipt-duplicate-current",
+            ReceiptStatus.FAILED,
+            None,
+            None,
+            now,
+        ),
+        _cockpit_receipt(
+            ambiguous,
+            "receipt-ambiguous",
+            ReceiptStatus.SUCCEEDED,
+            "observation-duplicate",
+            "verification-duplicate",
+            now,
+        ),
     )
     approvals = (
-        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="pending", requested_at=now),
-        ApprovalRecord(approval_id="approval-duplicate", intent_id=ambiguous.intent_id, status="approved", requested_at=now, resolved_at=now, actor_id="operator"),
+        ApprovalRecord(
+            approval_id="approval-duplicate",
+            intent_id=ambiguous.intent_id,
+            status="pending",
+            requested_at=now,
+        ),
+        ApprovalRecord(
+            approval_id="approval-duplicate",
+            intent_id=ambiguous.intent_id,
+            status="approved",
+            requested_at=now,
+            resolved_at=now,
+            actor_id="operator",
+        ),
     )
     observations = (
-        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", True, now),
-        _cockpit_observation(ambiguous, "receipt-ambiguous", "observation-duplicate", False, now, errors=("result_fields_invalid",)),
+        _cockpit_observation(
+            ambiguous, "receipt-ambiguous", "observation-duplicate", True, now
+        ),
+        _cockpit_observation(
+            ambiguous,
+            "receipt-ambiguous",
+            "observation-duplicate",
+            False,
+            now,
+            errors=("result_fields_invalid",),
+        ),
     )
     verifications = (
-        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=True, reason="observation_schema_valid", verified_at=now),
-        OutcomeVerification(verification_id="verification-duplicate", intent_id=ambiguous.intent_id, observation_id="observation-duplicate", success=False, reason="observation_schema_invalid", verified_at=now),
+        OutcomeVerification(
+            verification_id="verification-duplicate",
+            intent_id=ambiguous.intent_id,
+            observation_id="observation-duplicate",
+            success=True,
+            reason="observation_schema_valid",
+            verified_at=now,
+        ),
+        OutcomeVerification(
+            verification_id="verification-duplicate",
+            intent_id=ambiguous.intent_id,
+            observation_id="observation-duplicate",
+            success=False,
+            reason="observation_schema_invalid",
+            verified_at=now,
+        ),
     )
     state = ActionState(
-        intents=(cross_decision, cross_idempotency, cross_plan, duplicate_current, ambiguous),
+        intents=(
+            cross_decision,
+            cross_idempotency,
+            cross_plan,
+            duplicate_current,
+            ambiguous,
+        ),
         approvals=approvals,
         receipts=receipts,
         observations=observations,
         verifications=verifications,
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
 
         response = client.get("/api/actions/trace", headers=admin_headers())
 
@@ -1477,24 +1716,116 @@ def test_admin_cockpit_action_trace_validates_compensation_bindings(
         )
         for name in scenario_names
     )
-    valid = _cockpit_action_intent("intent-comp-valid", IntentStatus.COMPENSATED, now, receipt_id="receipt-comp-valid")
-    by_name = {name: intent for name, intent in zip(scenario_names, intents, strict=True)}
+    valid = _cockpit_action_intent(
+        "intent-comp-valid",
+        IntentStatus.COMPENSATED,
+        now,
+        receipt_id="receipt-comp-valid",
+    )
+    by_name = {
+        name: intent for name, intent in zip(scenario_names, intents, strict=True)
+    }
     receipts = [
-        _cockpit_receipt(by_name["missing"], "receipt-comp-missing", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-not-found"),
-        _cockpit_receipt(by_name["other-intent"], "receipt-comp-other-intent", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-intent"),
-        _cockpit_receipt(by_name["other-decision"], "receipt-comp-other-decision", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-other-decision"),
-        _cockpit_receipt(by_name["self"], "receipt-comp-self", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-comp-self"),
-        _cockpit_receipt(by_name["duplicate"], "receipt-comp-duplicate", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-duplicate"),
-        _cockpit_receipt(valid, "receipt-comp-valid", ReceiptStatus.COMPENSATED, None, None, now, compensation_of="receipt-target-valid"),
-        _cockpit_receipt(by_name["other-intent"], "receipt-target-other-intent", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"intent_id": "different-intent"}),
-        _cockpit_receipt(by_name["other-decision"], "receipt-target-other-decision", ReceiptStatus.SUCCEEDED, None, None, now).model_copy(update={"decision_id": "different-decision"}),
-        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.SUCCEEDED, None, None, now),
-        _cockpit_receipt(by_name["duplicate"], "receipt-target-duplicate", ReceiptStatus.FAILED, None, None, now),
-        _cockpit_receipt(valid, "receipt-target-valid", ReceiptStatus.SUCCEEDED, None, None, now - timedelta(seconds=1)),
+        _cockpit_receipt(
+            by_name["missing"],
+            "receipt-comp-missing",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-not-found",
+        ),
+        _cockpit_receipt(
+            by_name["other-intent"],
+            "receipt-comp-other-intent",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-target-other-intent",
+        ),
+        _cockpit_receipt(
+            by_name["other-decision"],
+            "receipt-comp-other-decision",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-target-other-decision",
+        ),
+        _cockpit_receipt(
+            by_name["self"],
+            "receipt-comp-self",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-comp-self",
+        ),
+        _cockpit_receipt(
+            by_name["duplicate"],
+            "receipt-comp-duplicate",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-target-duplicate",
+        ),
+        _cockpit_receipt(
+            valid,
+            "receipt-comp-valid",
+            ReceiptStatus.COMPENSATED,
+            None,
+            None,
+            now,
+            compensation_of="receipt-target-valid",
+        ),
+        _cockpit_receipt(
+            by_name["other-intent"],
+            "receipt-target-other-intent",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ).model_copy(update={"intent_id": "different-intent"}),
+        _cockpit_receipt(
+            by_name["other-decision"],
+            "receipt-target-other-decision",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ).model_copy(update={"decision_id": "different-decision"}),
+        _cockpit_receipt(
+            by_name["duplicate"],
+            "receipt-target-duplicate",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now,
+        ),
+        _cockpit_receipt(
+            by_name["duplicate"],
+            "receipt-target-duplicate",
+            ReceiptStatus.FAILED,
+            None,
+            None,
+            now,
+        ),
+        _cockpit_receipt(
+            valid,
+            "receipt-target-valid",
+            ReceiptStatus.SUCCEEDED,
+            None,
+            None,
+            now - timedelta(seconds=1),
+        ),
     ]
     state = ActionState(intents=(*intents, valid), receipts=tuple(receipts))
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
 
         response = client.get("/api/actions/trace", headers=admin_headers())
 
@@ -1502,7 +1833,10 @@ def test_admin_cockpit_action_trace_validates_compensation_bindings(
         by_id = {item["intent_id"]: item for item in response.json()["traces"]}
         for name in scenario_names:
             assert by_id[f"intent-comp-{name}"]["receipt"]["compensation_of"] is None
-        assert by_id["intent-comp-valid"]["receipt"]["compensation_of"] == "receipt-target-valid"
+        assert (
+            by_id["intent-comp-valid"]["receipt"]["compensation_of"]
+            == "receipt-target-valid"
+        )
         assert by_id["intent-comp-valid"]["related_receipts"] == [
             {"receipt_id": "receipt-target-valid", "status": "succeeded"}
         ]
@@ -1512,11 +1846,33 @@ def test_admin_cockpit_action_trace_requires_semantic_policy_binding(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 7, 30, tzinfo=UTC)
-    valid = _cockpit_validation_record("validation-binding-valid", "local_notification_enqueue", now, arguments_valid=True)
-    decision_mismatch = _cockpit_validation_record("validation-binding-decision", "local_notification_enqueue", now, arguments_valid=True)
-    risk_mismatch = _cockpit_validation_record("validation-binding-risk", "local_notification_enqueue", now, arguments_valid=True)
-    invalid = _cockpit_validation_record("validation-binding-invalid", "document_search", now, arguments_valid=False)
-    duplicate_one = _cockpit_validation_record("validation-binding-duplicate", "local_notification_enqueue", now, arguments_valid=True)
+    valid = _cockpit_validation_record(
+        "validation-binding-valid",
+        "local_notification_enqueue",
+        now,
+        arguments_valid=True,
+    )
+    decision_mismatch = _cockpit_validation_record(
+        "validation-binding-decision",
+        "local_notification_enqueue",
+        now,
+        arguments_valid=True,
+    )
+    risk_mismatch = _cockpit_validation_record(
+        "validation-binding-risk",
+        "local_notification_enqueue",
+        now,
+        arguments_valid=True,
+    )
+    invalid = _cockpit_validation_record(
+        "validation-binding-invalid", "document_search", now, arguments_valid=False
+    )
+    duplicate_one = _cockpit_validation_record(
+        "validation-binding-duplicate",
+        "local_notification_enqueue",
+        now,
+        arguments_valid=True,
+    )
     duplicate_two = duplicate_one.model_copy(update={"tool_name": "document_search"})
 
     def rejection(
@@ -1542,23 +1898,43 @@ def test_admin_cockpit_action_trace_requires_semantic_policy_binding(
 
     rejections = (
         rejection("rejection-binding-valid", valid),
-        rejection("rejection-binding-decision", decision_mismatch, decision_id="different-decision"),
-        rejection("rejection-binding-risk", risk_mismatch, risk_class=RiskClass.READ_ONLY),
+        rejection(
+            "rejection-binding-decision",
+            decision_mismatch,
+            decision_id="different-decision",
+        ),
+        rejection(
+            "rejection-binding-risk", risk_mismatch, risk_class=RiskClass.READ_ONLY
+        ),
         rejection("rejection-binding-invalid", invalid),
         rejection("rejection-binding-duplicate", duplicate_one),
     )
     state = ActionState(
-        validation_records=(valid, decision_mismatch, risk_mismatch, invalid, duplicate_one, duplicate_two),
+        validation_records=(
+            valid,
+            decision_mismatch,
+            risk_mismatch,
+            invalid,
+            duplicate_one,
+            duplicate_two,
+        ),
         policy_rejections=rejections,
     )
     with _client(tmp_path) as client:
-        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = state.model_dump(mode="json")
+        client.app.state.main_loop.persistent_state.extensions[ACTION_STATE_KEY] = (
+            state.model_dump(mode="json")
+        )
 
         response = client.get("/api/actions/trace", headers=admin_headers())
 
         assert response.status_code == 200
-        failures = {item["failure_id"]: item for item in response.json()["pre_intent_failures"]}
-        assert failures["rejection-binding-valid"]["tool_name"] == "local_notification_enqueue"
+        failures = {
+            item["failure_id"]: item for item in response.json()["pre_intent_failures"]
+        }
+        assert (
+            failures["rejection-binding-valid"]["tool_name"]
+            == "local_notification_enqueue"
+        )
         for rejection_id in (
             "rejection-binding-decision",
             "rejection-binding-risk",
@@ -1566,6 +1942,7 @@ def test_admin_cockpit_action_trace_requires_semantic_policy_binding(
             "rejection-binding-duplicate",
         ):
             assert failures[rejection_id]["tool_name"] is None
+
 
 def test_concurrent_chat_requests_share_one_ordered_subject_state(
     tmp_path: Path,
@@ -2647,35 +3024,26 @@ def test_semantic_lifecycle_graph_api_is_idempotent_and_admin_only(
 
 
 def test_agent_state_admin_snapshot_restore_and_reset(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    assert client.get("/api/state/export").status_code == 200
-    chat = client.post("/api/chat", json={"text": "stateful", "attachments": []})
-    assert chat.status_code == 200
+    with _client(tmp_path) as client:
+        for response in (
+            client.get("/api/state/export", headers=admin_headers()),
+            client.post("/api/state/restore", headers=admin_headers(), json={}),
+            client.post("/api/state/reset", headers=admin_headers()),
+        ):
+            assert response.status_code == 409
+            assert set(response.json()) == {"detail"}
+            assert set(response.json()["detail"]) == {"code"}
+            assert response.json()["detail"]["code"] in {
+                "private_state_projection_unavailable",
+                "operator_restore_contract_required",
+            }
+            assert "hidden_thought" not in response.text
+            assert "prompt" not in response.text
 
-    exported = client.get("/api/state/export", headers=admin_headers())
-    assert exported.status_code == 200
-    snapshot = exported.json()
-    assert snapshot["last_processed_event_sequence"] >= 2
-    assert "turns" not in snapshot
-    assert "stateful" not in str(snapshot)
-
-    snapshot["emotion_state"] = {
-        "valence": -0.25,
-        "arousal": 0.4,
-        "optimal_loss": 0.8,
-    }
-    restored = client.post("/api/state/restore", headers=admin_headers(), json=snapshot)
-    assert restored.status_code == 200
-    assert restored.json()["emotion_state"]["valence"] == -0.25
-
-    reset = client.post("/api/state/reset", headers=admin_headers())
-    assert reset.status_code == 200
-    assert reset.json()["emotion_state"] == {
-        "valence": 0.0,
-        "arousal": 0.0,
-        "optimal_loss": 1.0,
-    }
-    assert client.app.state.main_loop.session_state.turns == []
+        # The authoritative Python contracts remain available to the runtime; only
+        # their unsafe legacy HTTP projections are tombstoned.
+        assert client.app.state.main_loop.persistent_state is not None
+        assert client.app.state.main_loop.session_state.turns == []
 
 
 def test_point_in_time_restore_is_new_event_without_external_replay(
@@ -2696,28 +3064,247 @@ def test_point_in_time_restore_is_new_event_without_external_replay(
         reconstructed = client.get("/api/state/reconstruct/0", headers=admin_headers())
         dry_run = client.post("/api/state/restore/0/dry-run", headers=admin_headers())
 
-        assert reconstructed.status_code == 200
-        assert reconstructed.json()["snapshot_hash"] == baseline.snapshot_hash
-        assert reconstructed.json()["external_side_effects_replayed"] is False
-        assert dry_run.status_code == 200
-        assert dry_run.json()["current_hash"] == current_hash
+        for response in (reconstructed, dry_run):
+            assert response.status_code == 409
+            assert response.json() == {"detail": {"code": "raw_state_replay_disabled"}}
+            assert "external_side_effects" not in response.text
+            assert "hidden_thought" not in response.text
+        # Internal reconstruction remains covered without exposing raw state.
+        assert baseline.snapshot_hash == hash_snapshot(
+            client.app.state.state_wal.reconstruct(0).snapshot
+        )
         assert (
             hash_snapshot(client.app.state.agent_state_store.last_snapshot)
             == current_hash
         )
 
         restored = client.post("/api/state/restore/0", headers=admin_headers())
-
-        assert restored.status_code == 200
-        assert (
-            restored.json()["emotion_state"]
-            == baseline.snapshot.model_dump(mode="json")["emotion_state"]
-        )
+        assert restored.status_code == 409
+        assert restored.json() == {"detail": {"code": "raw_state_restore_disabled"}}
         assert client.app.state.memory_system.db1.get()["ids"] == memory_ids
 
     records = StateWAL(settings.agent_state_wal.path).verify()
-    assert records[-1].event_type == AgentEventType.STATE_POINT_IN_TIME_RESTORE.value
-    assert records[-1].processing_sequence > baseline.sequence
+    assert all(
+        record.event_type != AgentEventType.STATE_POINT_IN_TIME_RESTORE.value
+        for record in records
+    )
+
+
+def test_governed_operator_restore_summary_preview_commit_and_retention(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post(
+            "/api/chat", json={"text": "before restore", "attachments": []}
+        )
+        assert first.status_code == 200
+        headers = admin_headers()
+
+        summary = client.get("/api/state/operator-restore/summary", headers=headers)
+        assert summary.status_code == 200
+        assert summary.json()["external_side_effects_replayed"] is False
+        assert all(
+            "hidden_thought" not in json.dumps(item)
+            for item in summary.json()["targets"]
+        )
+
+        preview = client.post("/api/state/operator-restore/preview/0", headers=headers)
+        assert preview.status_code == 200, preview.text
+        preview_payload = preview.json()
+        assert preview_payload["restoreable"] is True
+        assert "before" not in preview_payload
+        assert "after" not in preview_payload
+        assert "hidden_thought" not in preview.text
+        assert "prompt" not in preview.text
+
+        commit_body = {
+            "target_sequence": preview_payload["target_sequence"],
+            "expected_target_hash": preview_payload["target_snapshot_hash"],
+            "expected_semantic_revision": preview_payload["semantic_revision"],
+            "expected_current_logical_digest": preview_payload[
+                "current_logical_digest"
+            ],
+            "expected_preview_digest": preview_payload["preview_digest"],
+            "expected_external_effect_digest": preview_payload["external_effects"][
+                "effect_digest"
+            ],
+            "confirmation_phrase": preview_payload["confirmation_phrase"],
+        }
+        committed = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=commit_body
+        )
+        assert committed.status_code == 200, committed.text
+        result = committed.json()
+        assert result["disposition"] == "completed"
+        assert result["operation_status"] == "completed"
+        assert result["external_side_effects_replayed"] is False
+        assert set(result) <= {
+            "command",
+            "disposition",
+            "operation_id",
+            "event_id",
+            "processing_sequence",
+            "restored_target_sequence",
+            "restored_target_hash",
+            "post_restore_sequence",
+            "post_restore_hash",
+            "operation_status",
+            "error_code",
+            "external_side_effects_replayed",
+        }
+        assert "hidden_thought" not in committed.text
+        assert "prompt" not in committed.text
+        assert "before restore" not in committed.text
+
+        duplicate = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=commit_body
+        )
+        assert duplicate.status_code == 409
+        assert duplicate.json() == {"detail": {"code": "restore_operation_in_progress"}}
+        assert "hidden_thought" not in duplicate.text
+
+        after = client.post(
+            "/api/chat", json={"text": "after restore", "attachments": []}
+        )
+        assert after.status_code == 200
+        assert after.json()["episode_id"] != first.json()["episode_id"]
+        post_summary = client.get(
+            "/api/state/operator-restore/summary", headers=headers
+        )
+        assert post_summary.status_code == 200
+        post_payload = post_summary.json()
+        assert (
+            post_payload["latest_operation"]["operation_id"] == result["operation_id"]
+        )
+        assert post_payload["current_sequence"] == result["post_restore_sequence"] + 1
+        assert (
+            post_payload["retained_min_sequence"]
+            <= 0
+            <= post_payload["retained_max_sequence"]
+        )
+        assert "before restore" not in post_summary.text
+        assert "after restore" not in post_summary.text
+
+    records = EventJournal(settings.agent_journal.path).verify()
+    assert any(
+        record.event_type == AgentEventType.STATE_POINT_IN_TIME_RESTORE.value
+        for record in records
+    )
+    with _client(tmp_path, settings=settings) as restarted:
+        persisted = restarted.get(
+            "/api/state/operator-restore/summary", headers=admin_headers()
+        )
+        assert persisted.status_code == 200
+        assert (
+            persisted.json()["latest_operation"]["operation_id"]
+            == result["operation_id"]
+        )
+        assert persisted.json()["latest_operation"]["state"] == "completed"
+
+
+def test_governed_operator_restore_rejects_exact_bindings_safely_and_standby(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        headers = admin_headers()
+        missing = client.post(
+            "/api/state/operator-restore/preview/999999", headers=headers
+        )
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": {"code": "restore_target_not_retained"}}
+        assert "999999" not in missing.text
+
+        preview = client.post("/api/state/operator-restore/preview/0", headers=headers)
+        assert preview.status_code == 200
+        payload = preview.json()
+        base = {
+            "target_sequence": payload["target_sequence"],
+            "expected_target_hash": payload["target_snapshot_hash"],
+            "expected_semantic_revision": payload["semantic_revision"],
+            "expected_current_logical_digest": payload["current_logical_digest"],
+            "expected_preview_digest": payload["preview_digest"],
+            "expected_external_effect_digest": payload["external_effects"][
+                "effect_digest"
+            ],
+            "confirmation_phrase": payload["confirmation_phrase"],
+        }
+        wrong_hash = {**base, "expected_target_hash": "a" * 64}
+        rejected = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=wrong_hash
+        )
+        assert rejected.status_code == 409
+        assert rejected.json() == {"detail": {"code": "restore_preview_stale"}}
+        assert "a" * 64 not in rejected.text
+
+        client.app.state.operator_restore_service.authority = lambda _actor: False
+        standby = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=base
+        )
+        assert standby.status_code == 409
+        assert standby.json() == {"detail": {"code": "restore_not_authoritative"}}
+        assert "before" not in standby.text
+        assert "after" not in standby.text
+
+
+def test_governed_operator_restore_reports_indeterminate_without_retry(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        headers = admin_headers()
+        # Persist a normal baseline before injecting a pre-WAL completion failure.
+        assert (
+            client.get("/api/state/working-memory", headers=headers).status_code == 200
+        )
+        preview = client.post(
+            "/api/state/operator-restore/preview/0", headers=headers
+        ).json()
+        body = {
+            "target_sequence": preview["target_sequence"],
+            "expected_target_hash": preview["target_snapshot_hash"],
+            "expected_semantic_revision": preview["semantic_revision"],
+            "expected_current_logical_digest": preview["current_logical_digest"],
+            "expected_preview_digest": preview["preview_digest"],
+            "expected_external_effect_digest": preview["external_effects"][
+                "effect_digest"
+            ],
+            "confirmation_phrase": preview["confirmation_phrase"],
+        }
+
+        def fail_before_wal_append(phase: str) -> None:
+            if phase == "before_wal_append":
+                raise OSError("PRIVATE_SENTINEL /private/state-wal")
+
+        client.app.state.state_wal._failure_injector = fail_before_wal_append
+        result = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=body
+        )
+        assert result.status_code == 503
+        assert result.json() == {"detail": {"code": "commit_indeterminate"}}
+        assert "PRIVATE_SENTINEL" not in result.text
+        assert "/private" not in result.text
+
+        summary = client.get("/api/state/operator-restore/summary", headers=headers)
+        assert summary.status_code == 200
+        assert summary.json()["latest_operation"]["state"] == "commit_indeterminate"
+        duplicate = client.post(
+            "/api/state/operator-restore/commit", headers=headers, json=body
+        )
+        assert duplicate.status_code == 409
+        assert duplicate.json() == {"detail": {"code": "restore_operation_in_progress"}}
+        operation_id = summary.json()["latest_operation"]["operation_id"]
+
+    with _client(tmp_path, settings=settings) as restarted:
+        recovered = restarted.get(
+            "/api/state/operator-restore/summary", headers=admin_headers()
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["latest_operation"]["operation_id"] == operation_id
+        assert recovered.json()["latest_operation"]["state"] == "failed"
+        assert recovered.json()["latest_operation"]["error_code"] == (
+            "restore_commit_failed"
+        )
 
 
 def test_chat_external_saga_retries_finalize_and_exposes_safe_audit(
@@ -2745,12 +3332,14 @@ def test_chat_external_saga_retries_finalize_and_exposes_safe_audit(
     episode = client.app.state.memory_system.get_episodic(chat.json()["episode_id"])
     assert episode is not None
     assert episode.external_transaction_status == ExternalTransactionStatus.COMMITTED
-    assert audit.status_code == 200
-    assert audit.json()[0]["schema_version"] == 1
-    assert audit.json()[0]["revision"] == 2
-    assert [entry["status"] for entry in audit.json()[0]["audit"]] == [
-        "pending",
-        "committed",
+    assert audit.status_code == 409
+    assert audit.json() == {"detail": {"code": "raw_state_replay_disabled"}}
+    internal_audit = client.app.state.memory_system.list_external_transactions()
+    assert internal_audit[0].schema_version == 1
+    assert internal_audit[0].revision == 2
+    assert [entry.status for entry in internal_audit[0].audit] == [
+        ExternalTransactionStatus.PENDING,
+        ExternalTransactionStatus.COMMITTED,
     ]
     assert "saga audit private text" not in audit.text
     assert "hidden_thought" not in audit.text
@@ -2829,14 +3418,27 @@ def test_restart_reconciliation_finalizes_pending_chat_once(tmp_path: Path) -> N
         diff = restarted.get(
             "/api/state/restore/0/external-diff", headers=admin_headers()
         )
-        assert diff.status_code == 200
-        assert diff.json()["effects"][0]["artifact_id"] == chat.json()["episode_id"]
-        assert diff.json()["external_side_effects_replayed"] is False
+        assert diff.status_code == 409
+        assert diff.json() == {"detail": {"code": "raw_state_replay_disabled"}}
+        assert chat.json()["episode_id"] in {
+            item.artifact_id
+            for item in restarted.app.state.memory_system.list_external_transactions()
+        }
         replay = restarted.post(
             "/api/state/external-transactions/reconcile", headers=admin_headers()
         )
-        assert replay.status_code == 200
-        assert replay.json() == {"finalized": 0, "compensated": 0, "retryable": 0}
+        assert replay.status_code == 409
+        assert replay.json() == {"detail": {"code": "raw_state_replay_disabled"}}
+        internal_replay = (
+            restarted.app.state.external_transaction_coordinator.reconcile(
+                restarted.app.state.event_journal.verify()
+            )
+        )
+        assert internal_replay.model_dump() == {
+            "finalized": 0,
+            "compensated": 0,
+            "retryable": 0,
+        }
         unchanged = restarted.app.state.memory_system.get_episodic(
             chat.json()["episode_id"]
         )
@@ -3536,10 +4138,13 @@ def test_decision_record_lifecycle_and_dataset_boundary(tmp_path: Path) -> None:
         },
     )
     assert duplicate_create.json() == explanation
-    assert json.dumps(
-        client.app.state.main_loop.persistent_state.extensions,
-        sort_keys=True,
-    ) == state_before_retry
+    assert (
+        json.dumps(
+            client.app.state.main_loop.persistent_state.extensions,
+            sort_keys=True,
+        )
+        == state_before_retry
+    )
     assert client.get("/api/decisions/explanations").status_code == 200
     filtered = client.post(
         "/api/decisions/decision-api-1/explanations",
@@ -5077,16 +5682,16 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         "parameters": {
             "action": {
                 "tool_name": "local_notification_enqueue",
-                    "arguments": {
-                        "channel": "local",
+                "arguments": {
+                    "channel": "local",
+                    "title": "Review",
+                    "body": "Please review the result",
+                    "public_preview": {
+                        "kind": "local_notification_enqueue",
                         "title": "Review",
                         "body": "Please review the result",
-                        "public_preview": {
-                            "kind": "local_notification_enqueue",
-                            "title": "Review",
-                            "body": "Please review the result",
-                        },
                     },
+                },
             }
         },
         "prerequisites": [],
@@ -5288,20 +5893,25 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             compensated_explanation["risk"]["receipt_ref"]
             == compensated.json()["action"]["receipt"]["receipt_id"]
         )
-        explanation_history = client.app.state.main_loop.decision_explanation_store.history(
-            "api-action-explanation"
+        explanation_history = (
+            client.app.state.main_loop.decision_explanation_store.history(
+                "api-action-explanation"
+            )
         )
         assert explanation_history[-2].outcome.status == "succeeded"
         assert explanation_history[-1].outcome.status == "compensated"
 
-        assert client.post(
-            "/api/decisions",
-            headers=admin_headers(),
-            json={
-                "decision_id": "api-blocked-decision",
-                "candidates": [candidate, fallback],
-            },
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/decisions",
+                headers=admin_headers(),
+                json={
+                    "decision_id": "api-blocked-decision",
+                    "candidates": [candidate, fallback],
+                },
+            ).status_code
+            == 200
+        )
         blocked_intent = client.post(
             "/api/actions/intents",
             headers=admin_headers(),
@@ -5321,14 +5931,17 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert blocked_explanation["disposition"] == "blocked_policy"
         assert blocked_explanation["risk"]["policy_status"] == "blocked"
 
-        assert client.post(
-            "/api/decisions",
-            headers=admin_headers(),
-            json={
-                "decision_id": "api-failed-decision",
-                "candidates": [candidate, fallback],
-            },
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/decisions",
+                headers=admin_headers(),
+                json={
+                    "decision_id": "api-failed-decision",
+                    "candidates": [candidate, fallback],
+                },
+            ).status_code
+            == 200
+        )
         failed_intent = client.post(
             "/api/actions/intents",
             headers=admin_headers(),
@@ -5350,7 +5963,9 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
             json={
                 "expected_intent_revision": failed_operator_action["revision"],
                 "expected_preview_digest": failed_operator_action["preview"]["digest"],
-                "expected_approval_id": failed_operator_action["approval"]["approval_id"],
+                "expected_approval_id": failed_operator_action["approval"][
+                    "approval_id"
+                ],
                 "approved": False,
                 "reason": "operator_rejected",
             },
@@ -5374,14 +5989,17 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
                 }
             },
         }
-        assert client.post(
-            "/api/decisions",
-            headers=admin_headers(),
-            json={
-                "decision_id": "api-invalid-decision",
-                "candidates": [invalid_candidate, fallback],
-            },
-        ).status_code == 200
+        assert (
+            client.post(
+                "/api/decisions",
+                headers=admin_headers(),
+                json={
+                    "decision_id": "api-invalid-decision",
+                    "candidates": [invalid_candidate, fallback],
+                },
+            ).status_code
+            == 200
+        )
         invalid_result = client.post(
             "/api/actions/intents",
             headers=admin_headers(),
@@ -5405,10 +6023,15 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         )
         assert duplicate_invalid.status_code == 422
         assert duplicate_invalid.json() == invalid_result.json()
-        assert json.dumps(
-            client.app.state.main_loop.persistent_state.extensions["action_execution"],
-            sort_keys=True,
-        ) == action_state_after_invalid
+        assert (
+            json.dumps(
+                client.app.state.main_loop.persistent_state.extensions[
+                    "action_execution"
+                ],
+                sort_keys=True,
+            )
+            == action_state_after_invalid
+        )
         conflicting_invalid = client.post(
             "/api/actions/intents",
             headers=admin_headers(),
@@ -5419,10 +6042,15 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         )
         assert conflicting_invalid.status_code == 409
         assert "different action request" in conflicting_invalid.json()["detail"]
-        assert json.dumps(
-            client.app.state.main_loop.persistent_state.extensions["action_execution"],
-            sort_keys=True,
-        ) == action_state_after_invalid
+        assert (
+            json.dumps(
+                client.app.state.main_loop.persistent_state.extensions[
+                    "action_execution"
+                ],
+                sort_keys=True,
+            )
+            == action_state_after_invalid
+        )
         invalid_explanation = client.post(
             "/api/decisions/api-invalid-decision/explanations",
             headers=admin_headers(),
@@ -5448,7 +6076,9 @@ def test_action_api_approval_execution_receipts_and_wal_replay(
         assert any(
             item.status == IntentStatus.COMPENSATED for item in action_state.intents
         )
-        assert any(item.status == IntentStatus.REJECTED for item in action_state.intents)
+        assert any(
+            item.status == IntentStatus.REJECTED for item in action_state.intents
+        )
         outbox_messages = restarted.get(
             "/api/outbox/messages", headers=admin_headers()
         ).json()["messages"]
@@ -5652,11 +6282,14 @@ def _prepare_compensable_api_action(
         ],
         "estimated_risk": 0.0,
     }
-    assert client.post(
-        "/api/decisions",
-        headers=admin_headers(),
-        json={"decision_id": decision_id, "candidates": [candidate, fallback]},
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/decisions",
+            headers=admin_headers(),
+            json={"decision_id": decision_id, "candidates": [candidate, fallback]},
+        ).status_code
+        == 200
+    )
     created = client.post(
         "/api/actions/intents",
         headers=admin_headers(),
@@ -5702,11 +6335,11 @@ def _prepare_compensable_api_action(
     }
 
 
-def _corrupt_compensation_state(
-    state: ActionState, corruption: str
-) -> ActionState:
+def _corrupt_compensation_state(state: ActionState, corruption: str) -> ActionState:
     intent = state.intents[0]
-    target = next(item for item in state.receipts if item.receipt_id == intent.receipt_id)
+    target = next(
+        item for item in state.receipts if item.receipt_id == intent.receipt_id
+    )
     if corruption == "decision":
         return state.model_copy(
             update={"receipts": (target.model_copy(update={"decision_id": "other"}),)}

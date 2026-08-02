@@ -124,11 +124,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 _schedule_subject_authority_loss(app)
         if request.url.path.startswith("/api/") and app.state.subject_role != "active":
             code = 409 if request.method not in {"GET", "HEAD", "OPTIONS"} else 503
+            error_code = (
+                "restore_not_authoritative"
+                if request.url.path.startswith("/api/state/operator-restore/")
+                else NOT_AUTHORITATIVE
+            )
             return JSONResponse(
                 status_code=code,
                 content={
                     "detail": {
-                        "code": NOT_AUTHORITATIVE,
+                        "code": error_code,
                         "role": app.state.subject_role,
                     }
                 },
@@ -154,12 +159,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(AgentRuntimeJournalError)
     async def indeterminate_commit(
-        _request: Request, _exc: AgentRuntimeJournalError
+        request: Request, _exc: AgentRuntimeJournalError
     ) -> JSONResponse:
         code = (
             NOT_AUTHORITATIVE
             if app_settings.failover.enabled and app.state.subject_role != "active"
-            else "commit_indeterminate"
+            else (
+                "commit_indeterminate"
+                if request.url.path == "/api/state/operator-restore/commit"
+                else "runtime_commit_indeterminate"
+            )
         )
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -366,6 +375,8 @@ def _teardown_subject_runtime(app: FastAPI, *, close_authority: bool) -> None:
         "main_loop",
         "memory_system",
         "external_transaction_coordinator",
+        "operator_restore_service",
+        "operator_restore_lock",
         "external_reconciliation",
         "adapter_registry",
         "adapter_runtime_manager",
@@ -585,6 +596,10 @@ def _build_subject_runtime(
     if not allow_restore_marker:
         assert_no_incomplete_restore(settings)
     require_encrypted_generation(settings)
+    if getattr(app.state, "operator_restore_lock", None) is None:
+        app.state.operator_restore_lock = (
+            getattr(app.state, "failover_commit_lock", None) or RLock()
+        )
     live_codecs = getattr(app.state, "live_codecs", None)
     if live_codecs is None:
         live_codecs = build_live_codecs(settings)
@@ -790,8 +805,11 @@ def _build_subject_runtime(
                     app, settings, event
                 )
             ),
-            event_boundary_lock=getattr(app.state, "failover_commit_lock", None),
-            event_boundary_types={AgentEventType.ADAPTER_UPDATE},
+            event_boundary_lock=app.state.operator_restore_lock,
+            event_boundary_types={
+                AgentEventType.ADAPTER_UPDATE,
+                AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            },
             telemetry=app.state.operational_telemetry,
         )
     if getattr(app.state, "chat_job_registry", None) is None:
@@ -871,7 +889,7 @@ def _event_sequence(sequence: int | None) -> int:
 
 
 def _commit_subject_event(app: FastAPI, event: AgentEvent) -> str:
-    lock = getattr(app.state, "failover_commit_lock", None)
+    lock = getattr(app.state, "operator_restore_lock", None)
     with nullcontext() if lock is None else lock:
         return _commit_subject_event_locked(app, event)
 
@@ -916,7 +934,7 @@ def _commit_subject_event_locked(app: FastAPI, event: AgentEvent) -> str:
 
 
 def _fail_subject_event(app: FastAPI, event: AgentEvent) -> str:
-    lock = getattr(app.state, "failover_commit_lock", None)
+    lock = getattr(app.state, "operator_restore_lock", None)
     with nullcontext() if lock is None else lock:
         return _fail_subject_event_locked(app, event)
 

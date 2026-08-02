@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import { evaluationAnchor, evaluationHref } from "@/lib/anchors";
 import { CockpitClient } from "./cockpit-client";
 
@@ -11,7 +11,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...original,
     api: {
-      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), actionOperatorSummary: vi.fn(), approveAction: vi.fn(), rejectAction: vi.fn(), cancelAction: vi.fn(), retryAction: vi.fn(), compensateAction: vi.fn(), cockpitTraining: vi.fn(), behavioralEvaluations: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(),
+      systemInfo: vi.fn(), emotion: vi.fn(), workingMemory: vi.fn(), contexts: vi.fn(), goals: vi.fn(), commitments: vi.fn(), plans: vi.fn(), decisions: vi.fn(), cockpitOutbox: vi.fn(), actionTrace: vi.fn(), actionOperatorSummary: vi.fn(), approveAction: vi.fn(), rejectAction: vi.fn(), cancelAction: vi.fn(), retryAction: vi.fn(), compensateAction: vi.fn(), cockpitTraining: vi.fn(), behavioralEvaluations: vi.fn(), eventJournal: vi.fn(), adapters: vi.fn(), operatorRestoreSummary: vi.fn(), previewOperatorRestore: vi.fn(), commitOperatorRestore: vi.fn(),
     },
   };
 });
@@ -89,6 +89,188 @@ describe("CockpitClient", () => {
 
     expect(link).toHaveAttribute("href", evaluationHref("eval-1"));
     expect(new URL(link.getAttribute("href") ?? "", window.location.origin).hash).toBe(`#${evaluationAnchor("eval-1")}`);
+  });
+
+  it("previews only on explicit action and commits the exact preview binding", async () => {
+    mockedApi.operatorRestoreSummary.mockResolvedValue({ schema_version: 1, current_sequence: 12, current_snapshot_hash: "c".repeat(64), current_logical_digest: "d".repeat(64), semantic_revision: 4, retained_min_sequence: 1, retained_max_sequence: 12, targets: [{ target_sequence: 7, target_snapshot_hash: "t".repeat(64), checkpoint_kind: "journal_completed", timestamp: "2026-01-01T00:00:00Z", event_type: "goal_update", eligible: true, reason_codes: ["safe_checkpoint"] }], latest_operation: null, external_side_effects_replayed: false });
+    const preview = { schema_version: 1, operation_id: "restore-op", preview_digest: "p".repeat(64), created_at: "2026-01-01T00:00:00Z", expires_at: "2026-01-01T01:00:00Z", current_logical_digest: "d".repeat(64), semantic_revision: 4, display_sequence: 12, target_sequence: 7, target_snapshot_hash: "t".repeat(64), newer_authoritative_event_count: 5, domains: [{ domain: "motivation" as const, before_count: 2, after_count: 1, added_count: 0, removed_count: 1, changed_count: 0, changed_revision_count: 0, newer_state_loss_count: 1, refs: [{ kind: "goal" as const, id: "goal-1" }], truncated: false, reason_code: null }], external_effects: { consistency_status: "consistent" as const, artifacts: [], retained_not_replayed_count: 0, pending_count: 0, orphaned_count: 0, retryable_count: 0, effect_digest: "e".repeat(64), external_side_effects_replayed: false }, restoreable: true, reason_codes: ["eligible"], external_side_effects_replayed: false, confirmation_phrase: "RESTORE 7" };
+    mockedApi.previewOperatorRestore.mockResolvedValue(preview);
+    mockedApi.commitOperatorRestore.mockResolvedValue({ command: "restore", disposition: "completed", operation_id: "restore-op", event_id: "event-restore", processing_sequence: 13, restored_target_sequence: 7, restored_target_hash: "t".repeat(64), post_restore_sequence: 14, post_restore_hash: "r".repeat(64), operation_status: "completed", error_code: null, external_side_effects_replayed: false });
+    renderCockpit();
+    const target = await screen.findByRole("combobox", { name: "Safe eligible restore target" });
+    await userEvent.selectOptions(target, "7");
+    expect(mockedApi.previewOperatorRestore).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByText(/Preview digest/);
+    const phrase = screen.getByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(phrase, "RESTORE 7");
+    await userEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(mockedApi.commitOperatorRestore).toHaveBeenCalledWith({ target_sequence: 7, expected_target_hash: "t".repeat(64), expected_semantic_revision: 4, expected_current_logical_digest: "d".repeat(64), expected_preview_digest: "p".repeat(64), expected_external_effect_digest: "e".repeat(64), confirmation_phrase: "RESTORE 7" });
+  });
+
+  it("offers only eligible restore targets and gates Restore on the exact phrase", async () => {
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([
+      restoreTarget(7, true),
+      restoreTarget(8, false),
+      restoreTarget(9, true),
+    ]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(restorePreviewFixture() as never);
+    renderCockpit();
+
+    const target = await screen.findByRole("combobox", { name: "Safe eligible restore target" });
+    expect(within(target).getByRole("option", { name: /Sequence 7/ })).toBeInTheDocument();
+    expect(within(target).getByRole("option", { name: /Sequence 9/ })).toBeInTheDocument();
+    expect(within(target).queryByRole("option", { name: /Sequence 8/ })).not.toBeInTheDocument();
+    await userEvent.selectOptions(target, "7");
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    const restore = await screen.findByRole("button", { name: "Restore" });
+    expect(restore).toBeDisabled();
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "WRONG");
+    expect(restore).toBeDisabled();
+    await userEvent.clear(screen.getByRole("textbox", { name: "Exact restore confirmation" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "RESTORE 7");
+    expect(restore).toBeEnabled();
+  });
+
+  it("submits duplicate preview and commit clicks only once", async () => {
+    const previewRequest = deferred<ReturnType<typeof restorePreviewFixture>>();
+    const commitRequest = deferred<unknown>();
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockReturnValue(previewRequest.promise as never);
+    mockedApi.commitOperatorRestore.mockReturnValue(commitRequest.promise as never);
+    renderCockpit();
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Safe eligible restore target" }), "7");
+    const previewButton = screen.getByRole("button", { name: "Preview" });
+    await vi.waitFor(() => expect(previewButton).toBeEnabled());
+    await act(async () => {
+      fireEvent.click(previewButton);
+      fireEvent.click(previewButton);
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(mockedApi.previewOperatorRestore).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      previewRequest.resolve(restorePreviewFixture());
+      await previewRequest.promise;
+    });
+    const phrase = await screen.findByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(phrase, "RESTORE 7");
+    const restore = screen.getByRole("button", { name: "Restore" });
+    await act(async () => {
+      fireEvent.click(restore);
+      fireEvent.click(restore);
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(mockedApi.commitOperatorRestore).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      commitRequest.resolve(restoreCommitResponse());
+      await commitRequest.promise;
+    });
+    expect(await screen.findByRole("status")).toHaveTextContent("Restore completed");
+  });
+
+  it("renders bounded preview counts and safe anchors without private fields", async () => {
+    const preview = restorePreviewFixture();
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(preview as never);
+    const { queryClient } = renderCockpit();
+    const target = await screen.findByRole("combobox", { name: "Safe eligible restore target" });
+    await userEvent.selectOptions(target, "7");
+    const previewButton = screen.getByRole("button", { name: "Preview" });
+    await vi.waitFor(() => expect(previewButton).toBeEnabled());
+    await userEvent.click(previewButton);
+    expect(await screen.findByText(/Newer authoritative events: 5/)).toBeInTheDocument();
+    expect(screen.getByText(/Public counts: 2 before · 1 after · 0 added · 1 removed · 0 changed · 1 newer-state loss/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "goal:goal-1" })).toHaveAttribute("href", "#goal-goal-1");
+    expect(screen.getByText(/External effects: consistent · retained 2 · pending 0 · orphaned 0 · retryable 0/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getQueryCache().getAll().filter((query) => JSON.stringify(query.queryKey).includes("restore")))).not.toContain("PRIVATE_SENTINEL");
+    expect(JSON.stringify(queryClient.getMutationCache().getAll())).not.toContain("PRIVATE_SENTINEL");
+  });
+
+  it("clears a stale preview on 409 and refetches authoritative restore keys", async () => {
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(restorePreviewFixture() as never);
+    mockedApi.commitOperatorRestore.mockRejectedValue(new ApiError("stale", 409, null, "restore_preview_stale"));
+    const { queryClient } = renderCockpit();
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Safe eligible restore target" }), "7");
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "RESTORE 7");
+    await userEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Restore preview is stale");
+    expect(screen.queryByRole("textbox", { name: "Exact restore confirmation" })).not.toBeInTheDocument();
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["cockpit", "restore-summary"] }));
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["cockpit", "restore-preview"] }));
+  });
+
+  it("does not retry an indeterminate 503 and displays bounded status", async () => {
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(restorePreviewFixture() as never);
+    mockedApi.commitOperatorRestore.mockRejectedValue(new ApiError("indeterminate", 503, null, "commit_indeterminate"));
+    renderCockpit();
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Safe eligible restore target" }), "7");
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "RESTORE 7");
+    await userEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("was not retried");
+    expect(mockedApi.commitOperatorRestore).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("combobox", { name: "Safe eligible restore target" })).toBeDisabled();
+    expect(screen.getByText(/indeterminate and cannot be canceled/)).toBeInTheDocument();
+    expect(screen.queryByText(/indeterminate.*indeterminate.*indeterminate/i)).not.toBeInTheDocument();
+  });
+
+  it("invalidates cockpit and standalone queries after restore success", async () => {
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(restorePreviewFixture() as never);
+    mockedApi.commitOperatorRestore.mockResolvedValue(restoreCommitResponse() as never);
+    const standaloneExplanations = vi.fn().mockResolvedValue({ explanations: [{ explanation_id: "fresh" }] });
+    const standaloneOutbox = vi.fn().mockResolvedValue({ messages: [{ message_id: "fresh" }] });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    await queryClient.prefetchQuery({ queryKey: ["decision-explanations"], queryFn: standaloneExplanations });
+    await queryClient.prefetchQuery({ queryKey: ["outbox"], queryFn: standaloneOutbox });
+    const { queryClient: renderedClient } = renderCockpit(queryClient);
+    const invalidate = vi.spyOn(renderedClient, "invalidateQueries");
+    await userEvent.selectOptions(await screen.findByRole("combobox", { name: "Safe eligible restore target" }), "7");
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "RESTORE 7");
+    await userEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Restore completed");
+    for (const key of ["runtime", "emotion", "working-memory", "contexts", "goals", "commitments", "plans", "decisions", "outbox", "actions", "training", "evaluations", "journal", "adapters", "action-operator", "restore-summary"]) {
+      expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["cockpit", key] }));
+    }
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["decision-explanations"] }));
+    expect(invalidate).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["outbox"] }));
+  });
+
+  it("shows pending restore as non-cancelable and locks controls", async () => {
+    const commit = deferred<unknown>();
+    mockedApi.operatorRestoreSummary.mockResolvedValue(restoreSummaryFixture([restoreTarget(7, true)]) as never);
+    mockedApi.previewOperatorRestore.mockResolvedValue(restorePreviewFixture() as never);
+    mockedApi.commitOperatorRestore.mockReturnValue(commit.promise as never);
+    renderCockpit();
+    const target = await screen.findByRole("combobox", { name: "Safe eligible restore target" });
+    await userEvent.selectOptions(target, "7");
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await screen.findByRole("textbox", { name: "Exact restore confirmation" });
+    await userEvent.type(screen.getByRole("textbox", { name: "Exact restore confirmation" }), "RESTORE 7");
+    await userEvent.click(screen.getByRole("button", { name: "Restore" }));
+    expect(await screen.findByText("Restore is pending/finalizing or indeterminate and cannot be canceled.")).toBeInTheDocument();
+    expect(target).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Exact restore confirmation" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Restoring…" })).toBeDisabled();
+    await act(async () => commit.resolve(restoreCommitResponse()));
+  });
+
+  it("keeps existing sections visible when restore summary fails", async () => {
+    mockedApi.operatorRestoreSummary.mockRejectedValue(new Error("restore unavailable"));
+    renderCockpit();
+    expect(await screen.findByText("State replay / restore is unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Ship safely")).toBeInTheDocument();
+    expect(screen.getByText("Action Execution")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("PRIVATE_SENTINEL");
   });
 
   it("shows action loading without hiding loaded sections", async () => {
@@ -407,6 +589,27 @@ function renderCockpit(queryClient = new QueryClient({ defaultOptions: { queries
   return { ...render(<QueryClientProvider client={queryClient}><CockpitClient /></QueryClientProvider>), queryClient };
 }
 
+function restoreTarget(sequence: number, eligible: boolean) {
+  return { target_sequence: sequence, target_snapshot_hash: String(sequence).repeat(64), checkpoint_kind: "journal_completed" as const, timestamp: "2026-01-01T00:00:00Z", event_type: "goal_update", eligible, reason_codes: eligible ? ["safe_checkpoint"] : ["unsafe_checkpoint"] };
+}
+
+function restoreSummaryFixture(targets: ReturnType<typeof restoreTarget>[]) {
+  return { schema_version: 1, current_sequence: 12, current_snapshot_hash: "c".repeat(64), current_logical_digest: "d".repeat(64), semantic_revision: 4, retained_min_sequence: 1, retained_max_sequence: 12, targets, latest_operation: null, external_side_effects_replayed: false };
+}
+
+function restorePreviewFixture() {
+  return {
+    schema_version: 1, operation_id: "restore-op", preview_digest: "p".repeat(64), created_at: "2026-01-01T00:00:00Z", expires_at: "2026-01-01T01:00:00Z", current_logical_digest: "d".repeat(64), semantic_revision: 4, display_sequence: 12, target_sequence: 7, target_snapshot_hash: "7".repeat(64), newer_authoritative_event_count: 5,
+    domains: [{ domain: "motivation" as const, before_count: 2, after_count: 1, added_count: 0, removed_count: 1, changed_count: 0, changed_revision_count: 0, newer_state_loss_count: 1, refs: [{ kind: "goal" as const, id: "goal-1" }], truncated: false, reason_code: null }],
+    external_effects: { consistency_status: "consistent" as const, artifacts: [{ artifact_type: "memory" as const, count: 2, refs: [], truncated: true }], retained_not_replayed_count: 2, pending_count: 0, orphaned_count: 0, retryable_count: 0, effect_digest: "e".repeat(64), external_side_effects_replayed: false },
+    restoreable: true, reason_codes: ["eligible"], external_side_effects_replayed: false, confirmation_phrase: "RESTORE 7",
+  };
+}
+
+function restoreCommitResponse() {
+  return { command: "restore" as const, disposition: "completed" as const, operation_id: "restore-op", event_id: "event-restore", processing_sequence: 13, restored_target_sequence: 7, restored_target_hash: "7".repeat(64), post_restore_sequence: 14, post_restore_hash: "r".repeat(64), operation_status: "completed" as const, error_code: null, external_side_effects_replayed: false as const };
+}
+
 function resolveRepresentativeData() {
   mockedApi.systemInfo.mockResolvedValue({ project: "KAGYA", status: "ok", build: { version: "1.0", commit: "abc123" }, runtime: { environment: "test", provider: "dummy", primary_model_id: "model-1", fallback_configured: false, transformers_4bit: false, qlora_dry_run: true } });
   mockedApi.emotion.mockResolvedValue({ valence: 0.4, arousal: 0.3, optimal_loss: 1 });
@@ -420,6 +623,7 @@ function resolveRepresentativeData() {
   mockedApi.cockpitOutbox.mockResolvedValue({ pending_count: 42, critical_count: 9, messages: rawOutboxFixtures.map(cockpitOutboxProjection) });
   mockedApi.actionTrace.mockResolvedValue({ pending_approval_count: 2, retry_pending_count: 1, failed_count: 5, traces: rawActionFixtures.map(cockpitActionProjection) as never, pre_intent_failures: rawActionFailures.map(cockpitFailureProjection) as never });
   mockedApi.actionOperatorSummary.mockResolvedValue({ pending_approval_count: 0, operator_action_count: 0, risk_ceiling: "reversible_write", actions: [], action_tools: [], registry_tools: [] });
+  mockedApi.operatorRestoreSummary.mockResolvedValue({ schema_version: 1, current_sequence: 12, current_snapshot_hash: "c".repeat(64), current_logical_digest: "d".repeat(64), semantic_revision: 4, retained_min_sequence: 1, retained_max_sequence: 12, targets: [], latest_operation: null, external_side_effects_replayed: false });
   mockedApi.cockpitTraining.mockResolvedValue(cockpitTrainingProjection());
   mockedApi.behavioralEvaluations.mockResolvedValue({ results: [{ evaluation_id: "eval-1" }] } as never);
   mockedApi.eventJournal.mockResolvedValue({ records: [{ record_id: "record-1", timestamp: "2026-01-01T00:00:00Z", lifecycle: "completed", event_id: "event-1", event_type: "goal_update", source: "runtime", processing_sequence: 1, snapshot_sequence: 1, causation_id: null, correlation_id: null, state_hash_before: null, state_hash_after: null, snapshot_hash: null, failure_category: null, actor_id: null, actor_role: null, target: "goal:goal-1", reauthenticated: null, previous_record_hash: null, record_hash: "hash", private_replay: "PRIVATE_SENTINEL" } as never] });
