@@ -12,6 +12,7 @@ from kagya.actions.execution import (
     ActionPreview,
     ActionProvenance,
     ActionState,
+    ValidatedActionState,
     ActionValidationErrorCode,
     ActionValidationRecord,
     ActionToolDescriptor,
@@ -32,6 +33,7 @@ from kagya.actions.execution import (
     RiskClass,
     public_tool_name,
     receipt_matches_intent,
+    validate_action_state_semantics,
 )
 
 __all__ = [
@@ -46,6 +48,7 @@ __all__ = [
     "ActionPreview",
     "ActionProvenance",
     "ActionState",
+    "ValidatedActionState",
     "ActionValidationErrorCode",
     "ActionValidationRecord",
     "ActionToolDescriptor",
@@ -66,4 +69,5 @@ __all__ = [
     "RiskClass",
     "public_tool_name",
     "receipt_matches_intent",
+    "validate_action_state_semantics",
 ]

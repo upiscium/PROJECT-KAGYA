@@ -194,7 +194,7 @@ Distributed training operations are available through admin-token-protected endp
 - `GET /api/adapters/{adapter_id}/provenance` reports model/job/node provenance and activation/rollback history.
 - `GET /api/system/journal` returns admin-only, operator-safe durable event lifecycle records and hash continuity metadata. It never returns event payloads, prompts, generated text, attachments, credentials, or hidden thoughts.
 - `agent_state_wal.path` is a separate mode-`0600` private authoritative state log. Keep it with the state snapshot in encrypted backups; do not publish it as operational telemetry or an operator-safe Journal.
-- Admin-only `GET /api/state/reconstruct/{sequence}` and `POST /api/state/restore/{sequence}/dry-run` reconstruct and compare retained state without replaying side effects. `POST /api/state/restore/{sequence}` commits the selected state as a new runtime event; tools, network, notifications, training, Chroma, and adapter-registry operations are never replayed.
+- Subject Cockpit uses the governed `GET /api/state/operator-restore/summary`, `POST /api/state/operator-restore/preview/{sequence}`, and `POST /api/state/operator-restore/commit` workflow. It exposes only verified checkpoint metadata and bounded public projections, requires an expiring exact confirmation binding, records restore as a new runtime event, and never replays external effects. Legacy raw snapshot, reconstruction, dry-run, external-diff, and unbound restore routes are intentional bounded `409` tombstones; private WAL/snapshot contracts remain internal Python APIs.
 
 ### Operational Observability
 

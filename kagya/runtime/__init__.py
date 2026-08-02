@@ -70,6 +70,22 @@ from kagya.runtime.working_memory import (
     working_memory_item,
 )
 from kagya.runtime.bootstrap import RemoteTrainingDispatcher, TrainingWorkerRuntime
+from kagya.runtime.operator_restore import (
+    OperatorRestoreService,
+    RestoreArtifact,
+    RestoreCommitRequest,
+    RestoreCommitResponse,
+    RestoreContractError,
+    RestoreDomain,
+    RestoreErrorCode,
+    RestoreExternal,
+    RestoreOperation,
+    RestorePreview,
+    RestoreSummary,
+    RestoreTarget,
+    event_id_for_operation,
+    logical_state_digest,
+)
 from kagya.runtime.autonomy import (
     AutonomyLoop,
     CycleResult,
@@ -165,4 +181,18 @@ __all__ = [
     "SubjectScheduler",
     "WakeUpKind",
     "WakeUpSchedule",
+    "OperatorRestoreService",
+    "RestoreArtifact",
+    "RestoreCommitRequest",
+    "RestoreCommitResponse",
+    "RestoreContractError",
+    "RestoreDomain",
+    "RestoreErrorCode",
+    "RestoreExternal",
+    "RestoreOperation",
+    "RestorePreview",
+    "RestoreSummary",
+    "RestoreTarget",
+    "event_id_for_operation",
+    "logical_state_digest",
 ]

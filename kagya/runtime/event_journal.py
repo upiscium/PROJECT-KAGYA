@@ -423,6 +423,13 @@ class EventJournal:
     ) -> JournalRecord:
         _reject_private_payload(getattr(event, "payload", {}))
         event_type = getattr(event.event_type, "value", str(event.event_type))
+        payload = getattr(event, "payload", {})
+        target = (
+            payload.get("journal_target")
+            if isinstance(payload, dict)
+            and isinstance(payload.get("journal_target"), str)
+            else None
+        )
         operation_status = {
             JournalLifecycle.ACCEPTED: OperationState.QUEUED,
             JournalLifecycle.STARTED: OperationState.RUNNING,
@@ -449,6 +456,7 @@ class EventJournal:
             snapshot_sequence=snapshot_sequence,
             failure_category=failure_category,
             operation_status=operation_status,
+            target=_safe_optional_label(target),
         )
 
     def _append(self, **values: Any) -> JournalRecord:
@@ -585,6 +593,7 @@ class EventJournal:
             snapshot_sequence=snapshot_sequence,
             causation_id=record.causation_id,
             correlation_id=record.correlation_id,
+            target=record.target,
             snapshot_hash=snapshot_hash,
             failure_category=category,
         )

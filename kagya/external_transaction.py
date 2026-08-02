@@ -98,6 +98,11 @@ class JournalOutcome(Protocol):
 class ExternalTransactionCoordinator:
     def __init__(self, stores: list[ExternalArtifactStore]) -> None:
         self._stores = list(stores)
+        self._last_reconciliation = ExternalReconciliationReport()
+
+    @property
+    def last_reconciliation(self) -> ExternalReconciliationReport:
+        return self._last_reconciliation.model_copy()
 
     def records(self) -> list[ExternalTransactionRecord]:
         records = [
@@ -198,13 +203,28 @@ class ExternalTransactionCoordinator:
                 )
             else:
                 retryable += 1
-        return ExternalReconciliationReport(
+        report = ExternalReconciliationReport(
             finalized=finalized,
             compensated=compensated,
             retryable=retryable,
         )
+        self._last_reconciliation = report
+        return report
 
     def restore_diff(self, target_sequence: int) -> ExternalRestoreDiff:
+        _records, diff, _reconciliation = self.restore_view(target_sequence)
+        return diff
+
+    def restore_view(
+        self, target_sequence: int
+    ) -> tuple[
+        list[ExternalTransactionRecord],
+        ExternalRestoreDiff,
+        ExternalReconciliationReport,
+    ]:
+        """Capture one immutable record set for a restore consistency decision."""
+
+        records = self.records()
         effects = [
             ExternalRestoreEffect(
                 transaction_id=record.transaction_id,
@@ -214,10 +234,14 @@ class ExternalTransactionCoordinator:
                 processing_sequence=record.processing_sequence,
                 status=record.status,
             )
-            for record in self.records()
+            for record in records
             if record.event_id is not None
             and record.processing_sequence is not None
             and record.processing_sequence > target_sequence
             and record.status == ExternalTransactionStatus.COMMITTED
         ]
-        return ExternalRestoreDiff(target_sequence=target_sequence, effects=effects)
+        return (
+            records,
+            ExternalRestoreDiff(target_sequence=target_sequence, effects=effects),
+            self.last_reconciliation,
+        )
