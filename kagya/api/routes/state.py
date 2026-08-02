@@ -153,6 +153,10 @@ def commit_operator_restore(
         if reserved_preview is not None:
             service.release(reserved_preview.preview_digest)
         raise
+    except Exception:
+        if reserved_preview is not None:
+            service.release(reserved_preview.preview_digest)
+        raise
 
 
 @router.get("/working-memory", response_model=WorkingMemorySummaryResponse)

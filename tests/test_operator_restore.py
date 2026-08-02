@@ -22,6 +22,7 @@ from kagya.runtime.operator_restore import (
     RestoreCommitRequest,
     RestoreContractError,
     RestoreErrorCode,
+    RestoreOperation,
     logical_state_digest,
 )
 from kagya.runtime.state_wal import StateWAL
@@ -235,6 +236,24 @@ def test_preview_expiry_and_duplicate_reservation_are_atomic(tmp_path: Any) -> N
     assert exc.value.code == RestoreErrorCode.PREVIEW_EXPIRED.value
 
 
+def test_reserved_capability_is_pinned_and_release_preserves_consumed_marker(
+    tmp_path: Any,
+) -> None:
+    clock = Clock()
+    service, _store, _wal, _journal = _service(tmp_path, clock=clock)
+    preview = service.preview(1)
+    service.reserve(preview, "operator")
+    clock.now += timedelta(seconds=301)
+    with service._lock:
+        service._evict_capabilities_locked()
+    assert preview.preview_digest in service._capabilities
+
+    service._consumed.add(preview.preview_digest)
+    service.release(preview.preview_digest)
+    assert preview.preview_digest not in service._capabilities
+    assert preview.preview_digest in service._consumed
+
+
 def test_concurrent_reservation_allows_exactly_one_winner(tmp_path: Any) -> None:
     service, _store, _wal, _journal = _service(tmp_path)
     preview = service.preview(1)
@@ -393,7 +412,7 @@ def test_operation_projection_preserves_public_operation_shape(tmp_path: Any) ->
         "requested_at": preview.created_at,
         "started_at": None,
         "completed_at": None,
-        "event_id": "restore-event-3",
+        "event_id": f"operator-restore-{preview.operation_id}",
         "processing_sequence": 3,
         "state": "finalizing",
         "error_code": None,
@@ -786,10 +805,10 @@ def test_restore_projections_omit_private_refs_and_opaque_external_artifacts(
     assert "PRIVATE_SENTINEL" not in external_text
     assert "credential_token" not in external_text
     assert "hidden_thought" not in external_text
+    artifact_handle = external_preview.external_effects.artifacts[0].refs[0]
+    assert len(artifact_handle) == 64
     assert (
-        external_preview.external_effects.artifacts[0]
-        .refs[0]
-        .endswith(__import__("hashlib").sha256(b"PRIVATE_SENTINEL").hexdigest())
+        artifact_handle != __import__("hashlib").sha256(b"PRIVATE_SENTINEL").hexdigest()
     )
 
     governed = Event(
@@ -806,3 +825,401 @@ def test_restore_projections_omit_private_refs_and_opaque_external_artifacts(
     assert record.correlation_id == "b" * 64
     journal_metadata = f"{record.target} {record.correlation_id}"
     assert all(value not in journal_metadata for value in private_ids.values())
+
+
+def test_target_summary_cap_does_not_hide_retained_preview_target(
+    tmp_path: Any,
+) -> None:
+    service, _store, _wal, _journal = _service(tmp_path)
+    # The UI list is intentionally smaller than the retained evidence set.
+    bounded = OperatorRestoreService(
+        service.state_store,
+        service.wal,
+        service.journal,
+        service.external,
+        max_targets=1,
+    )
+    assert [item.target_sequence for item in bounded.summary().targets] == [2]
+    assert bounded.preview(1).target_sequence == 1
+
+
+def test_summary_uses_first_verified_target_after_non_target_transition(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, journal = _service(tmp_path)
+    prior = store.last_snapshot
+    assert prior is not None
+    failed = _snapshot(prior, 3, 0.6)
+    failed_event = Event("failed-3", 3)
+    journal.started(failed_event)
+    wal.append_transition(failed_event, prior, failed)
+    journal.failed(failed_event, "injected_failure", hash_snapshot(failed))
+    verified = _snapshot(failed, 4, 0.6)
+    verified_event = Event("event-4", 4)
+    journal.started(verified_event)
+    wal.append_transition(verified_event, failed, verified)
+    journal.completed(verified_event, hash_snapshot(verified))
+    latest = _snapshot(verified, 5, 0.8)
+    latest_event = Event("event-5", 5)
+    journal.started(latest_event)
+    wal.append_transition(latest_event, verified, latest)
+    journal.completed(latest_event, hash_snapshot(latest))
+    store.last_snapshot = latest
+
+    targets = {item.target_sequence for item in service.summary().targets}
+    assert 3 not in targets
+    assert {4, 5} <= targets
+
+
+def test_latest_operation_uses_authoritative_order_across_sources(
+    tmp_path: Any,
+) -> None:
+    service, store, _wal, _journal = _service(tmp_path)
+
+    def operation(
+        identifier: str, sequence: int | None, requested: str
+    ) -> RestoreOperation:
+        return RestoreOperation(
+            operation_id=identifier,
+            target_sequence=1,
+            target_snapshot_hash="a" * 64,
+            preview_digest="b" * 64,
+            requested_at=requested,
+            started_at=requested,
+            completed_at=requested,
+            event_id=f"operator-restore-{identifier}",
+            processing_sequence=sequence,
+            state="completed",
+            error_code=None,
+        )
+
+    in_memory = operation(
+        "00000000-0000-0000-0000-000000000010", 4, "2026-01-01T00:00:04+00:00"
+    )
+    journal = operation(
+        "00000000-0000-0000-0000-000000000011", 9, "2026-01-01T00:00:01+00:00"
+    )
+    persisted = operation(
+        "00000000-0000-0000-0000-000000000012", 9, "2026-01-01T00:00:01+00:00"
+    )
+    service._operations = [in_memory]
+    service._journal_operations = lambda _records: [journal]
+    current = store.last_snapshot
+    assert current is not None
+    store.last_snapshot = current.model_copy(
+        update={"extensions": {"operator_restore": [persisted.model_dump(mode="json")]}}
+    )
+    latest = service.summary().latest_operation
+    assert latest is not None
+    assert latest.operation_id == persisted.operation_id
+
+
+def test_newer_unsequenced_journal_operation_wins_with_clock_rollback(
+    tmp_path: Any,
+) -> None:
+    service, store, _wal, journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    older_id = "00000000-0000-0000-0000-000000000012"
+    older = RestoreOperation(
+        operation_id=older_id,
+        target_sequence=1,
+        target_snapshot_hash="a" * 64,
+        preview_digest="b" * 64,
+        requested_at="2027-01-01T00:00:00+00:00",
+        started_at="2027-01-01T00:00:00+00:00",
+        completed_at="2027-01-01T00:00:00+00:00",
+        event_id=f"operator-restore-{older_id}",
+        processing_sequence=2,
+        state="completed",
+        error_code=None,
+    )
+    store.last_snapshot = current.model_copy(
+        update={"extensions": {"operator_restore": [older.model_dump(mode="json")]}}
+    )
+    newer_id = "00000000-0000-0000-0000-000000000013"
+    journal.accepted(
+        Event(
+            f"operator-restore-{newer_id}",
+            None,  # type: ignore[arg-type]
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
+            source="api.state.operator_restore.commit",
+            correlation_id="c" * 64,
+            payload={"journal_target": f"restore:1:{hash_snapshot(current)}"},
+        )
+    )
+    latest = service.summary().latest_operation
+    assert latest is not None
+    assert latest.operation_id == newer_id
+    assert latest.state == "commit_indeterminate"
+
+
+def test_operation_chronology_uses_acceptance_not_later_lifecycle(
+    tmp_path: Any,
+) -> None:
+    service, store, _wal, journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+
+    def restore_event(identifier: str) -> Event:
+        return Event(
+            f"operator-restore-{identifier}",
+            None,  # type: ignore[arg-type]
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE.value,
+            source="api.state.operator_restore.commit",
+            correlation_id="d" * 64,
+            payload={"journal_target": f"restore:1:{hash_snapshot(current)}"},
+        )
+
+    older = restore_event("00000000-0000-0000-0000-000000000014")
+    newer = restore_event("00000000-0000-0000-0000-000000000015")
+    journal.accepted(older)
+    journal.accepted(newer)
+    older.processing_sequence = 3
+    journal.started(older)
+
+    latest = service.summary().latest_operation
+    assert latest is not None
+    assert latest.operation_id == "00000000-0000-0000-0000-000000000015"
+
+
+def test_external_preview_tokens_are_opaque_per_preview_and_cross_preview_tokens_fail(
+    tmp_path: Any,
+) -> None:
+    service, _store, _wal, _journal = _service(tmp_path)
+
+    class Store:
+        def list_external_transactions(self) -> list[ExternalTransactionRecord]:
+            return [
+                ExternalTransactionRecord(
+                    transaction_id="transaction-opaque",
+                    revision=1,
+                    artifact_type="episodic_chroma",
+                    artifact_id="memory-opaque-1",
+                    status=ExternalTransactionStatus.COMMITTED,
+                    event_id="event-opaque-1",
+                    processing_sequence=2,
+                    source="test",
+                    created_at="2026-01-01T00:00:00Z",
+                    updated_at="2026-01-01T00:00:00Z",
+                    audit=[],
+                )
+            ]
+
+        def finalize_external_event(
+            self, event_id: str, processing_sequence: int
+        ) -> int:
+            return 0
+
+        def orphan_external_event(self, event_id: str, reason: str) -> int:
+            return 0
+
+        def compensate_external_event(self, event_id: str, reason: str) -> int:
+            return 0
+
+    service.external = ExternalTransactionCoordinator([Store()])
+    first = service.preview(1)
+    second = service.preview(1)
+    assert first.external_effects.effect_digest != second.external_effects.effect_digest
+    assert first.external_effects.artifacts != second.external_effects.artifacts
+    with pytest.raises(RestoreContractError) as exc:
+        service.preflight(
+            _request(
+                first,
+                expected_external_effect_digest=second.external_effects.effect_digest,
+            ),
+            "operator",
+        )
+    assert exc.value.code == RestoreErrorCode.PREVIEW_STALE.value
+
+
+def _restore_action_intent(
+    status: str,
+    *,
+    approval_id: str | None = None,
+    receipt_id: str | None = None,
+) -> Any:
+    from kagya.actions.execution import (
+        ActionBudget,
+        ActionIntent,
+        ActionPreview,
+        ActionProvenance,
+        PolicyEvaluation,
+        RiskClass,
+    )
+
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    budget = ActionBudget()
+    return ActionIntent(
+        intent_id="action-1",
+        revision=1,
+        idempotency_key="action-1",
+        tool_name="metadata_read",
+        arguments={"namespace": "project", "key": "name"},
+        risk_class=RiskClass.READ_ONLY,
+        status=status,
+        dry_run=False,
+        policy=PolicyEvaluation(
+            evaluation_id="policy-1",
+            tool_name="metadata_read",
+            risk_class=RiskClass.READ_ONLY,
+            allowed=True,
+            approval_required=approval_id is not None,
+            reasons=("allowlisted_tool",),
+            argument_digest="a" * 64,
+            evaluated_at=timestamp,
+        ),
+        preview=ActionPreview(
+            tool_name="metadata_read",
+            risk_class=RiskClass.READ_ONLY,
+            arguments={"namespace": "project", "key": "name"},
+            effect="read metadata",
+            bounded_by=budget,
+            compensation_available=False,
+        ),
+        provenance=ActionProvenance(
+            decision_id="decision-1", candidate_id="candidate-1"
+        ),
+        budget=budget,
+        attempts=1,
+        cost_units_used=0,
+        created_at=timestamp,
+        updated_at=timestamp,
+        deadline_at=timestamp + timedelta(minutes=1),
+        approval_id=approval_id,
+        receipt_id=receipt_id,
+    )
+
+
+def _protected_state(domain: str, *, active: bool) -> dict[str, Any]:
+    if domain == "action_execution":
+        from kagya.actions.execution import ActionState
+
+        status = "retry_pending" if active else "succeeded"
+        return ActionState(intents=(_restore_action_intent(status),)).model_dump(
+            mode="json"
+        )
+    if domain == "proactive_outbox":
+        from kagya.outbox import DeliveryStatus, OutboxMessage, OutboxState
+
+        timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+        message = OutboxMessage(
+            message_id="message-1",
+            kind="action_result",
+            title="Result",
+            body="Done",
+            not_before=timestamp,
+            deduplication_key="message-1",
+            created_at=timestamp,
+            updated_at=timestamp,
+            delivery_status=(
+                DeliveryStatus.PENDING if active else DeliveryStatus.DELIVERED
+            ),
+            delivered_at=None if active else timestamp,
+        )
+        return OutboxState(messages=(message,)).model_dump(mode="json")
+    from kagya.runtime.autonomy import ScheduleStatus, WakeUpSchedule
+
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    schedule = WakeUpSchedule(
+        schedule_id="schedule-1",
+        kind="operator",
+        wake_at=timestamp,
+        status=ScheduleStatus.PENDING if active else ScheduleStatus.COMPLETED,
+        created_at=timestamp,
+        completed_at=None if active else timestamp,
+    )
+    return {"schema_version": 1, "schedules": [schedule.model_dump(mode="json")]}
+
+
+@pytest.mark.parametrize(
+    "domain", ["action_execution", "proactive_outbox", "subject_scheduler"]
+)
+def test_terminal_protected_histories_restore_but_pending_or_invalid_fail_closed(
+    tmp_path: Any, domain: str
+) -> None:
+    service, store, _wal, _journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    value = _protected_state(domain, active=False)
+    store.last_snapshot = current.model_copy(update={"extensions": {domain: value}})
+    assert service.preview(1).restoreable
+
+    pending = _protected_state(domain, active=True)
+    store.last_snapshot = current.model_copy(update={"extensions": {domain: pending}})
+    assert not service.preview(1).restoreable
+
+    malformed = dict(value)
+    malformed.pop("schema_version")
+    store.last_snapshot = current.model_copy(update={"extensions": {domain: malformed}})
+    assert not service.preview(1).restoreable
+
+    if domain == "action_execution":
+        from kagya.actions.execution import ActionState, ApprovalRecord
+
+        invalid_reference = ActionState(
+            approvals=(
+                ApprovalRecord(
+                    approval_id="approval-1",
+                    intent_id="action-missing",
+                    status="rejected",
+                    requested_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+            )
+        ).model_dump(mode="json")
+        store.last_snapshot = current.model_copy(
+            update={"extensions": {domain: invalid_reference}}
+        )
+        assert not service.preview(1).restoreable
+
+
+def test_pending_approval_blocks_terminal_action_restore(tmp_path: Any) -> None:
+    from kagya.actions.execution import ActionState, ApprovalRecord
+
+    service, store, _wal, _journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    state = ActionState(
+        intents=(_restore_action_intent("succeeded", approval_id="approval-1"),),
+        approvals=(
+            ApprovalRecord(
+                approval_id="approval-1",
+                intent_id="action-1",
+                status="pending",
+                requested_at=timestamp,
+            ),
+        ),
+    )
+    store.last_snapshot = current.model_copy(
+        update={"extensions": {"action_execution": state.model_dump(mode="json")}}
+    )
+    assert not service.preview(1).restoreable
+
+
+def test_rebound_terminal_action_receipt_fails_closed(tmp_path: Any) -> None:
+    from kagya.actions.execution import ActionState, ExecutionReceipt
+
+    service, store, _wal, _journal = _service(tmp_path)
+    current = store.last_snapshot
+    assert current is not None
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    receipt = ExecutionReceipt(
+        receipt_id="receipt-1",
+        intent_id="action-1",
+        idempotency_key="rebound-key",
+        attempt=1,
+        status="succeeded",
+        started_at=timestamp,
+        finished_at=timestamp,
+        duration_ms=0,
+        decision_id="decision-1",
+    )
+    state = ActionState(
+        intents=(_restore_action_intent("succeeded", receipt_id="receipt-1"),),
+        receipts=(receipt,),
+    )
+    store.last_snapshot = current.model_copy(
+        update={"extensions": {"action_execution": state.model_dump(mode="json")}}
+    )
+    assert not service.preview(1).restoreable

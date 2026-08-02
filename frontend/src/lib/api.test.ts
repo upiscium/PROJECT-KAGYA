@@ -548,7 +548,7 @@ describe("api client", () => {
     fetchMock.mockReturnValueOnce(jsonResponse(operatorRestorePreviewPayload));
     const preview = await api.previewOperatorRestore(7);
     expect(fetchMock).toHaveBeenLastCalledWith("/admin-proxy/state/operator-restore/preview/7", expect.anything());
-    expect(preview.external_effects.artifacts[0].refs).toEqual(["artifact-1"]);
+    expect(preview.external_effects.artifacts[0].refs).toEqual([externalArtifactHandle]);
     expect(preview.confirmation_phrase).toBe("RESTORE TARGET 7");
     expect(preview.external_side_effects_replayed).toBe(false);
   });
@@ -617,11 +617,18 @@ describe("api client", () => {
     await expect(api.previewOperatorRestore(7)).rejects.toMatchObject({ name: "ApiError" });
   });
 
-  it.each([
-    "artifact-transaction-1",
-    "transaction-1",
-    "a".repeat(64),
-  ])("preserves opaque external artifact references: %s", async (reference) => {
+  it.each([[[]], [[externalArtifactHandle]]])("accepts empty or opaque external artifact references", async (refs) => {
+    fetchMock.mockReturnValue(jsonResponse({
+      ...operatorRestorePreviewPayload,
+      external_effects: {
+        ...operatorRestorePreviewPayload.external_effects,
+        artifacts: [{ ...operatorRestorePreviewPayload.external_effects.artifacts[0], refs }],
+      },
+    }));
+    await expect(api.previewOperatorRestore(7)).resolves.toMatchObject({ external_effects: { artifacts: [{ refs }] } });
+  });
+
+  it.each(["artifact-transaction-1", `sha256:${restoreDigestA}`, "PRIVATE_SENTINEL"])("rejects a raw or non-opaque external artifact reference: %s", async (reference) => {
     fetchMock.mockReturnValue(jsonResponse({
       ...operatorRestorePreviewPayload,
       external_effects: {
@@ -629,18 +636,17 @@ describe("api client", () => {
         artifacts: [{ ...operatorRestorePreviewPayload.external_effects.artifacts[0], refs: [reference] }],
       },
     }));
-    await expect(api.previewOperatorRestore(7)).resolves.toMatchObject({ external_effects: { artifacts: [{ refs: [reference] }] } });
+    await expect(api.previewOperatorRestore(7)).rejects.toMatchObject({ name: "ApiError" });
   });
 
-  it("rejects a raw private external artifact reference", async () => {
-    fetchMock.mockReturnValue(jsonResponse({
-      ...operatorRestorePreviewPayload,
-      external_effects: {
-        ...operatorRestorePreviewPayload.external_effects,
-        artifacts: [{ ...operatorRestorePreviewPayload.external_effects.artifacts[0], refs: ["PRIVATE_SENTINEL"] }],
-      },
-    }));
-    await expect(api.previewOperatorRestore(7)).rejects.toMatchObject({ name: "ApiError" });
+  it.each([
+    ["summary operation UUID", { ...operatorRestoreSummaryPayload, latest_operation: { ...operatorRestoreSummaryPayload.latest_operation, operation_id: "restore-op-1" } }, api.operatorRestoreSummary],
+    ["summary operation event binding", { ...operatorRestoreSummaryPayload, latest_operation: { ...operatorRestoreSummaryPayload.latest_operation, event_id: "operator-restore-22222222-2222-2222-2222-222222222222" } }, api.operatorRestoreSummary],
+    ["commit operation UUID", { ...operatorRestoreCommitPayload, operation_id: "7" }, () => api.commitOperatorRestore(restoreCommitRequest)],
+    ["commit event binding", { ...operatorRestoreCommitPayload, event_id: "operator-restore-22222222-2222-2222-2222-222222222222" }, () => api.commitOperatorRestore(restoreCommitRequest)],
+  ])("rejects restore operation forgery: %s", async (_label, payload, client) => {
+    fetchMock.mockReturnValue(jsonResponse(payload));
+    await expect(client()).rejects.toMatchObject({ name: "ApiError" });
   });
 
   it("sanitizes governed restore HTTP errors", async () => {
@@ -824,7 +830,8 @@ const cockpitTrainingPayload = {
 const restoreDigestA = "a".repeat(64);
 const restoreDigestB = "b".repeat(64);
 const restoreDigestC = "c".repeat(64);
-const restoreDigestD = "d".repeat(64);
+const restoreDigestD = "d1e2f3a4b5c697887766554433221100fedcba98765432100123456789abcdef";
+const externalArtifactHandle = "9f4a7c2e1b6d8a50392716e0f5c4b3a29182736455463728190abcdef1234567";
 const restoreCommitRequest = {
   target_sequence: 7,
   expected_target_hash: restoreDigestA,
@@ -853,14 +860,14 @@ const operatorRestoreSummaryPayload = {
     reason_codes: ["eligible"],
   }],
   latest_operation: {
-    operation_id: "restore-op-1",
+    operation_id: "11111111-1111-1111-1111-111111111111",
     target_sequence: 7,
     target_snapshot_hash: restoreDigestC,
     preview_digest: restoreDigestD,
     requested_at: "2026-01-01T00:00:00Z",
     started_at: null,
     completed_at: null,
-    event_id: "event-restore-1",
+    event_id: "operator-restore-11111111-1111-1111-1111-111111111111",
     processing_sequence: 11,
     state: "previewed",
     error_code: null,
@@ -871,7 +878,7 @@ const operatorRestoreSummaryPayload = {
 
 const operatorRestorePreviewPayload = {
   schema_version: 1,
-  operation_id: "restore-op-1",
+  operation_id: "11111111-1111-1111-1111-111111111111",
   preview_digest: restoreDigestD,
   created_at: "2026-01-01T00:00:00Z",
   expires_at: "2026-01-01T01:00:00Z",
@@ -896,7 +903,7 @@ const operatorRestorePreviewPayload = {
   }],
   external_effects: {
     consistency_status: "consistent",
-    artifacts: [{ artifact_type: "outbox", count: 1, refs: ["artifact-1"], truncated: false }],
+    artifacts: [{ artifact_type: "outbox", count: 1, refs: [externalArtifactHandle], truncated: false }],
     retained_not_replayed_count: 1,
     pending_count: 0,
     orphaned_count: 0,
@@ -913,8 +920,8 @@ const operatorRestorePreviewPayload = {
 const operatorRestoreCommitPayload = {
   command: "restore",
   disposition: "completed",
-  operation_id: "restore-op-1",
-  event_id: "event-restore-2",
+  operation_id: "11111111-1111-1111-1111-111111111111",
+  event_id: "operator-restore-11111111-1111-1111-1111-111111111111",
   processing_sequence: 12,
   restored_target_sequence: 7,
   restored_target_hash: restoreDigestC,

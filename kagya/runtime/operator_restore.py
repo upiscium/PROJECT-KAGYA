@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -135,8 +134,8 @@ class RestoreArtifact(_Strict):
     @field_validator("refs")
     @classmethod
     def validate_public_refs(cls, values: list[str]) -> list[str]:
-        if any(not public_reference(value) for value in values):
-            raise ValueError("artifact reference is not public-safe")
+        if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in values):
+            raise ValueError("artifact reference is not an opaque handle")
         return values
 
 
@@ -179,11 +178,23 @@ class RestoreOperation(_Strict):
     error_code: str | None
     external_side_effects_replayed: Literal[False] = False
 
-    @field_validator("operation_id", "event_id")
+    @model_validator(mode="after")
+    def validate_operation_binding(self) -> "RestoreOperation":
+        if not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            self.operation_id,
+        ) or self.event_id != event_id_for_operation(self.operation_id):
+            raise ValueError("restore operation identity binding is invalid")
+        return self
+
+    @field_validator("requested_at", "started_at", "completed_at")
     @classmethod
-    def validate_public_ids(cls, value: str) -> str:
-        if not public_reference(value):
-            raise ValueError("operation ID is not public-safe")
+    def validate_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError("restore operation timestamp must include a timezone")
         return value
 
 
@@ -222,8 +233,11 @@ class RestorePreview(_Strict):
     @field_validator("operation_id")
     @classmethod
     def validate_public_operation_id(cls, value: str) -> str:
-        if not public_reference(value):
-            raise ValueError("operation ID is not public-safe")
+        if not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            value,
+        ):
+            raise ValueError("operation ID is not canonical")
         return value
 
 
@@ -243,12 +257,14 @@ class RestoreCommitResponse(_Strict):
     error_code: str | None
     external_side_effects_replayed: Literal[False] = False
 
-    @field_validator("operation_id", "event_id")
-    @classmethod
-    def validate_public_ids(cls, value: str) -> str:
-        if not public_reference(value):
-            raise ValueError("operation ID is not public-safe")
-        return value
+    @model_validator(mode="after")
+    def validate_operation_binding(self) -> "RestoreCommitResponse":
+        if not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            self.operation_id,
+        ) or self.event_id != event_id_for_operation(self.operation_id):
+            raise ValueError("restore operation identity binding is invalid")
+        return self
 
 
 _RESERVED = "operator_restore"
@@ -363,7 +379,15 @@ class _EvidenceIndex:
     maximum: int
     semantic_revision: int
     semantic_transition_count: int
-    targets: tuple[_VerifiedTarget, ...]
+    restorable_by_sequence: dict[int, _VerifiedTarget]
+    semantic_targets: tuple[_VerifiedTarget, ...]
+
+
+@dataclass(frozen=True)
+class _PreviewCapability:
+    preview: RestorePreview
+    canonical_external_digest: str
+    reserved: bool = False
 
 
 def public_reference(value: str, kind: str | None = None) -> bool:
@@ -555,42 +579,228 @@ def _public_artifact_type(value: str) -> str | None:
     return None
 
 
-def _contains_rearmable_records(value: Any) -> bool:
+def _protected_domain_has_active_work(key: str, value: Any) -> bool:
     if value is None:
         return False
     if not isinstance(value, dict):
-        return True
-    return any(isinstance(item, list) and bool(item) for item in value.values())
+        raise ValueError("protected domain state must be an object")
+    if key == "action_execution":
+        from kagya.actions.execution import (
+            ActionState,
+            IntentStatus,
+            receipt_matches_intent,
+        )
 
+        if value.get("schema_version") != 4:
+            raise ValueError("protected action state version is invalid")
+        action_state = ActionState.model_validate(value)
+        intents = {item.intent_id: item for item in action_state.intents}
+        validations = {
+            item.validation_id: item for item in action_state.validation_records
+        }
+        approvals = {item.approval_id: item for item in action_state.approvals}
+        receipts = {item.receipt_id: item for item in action_state.receipts}
+        observations = {item.observation_id: item for item in action_state.observations}
+        verifications = {
+            item.verification_id: item for item in action_state.verifications
+        }
+        collections = (
+            (intents, action_state.intents),
+            (validations, action_state.validation_records),
+            (approvals, action_state.approvals),
+            (receipts, action_state.receipts),
+            (observations, action_state.observations),
+            (verifications, action_state.verifications),
+        )
+        if any(len(index) != len(records) for index, records in collections):
+            raise ValueError("protected action identifiers must be unique")
+        if any(
+            item.intent_id is not None and item.intent_id not in intents
+            for item in action_state.validation_records
+        ) or any(
+            item.validation_id not in validations
+            for item in action_state.policy_rejections
+        ):
+            raise ValueError("protected action validation binding is invalid")
+        for intent in action_state.intents:
+            if (
+                intent.validation_record_id is not None
+                and intent.validation_record_id not in validations
+            ):
+                raise ValueError("protected action intent validation is invalid")
+            if intent.approval_id is not None and intent.approval_id not in approvals:
+                raise ValueError("protected action approval binding is invalid")
+            if intent.receipt_id is not None and intent.receipt_id not in receipts:
+                raise ValueError("protected action receipt binding is invalid")
+            if (
+                intent.receipt_id is not None
+                and receipts[intent.receipt_id].intent_id != intent.intent_id
+            ):
+                raise ValueError("protected action receipt ownership is invalid")
+        for validation in action_state.validation_records:
+            if validation.intent_id is not None and (
+                intents[validation.intent_id].validation_record_id
+                != validation.validation_id
+            ):
+                raise ValueError("protected action validation ownership is invalid")
+        approvals_by_intent: dict[str, Any] = {}
+        for approval_record in action_state.approvals:
+            if (
+                approval_record.intent_id not in intents
+                or approval_record.intent_id in approvals_by_intent
+            ):
+                raise ValueError("protected approval intent binding is invalid")
+            approvals_by_intent[approval_record.intent_id] = approval_record
+        for intent in action_state.intents:
+            bound_approval = approvals_by_intent.get(intent.intent_id)
+            if (intent.approval_id is None) != (bound_approval is None) or (
+                bound_approval is not None
+                and bound_approval.approval_id != intent.approval_id
+            ):
+                raise ValueError("protected approval binding is inconsistent")
+        for receipt_record in action_state.receipts:
+            bound_intent = intents.get(receipt_record.intent_id)
+            if (
+                bound_intent is None
+                or not receipt_matches_intent(receipt_record, bound_intent)
+                or (
+                    receipt_record.compensation_of is not None
+                    and receipt_record.compensation_of not in receipts
+                )
+            ):
+                raise ValueError("protected receipt binding is invalid")
+            if receipt_record.observation_id is not None and (
+                receipt_record.observation_id not in observations
+                or observations[receipt_record.observation_id].receipt_id
+                != receipt_record.receipt_id
+                or observations[receipt_record.observation_id].intent_id
+                != receipt_record.intent_id
+            ):
+                raise ValueError("protected receipt observation binding is invalid")
+            if receipt_record.verification_id is not None and (
+                receipt_record.verification_id not in verifications
+                or verifications[receipt_record.verification_id].intent_id
+                != receipt_record.intent_id
+            ):
+                raise ValueError("protected receipt verification binding is invalid")
+        for observation_record in action_state.observations:
+            bound_receipt = receipts.get(observation_record.receipt_id)
+            if (
+                observation_record.intent_id not in intents
+                or bound_receipt is None
+                or bound_receipt.intent_id != observation_record.intent_id
+            ):
+                raise ValueError("protected observation binding is invalid")
+        for verification_record in action_state.verifications:
+            bound_observation = (
+                None
+                if verification_record.observation_id is None
+                else observations.get(verification_record.observation_id)
+            )
+            if verification_record.intent_id not in intents or (
+                verification_record.observation_id is not None
+                and (
+                    bound_observation is None
+                    or bound_observation.intent_id != verification_record.intent_id
+                )
+            ):
+                raise ValueError("protected verification binding is invalid")
+        active_statuses = {
+            IntentStatus.AWAITING_APPROVAL,
+            IntentStatus.APPROVED,
+            IntentStatus.EXECUTING,
+            IntentStatus.RETRY_PENDING,
+        }
+        notification_statuses = {
+            "queued",
+            "pending",
+            "delivering",
+            "retry_pending",
+            "executing",
+            "delivered",
+            "cancelled",
+            "expired",
+            "failed",
+        }
+        notification_ids: set[Any] = set()
+        notification_keys: set[Any] = set()
+        for notification in action_state.notifications:
+            if (
+                set(notification)
+                != {
+                    "notification_id",
+                    "idempotency_key",
+                    "channel",
+                    "title",
+                    "body",
+                    "status",
+                    "created_at",
+                }
+                or notification.get("status") not in notification_statuses
+                or notification.get("channel") != "local"
+                or not isinstance(notification.get("notification_id"), str)
+                or not isinstance(notification.get("idempotency_key"), str)
+            ):
+                raise ValueError("protected action notification is invalid")
+            notification_id = notification["notification_id"]
+            idempotency_key = notification["idempotency_key"]
+            if (
+                notification_id in notification_ids
+                or idempotency_key in notification_keys
+                or sum(
+                    intent.idempotency_key == idempotency_key
+                    and intent.tool_name == "local_notification_enqueue"
+                    for intent in action_state.intents
+                )
+                != 1
+            ):
+                raise ValueError("protected action notification binding is invalid")
+            notification_ids.add(notification_id)
+            notification_keys.add(idempotency_key)
+        return (
+            any(item.status in active_statuses for item in action_state.intents)
+            or any(item.status == "pending" for item in action_state.approvals)
+            or any(
+                item["status"]
+                in {"queued", "pending", "delivering", "retry_pending", "executing"}
+                for item in action_state.notifications
+            )
+        )
+    if key == "proactive_outbox":
+        from kagya.outbox import (
+            AcknowledgmentStatus,
+            DeliveryStatus,
+            OutboxState,
+        )
 
-def _valid_protected_domain(key: str, value: Any) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, dict):
-        return False
-    requirements = {
-        "action_execution": (
-            4,
-            {
-                "intents",
-                "validation_records",
-                "policy_rejections",
-                "approvals",
-                "receipts",
-                "observations",
-                "verifications",
-                "notifications",
-            },
-        ),
-        "proactive_outbox": (1, {"messages"}),
-        "subject_scheduler": (1, {"schedules"}),
-    }
-    schema_version, list_keys = requirements[key]
-    return value.get("schema_version") == schema_version and all(
-        isinstance(value.get(item), list)
-        and all(isinstance(record, dict) for record in value[item])
-        for item in list_keys
-    )
+        if value.get("schema_version") != 1:
+            raise ValueError("protected outbox state version is invalid")
+        outbox_state = OutboxState.model_validate(value)
+        identifiers = {item.message_id for item in outbox_state.messages}
+        if len(identifiers) != len(outbox_state.messages):
+            raise ValueError("protected outbox identifiers must be unique")
+        return any(
+            item.delivery_status in {DeliveryStatus.PENDING, DeliveryStatus.FAILED}
+            and item.acknowledgment_status == AcknowledgmentStatus.UNACKNOWLEDGED
+            for item in outbox_state.messages
+        )
+    if key == "subject_scheduler":
+        from kagya.runtime.autonomy import ScheduleStatus, WakeUpSchedule
+
+        if value.get("schema_version") != 1 or set(value) != {
+            "schema_version",
+            "schedules",
+        }:
+            raise ValueError("protected scheduler state is invalid")
+        raw_schedules = value.get("schedules")
+        if not isinstance(raw_schedules, list):
+            raise ValueError("protected scheduler state is invalid")
+        schedules = [WakeUpSchedule.model_validate(item) for item in raw_schedules]
+        identifiers = {item.schedule_id for item in schedules}
+        if len(identifiers) != len(schedules):
+            raise ValueError("protected scheduler identifiers must be unique")
+        return any(item.status == ScheduleStatus.PENDING for item in schedules)
+    raise ValueError("unknown protected domain")
 
 
 def _has_duplicate_entity_ids(value: Any) -> bool:
@@ -637,7 +847,7 @@ class OperatorRestoreService:
         )
         self.external_heads = external_heads or (lambda: {})
         self._lock = Lock()
-        self._capabilities: dict[str, tuple[RestorePreview, bool]] = {}
+        self._capabilities: dict[str, _PreviewCapability] = {}
         self._consumed: set[str] = set()
         self._operations: list[RestoreOperation] = []
         self._semantic_cache: tuple[int, str, int] | None = None
@@ -653,17 +863,22 @@ class OperatorRestoreService:
         now = self.clock()
         expired = [
             digest
-            for digest, (preview, _) in self._capabilities.items()
-            if now >= datetime.fromisoformat(preview.expires_at)
+            for digest, capability in self._capabilities.items()
+            if not capability.reserved
+            and now >= datetime.fromisoformat(capability.preview.expires_at)
         ]
         for digest in expired:
             self._capabilities.pop(digest, None)
         if len(self._capabilities) > 512:
             ordered = sorted(
-                self._capabilities,
-                key=lambda digest: self._capabilities[digest][0].created_at,
+                (
+                    digest
+                    for digest, capability in self._capabilities.items()
+                    if not capability.reserved
+                ),
+                key=lambda digest: self._capabilities[digest].preview.created_at,
             )
-            for digest in ordered[: len(self._capabilities) - 512]:
+            for digest in ordered[: max(0, len(self._capabilities) - 512)]:
                 self._capabilities.pop(digest, None)
         while len(self._consumed) > 512:
             self._consumed.pop()
@@ -737,12 +952,9 @@ class OperatorRestoreService:
         self,
         wal: list[StateWalRecord],
         journal: list[JournalRecord],
-        *,
-        target_limit: int | None = None,
     ) -> _EvidenceIndex:
         if not wal:
             self._fail(RestoreErrorCode.WAL_INTEGRITY_INVALID)
-        limit = min(target_limit or self.max_targets, self.max_targets)
         floor = self._retention_floor(wal, journal)
         evidence: dict[int, _SequenceEvidence] = {}
         for item in journal:
@@ -769,17 +981,21 @@ class OperatorRestoreService:
         start = bisect_left(wal, floor, key=lambda record: record.processing_sequence)
         if start >= len(wal) or wal[start].processing_sequence != floor:
             self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
-        targets: deque[_VerifiedTarget] = deque(maxlen=limit)
+        restorable_by_sequence: dict[int, _VerifiedTarget] = {}
+        semantic_targets: list[_VerifiedTarget] = []
+        projected_semantic_counts: set[int] = set()
+        latest_restorable: _VerifiedTarget | None = None
         previous_digest: str | None = None
         semantic_revision = self._semantic_anchor(wal, start)
         semantic_count = 0
         priority = {"journal_completed": 0, "journal_recovered": 1, "checkpoint": 2}
         for record in wal[start:]:
             digest = logical_state_digest(record.patch.value)
-            if previous_digest is not None and (
+            semantic_boundary = previous_digest is not None and (
                 digest != previous_digest
                 or record.event_type == "state_point_in_time_restore"
-            ):
+            )
+            if semantic_boundary:
                 semantic_count += 1
                 semantic_revision = record.processing_sequence
             previous_digest = digest
@@ -806,14 +1022,16 @@ class OperatorRestoreService:
                         bootstrap_evidence.eligible,
                         key=lambda candidate: priority[candidate[1]],
                     )
-                targets.append(
-                    _VerifiedTarget(
-                        wal=record,
-                        journal=journal_record,
-                        kind="bootstrap",
-                        semantic_count=semantic_count,
-                    )
+                target = _VerifiedTarget(
+                    wal=record,
+                    journal=journal_record,
+                    kind="bootstrap",
+                    semantic_count=semantic_count,
                 )
+                restorable_by_sequence[record.processing_sequence] = target
+                semantic_targets.append(target)
+                projected_semantic_counts.add(semantic_count)
+                latest_restorable = target
                 continue
             sequence_evidence = (
                 evidence.pop(record.processing_sequence)
@@ -852,16 +1070,25 @@ class OperatorRestoreService:
                 sequence_evidence.eligible,
                 key=lambda candidate: priority[candidate[1]],
             )
-            targets.append(
-                _VerifiedTarget(
-                    wal=record,
-                    journal=journal_record,
-                    kind=kind,
-                    semantic_count=semantic_count,
-                )
+            target = _VerifiedTarget(
+                wal=record,
+                journal=journal_record,
+                kind=kind,
+                semantic_count=semantic_count,
             )
+            restorable_by_sequence[record.processing_sequence] = target
+            if semantic_count not in projected_semantic_counts:
+                semantic_targets.append(target)
+                projected_semantic_counts.add(semantic_count)
+            latest_restorable = target
         if evidence:
             self._fail(RestoreErrorCode.CHECKPOINT_MISMATCH)
+        if latest_restorable is not None and (
+            not semantic_targets
+            or semantic_targets[-1].wal.processing_sequence
+            != latest_restorable.wal.processing_sequence
+        ):
+            semantic_targets.append(latest_restorable)
         with self._lock:
             self._semantic_cache = (
                 wal[-1].processing_sequence,
@@ -873,7 +1100,8 @@ class OperatorRestoreService:
             maximum=wal[-1].processing_sequence,
             semantic_revision=semantic_revision,
             semantic_transition_count=semantic_count,
-            targets=tuple(reversed(targets)),
+            restorable_by_sequence=restorable_by_sequence,
+            semantic_targets=tuple(reversed(semantic_targets)),
         )
 
     def _domains(
@@ -957,11 +1185,20 @@ class OperatorRestoreService:
                 [before.extensions.get(key), after.extensions.get(key)]
             ):
                 supported = False
-            if key in _EXTERNAL_REARM_DOMAINS and any(
-                not _valid_protected_domain(key, value)
-                for value in (before.extensions.get(key), after.extensions.get(key))
-            ):
-                supported = False
+            protected_domain_blocked = False
+            if key in _EXTERNAL_REARM_DOMAINS:
+                try:
+                    protected_domain_blocked = any(
+                        _protected_domain_has_active_work(key, value)
+                        for value in (
+                            before.extensions.get(key),
+                            after.extensions.get(key),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    protected_domain_blocked = True
+                if protected_domain_blocked:
+                    supported = False
             before_records = _extension_records(before.extensions.get(key))
             after_records = _extension_records(after.extensions.get(key))
             b, a, added, removed, changed = _counts(before_records, after_records)
@@ -984,14 +1221,11 @@ class OperatorRestoreService:
                         reason_code=None,
                     )
                 )
-                if key in _EXTERNAL_REARM_DOMAINS and (
-                    _contains_rearmable_records(before.extensions.get(key))
-                    or _contains_rearmable_records(after.extensions.get(key))
-                ):
+                if protected_domain_blocked:
                     supported = False
         return domains, supported
 
-    def _external(self, target: int) -> RestoreExternal:
+    def _external(self, target: int, *, nonce: str) -> tuple[RestoreExternal, str]:
         try:
             records, diff, reconciliation = self.external.restore_view(target)
             effects = diff.effects
@@ -1021,7 +1255,7 @@ class OperatorRestoreService:
                 "reconciliation": reconciliation.model_dump(mode="json"),
                 "authoritative_heads": self.external_heads(),
             }
-            digest = _hash(canonical)
+            canonical_digest = _hash(canonical)
             artifacts: list[RestoreArtifact] = []
             if not bad:
                 public_types = {
@@ -1029,7 +1263,7 @@ class OperatorRestoreService:
                 }
                 for kind in sorted(item for item in public_types if item is not None):
                     refs = [
-                        f"{kind}:{hashlib.sha256(effect.artifact_id.encode('utf-8')).hexdigest()}"
+                        _hash([nonce, kind, effect.artifact_id])
                         for effect in effects
                         if _public_artifact_type(effect.artifact_type) == kind
                     ]
@@ -1041,14 +1275,17 @@ class OperatorRestoreService:
                             truncated=len(refs) > 256,
                         )
                     )
-            return RestoreExternal(
-                consistency_status="inconsistent" if bad else "consistent",
-                artifacts=artifacts,
-                retained_not_replayed_count=len(effects),
-                pending_count=pending,
-                orphaned_count=orphaned,
-                retryable_count=retryable,
-                effect_digest=digest,
+            return (
+                RestoreExternal(
+                    consistency_status="inconsistent" if bad else "consistent",
+                    artifacts=artifacts,
+                    retained_not_replayed_count=len(effects),
+                    pending_count=pending,
+                    orphaned_count=orphaned,
+                    retryable_count=retryable,
+                    effect_digest=_hash([nonce, canonical_digest, target]),
+                ),
+                canonical_digest,
             )
         except Exception as exc:
             raise RestoreContractError(
@@ -1061,14 +1298,7 @@ class OperatorRestoreService:
         self._assert_authoritative(actor_id)
         wal, journal = self._evidence()
         analysis = self._analyze_evidence(wal, journal)
-        target = next(
-            (
-                x
-                for x in analysis.targets
-                if x.wal.processing_sequence == target_sequence
-            ),
-            None,
-        )
+        target = analysis.restorable_by_sequence.get(target_sequence)
         if target is None:
             if target_sequence < analysis.floor:
                 self._fail(RestoreErrorCode.TARGET_NOT_RETAINED)
@@ -1079,7 +1309,10 @@ class OperatorRestoreService:
         record = target.wal
         current = self._current()
         domains, supported = self._domains(current, record.patch.value)
-        external = self._external(target_sequence)
+        nonce = str(uuid4())
+        external, canonical_external_digest = self._external(
+            target_sequence, nonce=nonce
+        )
         reasons = ([] if supported else [RestoreErrorCode.UNSUPPORTED_DOMAIN.value]) + (
             []
             if external.consistency_status == "consistent"
@@ -1112,7 +1345,15 @@ class OperatorRestoreService:
         preview = RestorePreview.model_validate({**raw, "preview_digest": digest})
         with self._lock:
             self._evict_capabilities_locked()
-            self._capabilities[digest] = (preview, False)
+            if len(self._capabilities) >= 512 and all(
+                capability.reserved for capability in self._capabilities.values()
+            ):
+                self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
+            self._capabilities[digest] = _PreviewCapability(
+                preview=preview,
+                canonical_external_digest=canonical_external_digest,
+            )
+            self._evict_capabilities_locked()
         return preview
 
     def _check_request(
@@ -1121,12 +1362,15 @@ class OperatorRestoreService:
         request: RestoreCommitRequest,
         *,
         stale: bool = False,
+        allow_expired: bool = False,
     ) -> None:
         if RestoreErrorCode.UNSUPPORTED_DOMAIN.value in preview.reason_codes:
             self._fail(RestoreErrorCode.UNSUPPORTED_DOMAIN)
         if RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT.value in preview.reason_codes:
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
-        if self.clock() >= datetime.fromisoformat(preview.expires_at):
+        if not allow_expired and self.clock() >= datetime.fromisoformat(
+            preview.expires_at
+        ):
             self._fail(RestoreErrorCode.PREVIEW_EXPIRED)
         if request.confirmation_phrase != preview.confirmation_phrase:
             self._fail(RestoreErrorCode.CONFIRMATION_REQUIRED)
@@ -1151,30 +1395,26 @@ class OperatorRestoreService:
             if entry is None:
                 self._fail(RestoreErrorCode.PREVIEW_STALE)
             assert entry is not None
-            preview, reserved = entry
-            if reserved:
+            preview = entry.preview
+            if entry.reserved:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
         self._check_request(preview, request)
         wal, journal = self._evidence()
         analysis = self._analyze_evidence(wal, journal)
-        target = next(
-            (
-                item.wal
-                for item in analysis.targets
-                if item.wal.processing_sequence == request.target_sequence
-            ),
-            None,
-        )
+        verified_target = analysis.restorable_by_sequence.get(request.target_sequence)
+        target = None if verified_target is None else verified_target.wal
         if target is None or target.state_hash_after != request.expected_target_hash:
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         current = self._current()
-        current_external = self._external(request.target_sequence)
+        current_external, canonical_external_digest = self._external(
+            request.target_sequence, nonce=str(uuid4())
+        )
         if current_external.consistency_status != "consistent":
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
         if (
             logical_state_digest(current) != request.expected_current_logical_digest
             or analysis.semantic_revision != request.expected_semantic_revision
-            or current_external.effect_digest != request.expected_external_effect_digest
+            or canonical_external_digest != entry.canonical_external_digest
         ):
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         with self._lock:
@@ -1182,9 +1422,13 @@ class OperatorRestoreService:
             if entry is None:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
             assert entry is not None
-            if entry[1]:
+            if entry.reserved:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
-            self._capabilities[request.expected_preview_digest] = (entry[0], True)
+            self._capabilities[request.expected_preview_digest] = _PreviewCapability(
+                preview=entry.preview,
+                canonical_external_digest=entry.canonical_external_digest,
+                reserved=True,
+            )
         return preview
 
     def reserve(self, preview: RestorePreview, actor_id: str) -> RestorePreview:
@@ -1203,7 +1447,6 @@ class OperatorRestoreService:
     def release(self, preview_digest: str) -> None:
         with self._lock:
             self._capabilities.pop(preview_digest, None)
-            self._consumed.discard(preview_digest)
 
     def apply_commit(
         self, main_loop: Any, request: RestoreCommitRequest, actor_id: str
@@ -1216,33 +1459,29 @@ class OperatorRestoreService:
             if entry is None:
                 self._fail(RestoreErrorCode.PREVIEW_STALE)
             assert entry is not None
-            preview, reserved = entry
-            if not reserved:
+            preview = entry.preview
+            if not entry.reserved:
                 self._fail(RestoreErrorCode.OPERATION_IN_PROGRESS)
-        self._check_request(preview, request)
+        self._check_request(preview, request, allow_expired=True)
         wal, journal = self._evidence()
         analysis = self._analyze_evidence(wal, journal)
-        target_record = next(
-            (
-                item.wal
-                for item in analysis.targets
-                if item.wal.processing_sequence == request.target_sequence
-            ),
-            None,
-        )
+        verified_target = analysis.restorable_by_sequence.get(request.target_sequence)
+        target_record = None if verified_target is None else verified_target.wal
         if (
             target_record is None
             or target_record.state_hash_after != request.expected_target_hash
         ):
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         current = self._current()
-        current_external = self._external(request.target_sequence)
+        current_external, canonical_external_digest = self._external(
+            request.target_sequence, nonce=str(uuid4())
+        )
         if current_external.consistency_status != "consistent":
             self._fail(RestoreErrorCode.EXTERNAL_STATE_INCONSISTENT)
         if (
             logical_state_digest(current) != request.expected_current_logical_digest
             or analysis.semantic_revision != request.expected_semantic_revision
-            or current_external.effect_digest != request.expected_external_effect_digest
+            or canonical_external_digest != entry.canonical_external_digest
         ):
             self._fail(RestoreErrorCode.PREVIEW_STALE)
         event = current_agent_event()
@@ -1431,8 +1670,9 @@ class OperatorRestoreService:
     ) -> RestoreSummary:
         self._assert_authoritative(actor_id)
         wal, journal = self._evidence()
-        analysis = self._analyze_evidence(wal, journal, target_limit=limit)
+        analysis = self._analyze_evidence(wal, journal)
         current = self._current()
+        display_limit = min(limit or self.max_targets, self.max_targets)
         targets = [
             RestoreTarget(
                 target_sequence=item.wal.processing_sequence,
@@ -1443,7 +1683,7 @@ class OperatorRestoreService:
                 eligible=True,
                 reason_codes=[],
             )
-            for item in analysis.targets
+            for item in analysis.semantic_targets[:display_limit]
         ]
         operations_by_id = {item.operation_id: item for item in self._operations}
         operations_by_id.update(
@@ -1465,6 +1705,18 @@ class OperatorRestoreService:
                     ) from exc
         operations = list(operations_by_id.values())
         by_event = {j.event_id: j for j in journal}
+        journal_anchor: dict[str, tuple[int, int]] = {}
+        latest_journal_sequence = -1
+        for ordinal, item in enumerate(journal):
+            if item.processing_sequence is not None:
+                latest_journal_sequence = max(
+                    latest_journal_sequence, item.processing_sequence
+                )
+            anchor = (latest_journal_sequence, ordinal)
+            if item.lifecycle == JournalLifecycle.ACCEPTED:
+                journal_anchor[item.event_id] = anchor
+            else:
+                journal_anchor.setdefault(item.event_id, anchor)
         projected: list[RestoreOperation] = []
         for operation in operations:
             evidence = by_event.get(operation.event_id)
@@ -1539,6 +1791,34 @@ class OperatorRestoreService:
                         }
                     )
                 )
+
+        def operation_timestamp(operation: RestoreOperation) -> datetime:
+            return max(
+                datetime.fromisoformat(timestamp).astimezone(UTC)
+                for timestamp in (
+                    operation.requested_at,
+                    operation.started_at,
+                    operation.completed_at,
+                )
+                if timestamp is not None
+            )
+
+        def operation_chronology(
+            operation: RestoreOperation,
+        ) -> tuple[int, int, datetime, str]:
+            anchor_sequence, ordinal = journal_anchor.get(operation.event_id, (-1, -1))
+            return (
+                (
+                    anchor_sequence
+                    if ordinal >= 0
+                    else operation.processing_sequence or -1
+                ),
+                ordinal,
+                operation_timestamp(operation),
+                operation.operation_id,
+            )
+
+        latest_operation = max(projected, key=operation_chronology, default=None)
         return RestoreSummary(
             current_sequence=current.last_processed_event_sequence,
             current_snapshot_hash=hash_snapshot(current),
@@ -1547,5 +1827,5 @@ class OperatorRestoreService:
             retained_min_sequence=analysis.floor,
             retained_max_sequence=analysis.maximum,
             targets=targets,
-            latest_operation=projected[-1] if projected else None,
+            latest_operation=latest_operation,
         )
