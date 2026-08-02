@@ -16,7 +16,7 @@ from kagya.runtime.agent_state import (
     AgentStateStore,
     default_agent_state_snapshot,
 )
-from kagya.runtime.event_journal import EventJournal, hash_snapshot
+from kagya.runtime.event_journal import EventJournal, JournalLifecycle, hash_snapshot
 from kagya.runtime.operator_restore import (
     OperatorRestoreService,
     RestoreCommitRequest,
@@ -931,7 +931,7 @@ def test_latest_operation_uses_authoritative_order_across_sources(
         )
 
     in_memory = operation(
-        "00000000-0000-0000-0000-000000000010", 1, "2026-01-01T00:00:04+00:00"
+        "00000000-0000-0000-0000-000000000010", 2, "2026-01-01T00:00:01+00:00"
     )
     journal = operation(
         "00000000-0000-0000-0000-000000000011", 2, "2026-01-01T00:00:01+00:00"
@@ -1424,6 +1424,244 @@ def _operation_for_test(
         state=state,  # type: ignore[arg-type]
         error_code="restore_commit_failed" if state == "failed" else None,
     )
+
+
+@pytest.mark.parametrize(("target_sequence", "processing_sequence"), [(1, 1), (2, 1)])
+def test_operation_target_must_precede_processing_sequence(
+    tmp_path: Any, target_sequence: int, processing_sequence: int
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000206",
+        wal.reconstruct(target_sequence).snapshot_hash,
+        sequence=processing_sequence,
+    ).model_copy(update={"target_sequence": target_sequence})
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_missing_sequence_is_rejected_in_persisted_operation(tmp_path: Any) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000207",
+        wal.reconstruct(1).snapshot_hash,
+        sequence=None,
+    )
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_missing_sequence_is_rejected_in_memory_operation(tmp_path: Any) -> None:
+    service, _store, wal, _journal = _service(tmp_path)
+    service._operations = [
+        _operation_for_test(
+            "00000000-0000-0000-0000-000000000208",
+            wal.reconstruct(1).snapshot_hash,
+            sequence=None,
+        )
+    ]
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+@pytest.mark.parametrize("target_sequence", [1, 2])
+def test_persisted_operation_cannot_outlive_containing_snapshot(
+    tmp_path: Any, target_sequence: int
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000209",
+        wal.reconstruct(target_sequence).snapshot_hash,
+        sequence=3,
+    ).model_copy(update={"target_sequence": target_sequence})
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_persisted_target_history_cannot_outlive_target_snapshot(
+    tmp_path: Any,
+) -> None:
+    service, _store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000215",
+        wal.reconstruct(0).snapshot_hash,
+        sequence=2,
+    ).model_copy(update={"target_sequence": 0})
+    with pytest.raises(RestoreContractError) as exc:
+        service._parse_operation_source(
+            [operation], source="persisted_target", container_sequence=1
+        )
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_accepted_only_journal_operation_is_not_completed(tmp_path: Any) -> None:
+    service, _store, wal, journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000210"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    journal.accepted(
+        AgentEvent(
+            event_id=f"operator-restore-{operation_id}",
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.operator_restore.commit",
+            observed_at=now,
+            requested_at=now,
+            payload={"journal_target": f"restore:1:{target_hash}"},
+            correlation_id="a" * 64,
+        )
+    )
+    operation = service.summary().latest_operation
+    assert operation is not None
+    assert operation.processing_sequence is None
+    assert operation.state != "completed"
+
+
+def test_accepted_and_started_journal_operation_has_valid_causality(
+    tmp_path: Any,
+) -> None:
+    service, _store, wal, journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000211"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    accepted = AgentEvent(
+        event_id=f"operator-restore-{operation_id}",
+        event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+        source="api.state.operator_restore.commit",
+        observed_at=now,
+        requested_at=now,
+        payload={"journal_target": f"restore:1:{target_hash}"},
+        correlation_id="a" * 64,
+    )
+    journal.accepted(accepted)
+    journal.started(
+        AgentEvent(
+            event_id=accepted.event_id,
+            event_type=accepted.event_type,
+            source=accepted.source,
+            observed_at=accepted.observed_at,
+            requested_at=accepted.requested_at,
+            payload=accepted.payload,
+            processing_sequence=3,
+            correlation_id=accepted.correlation_id,
+        )
+    )
+    operation = service.summary().latest_operation
+    assert operation is not None
+    assert operation.processing_sequence == 3
+    assert operation.target_sequence < operation.processing_sequence
+
+
+def test_mixed_unsequenced_nonacceptance_journal_record_is_rejected(
+    tmp_path: Any,
+) -> None:
+    service, _store, wal, journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000216"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    accepted = AgentEvent(
+        event_id=f"operator-restore-{operation_id}",
+        event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+        source="api.state.operator_restore.commit",
+        observed_at=now,
+        requested_at=now,
+        payload={"journal_target": f"restore:1:{target_hash}"},
+        correlation_id="a" * 64,
+    )
+    journal.accepted(accepted)
+    journal.started(
+        AgentEvent(
+            event_id=accepted.event_id,
+            event_type=accepted.event_type,
+            source=accepted.source,
+            observed_at=accepted.observed_at,
+            requested_at=accepted.requested_at,
+            payload=accepted.payload,
+            processing_sequence=3,
+            correlation_id=accepted.correlation_id,
+        )
+    )
+    records = journal.verify()
+    governed = [item for item in records if item.event_id == accepted.event_id]
+    malformed = governed[0].model_copy(
+        update={"lifecycle": JournalLifecycle.AUDIT, "processing_sequence": None}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service._journal_operations([*records, malformed])
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_unsequenced_accepted_journal_merges_with_matching_persisted_sequence(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, journal = _service(tmp_path)
+    operation_id = "00000000-0000-0000-0000-000000000212"
+    target_hash = wal.reconstruct(1).snapshot_hash
+    operation = _operation_for_test(operation_id, target_hash, sequence=2)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    journal.accepted(
+        AgentEvent(
+            event_id=operation.event_id,
+            event_type=AgentEventType.STATE_POINT_IN_TIME_RESTORE,
+            source="api.state.operator_restore.commit",
+            observed_at=now,
+            requested_at=now,
+            payload={"journal_target": f"restore:1:{target_hash}"},
+            correlation_id=operation.preview_digest,
+        )
+    )
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    merged = service.summary().latest_operation
+    assert merged is not None
+    assert merged.operation_id == operation_id
+    assert merged.processing_sequence == 2
+
+
+def test_unrelated_unsequenced_persisted_operation_is_rejected(tmp_path: Any) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000213",
+        wal.reconstruct(1).snapshot_hash,
+        sequence=None,
+    )
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
+
+
+def test_below_retention_floor_operation_still_obeys_causality(
+    tmp_path: Any,
+) -> None:
+    service, store, wal, _journal = _service(tmp_path)
+    service._retention_floor = lambda _wal, _journal: 2
+    operation = _operation_for_test(
+        "00000000-0000-0000-0000-000000000214",
+        wal.reconstruct(2).snapshot_hash,
+        sequence=1,
+    ).model_copy(update={"target_sequence": 2})
+    store.last_snapshot = store.last_snapshot.model_copy(
+        update={"extensions": {"operator_restore": [operation.model_dump(mode="json")]}}
+    )
+    with pytest.raises(RestoreContractError) as exc:
+        service.summary()
+    assert exc.value.code == RestoreErrorCode.JOURNAL_INTEGRITY_INVALID.value
 
 
 @pytest.mark.parametrize(

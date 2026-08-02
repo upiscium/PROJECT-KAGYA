@@ -1080,7 +1080,7 @@ class ActionExecutionLayer:
                 request.intent_id, approved=False, actor_id=actor_id
             )
         if request.command == OperatorCommand.CANCEL:
-            return self.cancel(request.intent_id)
+            return self.cancel(request.intent_id, actor_id=actor_id)
         if request.command == OperatorCommand.RETRY_NOW:
             return self.execute(request.intent_id)
         return self.compensate(request.intent_id)
@@ -1842,7 +1842,7 @@ class ActionExecutionLayer:
             )
         return updated
 
-    def cancel(self, intent_id: str) -> ActionIntent:
+    def cancel(self, intent_id: str, *, actor_id: str = "operator") -> ActionIntent:
         intent = self.get_intent(intent_id)
         if intent.status not in {
             IntentStatus.AWAITING_APPROVAL,
@@ -1850,7 +1850,59 @@ class ActionExecutionLayer:
             IntentStatus.RETRY_PENDING,
         }:
             raise ValueError("Action intent cannot be cancelled")
+        decision = self.main_loop.decision_store.get(intent.provenance.decision_id)
+        if decision.status == DecisionStatus.RESOLVED:
+            raise ActionPolicyError("Decision already has a terminal outcome")
         now = self.clock()
+        state = self._state()
+        approvals = state.approvals
+        outbox = getattr(self.main_loop, "outbox", None)
+        approval_message_id: str | None = None
+        if intent.status == IntentStatus.AWAITING_APPROVAL:
+            approval = self._unique_approval(state, intent)
+            if approval is None or approval.status != "pending":
+                raise ActionPolicyError("Pending approval record is required")
+            if outbox is not None:
+                outbox_messages = outbox.list_messages()
+                approval_messages = [
+                    item
+                    for item in outbox_messages
+                    if item.kind == OutboxMessageKind.APPROVAL_REQUEST
+                    and item.references.action_id == intent.intent_id
+                ]
+                deduplication_matches = [
+                    item
+                    for item in outbox_messages
+                    if item.deduplication_key == f"action-approval:{intent.intent_id}"
+                ]
+                if (
+                    len(approval_messages) != 1
+                    or len(deduplication_matches) != 1
+                    or deduplication_matches[0].message_id
+                    != approval_messages[0].message_id
+                    or approval_messages[0].deduplication_key
+                    != f"action-approval:{intent.intent_id}"
+                    or approval_messages[0].acknowledgment_status.value
+                    in {"approved", "rejected"}
+                ):
+                    raise ActionPolicyError(
+                        "Correlated approval outbox record is invalid"
+                    )
+                approval_message_id = approval_messages[0].message_id
+            approvals = tuple(
+                item.model_copy(
+                    update={
+                        "status": "rejected",
+                        "resolved_at": now,
+                        "actor_id": actor_id,
+                        "reason": "action_cancelled",
+                    }
+                )
+                if item.approval_id == approval.approval_id
+                else item
+                for item in state.approvals
+            )
+        receipt_id = str(uuid4())
         updated = intent.model_copy(
             update={
                 "revision": intent.revision + 1,
@@ -1858,10 +1910,9 @@ class ActionExecutionLayer:
                 "updated_at": now,
                 "retry_at": None,
                 "failure_code": "cancelled",
+                "receipt_id": receipt_id,
             }
         )
-        state = self._state()
-        receipt_id = str(uuid4())
         observation, verification = self._failure_evidence(
             intent, receipt_id, ReceiptStatus.CANCELLED, "cancelled", now
         )
@@ -1880,11 +1931,36 @@ class ActionExecutionLayer:
         self._replace(
             state,
             updated,
+            approvals=approvals,
             receipts=(*state.receipts, receipt),
             observations=(*state.observations, observation),
             verifications=(*state.verifications, verification),
         )
         self._resolve_decision(updated, False, "action_cancelled")
+        if outbox is not None and intent.approval_id is not None:
+            cancelled_projection = outbox.cancel(f"action-approval:{intent.intent_id}")
+            if approval_message_id is not None and (
+                cancelled_projection is None
+                or cancelled_projection.message_id != approval_message_id
+            ):
+                raise ActionPolicyError(
+                    "Correlated approval outbox record did not cancel"
+                )
+            event = current_agent_event()
+            responded = outbox.respond_to_action_approval(
+                intent.intent_id,
+                approved=False,
+                actor_id=actor_id,
+                text="action_cancelled",
+                event_id=None if event is None else event.event_id,
+                event_sequence=None if event is None else event.processing_sequence,
+            )
+            if (
+                responded is None or responded.acknowledgment_status.value != "rejected"
+            ) and intent.status == IntentStatus.AWAITING_APPROVAL:
+                raise ActionPolicyError(
+                    "Correlated approval outbox record did not become terminal"
+                )
         return updated
 
     def timeout(self, intent_id: str) -> ActionIntent:
@@ -2726,6 +2802,7 @@ class ActionExecutionLayer:
                         update={
                             "status": "rejected",
                             "resolved_at": rejected_at_by_id[item.intent_id],
+                            "actor_id": "migration",
                             "reason": "legacy_unvalidated_intent",
                         }
                     )
@@ -2842,6 +2919,17 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
     intent_keys = [item.idempotency_key for item in state.intents]
     if len(intent_keys) != len(set(intent_keys)):
         reject("Action idempotency keys are not unique")
+    rejection_keys = [item.idempotency_key for item in state.policy_rejections]
+    if len(rejection_keys) != len(set(rejection_keys)) or set(rejection_keys) & set(
+        intent_keys
+    ):
+        reject("Action idempotency keys are not unique across intents and rejections")
+    validation_keys = [item.idempotency_key for item in state.validation_records]
+    if len(validation_keys) != len(set(validation_keys)):
+        reject("Action validation idempotency keys are not unique")
+    record_ids = {item.validation_id for item in state.validation_records}
+    if set(rejection_ids) & set(intents) or set(rejection_ids) & record_ids:
+        reject("Policy rejection identifiers conflict with action records")
     validation_owners: dict[str, int] = {
         item.validation_id: 0 for item in state.validation_records
     }
@@ -2865,6 +2953,23 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
     for approval in state.approvals:
         if approval.intent_id not in intents:
             reject("Approval record has an invalid intent binding")
+        intent = intents[approval.intent_id]
+        spec = _TOOLS.get(intent.tool_name)
+        if spec is None or not spec.approval_required or intent.dry_run:
+            reject("Approval record is not allowed for this action")
+        expected_statuses = {
+            IntentStatus.AWAITING_APPROVAL: {"pending"},
+            IntentStatus.REJECTED: {"rejected"},
+            IntentStatus.CANCELLED: {"approved", "rejected"},
+        }.get(intent.status, {"approved"})
+        if approval.status not in expected_statuses:
+            reject("Approval status does not match action lifecycle")
+        if approval.status == "pending":
+            if approval.resolved_at is not None or approval.actor_id is not None:
+                reject("Pending approval cannot have resolution metadata")
+        elif approval.resolved_at is None or not approval.actor_id:
+            reject("Resolved approval requires resolution metadata")
+    compensation_targets: set[str] = set()
     for receipt in state.receipts:
         bound_intent = intents.get(receipt.intent_id)
         if bound_intent is None or not receipt_matches_intent(receipt, bound_intent):
@@ -2874,11 +2979,22 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
         ):
             reject("Compensation receipt status and target disagree")
         if receipt.compensation_of is not None:
+            if (
+                receipt.observation_id is not None
+                or receipt.verification_id is not None
+            ):
+                reject("Compensation receipt cannot contain execution evidence")
             target = snapshot.receipts.get(receipt.compensation_of)
-            if target is None or target.intent_id != receipt.intent_id:
+            if (
+                target is None
+                or target.intent_id != receipt.intent_id
+                or target.status != ReceiptStatus.SUCCEEDED
+                or receipt.compensation_of in compensation_targets
+            ):
                 reject("Compensation receipt has an invalid target binding")
             if target.receipt_id == receipt.receipt_id:
                 reject("Compensation receipt cannot target itself")
+            compensation_targets.add(receipt.compensation_of)
         else:
             observation = snapshot.observations.get(receipt.observation_id or "")
             verification = snapshot.verifications.get(receipt.verification_id or "")
@@ -2897,17 +3013,40 @@ def validate_action_state_semantics(state: ActionState) -> ValidatedActionState:
             reject("Observation record has an invalid binding")
         if bound_receipt.intent_id != observation.intent_id:
             reject("Observation record has an invalid receipt binding")
+        if bound_receipt.observation_id != observation.observation_id:
+            reject("Observation record is not exhaustively linked by its receipt")
     for verification in state.verifications:
         if verification.intent_id not in intents:
             reject("Verification record has an invalid intent binding")
+        if verification.observation_id is None:
+            reject("Verification record has an invalid empty binding")
         if verification.observation_id is not None:
             observation = snapshot.observations.get(verification.observation_id)
             if observation is None or observation.intent_id != verification.intent_id:
                 reject("Verification record has an invalid observation binding")
+            bound_receipt = next(
+                (
+                    item
+                    for item in state.receipts
+                    if item.verification_id == verification.verification_id
+                ),
+                None,
+            )
+            if (
+                bound_receipt is None
+                or bound_receipt.intent_id != verification.intent_id
+            ):
+                reject("Verification record is not exhaustively linked by its receipt")
 
     for intent in intents.values():
         if not _intent_records_consistent_indexed(snapshot, intent):
             reject("Action intent semantic binding is invalid")
+        spec = _TOOLS.get(intent.tool_name)
+        requires_approval = bool(
+            spec is not None and spec.approval_required and not intent.dry_run
+        )
+        if requires_approval != (intent.approval_id is not None):
+            reject("Approval requirement and action lifecycle binding disagree")
         intent_receipts = snapshot.receipts_by_intent.get(intent.intent_id, ())
         if (intent.status == IntentStatus.DRY_RUN) != intent.dry_run:
             reject("Action dry-run status is inconsistent")

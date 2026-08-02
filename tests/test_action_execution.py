@@ -32,7 +32,7 @@ from kagya.decision import (
 )
 from kagya.runtime import AgentEventType, AgentRuntime, PersistentAgentState
 from kagya.api.routes.actions import _operator_action
-from kagya.outbox import DeliveryStatus, Outbox
+from kagya.outbox import DeliveryStatus, OUTBOX_STATE_KEY, Outbox
 from kagya.identity import (
     BoundaryAssessmentInput,
     IdentityBoundaryStore,
@@ -1767,6 +1767,206 @@ def test_action_validation_rejects_record_binding_and_event_mismatch(
     runtime.shutdown()
 
 
+def test_cancelled_approval_workflow_restores_as_terminal_and_closes_outbox(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    loop.outbox = Outbox(loop, quiet_hours_start=0, quiet_hours_end=0)
+    _decision(
+        loop,
+        "decision-cancel-approval",
+        "local_notification_enqueue",
+        _notification_args("Cancel me", "Approval is no longer needed"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=8)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.cancel-approval.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-cancel-approval", idempotency_key="cancel-approval"
+            ),
+        ).value
+        approval_message = next(
+            item
+            for item in loop.outbox.list_messages()
+            if item.kind.value == "approval_request"
+        )
+        cancelled = runtime.execute(
+            AgentEventType.ACTION_CANCEL,
+            source="test.cancel-approval.cancel",
+            handler=lambda: layer.cancel(intent.intent_id, actor_id="operator-cancel"),
+        ).value
+        with pytest.raises(ActionPolicyError, match="not executable"):
+            runtime.execute(
+                AgentEventType.ACTION_EXECUTE,
+                source="test.cancel-approval.execute",
+                handler=lambda: layer.execute(intent.intent_id),
+            )
+        with pytest.raises(ActionPolicyError, match="terminal outcome"):
+            runtime.execute(
+                AgentEventType.ACTION_APPROVAL,
+                source="test.cancel-approval.approve",
+                handler=lambda: layer.resolve_approval(
+                    intent.intent_id, approved=True, actor_id="operator-2"
+                ),
+            )
+        with pytest.raises(ActionPolicyError, match="not executable"):
+            runtime.execute(
+                AgentEventType.ACTION_EXECUTE,
+                source="test.cancel-approval.retry",
+                handler=lambda: layer.execute(intent.intent_id),
+            )
+    finally:
+        runtime.shutdown()
+
+    assert cancelled.status == IntentStatus.CANCELLED
+    persisted = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    validate_action_state_semantics(persisted)
+    approval = persisted.approvals[0]
+    assert approval.status == "rejected"
+    assert approval.actor_id == "operator-cancel"
+    assert approval.reason == "action_cancelled"
+    from kagya.runtime.operator_restore import _protected_domain_has_active_work
+
+    assert not _protected_domain_has_active_work(
+        "action_execution", persisted.model_dump(mode="json")
+    )
+    outbox_message = loop.outbox.get(approval_message.message_id)
+    assert outbox_message.delivery_status == DeliveryStatus.CANCELLED
+    assert outbox_message.acknowledgment_status.value == "rejected"
+    with pytest.raises(ValueError, match="already acknowledged"):
+        loop.outbox.respond(
+            approval_message.message_id, kind="approval", actor_id="operator-2"
+        )
+    repeated_rejection = loop.outbox.respond(
+        approval_message.message_id, kind="reject", actor_id="operator-2"
+    )
+    assert repeated_rejection == outbox_message
+
+
+def test_cancel_checks_terminal_decision_before_mutating_action_or_outbox(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    loop.outbox = Outbox(loop, quiet_hours_start=0, quiet_hours_end=0)
+    _decision(
+        loop,
+        "decision-cancel-terminal",
+        "local_notification_enqueue",
+        _notification_args("Keep pending", "Decision already completed"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.cancel-terminal.intent",
+            handler=lambda: layer.create_from_decision(
+                "decision-cancel-terminal", idempotency_key="cancel-terminal"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+    loop.decision_store.record_outcome(
+        "decision-cancel-terminal",
+        description="independently completed",
+        utility=1.0,
+        success=True,
+        observed_event_id=None,
+        observed_event_sequence=None,
+    )
+    action_before = json.dumps(
+        loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+    )
+    outbox_before = json.dumps(
+        loop.persistent_state.extensions[OUTBOX_STATE_KEY], sort_keys=True
+    )
+
+    with pytest.raises(ActionPolicyError, match="terminal outcome"):
+        layer.cancel(intent.intent_id, actor_id="operator-cancel")
+
+    assert (
+        json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+        == action_before
+    )
+    assert (
+        json.dumps(loop.persistent_state.extensions[OUTBOX_STATE_KEY], sort_keys=True)
+        == outbox_before
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing", "duplicate", "wrong_key", "shadow_key"]
+)
+def test_cancel_rejects_missing_or_ambiguous_approval_outbox_before_mutation(
+    tmp_path: Path, corruption: str
+) -> None:
+    loop = _Loop()
+    loop.outbox = Outbox(loop, quiet_hours_start=0, quiet_hours_end=0)
+    _decision(
+        loop,
+        f"decision-cancel-{corruption}",
+        "local_notification_enqueue",
+        _notification_args("Keep pending", "Approval projection is corrupt"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source=f"test.cancel-{corruption}.intent",
+            handler=lambda: layer.create_from_decision(
+                f"decision-cancel-{corruption}",
+                idempotency_key=f"cancel-{corruption}",
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+    raw_outbox = loop.persistent_state.extensions[OUTBOX_STATE_KEY]
+    if corruption == "missing":
+        raw_outbox["messages"] = []
+    elif corruption == "duplicate":
+        duplicate = {
+            **raw_outbox["messages"][0],
+            "message_id": "duplicate-approval-message",
+            "deduplication_key": "duplicate-approval-message",
+        }
+        raw_outbox["messages"].append(duplicate)
+    elif corruption == "wrong_key":
+        raw_outbox["messages"][0]["deduplication_key"] = "wrong-approval-key"
+    else:
+        shadow = {
+            **raw_outbox["messages"][0],
+            "message_id": "shadow-approval-message",
+            "kind": "action_result",
+        }
+        raw_outbox["messages"].insert(0, shadow)
+    action_before = json.dumps(
+        loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True
+    )
+
+    with pytest.raises(ActionPolicyError, match="outbox record is invalid"):
+        layer.cancel(intent.intent_id, actor_id="operator-cancel")
+
+    assert (
+        json.dumps(loop.persistent_state.extensions[ACTION_STATE_KEY], sort_keys=True)
+        == action_before
+    )
+
+
 def _notification_args(title: str, body: str) -> dict[str, object]:
     return {
         "channel": "local",
@@ -2086,6 +2286,8 @@ def test_validate_action_state_semantics_accepts_compensated_history(
             "receipt_id": "semantic-compensation",
             "status": ReceiptStatus.COMPENSATED,
             "compensation_of": original.receipt_id,
+            "observation_id": None,
+            "verification_id": None,
         }
     )
     compensated = intent.model_copy(
@@ -2120,6 +2322,13 @@ def test_validate_action_state_semantics_accepts_compensated_history(
         "retry_without_receipt",
         "self_compensation",
         "duplicate_compensation",
+        "two_distinct_compensations_same_target",
+        "compensation_with_extra_evidence",
+        "second_observation_same_receipt",
+        "second_verification_same_observation",
+        "orphan_observation",
+        "orphan_verification",
+        "empty_verification_observation",
         "cross_intent_compensation",
     ],
 )
@@ -2242,6 +2451,38 @@ def test_validate_action_state_semantics_rejects_third_review_matrix(
                 "verifications": (),
             }
         )
+    elif corruption == "second_observation_same_receipt":
+        second = state.observations[0].model_copy(
+            update={"observation_id": "semantic-second-observation"}
+        )
+        corrupted = state.model_copy(
+            update={"observations": (*state.observations, second)}
+        )
+    elif corruption == "second_verification_same_observation":
+        second = state.verifications[0].model_copy(
+            update={"verification_id": "semantic-second-verification"}
+        )
+        corrupted = state.model_copy(
+            update={"verifications": (*state.verifications, second)}
+        )
+    elif corruption == "orphan_observation":
+        orphan = state.observations[0].model_copy(
+            update={"observation_id": "semantic-orphan", "receipt_id": "missing"}
+        )
+        corrupted = state.model_copy(update={"observations": (orphan,)})
+    elif corruption == "orphan_verification":
+        orphan = state.verifications[0].model_copy(
+            update={
+                "verification_id": "semantic-orphan-verification",
+                "observation_id": "missing",
+            }
+        )
+        corrupted = state.model_copy(update={"verifications": (orphan,)})
+    elif corruption == "empty_verification_observation":
+        verification = state.verifications[0].model_copy(
+            update={"observation_id": None}
+        )
+        corrupted = state.model_copy(update={"verifications": (verification,)})
     else:
         compensation = receipt.model_copy(
             update={
@@ -2261,10 +2502,118 @@ def test_validate_action_state_semantics_rejects_third_review_matrix(
             corrupted = state.model_copy(
                 update={"receipts": (receipt, compensation, compensation)}
             )
+        elif corruption == "two_distinct_compensations_same_target":
+            second = compensation.model_copy(
+                update={"receipt_id": "semantic-duplicate-2"}
+            )
+            corrupted = state.model_copy(
+                update={"receipts": (receipt, compensation, second)}
+            )
+        elif corruption == "compensation_with_extra_evidence":
+            compensation = compensation.model_copy(
+                update={
+                    "observation_id": state.observations[0].observation_id,
+                    "verification_id": state.verifications[0].verification_id,
+                }
+            )
+            corrupted = state.model_copy(update={"receipts": (receipt, compensation)})
         elif corruption == "cross_intent_compensation":
             compensation = compensation.model_copy(update={"intent_id": "other-intent"})
-        if corruption != "duplicate_compensation":
+        if corruption not in {
+            "duplicate_compensation",
+            "two_distinct_compensations_same_target",
+        }:
             corrupted = state.model_copy(update={"receipts": (receipt, compensation)})
 
     with pytest.raises(ActionPolicyError):
         validate_action_state_semantics(corrupted)
+
+
+def test_semantic_validator_rejects_policy_rejection_idempotency_reuse(
+    tmp_path: Path,
+) -> None:
+    loop = _Loop()
+    _decision(
+        loop,
+        "decision-rejection-semantic",
+        "local_notification_enqueue",
+        _notification_args("Budget", "Budget rejection"),
+    )
+    layer = ActionExecutionLayer(
+        loop, document_root=tmp_path, calendar_path=tmp_path / "calendar.json"
+    )
+    runtime = AgentRuntime(queue_capacity=4)
+    runtime.start()
+    try:
+        runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.rejection-semantic",
+            handler=lambda: layer.create_from_decision(
+                "decision-rejection-semantic",
+                idempotency_key="semantic-rejection",
+                budget=ActionBudget(max_risk_class="read_only"),
+            ),
+        )
+    finally:
+        runtime.shutdown()
+    state = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    rejection = state.policy_rejections[0]
+    second_validation = state.validation_records[0].model_copy(
+        update={"validation_id": "second-rejection-validation"}
+    )
+    second_rejection = rejection.model_copy(
+        update={
+            "rejection_id": "second-policy-rejection",
+            "validation_id": second_validation.validation_id,
+        }
+    )
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(
+            state.model_copy(
+                update={
+                    "validation_records": (
+                        *state.validation_records,
+                        second_validation,
+                    ),
+                    "policy_rejections": (rejection, second_rejection),
+                }
+            )
+        )
+
+    _decision(
+        loop,
+        "decision-rejection-conflict",
+        "restricted_metadata_read",
+        {"namespace": "project", "key": "name"},
+    )
+    runtime = AgentRuntime(queue_capacity=2)
+    runtime.start()
+    try:
+        intent = runtime.execute(
+            AgentEventType.ACTION_INTENT,
+            source="test.rejection-conflict",
+            handler=lambda: layer.create_from_decision(
+                "decision-rejection-conflict", idempotency_key="temporary-intent"
+            ),
+        ).value
+    finally:
+        runtime.shutdown()
+    conflicted_intent = intent.model_copy(
+        update={"idempotency_key": rejection.idempotency_key}
+    )
+    current = ActionState.model_validate(
+        loop.persistent_state.extensions[ACTION_STATE_KEY]
+    )
+    intent_validation = current.validation_records[-1].model_copy(
+        update={"idempotency_key": rejection.idempotency_key}
+    )
+    conflicted = current.model_copy(
+        update={
+            "intents": (conflicted_intent,),
+            "validation_records": (*current.validation_records[:-1], intent_validation),
+        }
+    )
+    with pytest.raises(ActionPolicyError):
+        validate_action_state_semantics(conflicted)

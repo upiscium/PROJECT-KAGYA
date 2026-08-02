@@ -782,7 +782,11 @@ class OperatorRestoreService:
         return current
 
     def _parse_operation_source(
-        self, raw: Any, *, source: str
+        self,
+        raw: Any,
+        *,
+        source: str,
+        container_sequence: int | None = None,
     ) -> list[RestoreOperation]:
         if raw is None:
             return []
@@ -798,6 +802,14 @@ class OperatorRestoreService:
                     if isinstance(item, RestoreOperation)
                     else item
                 )
+                if operation.processing_sequence is None:
+                    if source != "journal":
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                elif operation.target_sequence >= operation.processing_sequence or (
+                    container_sequence is not None
+                    and operation.processing_sequence > container_sequence
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 if (
                     operation.operation_id in identifiers
                     or operation.event_id in event_ids
@@ -825,6 +837,11 @@ class OperatorRestoreService:
             if source.startswith("persisted"):
                 persisted_ids.update(item.operation_id for item in operations)
             for operation in operations:
+                if operation.processing_sequence is None:
+                    if source != "journal":
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                elif operation.target_sequence >= operation.processing_sequence:
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 if operation.target_sequence >= analysis.floor:
                     target = analysis.restorable_by_sequence.get(
                         operation.target_sequence
@@ -853,6 +870,14 @@ class OperatorRestoreService:
                     )
                 ):
                     self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+                if (prior.processing_sequence is None) != (
+                    operation.processing_sequence is None
+                ):
+                    unsequenced_is_journal = (
+                        prior.processing_sequence is None and "journal" in prior_sources
+                    ) or (operation.processing_sequence is None and source == "journal")
+                    if not unsequenced_is_journal:
+                        self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
                 prior_is_journal = "journal" in prior_sources
                 incoming_is_journal = source == "journal"
                 prior_requested = datetime.fromisoformat(prior.requested_at).astimezone(
@@ -1588,21 +1613,15 @@ class OperatorRestoreService:
             error_code=None,
         )
         target_history = self._parse_operation_source(
-            target.extensions.get(_RESERVED, []), source="persisted_target"
+            target.extensions.get(_RESERVED, []),
+            source="persisted_target",
+            container_sequence=target.last_processed_event_sequence,
         )
         current_history = self._parse_operation_source(
-            current.extensions.get(_RESERVED, []), source="persisted_current"
+            current.extensions.get(_RESERVED, []),
+            source="persisted_current",
+            container_sequence=current.last_processed_event_sequence,
         )
-        if any(
-            item.processing_sequence is not None
-            and item.processing_sequence > target.last_processed_event_sequence
-            for item in target_history
-        ) or any(
-            item.processing_sequence is not None
-            and item.processing_sequence > current.last_processed_event_sequence
-            for item in current_history
-        ):
-            self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
         in_memory = self._parse_operation_source(
             list(self._operations), source="memory"
         )
@@ -1723,6 +1742,25 @@ class OperatorRestoreService:
                 for item in records
                 if item.processing_sequence is not None
             }
+            if any(
+                item.processing_sequence is None
+                and item.lifecycle != JournalLifecycle.ACCEPTED
+                and not (
+                    item.lifecycle == JournalLifecycle.RECOVERY_CLASSIFIED
+                    and item.failure_category == "accepted_not_started"
+                )
+                for item in records
+            ):
+                self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+            for item in records:
+                if item.lifecycle in {
+                    JournalLifecycle.COMPLETED,
+                    JournalLifecycle.FAILED,
+                } and (
+                    item.snapshot_sequence != item.processing_sequence
+                    or item.snapshot_hash is None
+                ):
+                    self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
             if target_match is None or not re.fullmatch(
                 r"[0-9a-f]{64}", preview_digest
             ):
@@ -1796,13 +1834,11 @@ class OperatorRestoreService:
         journal_operations = self._parse_operation_source(
             self._journal_operations(journal), source="journal"
         )
-        persisted = self._parse_operation_source(raw, source="persisted_current")
-        if any(
-            item.processing_sequence is not None
-            and item.processing_sequence > current.last_processed_event_sequence
-            for item in persisted
-        ):
-            self._fail(RestoreErrorCode.JOURNAL_INTEGRITY_INVALID)
+        persisted = self._parse_operation_source(
+            raw,
+            source="persisted_current",
+            container_sequence=current.last_processed_event_sequence,
+        )
         operations, persisted_operation_ids = self._merge_operation_sources(
             [
                 ("memory", in_memory),
