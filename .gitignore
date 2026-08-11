@@ -21,6 +21,7 @@ wheels/
 # Runtime artifacts
 .kagya/
 .worktrees/
+.task-state/
 
 # local config
 *.local.yaml
@@ -31,3 +32,5 @@ frontend/.next/
 frontend/.env*
 frontend/out/
 frontend/coverage/
+
+/.worktrees/
