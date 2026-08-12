@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -101,10 +102,14 @@ class AdapterRegistry:
         with self.path.open("r", encoding="utf-8") as registry_file:
             data = json.load(registry_file)
         adapters = data.get("adapters", []) if isinstance(data, dict) else []
-        return [AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)]
+        return [
+            AdapterEntry.from_json(item) for item in adapters if isinstance(item, dict)
+        ]
 
     def lookup(self, adapter_id: str) -> AdapterEntry | None:
-        return next((entry for entry in self.list() if entry.adapter_id == adapter_id), None)
+        return next(
+            (entry for entry in self.list() if entry.adapter_id == adapter_id), None
+        )
 
     def apply_evaluation(
         self,
@@ -132,7 +137,9 @@ class AdapterRegistry:
     def approve(self, adapter_id: str, *, notes: str = "") -> AdapterEntry:
         entry = self._require(adapter_id)
         self._ensure_transition(entry.status, AdapterStatus.APPROVED)
-        return self._replace(adapter_id, status=AdapterStatus.APPROVED, notes=notes or entry.notes)
+        return self._replace(
+            adapter_id, status=AdapterStatus.APPROVED, notes=notes or entry.notes
+        )
 
     def activate(self, adapter_id: str) -> AdapterEntry:
         entry = self._require(adapter_id)
@@ -142,10 +149,16 @@ class AdapterRegistry:
         now = _now_iso()
         for existing in self.list():
             if existing.adapter_id == adapter_id:
-                activated = _copy_entry(existing, status=AdapterStatus.ACTIVE, updated_at=now)
+                activated = _copy_entry(
+                    existing, status=AdapterStatus.ACTIVE, updated_at=now
+                )
                 entries.append(activated)
             elif existing.status == AdapterStatus.ACTIVE:
-                entries.append(_copy_entry(existing, status=AdapterStatus.ARCHIVED, updated_at=now))
+                entries.append(
+                    _copy_entry(
+                        existing, status=AdapterStatus.ARCHIVED, updated_at=now
+                    )
+                )
             else:
                 entries.append(existing)
         self._write(entries)
@@ -178,14 +191,21 @@ class AdapterRegistry:
             raise ValueError(f"Unknown adapter: {adapter_id}")
         return updated_entry
 
-    def _write(self, entries: list[AdapterEntry]) -> None:
+    def _write(self, entries: builtins.list[AdapterEntry]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as registry_file:
-            json.dump({"adapters": [entry.to_json() for entry in entries]}, registry_file, indent=2)
+            json.dump(
+                {"adapters": [entry.to_json() for entry in entries]},
+                registry_file,
+                indent=2,
+            )
 
     def _ensure_transition(self, current: AdapterStatus, target: AdapterStatus) -> None:
         allowed = {
-            AdapterStatus.CANDIDATE: {AdapterStatus.TRIAL_ACTIVE, AdapterStatus.REJECTED},
+            AdapterStatus.CANDIDATE: {
+                AdapterStatus.TRIAL_ACTIVE,
+                AdapterStatus.REJECTED,
+            },
             AdapterStatus.TRIAL_ACTIVE: {AdapterStatus.APPROVED},
             AdapterStatus.APPROVED: {AdapterStatus.ACTIVE},
             AdapterStatus.ACTIVE: {AdapterStatus.ARCHIVED},
@@ -193,7 +213,9 @@ class AdapterRegistry:
             AdapterStatus.ARCHIVED: set(),
         }
         if target not in allowed[current]:
-            raise ValueError(f"Invalid adapter status transition: {current} -> {target}")
+            raise ValueError(
+                f"Invalid adapter status transition: {current} -> {target}"
+            )
 
 
 def _copy_entry(entry: AdapterEntry, **updates: Any) -> AdapterEntry:
