@@ -1,50 +1,60 @@
-# デフォルトのアクション（引数なしで実行された場合）
-# エージェントが迷ったときや、コミット前に全体を検証するための安全なフォールバックです。
+# Default deterministic repository validation.
 default: check-all
 
 # =============================================================================
-# Agent API: 以下のコマンド群のみを CLAUDE.md でエージェントに露出させます
+# Stable repository validation API
 # =============================================================================
 
-# コードの静的解析（Lint）を実行します
-lint target="src/":
-    @echo "==> Running Linter (Ruff) on {{target}}..."
+# Lint the backend package and backend tests.
+lint target="kagya tests":
+    @echo "==> Running Ruff on {{target}}..."
     uv run ruff check {{target}}
 
-# コードの自動フォーマットを実行します
-format target="src/":
-    @echo "==> Running Formatter (Ruff) on {{target}}..."
+# Format backend source/tests and apply safe Ruff fixes.
+format target="kagya tests":
+    @echo "==> Formatting {{target}}..."
     uv run ruff format {{target}}
     uv run ruff check --fix {{target}}
 
-# 静的型チェックを実行します
-typecheck target="src/":
-    @echo "==> Running Type Checker (Mypy) on {{target}}..."
+# Type-check the actual backend package tree.
+typecheck target="kagya":
+    @echo "==> Running Mypy on {{target}}..."
     uv run mypy {{target}}
 
-# テストを実行します
+# Run backend tests.
 test target="tests/":
-    @echo "==> Running Tests (Pytest) on {{target}}..."
+    @echo "==> Running Pytest on {{target}}..."
     uv run pytest {{target}} -v
 
-# FastAPI サーバーを起動します
+# Run the deterministic frontend test suite.
+frontend-test:
+    @echo "==> Running frontend tests..."
+    cd frontend && npm test
+
+# Build the frontend in production mode, including its type checks.
+frontend-build:
+    @echo "==> Building frontend..."
+    cd frontend && npm run build
+
+# Start the FastAPI server.
 api:
     @echo "==> Starting PROJECT-KAGYA FastAPI server..."
     uv run python -m kagya.api.server
 
 # =============================================================================
-# 複合タスク (Pipelines)
+# Composite validation
 # =============================================================================
 
-# プルリクエスト作成前や、大きな変更の後にエージェントに実行させる一括検証
-check-all: lint typecheck test
-    @echo "==> [OK] All checks passed successfully."
+# Repository-wide deterministic gate for the implementation that exists today.
+# Later rebuild PRs may extend this only after their implementation/tests exist.
+check-all: lint typecheck test frontend-test frontend-build
+    @echo "==> [OK] All deterministic repository checks passed."
 
 # =============================================================================
-# ユーティリティ (依存関係管理など)
+# Dependency management
 # =============================================================================
 
-# 依存関係の同期（.envrc からも呼ばれますが、明示的なAPIとしても提供）
+# Reproduce the committed backend dependency graph.
 sync:
-    @echo "==> Syncing dependencies with uv..."
-    uv sync
+    @echo "==> Syncing locked backend dependencies..."
+    uv sync --locked
