@@ -1,19 +1,28 @@
 """Memory routes."""
 
+from collections.abc import Mapping
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from kagya.api.dependencies import get_memory_system, require_admin
-from kagya.api.schemas.memory import EpisodeMemoryResponse, MemorySearchResponse, SemanticMemoryResponse
+from kagya.api.schemas.memory import (
+    EpisodeMemoryResponse,
+    MemorySearchResponse,
+    SemanticMemoryResponse,
+)
 from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
 
 
-router = APIRouter(prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)])
+router = APIRouter(
+    prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)]
+)
 
 
 @router.get("/search", response_model=MemorySearchResponse)
-def search_memory(query: str, memory: DualMemorySystem = Depends(get_memory_system)) -> MemorySearchResponse:
+def search_memory(
+    query: str, memory: DualMemorySystem = Depends(get_memory_system)
+) -> MemorySearchResponse:
     context = memory.retrieve_context(query)
     return MemorySearchResponse(
         db1_results=[episode_response(record) for record in context.db1_results],
@@ -22,7 +31,9 @@ def search_memory(query: str, memory: DualMemorySystem = Depends(get_memory_syst
 
 
 @router.get("/episodes/{episode_id}", response_model=EpisodeMemoryResponse)
-def get_episode(episode_id: str, memory: DualMemorySystem = Depends(get_memory_system)) -> EpisodeMemoryResponse:
+def get_episode(
+    episode_id: str, memory: DualMemorySystem = Depends(get_memory_system)
+) -> EpisodeMemoryResponse:
     result = memory.db1.get(ids=[episode_id], include=["metadatas"])
     ids = result.get("ids") or []
     if not ids:
@@ -32,9 +43,9 @@ def get_episode(episode_id: str, memory: DualMemorySystem = Depends(get_memory_s
         id=episode_id,
         user_input=str(metadata.get("user_input", "")),
         response=str(metadata.get("response", "")),
-        loss=float(metadata.get("loss", 0.0)),
-        emotion_valence=float(metadata.get("emotion_valence", 0.0)),
-        emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
+        loss=_metadata_float(metadata, "loss"),
+        emotion_valence=_metadata_float(metadata, "emotion_valence"),
+        emotion_arousal=_metadata_float(metadata, "emotion_arousal"),
         record_type=str(metadata.get("record_type", "episodic_log")),
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
@@ -42,7 +53,9 @@ def get_episode(episode_id: str, memory: DualMemorySystem = Depends(get_memory_s
 
 
 @router.get("/semantic/{memory_id}", response_model=SemanticMemoryResponse)
-def get_semantic(memory_id: str, memory: DualMemorySystem = Depends(get_memory_system)) -> SemanticMemoryResponse:
+def get_semantic(
+    memory_id: str, memory: DualMemorySystem = Depends(get_memory_system)
+) -> SemanticMemoryResponse:
     result = memory.db2.get(ids=[memory_id], include=["documents", "metadatas"])
     ids = result.get("ids") or []
     if not ids:
@@ -81,3 +94,10 @@ def semantic_response(record: SemanticMemoryRecord) -> SemanticMemoryResponse:
         record_type=record.record_type.value,
         created_at=record.created_at,
     )
+
+
+def _metadata_float(metadata: Mapping[str, object], key: str) -> float:
+    value = metadata.get(key, 0.0)
+    if isinstance(value, (str, int, float)):
+        return float(value)
+    raise ValueError(f"Memory metadata {key!r} is not numeric")
