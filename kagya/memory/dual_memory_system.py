@@ -45,6 +45,14 @@ class DeterministicEmbeddingFunction:
         return True
 
 
+def _resolve_embedding_function(embedding_function: Any | None) -> Any:
+    """Return the injected embedding function or the deterministic baseline adapter."""
+
+    if embedding_function is None:
+        return DeterministicEmbeddingFunction()
+    return embedding_function
+
+
 class DualMemorySystem:
     """Dual memory backed by DB1 hippocampus and DB2 cortex Chroma collections."""
 
@@ -55,11 +63,7 @@ class DualMemorySystem:
         evaluator: MemoryEvaluator | None = None,
     ) -> None:
         self.settings = settings
-        self.embedding_function: Any = (
-            embedding_function
-            if embedding_function is not None
-            else DeterministicEmbeddingFunction()
-        )
+        self.embedding_function = _resolve_embedding_function(embedding_function)
         self.evaluator = evaluator or MemoryEvaluator()
         self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
         self.db1 = self.client.get_or_create_collection(
