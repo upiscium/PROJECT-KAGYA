@@ -10,15 +10,14 @@ from kagya.memory import EpisodicMemoryRecord
 @dataclass(frozen=True)
 class DreamDatasetRecord:
     input: str
-    thought: str
     output: str
 
     def to_json(self) -> dict[str, str]:
-        return {"input": self.input, "thought": self.thought, "output": self.output}
+        return {"input": self.input, "output": self.output}
 
 
 class DreamDatasetGenerator:
-    """Write high-emotion episodes as JSONL dream training examples."""
+    """Write visible high-emotion episodes as JSONL training examples."""
 
     def generate(
         self,
@@ -26,11 +25,7 @@ class DreamDatasetGenerator:
         dataset_path: Path,
     ) -> list[DreamDatasetRecord]:
         records = [
-            DreamDatasetRecord(
-                input=episode.user_input,
-                thought=episode.hidden_thought,
-                output=episode.response,
-            )
+            DreamDatasetRecord(input=episode.user_input, output=episode.response)
             for episode in episodes
         ]
         dataset_path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,10 +36,4 @@ class DreamDatasetGenerator:
 
 
 def format_training_text(record: DreamDatasetRecord) -> str:
-    return (
-        f"ユーザー: {record.input}\n"
-        "私: <think>\n"
-        f"{record.thought}\n"
-        "</think>\n"
-        f"{record.output}<eos>"
-    )
+    return f"ユーザー: {record.input}\n私: {record.output}<eos>"
