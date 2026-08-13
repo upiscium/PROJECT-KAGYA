@@ -19,7 +19,11 @@ def load_settings(path: str | Path | None = None) -> Settings:
 
     if path is None:
         configured_path = os.getenv(CONFIG_PATH_ENV)
-        config_path = Path(configured_path) if configured_path else DEFAULT_CONFIG_PATH
+        config_path = (
+            DEFAULT_CONFIG_PATH
+            if configured_path is None
+            else Path(configured_path)
+        )
     else:
         config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as config_file:
