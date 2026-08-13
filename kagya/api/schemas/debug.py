@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from kagya.api.schemas.chat import ChatResponse, EmotionSchema, ModelSchema
+from kagya.api.schemas.chat import ChatResponse, EmotionSchema
 
 
 class RetrievedEpisodeSchema(BaseModel):

@@ -1,12 +1,13 @@
 """ChromaDB-backed dual memory implementation."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 import json
 from typing import Any
 from uuid import uuid4
 
 import chromadb
+from chromadb.api.types import Metadata
 
 from kagya.config import Settings
 from kagya.memory.consolidation import build_consolidation_prompt
@@ -41,6 +42,14 @@ class DeterministicEmbeddingFunction:
         return True
 
 
+def _resolve_embedding_function(embedding_function: Any | None) -> Any:
+    """Return the injected embedding function or the deterministic baseline adapter."""
+
+    if embedding_function is None:
+        return DeterministicEmbeddingFunction()
+    return embedding_function
+
+
 class DualMemorySystem:
     """Dual memory backed by DB1 hippocampus and DB2 cortex Chroma collections."""
 
@@ -51,7 +60,7 @@ class DualMemorySystem:
         evaluator: MemoryEvaluator | None = None,
     ) -> None:
         self.settings = settings
-        self.embedding_function = embedding_function or DeterministicEmbeddingFunction()
+        self.embedding_function = _resolve_embedding_function(embedding_function)
         self.evaluator = evaluator or MemoryEvaluator()
         self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
         self.db1 = self.client.get_or_create_collection(
@@ -77,7 +86,7 @@ class DualMemorySystem:
     ) -> str:
         episode_id = f"episode-{uuid4()}"
         created_at = _now_iso()
-        record_metadata = {
+        record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
             "hidden_thought": hidden_thought,
@@ -104,7 +113,7 @@ class DualMemorySystem:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         semantic_id = f"semantic-{uuid4()}"
-        record_metadata = {
+        record_metadata: Metadata = {
             "text": text,
             "source_episode_ids": json.dumps(source_episode_ids or []),
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
@@ -172,29 +181,45 @@ def _episodic_document(user_input: str, response: str, hidden_thought: str) -> s
     return f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
 
 
-def _episodic_records_from_query(result: dict[str, Any]) -> list[EpisodicMemoryRecord]:
+def _episodic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[EpisodicMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     metadatas = _first_result_list(result.get("metadatas"))
-    return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
 
 
-def _semantic_records_from_query(result: dict[str, Any]) -> list[SemanticMemoryRecord]:
+def _semantic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[SemanticMemoryRecord]:
     ids = _first_result_list(result.get("ids"))
     documents = _first_result_list(result.get("documents"))
     metadatas = _first_result_list(result.get("metadatas"))
     return [
         _semantic_record_from_metadata(record_id, document or "", metadata or {})
-        for record_id, document, metadata in zip(ids, documents, metadatas, strict=False)
+        for record_id, document, metadata in zip(
+            ids, documents, metadatas, strict=False
+        )
     ]
 
 
-def _episodic_records_from_get(result: dict[str, Any]) -> list[EpisodicMemoryRecord]:
+def _episodic_records_from_get(
+    result: Mapping[str, Any],
+) -> list[EpisodicMemoryRecord]:
     ids = result.get("ids") or []
     metadatas = result.get("metadatas") or []
-    return [_episodic_record_from_metadata(record_id, metadata or {}) for record_id, metadata in zip(ids, metadatas, strict=False)]
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
 
 
-def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> EpisodicMemoryRecord:
+def _episodic_record_from_metadata(
+    record_id: str, metadata: dict[str, Any]
+) -> EpisodicMemoryRecord:
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
@@ -203,19 +228,25 @@ def _episodic_record_from_metadata(record_id: str, metadata: dict[str, Any]) -> 
         loss=float(metadata.get("loss", 0.0)),
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
-        record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))),
+        record_type=MemoryRecordType(
+            str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))
+        ),
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
         metadata=_loads_json_dict(metadata.get("extra")),
     )
 
 
-def _semantic_record_from_metadata(record_id: str, document: str, metadata: dict[str, Any]) -> SemanticMemoryRecord:
+def _semantic_record_from_metadata(
+    record_id: str, document: str, metadata: dict[str, Any]
+) -> SemanticMemoryRecord:
     return SemanticMemoryRecord(
         id=record_id,
         text=str(metadata.get("text", document)),
         source_episode_ids=_loads_json_list(metadata.get("source_episode_ids")),
-        record_type=MemoryRecordType(str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))),
+        record_type=MemoryRecordType(
+            str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))
+        ),
         created_at=str(metadata.get("created_at", "")),
         metadata=_loads_json_dict(metadata.get("extra")),
     )
