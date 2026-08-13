@@ -225,7 +225,7 @@ def _episodic_document(user_input: str, response: str) -> str:
 
 
 def _sanitize_persisted_metadata(metadata: Mapping[str, Any]) -> Metadata:
-    sanitized: Metadata = {}
+    sanitized: dict[str, str | int | float | bool] = {}
     for key, value in metadata.items():
         if normalize_private_key(key) in PRIVATE_FIELD_KEYS:
             continue
