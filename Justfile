@@ -104,3 +104,11 @@ check-all: lint typecheck test behavioral-runtime config-check schema-check
 sync:
     @echo "==> Syncing dependencies with uv..."
     uv sync
+
+# Agent Core module router
+mod agent '.automation/just/agent.just'
+mod automation '.automation/just/automation.just'
+mod integrate '.automation/just/integrate.just'
+mod project 'just/project/mod.just'
+mod repository '.automation/just/repository.just'
+mod? local 'just/local.just'
