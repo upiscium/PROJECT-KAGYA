@@ -8,7 +8,6 @@ from uuid import uuid4
 
 import chromadb
 from chromadb.api.types import Metadata
-import numpy as np
 
 from kagya.config import Settings
 from kagya.memory.consolidation import build_consolidation_prompt
@@ -28,10 +27,8 @@ class DeterministicEmbeddingFunction:
     def __call__(self, input: Sequence[str]) -> list[list[float]]:
         return [_embed_text(text) for text in input]
 
-    def embed_query(
-        self, input: Sequence[str]
-    ) -> np.ndarray[Any, np.dtype[np.float32]]:
-        return np.asarray(self(input), dtype=np.float32)
+    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
+        return self(input)
 
     def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
         return self(input)
