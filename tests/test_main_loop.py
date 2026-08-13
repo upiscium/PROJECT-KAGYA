@@ -7,10 +7,11 @@ from kagya.runtime import KagyaMainLoop
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 
 
 class ThinkingDummyProvider(DummyProvider):
-    response_text = "<think>internal runtime thought</think>Visible runtime answer."
+    response_text = f"<think>{PRIVATE_SENTINEL}</think>Visible runtime answer."
 
     def __init__(self) -> None:
         self.prompts: list[str] = []
@@ -20,45 +21,73 @@ class ThinkingDummyProvider(DummyProvider):
         return self.response_text
 
 
-def test_dummy_provider_drives_user_input_to_response_end_to_end(tmp_path: Path) -> None:
+def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
+    tmp_path: Path,
+) -> None:
     provider = ThinkingDummyProvider()
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
-    loop = KagyaMainLoop(_settings_for_tmp_memory(tmp_path), provider, memory)
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    loop = KagyaMainLoop(settings, provider, memory)
 
-    result = loop.chat("hello", debug=True)
+    result = loop.chat("hello")
 
     assert result.response == "Visible runtime answer."
-    assert result.hidden_thought == "internal runtime thought"
     assert result.loss == DummyProvider.loss_value
     assert result.episode_id.startswith("episode-")
-    assert result.model_id == _settings_for_tmp_memory(tmp_path).model.primary_id
+    assert result.model_id == settings.model.primary_id
     assert result.adapter_id is None
+    assert not hasattr(result, "hidden_thought")
+    assert not hasattr(result, "prompt")
+    assert not hasattr(result, "memory_context")
 
 
-def test_db1_receives_saved_episode_with_hidden_thought(tmp_path: Path) -> None:
+def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+    )
+
+    result, trace = loop.chat_debug("inspect this turn")
+
+    assert result.response == "Visible runtime answer."
+    assert trace.hidden_thought == PRIVATE_SENTINEL
+    assert PRIVATE_SENTINEL not in str(result)
+    assert "Assistant:" in trace.prompt
+
+
+def test_db1_never_persists_extracted_private_thought(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
-    result = loop.chat("remember this", debug=True)
-    stored = memory.db1.get(ids=[result.episode_id], include=["metadatas"])
+    result, trace = loop.chat_debug("remember this")
+    stored = memory.db1.get(
+        ids=[result.episode_id], include=["documents", "metadatas"]
+    )
 
+    assert trace.hidden_thought == PRIVATE_SENTINEL
     assert stored["ids"] == [result.episode_id]
     assert stored["metadatas"][0]["user_input"] == "remember this"
     assert stored["metadatas"][0]["response"] == "Visible runtime answer."
-    assert stored["metadatas"][0]["hidden_thought"] == "internal runtime thought"
+    assert "hidden_thought" not in stored["metadatas"][0]
+    assert PRIVATE_SENTINEL not in str(stored)
 
 
-def test_visible_response_does_not_contain_think_tags(tmp_path: Path) -> None:
+def test_visible_response_does_not_contain_think_tags_or_private_sentinel(
+    tmp_path: Path,
+) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = KagyaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
-    ).chat("hello", debug=False)
+    ).chat("hello")
 
     assert "<think>" not in result.response
     assert "</think>" not in result.response
+    assert PRIVATE_SENTINEL not in result.response
 
 
 def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
@@ -66,7 +95,7 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     before = loop.emotion_engine.state
 
-    result = loop.chat("emotion update", debug=True)
+    result = loop.chat("emotion update")
 
     assert result.arousal != before.arousal
     assert result.optimal_loss != before.optimal_loss
@@ -80,32 +109,32 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     memory.save_semantic("stable semantic memory")
     loop = KagyaMainLoop(settings, provider, memory)
 
-    result = loop.chat("old semantic query", debug=True)
+    _result, trace = loop.chat_debug("old semantic query")
 
-    assert "valence:" in result.prompt
-    assert "arousal:" in result.prompt
-    assert "optimal_loss:" in result.prompt
-    assert "old episode" in result.prompt
-    assert "stable semantic memory" in result.prompt
-    assert "hidden_thought" not in result.prompt
-    assert "<think>" not in result.prompt
-    assert "Assistant response:" not in result.prompt
-    assert result.prompt.endswith("Assistant:")
-    assert provider.prompts == [result.prompt]
+    assert "valence:" in trace.prompt
+    assert "arousal:" in trace.prompt
+    assert "optimal_loss:" in trace.prompt
+    assert "old episode" in trace.prompt
+    assert "stable semantic memory" in trace.prompt
+    assert "hidden_thought" not in trace.prompt
+    assert "<think>" not in trace.prompt
+    assert "Assistant response:" not in trace.prompt
+    assert trace.prompt.endswith("Assistant:")
+    assert provider.prompts == [trace.prompt]
 
 
 def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    result = KagyaMainLoop(
+    _result, trace = KagyaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
-    ).chat("answer naturally", debug=True)
+    ).chat_debug("answer naturally")
 
-    assert result.prompt.startswith("Context: PROJECT-KAGYA")
-    assert "private local AI assistant" in result.prompt
-    assert "Private runtime data below is for tone and context only" in result.prompt
-    assert "User: answer naturally\nAssistant:" in result.prompt
+    assert trace.prompt.startswith("Context: PROJECT-KAGYA")
+    assert "private local AI assistant" in trace.prompt
+    assert "Private runtime data below is for tone and context only" in trace.prompt
+    assert "User: answer naturally\nAssistant:" in trace.prompt
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
