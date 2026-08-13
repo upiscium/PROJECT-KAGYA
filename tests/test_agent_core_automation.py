@@ -119,10 +119,10 @@ def test_packed_batch_rejects_shell_metacharacters_before_execution(
 
 
 def test_automation_source_uses_just_shell_quoting() -> None:
-    recipe = (Path(__file__).parents[1] / "just" / "automation.just").read_text(
-        encoding="utf-8"
-    )
-    assert "--source {{quote(source)}}" in recipe
+    recipe = (
+        Path(__file__).parents[1] / ".automation" / "just" / "automation.just"
+    ).read_text(encoding="utf-8")
+    assert "--source '{{source}}'" in recipe
 
 
 def test_publication_uses_allowed_task_state_base(

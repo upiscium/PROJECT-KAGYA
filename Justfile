@@ -107,7 +107,7 @@ sync:
 
 # Agent Core module router
 mod agent '.automation/just/agent.just'
-mod automation 'just/automation.just'
+mod automation '.automation/just/automation.just'
 mod integrate '.automation/just/integrate.just'
 mod project 'just/project/mod.just'
 mod repository '.automation/just/repository.just'
