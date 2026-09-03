@@ -1,5 +1,9 @@
-from pathlib import Path
 import os
+from collections.abc import Callable
+from concurrent.futures import Future
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -9,6 +13,16 @@ from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.runtime import (
+    AgentEvent,
+    AgentEventOutcome,
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+    AgentRuntimeQueueFull,
+    AgentRuntimeStopped,
+    AgentRuntimeStatus,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -20,59 +34,88 @@ class ThinkingProvider(DummyProvider):
     response_text = f"<think>{PRIVATE_SENTINEL}</think>Visible API answer."
 
 
+class RecordingRuntime(AgentRuntime):
+    def __init__(self) -> None:
+        super().__init__(queue_capacity=32)
+        self.submissions: list[tuple[AgentEventType, AgentEventSource]] = []
+
+    def submit(
+        self,
+        event_type: AgentEventType,
+        source: AgentEventSource,
+        handler: Callable[[], Any],
+    ) -> Future[AgentEventOutcome[Any]]:
+        self.submissions.append((event_type, source))
+        return super().submit(event_type, source, handler)
+
+
+class AdmissionRuntime:
+    def __init__(self, error_type: type[Exception]) -> None:
+        self.error_type = error_type
+        self.status = AgentRuntimeStatus.CREATED
+
+    def start(self) -> None:
+        self.status = AgentRuntimeStatus.ACCEPTING
+
+    def shutdown(self) -> None:
+        self.status = AgentRuntimeStatus.STOPPED
+
+    def submit(
+        self,
+        event_type: AgentEventType,
+        source: AgentEventSource,
+        handler: Callable[[], Any],
+    ) -> NoReturn:
+        event = AgentEvent("test-event", event_type, source, datetime.now(timezone.utc))
+        raise self.error_type(event)
+
+
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.post(
-        "/api/chat", json={"message": "hello", "attachments": [], "debug": False}
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert set(data) == {"episode_id", "response", "emotion", "model"}
-    assert data["response"] == "Visible API answer."
-    assert "hidden_thought" not in data
-    assert "prompt" not in data
-    assert "<think>" not in str(data)
-    assert PRIVATE_SENTINEL not in str(data)
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat", json={"message": "hello", "attachments": [], "debug": False}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert set(data) == {"episode_id", "response", "emotion", "model"}
+        assert data["response"] == "Visible API answer."
+        assert "hidden_thought" not in data
+        assert "prompt" not in data
+        assert "<think>" not in str(data)
+        assert PRIVATE_SENTINEL not in str(data)
 
 
 def test_api_chat_debug_requires_explicit_opt_in(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.post(
-        "/api/chat/debug",
-        headers=admin_headers(),
-        json={"message": "hello", "attachments": [], "debug": False},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Debug access requires debug=true"
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "hello", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Debug access requires debug=true"
 
 
 def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    response = client.post(
-        "/api/chat/debug",
-        headers=admin_headers(),
-        json={"message": "hello", "attachments": [], "debug": True},
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["response"] == "Visible API answer."
-    assert data["hidden_thought"] == PRIVATE_SENTINEL
-    assert data["loss"] == DummyProvider.loss_value
-    assert "prompt" in data
-    assert "retrieved_memory" in data
-    assert "generation_params" in data
-
-    stored = client.app.state.memory_system.db1.get(
-        ids=[data["episode_id"]], include=["documents", "metadatas"]
-    )
-    assert PRIVATE_SENTINEL not in str(stored)
-    assert "hidden_thought" not in stored["metadatas"][0]
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "hello", "attachments": [], "debug": True},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["response"] == "Visible API answer."
+        assert data["hidden_thought"] == PRIVATE_SENTINEL
+        assert data["loss"] == DummyProvider.loss_value
+        assert "prompt" in data
+        assert "retrieved_memory" in data
+        assert "generation_params" in data
+        stored = client.app.state.memory_system.db1.get(
+            ids=[data["episode_id"]], include=["documents", "metadatas"]
+        )
+        assert PRIVATE_SENTINEL not in str(stored)
+        assert "hidden_thought" not in stored["metadatas"][0]
 
 
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
@@ -89,116 +132,223 @@ def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
 
 def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    client = _client(tmp_path, settings=settings)
-    registry = client.app.state.adapter_registry
-    registry.register_candidate(
-        adapter_id="adapter-api",
-        adapter_path=tmp_path / "adapter-api",
-        dataset_path=tmp_path / "dataset.jsonl",
-        dataset_hash="hash",
-    )
-
-    invalid = client.post(
-        "/api/adapters/adapter-api/activate", headers=admin_headers()
-    )
-    assert invalid.status_code == 400
-
-    evaluated = client.post(
-        "/api/adapters/adapter-api/evaluate",
-        headers=admin_headers(),
-        json={"deterministic_score": 0.9},
-    )
-    assert evaluated.status_code == 200
-    assert evaluated.json()["status"] == "trial_active"
-    approved = client.post(
-        "/api/adapters/adapter-api/approve", headers=admin_headers()
-    )
-    assert approved.status_code == 200
-    assert approved.json()["status"] == "approved"
-    active = client.post(
-        "/api/adapters/adapter-api/activate", headers=admin_headers()
-    )
-    assert active.status_code == 200
-    assert active.json()["status"] == "active"
-    listed = client.get("/api/adapters", headers=admin_headers())
-    assert listed.status_code == 200
-    assert listed.json()["adapters"][0]["status"] == "active"
+    with _client(tmp_path, settings=settings) as client:
+        registry = client.app.state.adapter_registry
+        registry.register_candidate(
+            adapter_id="adapter-api",
+            adapter_path=tmp_path / "adapter-api",
+            dataset_path=tmp_path / "dataset.jsonl",
+            dataset_hash="hash",
+        )
+        invalid = client.post(
+            "/api/adapters/adapter-api/activate", headers=admin_headers()
+        )
+        assert invalid.status_code == 400
+        evaluated = client.post(
+            "/api/adapters/adapter-api/evaluate",
+            headers=admin_headers(),
+            json={"deterministic_score": 0.9},
+        )
+        assert evaluated.status_code == 200
+        assert evaluated.json()["status"] == "trial_active"
+        approved = client.post(
+            "/api/adapters/adapter-api/approve", headers=admin_headers()
+        )
+        assert approved.status_code == 200
+        assert approved.json()["status"] == "approved"
+        active = client.post(
+            "/api/adapters/adapter-api/activate", headers=admin_headers()
+        )
+        assert active.status_code == 200
+        assert active.json()["status"] == "active"
+        listed = client.get("/api/adapters", headers=admin_headers())
+        assert listed.status_code == 200
+        assert listed.json()["adapters"][0]["status"] == "active"
 
 
 def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    memory = client.app.state.memory_system
-    memory.save_episodic(
-        "sleep input",
-        "sleep output",
-        emotion_arousal=0.9,
-    )
+    with _client(tmp_path) as client:
+        memory = client.app.state.memory_system
+        memory.save_episodic(
+            "sleep input",
+            "sleep output",
+            emotion_arousal=0.9,
+        )
 
-    response = client.post("/api/sleep/run", headers=admin_headers())
+        response = client.post("/api/sleep/run", headers=admin_headers())
 
-    assert response.status_code == 200
-    data = response.json()
-    assert data["selected_episode_ids"]
-    assert data["semantic_memory_ids"]
-    assert data["adapter_id"] is not None
-    assert data["adapter_status"] == "candidate"
-    assert data["dry_run"] is True
-    assert "thought" not in client.app.state.settings.sleep.dream_dataset_path.read_text(
-        encoding="utf-8"
-    ).casefold()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["selected_episode_ids"]
+        assert data["semantic_memory_ids"]
+        assert data["adapter_id"] is not None
+        assert data["adapter_status"] == "candidate"
+        assert data["dry_run"] is True
+        assert (
+            "thought"
+            not in client.app.state.settings.sleep.dream_dataset_path.read_text(
+                encoding="utf-8"
+            ).casefold()
+        )
 
 
 def test_memory_api_does_not_expose_private_fields(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-    memory = client.app.state.memory_system
-    episode_id = memory.save_episodic("memory input", "memory output")
+    with _client(tmp_path) as client:
+        memory = client.app.state.memory_system
+        episode_id = memory.save_episodic("memory input", "memory output")
 
-    search = client.get(
-        "/api/memory/search", headers=admin_headers(), params={"query": "memory"}
-    )
-    detail = client.get(
-        f"/api/memory/episodes/{episode_id}", headers=admin_headers()
-    )
-
-    assert search.status_code == 200
-    assert detail.status_code == 200
-    assert "hidden_thought" not in str(search.json())
-    assert "hidden_thought" not in detail.json()
+        search = client.get(
+            "/api/memory/search", headers=admin_headers(), params={"query": "memory"}
+        )
+        detail = client.get(
+            f"/api/memory/episodes/{episode_id}", headers=admin_headers()
+        )
+        assert search.status_code == 200
+        assert detail.status_code == 200
+        assert "hidden_thought" not in str(search.json())
+        assert "hidden_thought" not in detail.json()
 
 
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
-    client = _client(tmp_path)
-
-    assert (
-        client.post(
-            "/api/chat",
-            json={"message": "hello", "attachments": [], "debug": False},
-        ).status_code
-        == 200
-    )
-    assert (
-        client.post(
-            "/api/chat/debug",
-            json={"message": "hello", "attachments": [], "debug": True},
-        ).status_code
-        == 401
-    )
-    assert client.get("/api/memory/search", params={"query": "hello"}).status_code == 401
-    assert client.post("/api/sleep/run").status_code == 401
-    assert client.get("/api/adapters").status_code == 401
+    with _client(tmp_path) as client:
+        assert (
+            client.post(
+                "/api/chat",
+                json={"message": "hello", "attachments": [], "debug": False},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/chat/debug",
+                json={"message": "hello", "attachments": [], "debug": True},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.get("/api/memory/search", params={"query": "hello"}).status_code
+            == 401
+        )
+        assert client.post("/api/sleep/run").status_code == 401
+        assert client.get("/api/adapters").status_code == 401
 
 
 def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
-    client = _client(tmp_path, configure_admin_token=False)
+    with _client(tmp_path, configure_admin_token=False) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "hello", "attachments": [], "debug": True},
+        )
+        assert response.status_code == 503
+        assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
-    response = client.post(
-        "/api/chat/debug",
-        headers=admin_headers(),
-        json={"message": "hello", "attachments": [], "debug": True},
-    )
 
-    assert response.status_code == 503
-    assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
+def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        runtime = client.app.state.agent_runtime
+        assert runtime is client.app.state.agent_runtime
+        assert runtime.status is AgentRuntimeStatus.ACCEPTING
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_mutating_routes_submit_events_without_private_metadata(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runtime = RecordingRuntime()
+    with _client(tmp_path, settings=settings, runtime=runtime) as client:
+        registry = client.app.state.adapter_registry
+        registry.register_candidate(
+            adapter_id="recorded",
+            adapter_path=tmp_path / "recorded",
+            dataset_path=tmp_path / "dataset.jsonl",
+            dataset_hash="hash",
+        )
+        assert (
+            client.post(
+                "/api/chat", json={"message": PRIVATE_SENTINEL, "attachments": []}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/chat/debug",
+                headers=admin_headers(),
+                json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": True},
+            ).status_code
+            == 200
+        )
+        assert client.post("/api/sleep/run", headers=admin_headers()).status_code == 200
+        assert (
+            client.post(
+                "/api/adapters/recorded/evaluate",
+                headers=admin_headers(),
+                json={"deterministic_score": 0.9},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/adapters/recorded/approve", headers=admin_headers()
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/adapters/recorded/activate", headers=admin_headers()
+            ).status_code
+            == 200
+        )
+        # Invalid transitions still admit an ADAPTER_UPDATE event before the domain 400.
+        assert (
+            client.post(
+                "/api/adapters/missing/trial", headers=admin_headers()
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post(
+                "/api/adapters/missing/reject", headers=admin_headers()
+            ).status_code
+            == 400
+        )
+
+    assert [(kind, source) for kind, source in runtime.submissions] == [
+        (AgentEventType.CHAT, AgentEventSource.API_CHAT),
+        (AgentEventType.DEBUG_CHAT, AgentEventSource.API_CHAT_DEBUG),
+        (AgentEventType.SLEEP, AgentEventSource.API_SLEEP_RUN),
+        (AgentEventType.ADAPTER_EVALUATE, AgentEventSource.API_ADAPTER_EVALUATE),
+        (AgentEventType.ADAPTER_UPDATE, AgentEventSource.API_ADAPTER_APPROVE),
+        (AgentEventType.ADAPTER_UPDATE, AgentEventSource.API_ADAPTER_ACTIVATE),
+        (AgentEventType.ADAPTER_UPDATE, AgentEventSource.API_ADAPTER_TRIAL),
+        (AgentEventType.ADAPTER_UPDATE, AgentEventSource.API_ADAPTER_REJECT),
+    ]
+    assert PRIVATE_SENTINEL not in str(runtime.submissions)
+
+
+def test_runtime_admission_failures_are_bounded_503(tmp_path: Path) -> None:
+    for error_type in (AgentRuntimeQueueFull, AgentRuntimeStopped):
+        runtime = AdmissionRuntime(error_type)
+        with _client(tmp_path / error_type.__name__, runtime=runtime) as client:
+            response = client.post(
+                "/api/chat",
+                json={"message": PRIVATE_SENTINEL, "attachments": []},
+            )
+            assert response.status_code == 503
+            assert PRIVATE_SENTINEL not in response.text
+            assert "test-event" not in response.text
+
+
+def test_read_only_routes_do_not_submit_events(tmp_path: Path) -> None:
+    runtime = RecordingRuntime()
+    with _client(tmp_path, runtime=runtime) as client:
+        assert client.get("/api/adapters", headers=admin_headers()).status_code == 200
+        assert (
+            client.get(
+                "/api/memory/search", headers=admin_headers(), params={"query": "none"}
+            ).status_code
+            == 200
+        )
+    assert runtime.submissions == []
 
 
 def _client(
@@ -206,6 +356,7 @@ def _client(
     *,
     settings: Settings | None = None,
     configure_admin_token: bool = True,
+    runtime: AgentRuntime | AdmissionRuntime | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -216,6 +367,8 @@ def _client(
     app.state.model_provider = ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
+    if runtime is not None:
+        app.state.agent_runtime = runtime
     return TestClient(app)
 
 
@@ -232,9 +385,7 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "sleep": settings.sleep.model_copy(
                 update={
-                    "dream_dataset_path": tmp_path
-                    / "dreams"
-                    / "dream_dataset.jsonl"
+                    "dream_dataset_path": tmp_path / "dreams" / "dream_dataset.jsonl"
                 }
             ),
             "qlora": settings.qlora.model_copy(

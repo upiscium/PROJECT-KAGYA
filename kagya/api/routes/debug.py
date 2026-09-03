@@ -2,8 +2,17 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_api_settings, get_main_loop, require_admin
-from kagya.api.routes.chat import chat_response_from_result, reject_unsupported_attachments
+from kagya.api.dependencies import (
+    get_agent_runtime,
+    get_api_settings,
+    get_main_loop,
+    require_admin,
+)
+from kagya.api.runtime_execution import execute
+from kagya.api.routes.chat import (
+    chat_response_from_result,
+    reject_unsupported_attachments,
+)
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
     DebugChatResponse,
@@ -14,7 +23,7 @@ from kagya.api.schemas.debug import (
     RetrievedSemanticSchema,
 )
 from kagya.config import Settings
-from kagya.runtime import KagyaMainLoop
+from kagya.runtime import AgentEventSource, AgentEventType, AgentRuntime, KagyaMainLoop
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -25,13 +34,19 @@ def debug_chat(
     request: ChatRequest,
     main_loop: KagyaMainLoop = Depends(get_main_loop),
     settings: Settings = Depends(get_api_settings),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> DebugChatResponse:
     """Return request-scoped diagnostics behind admin auth and explicit opt-in."""
 
     if not request.debug:
         raise HTTPException(status_code=400, detail="Debug access requires debug=true")
     reject_unsupported_attachments(request)
-    result, trace = main_loop.chat_debug(request.message)
+    result, trace = execute(
+        runtime,
+        AgentEventType.DEBUG_CHAT,
+        AgentEventSource.API_CHAT_DEBUG,
+        lambda: main_loop.chat_debug(request.message),
+    )
     base = chat_response_from_result(result)
     return DebugChatResponse(
         **base.model_dump(),
