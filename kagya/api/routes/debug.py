@@ -1,6 +1,6 @@
 """Development-only debug routes."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from kagya.api.dependencies import get_api_settings, get_main_loop, require_admin
 from kagya.api.routes.chat import chat_response_from_result, reject_unsupported_attachments
@@ -26,16 +26,18 @@ def debug_chat(
     main_loop: KagyaMainLoop = Depends(get_main_loop),
     settings: Settings = Depends(get_api_settings),
 ) -> DebugChatResponse:
-    """Development-only debug chat gated by the admin token."""
+    """Return request-scoped diagnostics behind admin auth and explicit opt-in."""
 
+    if not request.debug:
+        raise HTTPException(status_code=400, detail="Debug access requires debug=true")
     reject_unsupported_attachments(request)
-    result = main_loop.chat(request.message, debug=True)
+    result, trace = main_loop.chat_debug(request.message)
     base = chat_response_from_result(result)
     return DebugChatResponse(
         **base.model_dump(),
-        hidden_thought=result.hidden_thought,
+        hidden_thought=trace.hidden_thought,
         loss=result.loss,
-        prompt=result.prompt,
+        prompt=trace.prompt,
         retrieved_memory=RetrievedMemorySchema(
             db1_results=[
                 RetrievedEpisodeSchema(
@@ -44,7 +46,7 @@ def debug_chat(
                     response=record.response,
                     record_type=record.record_type.value,
                 )
-                for record in result.memory_context.db1_results
+                for record in trace.memory_context.db1_results
             ],
             db2_results=[
                 RetrievedSemanticSchema(
@@ -52,7 +54,7 @@ def debug_chat(
                     text=record.text,
                     record_type=record.record_type.value,
                 )
-                for record in result.memory_context.db2_results
+                for record in trace.memory_context.db2_results
             ],
         ),
         generation_params=GenerationParamsSchema(
@@ -65,7 +67,9 @@ def debug_chat(
 
 
 @router.get("/state/emotion", response_model=EmotionStateResponse)
-def emotion_state(main_loop: KagyaMainLoop = Depends(get_main_loop)) -> EmotionStateResponse:
+def emotion_state(
+    main_loop: KagyaMainLoop = Depends(get_main_loop),
+) -> EmotionStateResponse:
     state = main_loop.emotion_engine.state
     return EmotionStateResponse(
         valence=state.valence,

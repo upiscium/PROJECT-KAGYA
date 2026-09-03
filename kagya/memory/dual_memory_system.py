@@ -19,6 +19,7 @@ from kagya.memory.memory_schema import (
     SemanticMemoryRecord,
 )
 from kagya.models import ModelProvider
+from kagya.privacy import PRIVATE_FIELD_KEYS, normalize_private_key, reject_private_fields, scrub_private_fields
 
 
 class DeterministicEmbeddingFunction:
@@ -71,36 +72,37 @@ class DualMemorySystem:
             name=settings.memory.db2_collection,
             embedding_function=self.embedding_function,
         )
+        self._scrub_legacy_private_records()
 
     def save_episodic(
         self,
         user_input: str,
         response: str,
         *,
-        hidden_thought: str = "",
         loss: float = 0.0,
         emotion_valence: float = 0.0,
         emotion_arousal: float = 0.0,
         record_type: MemoryRecordType = MemoryRecordType.EPISODIC_LOG,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        extra_metadata = metadata or {}
+        reject_private_fields(extra_metadata, context="Episodic memory metadata")
         episode_id = f"episode-{uuid4()}"
         created_at = _now_iso()
         record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
-            "hidden_thought": hidden_thought,
             "loss": float(loss),
             "emotion_valence": float(emotion_valence),
             "emotion_arousal": float(emotion_arousal),
             "record_type": record_type.value,
             "archived": False,
             "created_at": created_at,
-            "extra": json.dumps(metadata or {}),
+            "extra": json.dumps(extra_metadata),
         }
         self.db1.add(
             ids=[episode_id],
-            documents=[_episodic_document(user_input, response, hidden_thought)],
+            documents=[_episodic_document(user_input, response)],
             metadatas=[record_metadata],
         )
         return episode_id
@@ -112,13 +114,15 @@ class DualMemorySystem:
         source_episode_ids: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        extra_metadata = metadata or {}
+        reject_private_fields(extra_metadata, context="Semantic memory metadata")
         semantic_id = f"semantic-{uuid4()}"
         record_metadata: Metadata = {
             "text": text,
             "source_episode_ids": json.dumps(source_episode_ids or []),
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
             "created_at": _now_iso(),
-            "extra": json.dumps(metadata or {}),
+            "extra": json.dumps(extra_metadata),
         }
         self.db2.add(ids=[semantic_id], documents=[text], metadatas=[record_metadata])
         return semantic_id
@@ -164,6 +168,45 @@ class DualMemorySystem:
         metadata["archived"] = True
         self.db1.update(ids=[episode_id], metadatas=[metadata])
 
+    def _scrub_legacy_private_records(self) -> None:
+        """One-way sanitize pre-R02 records before they can be retrieved again."""
+
+        episodic = self.db1.get(include=["documents", "metadatas"])
+        episodic_ids = episodic.get("ids") or []
+        episodic_documents = episodic.get("documents") or []
+        episodic_metadatas = episodic.get("metadatas") or []
+        for record_id, document, raw_metadata in zip(
+            episodic_ids,
+            episodic_documents,
+            episodic_metadatas,
+            strict=False,
+        ):
+            metadata = dict(raw_metadata or {})
+            sanitized = _sanitize_persisted_metadata(metadata)
+            visible_document = _episodic_document(
+                str(sanitized.get("user_input", "")),
+                str(sanitized.get("response", "")),
+            )
+            if sanitized == metadata and document == visible_document:
+                continue
+            self.db1.delete(ids=[str(record_id)])
+            self.db1.add(
+                ids=[str(record_id)],
+                documents=[visible_document],
+                metadatas=[sanitized],
+            )
+
+        semantic = self.db2.get(include=["metadatas"])
+        semantic_ids = semantic.get("ids") or []
+        semantic_metadatas = semantic.get("metadatas") or []
+        for record_id, raw_metadata in zip(
+            semantic_ids, semantic_metadatas, strict=False
+        ):
+            metadata = dict(raw_metadata or {})
+            sanitized = _sanitize_persisted_metadata(metadata)
+            if sanitized != metadata:
+                self.db2.update(ids=[str(record_id)], metadatas=[sanitized])
+
 
 def _embed_text(text: str) -> list[float]:
     buckets = [0.0] * 16
@@ -177,8 +220,34 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _episodic_document(user_input: str, response: str, hidden_thought: str) -> str:
-    return f"User: {user_input}\nAssistant: {response}\nThought: {hidden_thought}".strip()
+def _episodic_document(user_input: str, response: str) -> str:
+    return f"User: {user_input}\nAssistant: {response}".strip()
+
+
+def _sanitize_persisted_metadata(metadata: Mapping[str, Any]) -> Metadata:
+    sanitized: dict[str, str | int | float | bool] = {}
+    for key, value in metadata.items():
+        if normalize_private_key(key) in PRIVATE_FIELD_KEYS:
+            continue
+        if key == "extra":
+            sanitized[key] = _sanitize_extra_metadata(value)
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+    return sanitized
+
+
+def _sanitize_extra_metadata(value: Any) -> str:
+    if not isinstance(value, str):
+        return "{}"
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return "{}"
+    if not isinstance(loaded, dict):
+        return "{}"
+    sanitized = scrub_private_fields(loaded)
+    return json.dumps(sanitized)
 
 
 def _episodic_records_from_query(
@@ -224,7 +293,6 @@ def _episodic_record_from_metadata(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
         response=str(metadata.get("response", "")),
-        hidden_thought=str(metadata.get("hidden_thought", "")),
         loss=float(metadata.get("loss", 0.0)),
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),

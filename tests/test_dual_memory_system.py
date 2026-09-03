@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem, MemoryRecordType
@@ -6,6 +9,7 @@ from kagya.models import DummyProvider
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 
 
 def test_saving_episodic_record_returns_episode_id(tmp_path: Path) -> None:
@@ -16,12 +20,13 @@ def test_saving_episodic_record_returns_episode_id(tmp_path: Path) -> None:
     assert episode_id.startswith("episode-")
 
 
-def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> None:
+def test_saved_episodic_records_can_be_retrieved_without_private_fields(
+    tmp_path: Path,
+) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
     episode_id = memory.save_episodic(
         "I like lunar gardens",
         "Remembering lunar gardens.",
-        hidden_thought="garden affinity",
         loss=0.25,
         emotion_valence=0.7,
         emotion_arousal=0.8,
@@ -31,7 +36,60 @@ def test_saved_episodic_records_can_be_retrieved_from_db1(tmp_path: Path) -> Non
 
     assert [record.id for record in context.db1_results] == [episode_id]
     assert context.db1_results[0].record_type == MemoryRecordType.EPISODIC_LOG
-    assert context.db1_results[0].hidden_thought == "garden affinity"
+    assert not hasattr(context.db1_results[0], "hidden_thought")
+
+
+def test_new_memory_metadata_rejects_private_fields(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+
+    with pytest.raises(ValueError, match="cannot contain private model fields"):
+        memory.save_episodic(
+            "input",
+            "output",
+            metadata={"nested": {"raw-prompt": PRIVATE_SENTINEL}},
+        )
+    with pytest.raises(ValueError, match="cannot contain private model fields"):
+        memory.save_semantic(
+            "visible fact",
+            metadata={"hidden_thought": PRIVATE_SENTINEL},
+        )
+
+
+def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    memory.db1.add(
+        ids=["legacy-private"],
+        documents=[
+            f"User: legacy user\nAssistant: visible answer\nThought: {PRIVATE_SENTINEL}"
+        ],
+        metadatas=[
+            {
+                "user_input": "legacy user",
+                "response": "visible answer",
+                "hidden_thought": PRIVATE_SENTINEL,
+                "loss": 0.1,
+                "emotion_valence": 0.2,
+                "emotion_arousal": 0.3,
+                "record_type": "episodic_log",
+                "archived": False,
+                "created_at": "legacy",
+                "extra": json.dumps(
+                    {"safe": "kept", "chain_of_thought": PRIVATE_SENTINEL}
+                ),
+            }
+        ],
+    )
+
+    reopened = DualMemorySystem(settings)
+    stored = reopened.db1.get(
+        ids=["legacy-private"], include=["documents", "metadatas"]
+    )
+
+    assert stored["documents"] == ["User: legacy user\nAssistant: visible answer"]
+    assert "hidden_thought" not in stored["metadatas"][0]
+    assert PRIVATE_SENTINEL not in str(stored)
+    assert json.loads(stored["metadatas"][0]["extra"]) == {"safe": "kept"}
 
 
 def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
@@ -58,7 +116,9 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
 
 
 def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None:
-    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path, db1_top_k=2, db2_top_k=1))
+    memory = DualMemorySystem(
+        _settings_for_tmp_memory(tmp_path, db1_top_k=2, db2_top_k=1)
+    )
     for index in range(3):
         memory.save_episodic(f"shared topic episode {index}", "response")
         memory.save_semantic(f"shared topic semantic {index}")

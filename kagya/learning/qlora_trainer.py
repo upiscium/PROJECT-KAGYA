@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from kagya.config import Settings
 from kagya.learning.dream_dataset_generator import DreamDatasetRecord, format_training_text
+from kagya.privacy import reject_private_fields
 
 
 @dataclass(frozen=True)
@@ -53,14 +54,22 @@ class QloraTrainer:
                 if not line.strip():
                     continue
                 data = json.loads(line)
+                if not isinstance(data, dict):
+                    raise ValueError(
+                        f"Invalid dream dataset record at line {line_number}"
+                    )
+                reject_private_fields(
+                    data, context=f"Dream dataset record at line {line_number}"
+                )
                 try:
                     record = DreamDatasetRecord(
                         input=str(data["input"]),
-                        thought=str(data["thought"]),
                         output=str(data["output"]),
                     )
                 except KeyError as exc:
-                    raise ValueError(f"Invalid dream dataset record at line {line_number}") from exc
+                    raise ValueError(
+                        f"Invalid dream dataset record at line {line_number}"
+                    ) from exc
                 format_training_text(record)
                 records.append(record)
         if not records:
@@ -90,7 +99,9 @@ class QloraTrainer:
                 "compute_dtype": "bfloat16",
             },
         }
-        with (adapter_path / "dry_run_manifest.json").open("w", encoding="utf-8") as manifest_file:
+        with (adapter_path / "dry_run_manifest.json").open(
+            "w", encoding="utf-8"
+        ) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
 

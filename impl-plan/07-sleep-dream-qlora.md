@@ -23,31 +23,30 @@ Implement sleep-time consolidation, dream dataset generation, and QLoRA training
 
 ## Dream Dataset Requirements
 
-- JSONL records use `{"input": "str", "thought": "str", "output": "str"}`.
+- JSONL records use only `{"input": "str", "output": "str"}` from visible episodic material.
 - Training text format is:
 
 ```text
 ユーザー: {input}
-私: <think>
-{thought}
-</think>
-{output}<eos>
+私: {output}<eos>
 ```
 
-- Preserve hidden thoughts only for training/debug paths, not normal API output.
+- Hidden/private model reasoning is not training material or training authority and must never be used as a target. Historical `thought` fields and `<think>` training targets are superseded by the R02 privacy contract in Issue #245.
 
 ## QLoRA Requirements
 
 - Use configured QLoRA params: `r`, `lora_alpha`, `lora_dropout`, `learning_rate`, `num_train_epochs`, NF4 quantization, and bfloat16 compute dtype.
 - Use Transformers, PEFT, and TRL stack.
 - Support dry-run that validates dataset and returns a candidate adapter path without expensive training.
+- Reject legacy or externally supplied dataset records containing `thought`, hidden/private-reasoning fields, or `<think>` training targets rather than silently training on them.
 - Register adapter through `AdapterRegistry` only.
 
 ## Test Requirements
 
 - High-emotion episode selection follows threshold rules.
-- Dream dataset JSONL is generated with expected fields.
-- Dataset records include `<think>` only in training format, not normal response paths.
+- Dream dataset JSONL contains only visible `input` and `output` fields.
+- Dataset records and formatted training text contain no private reasoning field or `<think>` target.
+- QLoRA dataset loading rejects the superseded private-data format.
 - QLoRA dry-run returns an adapter candidate result.
 - Sleep cycle registers adapter as `candidate`.
 - Sleep cycle never creates `active` adapters.
@@ -55,3 +54,4 @@ Implement sleep-time consolidation, dream dataset generation, and QLoRA training
 ## Completion Criteria
 
 - Sleep cycle can run in test mode without GPU or real model load.
+- R03 and later persistence/runtime work cannot reintroduce private reasoning into dream or QLoRA training paths.

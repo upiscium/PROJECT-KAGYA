@@ -13,15 +13,23 @@ from kagya.runtime.session_state import SessionState
 
 @dataclass(frozen=True)
 class ChatResult:
+    """Visible/structured result safe to pass to ordinary callers."""
+
     episode_id: str
     response: str
-    hidden_thought: str
     loss: float
     valence: float
     arousal: float
     optimal_loss: float
     model_id: str
     adapter_id: str | None
+
+
+@dataclass(frozen=True)
+class DebugChatTrace:
+    """Request-scoped diagnostic data that must never become durable authority."""
+
+    hidden_thought: str
     prompt: str
     memory_context: MemoryContext
 
@@ -56,7 +64,23 @@ class KagyaMainLoop:
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
 
-    def chat(self, user_input: str, debug: bool = False) -> ChatResult:
+    def chat(self, user_input: str) -> ChatResult:
+        """Run an ordinary chat turn without returning private diagnostic data."""
+
+        result, _trace = self._run_chat(user_input, capture_debug=False)
+        return result
+
+    def chat_debug(self, user_input: str) -> tuple[ChatResult, DebugChatTrace]:
+        """Run a turn and return explicitly ephemeral admin/debug diagnostics."""
+
+        result, trace = self._run_chat(user_input, capture_debug=True)
+        if trace is None:  # pragma: no cover - internal invariant
+            raise RuntimeError("Debug trace was not captured")
+        return result, trace
+
+    def _run_chat(
+        self, user_input: str, *, capture_debug: bool
+    ) -> tuple[ChatResult, DebugChatTrace | None]:
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
@@ -67,22 +91,26 @@ class KagyaMainLoop:
         episode_id = self.memory_system.save_episodic(
             user_input,
             processed_response.visible_response,
-            hidden_thought=processed_response.hidden_thought,
             loss=loss,
             emotion_valence=emotion_state.valence,
             emotion_arousal=emotion_state.arousal,
         )
         self.session_state.add_turn(user_input, processed_response.visible_response)
-        return ChatResult(
+        result = ChatResult(
             episode_id=episode_id,
             response=processed_response.visible_response,
-            hidden_thought=processed_response.hidden_thought if debug else processed_response.hidden_thought,
             loss=loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,
             optimal_loss=emotion_state.optimal_loss,
             model_id=self.settings.model.primary_id,
             adapter_id=self.adapter_id,
-            prompt=prompt,
-            memory_context=memory_context,
         )
+        trace = None
+        if capture_debug:
+            trace = DebugChatTrace(
+                hidden_thought=processed_response.hidden_thought,
+                prompt=prompt,
+                memory_context=memory_context,
+            )
+        return result, trace

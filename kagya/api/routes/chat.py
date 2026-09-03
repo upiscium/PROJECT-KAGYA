@@ -11,9 +11,11 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest, main_loop: KagyaMainLoop = Depends(get_main_loop)) -> ChatResponse:
+def chat(
+    request: ChatRequest, main_loop: KagyaMainLoop = Depends(get_main_loop)
+) -> ChatResponse:
     reject_unsupported_attachments(request)
-    result = main_loop.chat(request.message, debug=False)
+    result = main_loop.chat(request.message)
     return chat_response_from_result(result)
 
 
