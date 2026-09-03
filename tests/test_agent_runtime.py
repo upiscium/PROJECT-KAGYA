@@ -1,10 +1,11 @@
 from dataclasses import FrozenInstanceError, asdict
-from threading import Event, Thread
+from threading import Barrier, Event, Lock, Thread, current_thread
 
 import pytest
 
 from kagya.config.schema import Settings
 from kagya.runtime import (
+    AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
@@ -29,6 +30,78 @@ def test_fifo_order_and_consumer_sequences() -> None:
     assert [outcome.value for outcome in outcomes] == [0, 1, 2, 3]
     assert [outcome.event.processing_sequence for outcome in outcomes] == [1, 2, 3, 4]
     assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_concurrent_producers_share_one_consumer_and_preserve_local_order() -> None:
+    producer_count = 4
+    events_per_producer = 5
+    event_count = producer_count * events_per_producer
+    runtime = AgentRuntime(event_count)
+    start_barrier = Barrier(producer_count + 1)
+    results_lock = Lock()
+    producer_outcomes: dict[int, list[AgentEventOutcome[tuple[int, int, str]]]] = {}
+    producer_errors: list[BaseException] = []
+    runtime.start()
+
+    def produce(producer_id: int) -> None:
+        try:
+            start_barrier.wait(timeout=5)
+            futures = [
+                runtime.submit(
+                    AgentEventType.CHAT,
+                    AgentEventSource.API_CHAT,
+                    lambda local_index=local_index: (
+                        producer_id,
+                        local_index,
+                        current_thread().name,
+                    ),
+                )
+                for local_index in range(events_per_producer)
+            ]
+            outcomes = [future.result(timeout=5) for future in futures]
+            with results_lock:
+                producer_outcomes[producer_id] = outcomes
+        except BaseException as error:
+            with results_lock:
+                producer_errors.append(error)
+
+    producers = [
+        Thread(target=produce, args=(producer_id,), name=f"producer-{producer_id}")
+        for producer_id in range(producer_count)
+    ]
+    for producer in producers:
+        producer.start()
+    start_barrier.wait(timeout=5)
+    for producer in producers:
+        producer.join(timeout=5)
+    runtime.shutdown()
+
+    assert not producer_errors
+    assert all(not producer.is_alive() for producer in producers)
+    assert set(producer_outcomes) == set(range(producer_count))
+
+    all_outcomes = [
+        outcome
+        for outcomes in producer_outcomes.values()
+        for outcome in outcomes
+    ]
+    sequences: list[int] = []
+    for outcome in all_outcomes:
+        sequence = outcome.event.processing_sequence
+        assert sequence is not None
+        sequences.append(sequence)
+
+    assert sorted(sequences) == list(range(1, event_count + 1))
+    consumer_threads = {outcome.value[2] for outcome in all_outcomes}
+    assert consumer_threads == {"kagya-agent-runtime"}
+    assert consumer_threads.isdisjoint({producer.name for producer in producers})
+
+    for producer_id, outcomes in producer_outcomes.items():
+        local_indexes = [outcome.value[1] for outcome in outcomes]
+        local_sequences = [outcome.event.processing_sequence for outcome in outcomes]
+        assert all(outcome.value[0] == producer_id for outcome in outcomes)
+        assert local_indexes == list(range(events_per_producer))
+        assert local_sequences == sorted(local_sequences)
 
 
 def test_full_queue_is_rejected_without_waiting() -> None:
