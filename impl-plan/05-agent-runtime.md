@@ -30,7 +30,8 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 
 ## Main Loop Requirements
 
-- Implement `KagyaMainLoop.chat(user_input: str, debug: bool = False) -> ChatResult`.
+- Implement `KagyaMainLoop.chat(user_input: str) -> ChatResult` for ordinary chat; it never returns private/debug data.
+- Implement the separate ephemeral diagnostic boundary `KagyaMainLoop.chat_debug(user_input: str) -> tuple[ChatResult, DebugChatTrace]`.
 - Process in this order: input, context, surprisal, emotion update, memory retrieval, prompt build, generation, postprocess, DB1 save, result return.
 - Store no hidden/private model reasoning in DB1 documents or metadata.
 - Keep ordinary `ChatResult` limited to visible response and explicitly public structured data such as episode ID, loss/emotion values, model ID, and adapter ID; it does not own a hidden-thought field.
