@@ -23,23 +23,25 @@ ADMIN_TOKEN = "test-admin-token"
 
 
 def test_chat_request_accepts_empty_attachments(tmp_path: Path) -> None:
-    response = _client(tmp_path).post(
-        "/api/chat",
-        json={"message": "hello", "attachments": [], "debug": False},
-    )
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "hello", "attachments": [], "debug": False},
+        )
 
     assert response.status_code == 200
 
 
 def test_chat_request_rejects_non_empty_attachments_with_clear_v1_message(tmp_path: Path) -> None:
-    response = _client(tmp_path).post(
-        "/api/chat",
-        json={
-            "message": "hello",
-            "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
-            "debug": False,
-        },
-    )
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat",
+            json={
+                "message": "hello",
+                "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
+                "debug": False,
+            },
+        )
 
     assert response.status_code == 422
     assert "schema-only" in response.json()["detail"]
@@ -47,15 +49,16 @@ def test_chat_request_rejects_non_empty_attachments_with_clear_v1_message(tmp_pa
 
 
 def test_debug_chat_rejects_non_empty_attachments_with_clear_v1_message(tmp_path: Path) -> None:
-    response = _client(tmp_path).post(
-        "/api/chat/debug",
-        headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
-        json={
-            "message": "hello",
-            "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
-            "debug": True,
-        },
-    )
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
+            json={
+                "message": "hello",
+                "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
+                "debug": True,
+            },
+        )
 
     assert response.status_code == 422
     assert "schema-only" in response.json()["detail"]

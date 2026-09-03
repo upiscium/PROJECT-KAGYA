@@ -90,6 +90,10 @@ class FrontendSettings(StrictBaseModel):
     api_base_url: str = Field(min_length=1)
 
 
+class RuntimeSettings(StrictBaseModel):
+    queue_capacity: int = Field(default=64, gt=0)
+
+
 class Settings(StrictBaseModel):
     project: ProjectSettings
     model: ModelSettings
@@ -101,3 +105,4 @@ class Settings(StrictBaseModel):
     adapter_registry: AdapterRegistrySettings
     api: ApiSettings
     frontend: FrontendSettings
+    runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
