@@ -19,8 +19,8 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 - Include valence, arousal, and optimal loss.
 - Include related DB1 episodes.
 - Include related DB2 semantic memories.
-- Instruct the model to produce `<think>...</think>` followed by the final answer.
-- Make clear that internal thought is not normally visible to the user.
+- If the model is instructed to produce `<think>...</think>` followed by the final answer, treat the private segment only as ephemeral raw generation input to postprocessing.
+- Make clear that internal thought is neither user-visible nor durable/training authority.
 
 ## ConsciousAgent Requirements
 
@@ -32,19 +32,20 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 
 - Implement `KagyaMainLoop.chat(user_input: str, debug: bool = False) -> ChatResult`.
 - Process in this order: input, context, surprisal, emotion update, memory retrieval, prompt build, generation, postprocess, DB1 save, result return.
-- Store `hidden_thought` in DB1.
-- Return `hidden_thought` only when debug behavior explicitly allows it at API layer.
-- Include `episode_id`, response, hidden thought, loss, valence, arousal, optimal loss, model ID, and adapter ID in `ChatResult`.
+- Store no hidden/private model reasoning in DB1 documents or metadata.
+- Keep ordinary `ChatResult` limited to visible response and explicitly public structured data such as episode ID, loss/emotion values, model ID, and adapter ID; it does not own a hidden-thought field.
+- When explicitly requested and authorized, expose private diagnostics through a separate request-scoped debug boundary that cannot be persisted or returned through the ordinary result contract.
 
 ## Test Requirements
 
 - `DummyProvider` drives `user_input -> response` end-to-end.
 - DB1 receives a saved episode.
 - Visible response does not contain `<think>`.
-- Hidden thought is available in `ChatResult` for debug API use.
-- Normal API schema later excludes hidden thought.
+- Ordinary `ChatResult` and normal API schemas have no private/debug field.
+- Explicit debug inspection can observe private data only for the current request, and saving the same turn leaves no private sentinel in DB1.
 - Emotion state changes after loss calculation.
 
 ## Completion Criteria
 
 - Main loop integration test passes with no real model load.
+- R03 and later AgentRuntime or persistence work must preserve this R02 boundary and must not make private reasoning durable or authoritative.
