@@ -78,3 +78,6 @@ frontend:
 
 runtime:
   queue_capacity: 64
+
+agent_state:
+  path: .kagya/agent_state.json
