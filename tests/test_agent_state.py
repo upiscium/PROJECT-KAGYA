@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import traceback
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -28,6 +30,13 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 class LoopStub:
     def __init__(self, emotion: EmotionState) -> None:
         self.emotion_engine = EmotionEngineAllostasis(emotion)
+
+
+def assert_bounded_exception(error: Exception, sentinel: str) -> None:
+    rendered = "".join(traceback.format_exception(error))
+    assert sentinel not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def make_snapshot(sequence: int = 4) -> AgentStateSnapshot:
@@ -149,6 +158,29 @@ def test_v0_migration_rejects_unexpected_fields(tmp_path: Path) -> None:
         make_store(path).load()
 
 
+def test_v0_validation_detail_is_absent_from_full_exception(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 0,
+                "last_event_sequence": 7,
+                "emotion": {
+                    "valence": PRIVATE_SENTINEL,
+                    "arousal": 0.2,
+                    "optimal_loss": 0.9,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentStateLoadError) as error:
+        make_store(path).load()
+
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
 def test_future_version_is_distinct_and_never_defaults(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
     original = b'{"schema_version":999}'
@@ -181,13 +213,13 @@ def test_snapshot_inspection_error_is_bounded(
     path = tmp_path / "agent_state.json"
 
     def fail_lstat(_path: Path):
-        raise PermissionError("private filesystem detail")
+        raise PermissionError(PRIVATE_SENTINEL)
 
     monkeypatch.setattr(Path, "lstat", fail_lstat)
     with pytest.raises(AgentStateLoadError) as error:
         make_store(path).load()
 
-    assert "private filesystem detail" not in str(error.value)
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
 
 
 @pytest.mark.parametrize("content", [b"{broken", b"[]", b'{"schema_version":NaN}'])
@@ -225,6 +257,30 @@ def test_current_schema_rejects_unknown_root_and_nested_fields(
         make_store(path).load()
 
 
+def test_invalid_schema_value_is_absent_from_full_exception(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    raw = make_snapshot().model_dump(mode="json")
+    raw["emotion_state"]["valence"] = PRIVATE_SENTINEL
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(AgentStateLoadError) as error:
+        make_store(path).load()
+
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
+def test_unknown_field_value_is_absent_from_full_exception(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    raw = make_snapshot().model_dump(mode="json")
+    raw["unexpected"] = PRIVATE_SENTINEL
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(AgentStateLoadError) as error:
+        make_store(path).load()
+
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
 @pytest.mark.parametrize(
     "private_key",
     ["hiddenThought", "Hidden-Thought", "private_reasoning", "eventPayload", "turns"],
@@ -241,7 +297,7 @@ def test_normalized_private_aliases_fail_closed(
     with pytest.raises(AgentStateLoadError) as error:
         make_store(path).load()
 
-    assert PRIVATE_SENTINEL not in str(error.value)
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
     assert path.read_bytes() == original
 
 
@@ -288,15 +344,30 @@ def test_prepublication_failure_preserves_previous_snapshot_and_cleans_temp(
 
     def fail_at(current: AgentStateSaveStage) -> None:
         if current is stage:
-            raise OSError("injected failure")
+            raise OSError(PRIVATE_SENTINEL)
 
     with pytest.raises(AgentStateSaveError) as error:
         make_store(path, hook=fail_at).save(make_snapshot())
 
     assert error.value.stage is stage
     assert error.value.published is False
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
     assert path.read_bytes() == old_bytes
     assert list(tmp_path.glob(".agent_state.json.*.tmp")) == []
+
+
+def test_save_validation_detail_is_absent_from_full_exception(tmp_path: Path) -> None:
+    raw = make_snapshot().model_dump(mode="json")
+    raw["emotion_state"]["valence"] = PRIVATE_SENTINEL
+
+    with pytest.raises(AgentStateSaveError) as error:
+        make_store(tmp_path / "agent_state.json").save(
+            cast(AgentStateSnapshot, raw)
+        )
+
+    assert error.value.stage is AgentStateSaveStage.TEMP_WRITE
+    assert error.value.published is False
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
 
 
 def test_parent_fsync_failure_reports_published_without_rollback(
@@ -367,7 +438,7 @@ def test_model_constraints_are_strict_finite_and_timezone_aware() -> None:
 
 def test_capture_operational_failure_is_a_bounded_save_error(tmp_path: Path) -> None:
     def fail_clock() -> datetime:
-        raise OSError("private clock detail")
+        raise OSError(PRIVATE_SENTINEL)
 
     store = AgentStateStore(
         tmp_path / "agent_state.json",
@@ -381,4 +452,34 @@ def test_capture_operational_failure_is_a_bounded_save_error(tmp_path: Path) -> 
 
     assert error.value.stage is AgentStateSaveStage.CAPTURE
     assert error.value.published is False
-    assert "private clock detail" not in str(error.value)
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
+def test_restore_failure_is_absent_from_full_exception(tmp_path: Path) -> None:
+    class BrokenSnapshot:
+        def model_dump(self, *, mode: str) -> object:
+            raise OSError(PRIVATE_SENTINEL)
+
+    store = make_store(tmp_path / "agent_state.json")
+    loop = LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+
+    with pytest.raises(AgentStateLoadError) as error:
+        store.restore_into(loop, cast(AgentStateSnapshot, BrokenSnapshot()))
+
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
+def test_restore_validation_detail_is_absent_from_full_exception(tmp_path: Path) -> None:
+    class InvalidSnapshot:
+        def model_dump(self, *, mode: str) -> object:
+            raw = make_snapshot().model_dump(mode=mode)
+            raw["emotion_state"]["valence"] = PRIVATE_SENTINEL
+            return raw
+
+    store = make_store(tmp_path / "agent_state.json")
+    loop = LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+
+    with pytest.raises(AgentStateLoadError) as error:
+        store.restore_into(loop, cast(AgentStateSnapshot, InvalidSnapshot()))
+
+    assert_bounded_exception(error.value, PRIVATE_SENTINEL)

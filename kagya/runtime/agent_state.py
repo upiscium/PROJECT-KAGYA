@@ -205,6 +205,7 @@ class AgentStateStore:
         self._save_stage_hook = save_stage_hook
 
     def load(self) -> AgentStateSnapshot:
+        inspection_failure: AgentStateLoadError | None = None
         try:
             path_status = self.path.lstat()
         except FileNotFoundError:
@@ -212,14 +213,19 @@ class AgentStateStore:
                 return default_agent_state_snapshot(
                     self._baseline_surprisal, saved_at=self._now()
                 )
-            except (ValueError, ValidationError) as error:
-                raise AgentStateLoadError("AgentState bootstrap failed") from error
-        except OSError as error:
-            raise AgentStateLoadError("AgentState snapshot cannot be inspected") from error
+            except Exception:
+                inspection_failure = AgentStateLoadError("AgentState bootstrap failed")
+        except OSError:
+            inspection_failure = AgentStateLoadError(
+                "AgentState snapshot cannot be inspected"
+            )
+        if inspection_failure is not None:
+            raise inspection_failure
 
         if not stat.S_ISREG(path_status.st_mode):
             raise AgentStateLoadError("AgentState snapshot is not a regular file")
 
+        read_failure: AgentStateLoadError | None = None
         try:
             descriptor = os.open(
                 self.path,
@@ -238,24 +244,33 @@ class AgentStateStore:
                 raw_bytes.decode("utf-8"),
                 parse_constant=self._reject_json_constant,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-            raise AgentStateLoadError("AgentState snapshot is malformed") from error
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            read_failure = AgentStateLoadError("AgentState snapshot is malformed")
+        if read_failure is not None:
+            raise read_failure
 
         if not isinstance(raw, dict):
             raise AgentStateLoadError("AgentState snapshot root is invalid")
+        privacy_failure: AgentStateLoadError | None = None
         try:
             _reject_private_keys(raw)
-        except ValueError as error:
-            raise AgentStateLoadError("AgentState snapshot violates privacy") from error
+        except ValueError:
+            privacy_failure = AgentStateLoadError(
+                "AgentState snapshot violates privacy"
+            )
+        if privacy_failure is not None:
+            raise privacy_failure
 
         version = raw.get("schema_version")
         if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+            schema_failure: AgentStateLoadError | None = None
             try:
                 return AgentStateSnapshot.model_validate(raw)
-            except ValidationError as error:
-                raise AgentStateLoadError(
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
-                ) from error
+                )
+            raise schema_failure
         if version == 0:
             return self._migrate_v0(raw)
         if isinstance(version, int) and not isinstance(version, bool):
@@ -269,6 +284,7 @@ class AgentStateStore:
         published = False
         temporary_path: Path | None = None
         descriptor: int | None = None
+        save_failure: AgentStateSaveError | None = None
         try:
             raw: object = (
                 snapshot.model_dump(mode="python")
@@ -309,7 +325,7 @@ class AgentStateStore:
                 os.fsync(directory_descriptor)
             finally:
                 os.close(directory_descriptor)
-        except Exception as error:
+        except Exception:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
@@ -318,11 +334,14 @@ class AgentStateStore:
             if temporary_path is not None and not published:
                 try:
                     temporary_path.unlink()
-                except FileNotFoundError:
+                except OSError:
                     pass
-            raise AgentStateSaveError(stage, published=published) from error
+            save_failure = AgentStateSaveError(stage, published=published)
+        if save_failure is not None:
+            raise save_failure
 
     def capture(self, main_loop: KagyaMainLoop, sequence: int) -> AgentStateSnapshot:
+        capture_failure: AgentStateSaveError | None = None
         try:
             emotion = main_loop.emotion_engine.state
             return AgentStateSnapshot(
@@ -334,28 +353,33 @@ class AgentStateStore:
                     optimal_loss=emotion.optimal_loss,
                 ),
             )
-        except Exception as error:
-            raise AgentStateSaveError(
+        except Exception:
+            capture_failure = AgentStateSaveError(
                 AgentStateSaveStage.CAPTURE, published=False
-            ) from error
+            )
+        raise capture_failure
 
     def restore_into(
         self, main_loop: KagyaMainLoop, snapshot: AgentStateSnapshot
     ) -> None:
+        restore_failure: AgentStateLoadError | None = None
         try:
             validated = AgentStateSnapshot.model_validate(
                 snapshot.model_dump(mode="python")
             )
-        except (AttributeError, ValidationError) as error:
-            raise AgentStateLoadError("AgentState restore input is invalid") from error
-        emotion = validated.emotion_state
-        main_loop.emotion_engine.state = EmotionState(
-            valence=emotion.valence,
-            arousal=emotion.arousal,
-            optimal_loss=emotion.optimal_loss,
-        )
+            emotion = validated.emotion_state
+            main_loop.emotion_engine.state = EmotionState(
+                valence=emotion.valence,
+                arousal=emotion.arousal,
+                optimal_loss=emotion.optimal_loss,
+            )
+        except Exception:
+            restore_failure = AgentStateLoadError("AgentState restore failed")
+        if restore_failure is not None:
+            raise restore_failure
 
     def _migrate_v0(self, raw: dict[str, Any]) -> AgentStateSnapshot:
+        migration_failure: AgentStateLoadError | None = None
         try:
             legacy = _LegacyAgentStateV0.model_validate(raw)
             return AgentStateSnapshot(
@@ -367,8 +391,9 @@ class AgentStateStore:
                     optimal_loss=legacy.emotion.optimal_loss,
                 ),
             )
-        except (ValueError, ValidationError) as error:
-            raise AgentStateLoadError("AgentState v0 migration failed") from error
+        except Exception:
+            migration_failure = AgentStateLoadError("AgentState v0 migration failed")
+        raise migration_failure
 
     def _now(self) -> datetime:
         value = self._clock()
