@@ -141,6 +141,9 @@ def _settings(tmp_path: Path) -> Settings:
                     "eval_sets": [],
                 }
             ),
+            "agent_state": settings.agent_state.model_copy(
+                update={"path": tmp_path / "agent_state.json"}
+            ),
             "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
         }
     )

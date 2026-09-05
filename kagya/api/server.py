@@ -12,7 +12,7 @@ from kagya.config import Settings, get_settings
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
-from kagya.runtime import AgentRuntime, KagyaMainLoop
+from kagya.runtime import AgentEvent, AgentRuntime, AgentStateStore, KagyaMainLoop
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -34,6 +34,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.main_loop = getattr(app.state, "main_loop", None) or KagyaMainLoop(
             app_settings, app.state.model_provider, app.state.memory_system
         )
+        app.state.agent_state_store = getattr(
+            app.state, "agent_state_store", None
+        ) or AgentStateStore(
+            app_settings.agent_state.path,
+            app_settings.emotion.baseline_surprisal,
+        )
+        snapshot = app.state.agent_state_store.load()
+        app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
         app.state.sleep_cycle_manager = getattr(
             app.state, "sleep_cycle_manager", None
         ) or SleepCycleManager(
@@ -42,9 +50,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.model_provider,
             app.state.adapter_registry,
         )
-        app.state.agent_runtime = getattr(
-            app.state, "agent_runtime", None
-        ) or AgentRuntime(app_settings.runtime.queue_capacity)
+        if getattr(app.state, "agent_runtime", None) is None:
+
+            def completion_checkpoint(event: AgentEvent) -> None:
+                sequence = event.processing_sequence
+                assert sequence is not None
+                checkpoint = app.state.agent_state_store.capture(
+                    app.state.main_loop, sequence
+                )
+                app.state.agent_state_store.save(checkpoint)
+
+            app.state.agent_runtime = AgentRuntime(
+                app_settings.runtime.queue_capacity,
+                initial_sequence=snapshot.last_processed_event_sequence,
+                completion_checkpoint=completion_checkpoint,
+            )
         app.state.agent_runtime.start()
         try:
             yield

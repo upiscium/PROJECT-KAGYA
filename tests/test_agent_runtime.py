@@ -13,6 +13,8 @@ from kagya.runtime import (
     AgentRuntimeQueueFull,
     AgentRuntimeStatus,
     AgentRuntimeStopped,
+    AgentStateSaveError,
+    AgentStateSaveStage,
 )
 
 
@@ -30,6 +32,135 @@ def test_fifo_order_and_consumer_sequences() -> None:
     assert [outcome.value for outcome in outcomes] == [0, 1, 2, 3]
     assert [outcome.event.processing_sequence for outcome in outcomes] == [1, 2, 3, 4]
     assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_initial_sequence_is_used_for_first_event() -> None:
+    runtime = AgentRuntime(1, initial_sequence=7)
+    runtime.start()
+
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.event.processing_sequence == 8
+
+
+def test_checkpoint_runs_before_future_success_is_observable() -> None:
+    observations: list[str] = []
+
+    def checkpoint(event: object) -> None:
+        assert event is not None
+        observations.append("checkpoint")
+
+    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: observations.append("handler"),
+    )
+    future.add_done_callback(lambda _: observations.append("future"))
+
+    assert future.result(timeout=2).value is None
+    runtime.shutdown()
+
+    assert observations == ["handler", "checkpoint", "future"]
+
+
+def test_handler_failure_skips_checkpoint() -> None:
+    checkpoint_called = False
+
+    def checkpoint(_: object) -> None:
+        nonlocal checkpoint_called
+        checkpoint_called = True
+
+    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    runtime.start()
+
+    def fail() -> None:
+        raise ValueError("handler failed")
+
+    future = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, fail)
+    with pytest.raises(AgentRuntimeExecutionError) as error:
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert not checkpoint_called
+
+
+def test_checkpoint_failure_preserves_cause_and_consumer_continues() -> None:
+    checkpoint_calls = 0
+
+    def checkpoint(_: object) -> None:
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if checkpoint_calls == 1:
+            raise AgentStateSaveError(
+                AgentStateSaveStage.TEMP_FSYNC,
+                published=False,
+            )
+
+    handler_ran = Event()
+    runtime = AgentRuntime(2, completion_checkpoint=checkpoint)
+    runtime.start()
+    failed = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        handler_ran.set,
+    )
+    succeeding = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
+    )
+
+    with pytest.raises(AgentRuntimeExecutionError) as error:
+        failed.result(timeout=2)
+    assert succeeding.result(timeout=2).value == "ok"
+    runtime.shutdown()
+
+    assert handler_ran.is_set()
+    assert isinstance(error.value.__cause__, AgentStateSaveError)
+    assert checkpoint_calls == 2
+
+
+def test_cancelled_future_still_runs_checkpoint() -> None:
+    blocker_started = Event()
+    release_blocker = Event()
+    cancelled_handler_ran = Event()
+    checkpoint_sequences: list[int] = []
+
+    def checkpoint(event) -> None:
+        assert event.processing_sequence is not None
+        checkpoint_sequences.append(event.processing_sequence)
+
+    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    runtime.start()
+    blocker = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: (blocker_started.set(), release_blocker.wait())[1],
+    )
+    assert blocker_started.wait(timeout=2)
+    future = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        cancelled_handler_ran.set,
+    )
+    assert future.cancel()
+    release_blocker.set()
+    assert blocker.result(timeout=2).value is True
+    runtime.shutdown()
+
+    assert future.cancelled()
+    assert cancelled_handler_ran.is_set()
+    assert checkpoint_sequences == [1, 2]
+
+
+@pytest.mark.parametrize("initial_sequence", [-1, True, 1.5])
+def test_invalid_initial_sequence_is_rejected(initial_sequence: object) -> None:
+    with pytest.raises(ValueError):
+        AgentRuntime(1, initial_sequence=initial_sequence)  # type: ignore[arg-type]
 
 
 def test_concurrent_producers_share_one_consumer_and_preserve_local_order() -> None:
@@ -81,9 +212,7 @@ def test_concurrent_producers_share_one_consumer_and_preserve_local_order() -> N
     assert set(producer_outcomes) == set(range(producer_count))
 
     all_outcomes = [
-        outcome
-        for outcomes in producer_outcomes.values()
-        for outcome in outcomes
+        outcome for outcomes in producer_outcomes.values() for outcome in outcomes
     ]
     sequences: list[int] = []
     for outcome in all_outcomes:

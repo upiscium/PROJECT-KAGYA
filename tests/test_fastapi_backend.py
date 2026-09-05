@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
+import pytest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from kagya.api.server import create_app
+from kagya.body import EmotionState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem
@@ -22,6 +24,12 @@ from kagya.runtime import (
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     AgentRuntimeStatus,
+    AgentStateLoadError,
+    AgentStateSaveError,
+    AgentStateSaveStage,
+    AgentStateSnapshot,
+    AgentStateStore,
+    EmotionStateSnapshot,
 )
 
 
@@ -351,6 +359,185 @@ def test_read_only_routes_do_not_submit_events(tmp_path: Path) -> None:
     assert runtime.submissions == []
 
 
+def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    order: list[str] = []
+
+    class TrackingStore(AgentStateStore):
+        def load(self) -> AgentStateSnapshot:
+            order.append("load")
+            return super().load()
+
+        def restore_into(self, main_loop, snapshot: AgentStateSnapshot) -> None:
+            order.append("restore")
+            super().restore_into(main_loop, snapshot)
+
+    class TrackingRuntime(RecordingRuntime):
+        def start(self) -> None:
+            order.append("start")
+            super().start()
+
+    store = TrackingStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+    )
+    store.save(
+        AgentStateSnapshot(
+            saved_at=datetime.now(timezone.utc),
+            last_processed_event_sequence=7,
+            emotion_state=EmotionStateSnapshot(
+                valence=0.4,
+                arousal=0.5,
+                optimal_loss=0.6,
+            ),
+        )
+    )
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.agent_state_store = store
+    app.state.agent_runtime = TrackingRuntime()
+
+    with TestClient(app) as client:
+        assert order == ["load", "restore", "start"]
+        assert client.app.state.main_loop.emotion_engine.state == EmotionState(
+            valence=0.4,
+            arousal=0.5,
+            optimal_loss=0.6,
+        )
+
+
+def test_restored_sequence_continues_and_success_checkpoints_chat(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = AgentStateStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+    )
+    store.save(
+        AgentStateSnapshot(
+            saved_at=datetime.now(timezone.utc),
+            last_processed_event_sequence=7,
+            emotion_state=EmotionStateSnapshot(
+                valence=0.1,
+                arousal=0.2,
+                optimal_loss=0.9,
+            ),
+        )
+    )
+
+    with _client(tmp_path, settings=settings) as client:
+        assert client.app.state.main_loop.emotion_engine.state == EmotionState(
+            valence=0.1,
+            arousal=0.2,
+            optimal_loss=0.9,
+        )
+        response = client.post(
+            "/api/chat",
+            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        checkpoint = client.app.state.agent_state_store.load()
+        assert checkpoint.last_processed_event_sequence == 8
+        assert checkpoint.emotion_state == EmotionStateSnapshot(
+            valence=client.app.state.main_loop.emotion_engine.state.valence,
+            arousal=client.app.state.main_loop.emotion_engine.state.arousal,
+            optimal_loss=client.app.state.main_loop.emotion_engine.state.optimal_loss,
+        )
+
+    serialized = settings.agent_state.path.read_text(encoding="utf-8")
+    assert PRIVATE_SENTINEL not in serialized
+    assert "Visible API answer" not in serialized
+    assert "prompt" not in serialized.casefold()
+    assert "hidden" not in serialized.casefold()
+    assert "turns" not in serialized.casefold()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{corrupt",
+        b'{"schema_version":999}',
+        b'{"schema_version":1,"hiddenThought":"PRIVATE-SENTINEL-R02"}',
+    ],
+)
+def test_invalid_snapshot_prevents_runtime_start_and_is_not_overwritten(
+    tmp_path: Path, raw: bytes
+) -> None:
+    settings = _settings(tmp_path)
+    settings.agent_state.path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_state.path.write_bytes(raw)
+    runtime = RecordingRuntime()
+
+    with pytest.raises(AgentStateLoadError):
+        with _client(tmp_path, settings=settings, runtime=runtime):
+            pass
+
+    assert runtime.status is AgentRuntimeStatus.CREATED
+    assert settings.agent_state.path.read_bytes() == raw
+
+
+def test_snapshot_does_not_shadow_memory_or_adapter_registry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        memory_marker = "MEMORY-AUTHORITY-MARKER"
+        adapter_marker = "ADAPTER-AUTHORITY-MARKER"
+        client.app.state.memory_system.save_episodic(memory_marker, "visible")
+        client.app.state.adapter_registry.register_candidate(
+            adapter_id=adapter_marker,
+            adapter_path=tmp_path / "adapter",
+            dataset_path=tmp_path / "dataset.jsonl",
+            dataset_hash="dataset-hash-marker",
+        )
+        response = client.post(
+            "/api/chat",
+            json={"message": "checkpoint", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+
+    serialized = settings.agent_state.path.read_text(encoding="utf-8")
+    assert memory_marker not in serialized
+    assert adapter_marker not in serialized
+    assert "dataset-hash-marker" not in serialized
+    assert settings.adapter_registry.path.exists()
+    assert settings.memory.persist_directory.exists()
+
+
+def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    class FailingStore(AgentStateStore):
+        def save(self, snapshot: AgentStateSnapshot) -> None:
+            raise AgentStateSaveError(
+                AgentStateSaveStage.TEMP_WRITE,
+                published=False,
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.agent_state_store = FailingStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent state checkpoint could not be saved; outcome is indeterminate"
+        }
+        assert PRIVATE_SENTINEL not in response.text
+
+
 def _client(
     tmp_path: Path,
     *,
@@ -400,6 +587,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "api": settings.api.model_copy(
                 update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
+            ),
+            "agent_state": settings.agent_state.model_copy(
+                update={"path": tmp_path / "agent_state.json"}
             ),
         }
     )

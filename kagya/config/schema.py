@@ -94,6 +94,10 @@ class RuntimeSettings(StrictBaseModel):
     queue_capacity: int = Field(default=64, gt=0)
 
 
+class AgentStateSettings(StrictBaseModel):
+    path: Path = Path(".kagya/agent_state.json")
+
+
 class Settings(StrictBaseModel):
     project: ProjectSettings
     model: ModelSettings
@@ -106,3 +110,4 @@ class Settings(StrictBaseModel):
     api: ApiSettings
     frontend: FrontendSettings
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)

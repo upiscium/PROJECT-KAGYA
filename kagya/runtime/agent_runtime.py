@@ -75,7 +75,7 @@ class AgentRuntimeStopped(_AgentRuntimeEventError):
 
 
 class AgentRuntimeExecutionError(_AgentRuntimeEventError):
-    """A handler failed; the consumer remains available for later events."""
+    """A handler or completion checkpoint failed; the consumer remains available."""
 
 
 @dataclass(slots=True)
@@ -88,19 +88,32 @@ class _PendingEvent:
 class AgentRuntime:
     """Execute accepted handlers in FIFO order on one process-local thread."""
 
-    def __init__(self, queue_capacity: int) -> None:
+    def __init__(
+        self,
+        queue_capacity: int,
+        *,
+        initial_sequence: int = 0,
+        completion_checkpoint: Callable[[AgentEvent], None] | None = None,
+    ) -> None:
         if (
             isinstance(queue_capacity, bool)
             or not isinstance(queue_capacity, int)
             or queue_capacity <= 0
         ):
             raise ValueError("queue_capacity must be greater than zero")
+        if (
+            isinstance(initial_sequence, bool)
+            or not isinstance(initial_sequence, int)
+            or initial_sequence < 0
+        ):
+            raise ValueError("initial_sequence must be a non-negative integer")
         self._queue_capacity = queue_capacity
+        self._completion_checkpoint = completion_checkpoint
         self._condition = Condition()
         self._pending: deque[_PendingEvent] = deque()
         self._status = AgentRuntimeStatus.CREATED
         self._worker: Thread | None = None
-        self._sequence = 0
+        self._sequence = initial_sequence
 
     @property
     def status(self) -> AgentRuntimeStatus:
@@ -193,6 +206,17 @@ class AgentRuntime:
                     pass
             else:
                 try:
-                    pending.future.set_result(AgentEventOutcome(event, value))
-                except InvalidStateError:
-                    pass
+                    if self._completion_checkpoint is not None:
+                        self._completion_checkpoint(event)
+                except Exception as error:
+                    wrapped = AgentRuntimeExecutionError(event)
+                    wrapped.__cause__ = error
+                    try:
+                        pending.future.set_exception(wrapped)
+                    except InvalidStateError:
+                        pass
+                else:
+                    try:
+                        pending.future.set_result(AgentEventOutcome(event, value))
+                    except InvalidStateError:
+                        pass

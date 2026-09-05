@@ -12,6 +12,7 @@ from kagya.runtime import (
     AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
+    AgentStateSaveError,
 )
 
 
@@ -34,6 +35,11 @@ def execute(
             detail="Agent runtime is temporarily unavailable",
         ) from exc
     except AgentRuntimeExecutionError as exc:
+        if isinstance(exc.__cause__, AgentStateSaveError):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Agent state checkpoint could not be saved; outcome is indeterminate",
+            ) from exc
         if exc.__cause__ is not None:
             raise exc.__cause__
         raise
