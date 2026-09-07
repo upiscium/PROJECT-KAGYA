@@ -9,10 +9,10 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeDurabilityError,
     AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
-    AgentStateSaveError,
 )
 
 
@@ -34,12 +34,17 @@ def execute(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent runtime is temporarily unavailable",
         ) from exc
-    except AgentRuntimeExecutionError as exc:
-        if isinstance(exc.__cause__, AgentStateSaveError):
+    except AgentRuntimeDurabilityError as exc:
+        if exc.outcome_indeterminate:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Agent state checkpoint could not be saved; outcome is indeterminate",
+                detail="Agent mutation durability is indeterminate",
             ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent runtime durability is temporarily unavailable",
+        ) from exc
+    except AgentRuntimeExecutionError as exc:
         if exc.__cause__ is not None:
             raise exc.__cause__
         raise

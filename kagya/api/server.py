@@ -12,7 +12,15 @@ from kagya.config import Settings, get_settings
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
-from kagya.runtime import AgentEvent, AgentRuntime, AgentStateStore, KagyaMainLoop
+from kagya.runtime import (
+    AgentEvent,
+    AgentRuntime,
+    AgentStateSnapshot,
+    AgentStateStore,
+    EventJournal,
+    EventJournalLease,
+    KagyaMainLoop,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -40,36 +48,125 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app_settings.agent_state.path,
             app_settings.emotion.baseline_surprisal,
         )
-        snapshot = app.state.agent_state_store.load()
-        app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
-        app.state.sleep_cycle_manager = getattr(
-            app.state, "sleep_cycle_manager", None
-        ) or SleepCycleManager(
-            app_settings,
-            app.state.memory_system,
-            app.state.model_provider,
-            app.state.adapter_registry,
-        )
-        if getattr(app.state, "agent_runtime", None) is None:
-
-            def completion_checkpoint(event: AgentEvent) -> None:
-                sequence = event.processing_sequence
-                assert sequence is not None
-                checkpoint = app.state.agent_state_store.capture(
-                    app.state.main_loop, sequence
-                )
-                app.state.agent_state_store.save(checkpoint)
-
-            app.state.agent_runtime = AgentRuntime(
-                app_settings.runtime.queue_capacity,
-                initial_sequence=snapshot.last_processed_event_sequence,
-                completion_checkpoint=completion_checkpoint,
+        existing_journal = getattr(app.state, "event_journal", None)
+        if existing_journal is None:
+            journal_lease: EventJournalLease | None = EventJournalLease(
+                app_settings.event_journal.path
             )
-        app.state.agent_runtime.start()
+        else:
+            if not existing_journal.has_exclusive_authority:
+                raise RuntimeError("Injected EventJournal has no exclusive authority")
+            journal_lease = None
+        try:
+            snapshot = app.state.agent_state_store.load()
+            app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
+            app.state.agent_state_store.ensure_published(snapshot)
+            snapshot_hash = app.state.agent_state_store.snapshot_hash(snapshot)
+            if existing_journal is None:
+                assert journal_lease is not None
+                app.state.event_journal = EventJournal(
+                    app_settings.event_journal.path,
+                    app_settings.event_journal.max_bytes,
+                    app_settings.event_journal.retained_files,
+                    lease=journal_lease,
+                )
+            else:
+                app.state.event_journal = existing_journal
+            recovery = app.state.event_journal.verify_and_reconcile(
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+            )
+        except BaseException:
+            if journal_lease is not None:
+                journal_lease.close()
+            journal = getattr(app.state, "event_journal", None)
+            if journal is not None:
+                journal.close()
+            raise
+        try:
+            app.state.sleep_cycle_manager = getattr(
+                app.state, "sleep_cycle_manager", None
+            ) or SleepCycleManager(
+                app_settings,
+                app.state.memory_system,
+                app.state.model_provider,
+                app.state.adapter_registry,
+            )
+        except BaseException:
+            app.state.event_journal.close()
+            raise
+        committed_snapshot: AgentStateSnapshot = snapshot
+        committed_snapshot_hash = snapshot_hash
+
+        def admission_checkpoint(event: AgentEvent) -> None:
+            app.state.event_journal.append_accepted(event)
+
+        def started_checkpoint(event: AgentEvent) -> None:
+            app.state.event_journal.append_started(event)
+
+        def completion_checkpoint(event: AgentEvent) -> None:
+            nonlocal committed_snapshot, committed_snapshot_hash
+            sequence = event.processing_sequence
+            assert sequence is not None
+            candidate = app.state.agent_state_store.capture(
+                app.state.main_loop, sequence
+            )
+            candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
+            app.state.event_journal.append_prepared(
+                event,
+                committed_snapshot_hash,
+                candidate_hash,
+            )
+            app.state.agent_state_store.save(candidate)
+            app.state.event_journal.append_completed(
+                event,
+                sequence,
+                candidate_hash,
+            )
+            committed_snapshot = candidate
+            committed_snapshot_hash = candidate_hash
+
+        def failure_checkpoint(event: AgentEvent) -> None:
+            app.state.agent_state_store.restore_into(
+                app.state.main_loop, committed_snapshot
+            )
+            app.state.event_journal.append_failed(
+                event,
+                committed_snapshot.last_processed_event_sequence,
+                committed_snapshot_hash,
+            )
+
+        try:
+            if getattr(app.state, "agent_runtime", None) is None:
+                app.state.agent_runtime = AgentRuntime(
+                    app_settings.runtime.queue_capacity,
+                    initial_sequence=recovery.processing_high_water,
+                    admission_checkpoint=admission_checkpoint,
+                    started_checkpoint=started_checkpoint,
+                    completion_checkpoint=completion_checkpoint,
+                    failure_checkpoint=failure_checkpoint,
+                )
+            else:
+                app.state.agent_runtime.configure_durability(
+                    initial_sequence=recovery.processing_high_water,
+                    admission_checkpoint=admission_checkpoint,
+                    started_checkpoint=started_checkpoint,
+                    completion_checkpoint=completion_checkpoint,
+                    failure_checkpoint=failure_checkpoint,
+                )
+        except BaseException:
+            app.state.event_journal.close()
+            raise
+        try:
+            app.state.agent_runtime.start()
+        except BaseException:
+            app.state.event_journal.close()
+            raise
         try:
             yield
         finally:
             app.state.agent_runtime.shutdown()
+            app.state.event_journal.close()
 
     app = FastAPI(title=app_settings.project.name, lifespan=lifespan)
     app.state.settings = app_settings

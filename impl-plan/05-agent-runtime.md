@@ -44,14 +44,15 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 
 - Treat `AgentRuntime` as the single process-local authority for acceptance ordering and execution of authoritative subject mutations.
 - Admit events non-blockingly to one bounded queue and execute accepted handlers in FIFO order on exactly one consumer thread.
-- Assign a strictly increasing processing sequence on that consumer. A missing snapshot starts from zero; a valid R04 snapshot restores the last successfully checkpointed sequence so the next event receives `N + 1`.
+- Assign a strictly increasing processing sequence on that consumer. R05 initializes from the Journal processing high-water, which can exceed the committed snapshot sequence after a failed event.
 - Keep event metadata immutable and bounded to event identity, event type, constant source, request/acceptance time, and processing sequence. Request bodies, prompts, hidden/private reasoning, retrieved private memory, credentials, attachments, and arbitrary payloads must remain only in ephemeral in-memory handler closures and must not enter event metadata.
-- Distinguish `submit -> accepted -> ordered -> executed`. Acceptance does not mean that execution, persistence, durability, or an external effect has completed.
+- Distinguish `submit -> accepted durable -> ordered -> started durable -> executed`. Acceptance proves only durable admission evidence, not execution, snapshot commit, or an external effect.
 - Reject submission without mutation when the queue is full or the runtime is not accepting.
 - Once accepted, execute an event even if its caller stops waiting or cancels its result future.
 - On shutdown, stop accepting first, drain accepted events, and then stop the consumer.
-- Isolate handler failures so later accepted events still execute. R03 provides no transactional rollback: a handler that mutates state and then fails may leave a partial mutation.
-- `AgentRuntime` is not persistence authority and never serializes files. It provides no queue persistence, replay, EventJournal, or StateWAL.
+- Isolate handler failures only after restoring R04-owned snapshot state and durably recording bounded failed evidence. This is not a general transaction or compensation mechanism.
+- Enter explicit fail-stop on lifecycle/snapshot durability failure, reject admission, and fail pending work without executing later handlers.
+- `AgentRuntime` is not persistence authority and never serializes files. It invokes narrow ordered lifecycle/checkpoint callbacks and provides no queue persistence, replay, or StateWAL.
 
 ## AgentStateStore Requirements
 
@@ -59,11 +60,26 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 - Snapshot schema version 1 owns only a timezone-aware save time, the last successfully checkpointed processing sequence, and the current emotion values (`valence`, `arousal`, and `optimal_loss`).
 - Restore the strict snapshot and EmotionState before `AgentRuntime` becomes accepting. A missing canonical file bootstraps the configured baseline; a corrupt, private, invalid, or unsupported existing file fails startup instead of becoming fresh state.
 - Publish canonical JSON with a same-directory temporary file, mode `0600`, file flush/fsync, atomic replacement, and parent-directory fsync. Durable success is reported only after the directory fsync succeeds.
-- Execute successful mutations in this order: `handler success -> capture EmotionState and sequence -> fsynced atomic snapshot checkpoint -> successful event outcome`.
-- If the handler fails, do not checkpoint. If the handler succeeds but checkpointing fails, return a typed failure without claiming rollback or durable success, and keep the consumer available for later events.
+- Execute successful R05 mutations in this order: `prepared durable -> fsynced atomic snapshot checkpoint -> completed durable -> successful event outcome`.
+- On handler failure before prepared, restore only the last committed R04 snapshot. Do not roll back SessionState, Memory, AdapterRegistry, tools, network effects, or other authorities.
+- If snapshot publication or terminal lifecycle evidence fails, return an indeterminate durability failure and fail-stop without rollback.
 - An accepted event that has not completed its snapshot checkpoint is not crash durable in R04. Queue contents and event IDs are never restored.
 - Do not snapshot SessionState turns, chat transcripts, user messages, prompts, private reasoning, debug traces, request/event payloads, Memory records, or AdapterRegistry records. Memory and AdapterRegistry remain independent persistence authorities.
-- Support only the strict historical v0-to-v1 migration. R05 and R06 still own EventJournal, StateWAL, exact crash classification, and deterministic reconstruction beyond this minimal snapshot.
+- Support only the strict historical v0-to-v1 migration. R05 hashes the exact canonical snapshot bytes, while R06 still owns StateWAL and deterministic reconstruction.
+
+## EventJournal Requirements
+
+- Treat `EventJournal` as the durable lifecycle, integrity, processing high-water, and crash-classification authority; it is not a second state store.
+- Persist strict metadata-only `accepted`, `started`, `prepared`, `completed`, `failed`, `recovery_classified`, and `checkpoint` records in a canonical SHA-256 chain.
+- Under the runtime admission lock, check status/capacity, durably append accepted, then enqueue so concurrent durable acceptance and FIFO admission have one order.
+- Append started after assigning sequence and before invoking the handler. Successful handlers append prepared with canonical before/after state hashes, publish only through `AgentStateStore`, then append completed before Future success.
+- A handler failure consumes its sequence. After R04 restore and durable failed evidence, later events may continue from the Journal high-water even though the snapshot sequence remains older.
+- Verify every retained segment and reconcile it with the canonical snapshot before runtime acceptance. Recovery classifies accepted-only, uncommitted started/prepared, and matching prepared-plus-snapshot outcomes without replaying handlers.
+- Fail closed without truncation or repair on malformed/partial records, unsupported versions, hash or lifecycle breaks, sequence gaps, missing rotation artifacts, or Journal/snapshot mismatch.
+- Require a private service-owned Journal directory and one exclusive cross-process Journal authority so concurrent processes cannot fork the hash chain.
+- Rotate only at quiescent lifecycle boundaries and start each segment with a checkpoint preserving hash continuity, processing high-water, and snapshot identity.
+- Persist no messages, transcripts, prompts, private reasoning, request/event payloads, attachments, credentials, raw exceptions, tracebacks, or private filesystem details. Public Journal/runtime durability errors remain typed and bounded.
+- Do not introduce StateWAL, reconstruction, handler replay, external-store reconciliation, backup, encryption, or generalized rollback in R05.
 
 ## Test Requirements
 
@@ -76,9 +92,10 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 - Concurrent mutation producers cannot bypass the single-consumer runtime, rejected queue-full work does not execute, shutdown drains accepted work, caller cancellation does not cancel accepted work, and one handler failure does not terminate the consumer.
 - Serialized event metadata contains no private sentinel or arbitrary operation payload.
 - AgentState tests prove strict schema/migration/privacy rejection, atomic replacement, file and directory fsync, mode `0600`, restore-before-acceptance, sequence continuation, and exclusion of SessionState/Memory/AdapterRegistry data.
+- EventJournal tests prove durable lifecycle ordering, hash/lifecycle verification, Journal/snapshot reconciliation, failed-sequence high-water, fail-stop behavior, bounded rotation, restrictive permissions, and private-sentinel exclusion.
 
 ## Completion Criteria
 
 - Main loop integration test passes with no real model load.
 - R03 and later AgentRuntime or persistence work must preserve this R02 boundary and must not make private reasoning durable or authoritative.
-- R04 adds only the minimal EmotionState/sequence snapshot checkpoint; Journal and WAL layers must strengthen lifecycle evidence without redefining acceptance as persistence.
+- R05 adds durable lifecycle and crash-classification evidence without adding StateWAL reconstruction or becoming snapshot authority.
