@@ -808,6 +808,14 @@ class EventJournal:
                 and segment[0].previous_record_hash != previous_tail
             ):
                 raise EventJournalIntegrityError("EventJournal segment chain is broken")
+            if (
+                previous_tail is None
+                and segment_index is None
+                and segment[0].previous_record_hash is not None
+            ):
+                raise EventJournalIntegrityError(
+                    "EventJournal rotated predecessor is missing"
+                )
             if segment_index is not None and path == self.path:
                 raise EventJournalIntegrityError(
                     "EventJournal segment identity is invalid"
@@ -957,6 +965,8 @@ class EventJournal:
         if snapshot_sequence > high_water:
             raise EventJournalIntegrityError("Checkpoint sequence is impossible")
         open_events: dict[str, _EventState] = {}
+        accepted_queue: list[str] = []
+        processing_event_id: str | None = None
         seen_event_ids: set[str] = set()
         seen_record_ids: set[str] = set()
 
@@ -994,6 +1004,7 @@ class EventJournal:
                     EventLifecycle.ACCEPTED,
                     None,
                 )
+                accepted_queue.append(record.event_id)
                 continue
             if current is None:
                 raise EventJournalIntegrityError("Event lifecycle lacks acceptance")
@@ -1004,11 +1015,17 @@ class EventJournal:
                 raise EventJournalIntegrityError("Event metadata changed")
 
             if record.lifecycle is EventLifecycle.STARTED:
-                if current.lifecycle is not EventLifecycle.ACCEPTED:
+                if (
+                    current.lifecycle is not EventLifecycle.ACCEPTED
+                    or processing_event_id is not None
+                    or not accepted_queue
+                    or accepted_queue[0] != record.event_id
+                ):
                     raise EventJournalIntegrityError("Started lifecycle is impossible")
                 if record.processing_sequence != high_water + 1:
                     raise EventJournalIntegrityError("Processing sequence has a gap")
                 high_water = record.processing_sequence
+                processing_event_id = record.event_id
                 open_events[record.event_id] = _EventState(
                     current.event_id,
                     current.event_type,
@@ -1019,7 +1036,10 @@ class EventJournal:
                 )
             elif record.lifecycle is EventLifecycle.PREPARED:
                 if (
-                    current.lifecycle is not EventLifecycle.STARTED
+                    processing_event_id != record.event_id
+                    or not accepted_queue
+                    or accepted_queue[0] != record.event_id
+                    or current.lifecycle is not EventLifecycle.STARTED
                     or record.processing_sequence != current.processing_sequence
                     or record.state_hash_before != snapshot_hash
                 ):
@@ -1036,7 +1056,10 @@ class EventJournal:
                 )
             elif record.lifecycle is EventLifecycle.COMPLETED:
                 if (
-                    current.lifecycle is not EventLifecycle.PREPARED
+                    processing_event_id != record.event_id
+                    or not accepted_queue
+                    or accepted_queue[0] != record.event_id
+                    or current.lifecycle is not EventLifecycle.PREPARED
                     or record.processing_sequence != current.processing_sequence
                     or record.snapshot_sequence != current.processing_sequence
                     or record.snapshot_hash != current.state_hash_after
@@ -1049,20 +1072,34 @@ class EventJournal:
                 snapshot_sequence = record.snapshot_sequence
                 snapshot_hash = record.snapshot_hash
                 del open_events[record.event_id]
+                accepted_queue.pop(0)
+                processing_event_id = None
             elif record.lifecycle is EventLifecycle.FAILED:
                 if (
-                    current.lifecycle is not EventLifecycle.STARTED
+                    processing_event_id != record.event_id
+                    or not accepted_queue
+                    or accepted_queue[0] != record.event_id
+                    or current.lifecycle is not EventLifecycle.STARTED
                     or record.processing_sequence != current.processing_sequence
                     or record.snapshot_sequence != snapshot_sequence
                     or record.snapshot_hash != snapshot_hash
                 ):
                     raise EventJournalIntegrityError("Failed lifecycle is impossible")
                 del open_events[record.event_id]
+                accepted_queue.pop(0)
+                processing_event_id = None
             elif record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED:
                 if record.snapshot_sequence is None or record.snapshot_hash is None:
                     raise EventJournalIntegrityError("Recovery snapshot is missing")
                 if record.failure_category is EventFailureCategory.ACCEPTED_NOT_STARTED:
-                    if current.lifecycle is not EventLifecycle.ACCEPTED:
+                    if (
+                        current.lifecycle is not EventLifecycle.ACCEPTED
+                        or processing_event_id is not None
+                        or not accepted_queue
+                        or accepted_queue[0] != record.event_id
+                        or record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                    ):
                         raise EventJournalIntegrityError(
                             "Accepted recovery is impossible"
                         )
@@ -1071,7 +1108,10 @@ class EventJournal:
                     is EventFailureCategory.UNCOMMITTED_AFTER_CRASH
                 ):
                     if (
-                        current.lifecycle
+                        processing_event_id != record.event_id
+                        or not accepted_queue
+                        or accepted_queue[0] != record.event_id
+                        or current.lifecycle
                         not in {
                             EventLifecycle.STARTED,
                             EventLifecycle.PREPARED,
@@ -1088,7 +1128,10 @@ class EventJournal:
                     is EventFailureCategory.COMMITTED_BEFORE_CRASH
                 ):
                     if (
-                        current.lifecycle is not EventLifecycle.PREPARED
+                        processing_event_id != record.event_id
+                        or not accepted_queue
+                        or accepted_queue[0] != record.event_id
+                        or current.lifecycle is not EventLifecycle.PREPARED
                         or record.processing_sequence != current.processing_sequence
                         or record.snapshot_sequence != current.processing_sequence
                         or record.snapshot_hash != current.state_hash_after
@@ -1101,6 +1144,8 @@ class EventJournal:
                 else:
                     raise EventJournalIntegrityError("Recovery category is impossible")
                 del open_events[record.event_id]
+                accepted_queue.pop(0)
+                processing_event_id = None
             else:
                 raise EventJournalIntegrityError("Lifecycle is impossible")
 

@@ -346,6 +346,116 @@ def test_processing_sequence_gap_is_rejected_before_append(tmp_path: Path) -> No
     assert error.value.published is False
 
 
+def test_fifo_and_single_processing_order_is_enforced_before_append(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap(tmp_path / "events.jsonl")
+    accepted_a = event("fifo-a")
+    accepted_b = event("fifo-b")
+    value.append_accepted(accepted_a)
+    value.append_accepted(accepted_b)
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_started(event("fifo-b", 1))
+
+    value.append_started(event("fifo-a", 1))
+    with pytest.raises(EventJournalAppendError):
+        value.append_started(event("fifo-b", 2))
+
+    value.append_prepared(event("fifo-a", 1), HASH_0, HASH_1)
+    value.append_completed(event("fifo-a", 1), 1, HASH_1)
+    value.append_started(event("fifo-b", 2))
+    value.append_failed(event("fifo-b", 2), 1, HASH_1)
+
+    assert value.verify_and_reconcile(1, HASH_1).processing_high_water == 2
+
+
+@pytest.mark.parametrize("overlapping_start", [False, True])
+def test_canonically_hashed_out_of_order_start_fails_closed_on_load(
+    tmp_path: Path, overlapping_start: bool
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = bootstrap(path)
+    value.append_accepted(event("raw-a"))
+    value.append_accepted(event("raw-b"))
+    if overlapping_start:
+        value.append_started(event("raw-a", 1))
+        sequence = 2
+    else:
+        sequence = 1
+    records = value.records
+    invalid = value._make_record(
+        EventLifecycle.STARTED,
+        previous_hash=records[-1].record_hash,
+        event=event("raw-b", sequence),
+        processing_sequence=sequence,
+    )
+    value.close()
+    path.write_bytes(
+        b"".join(EventJournal._record_bytes(item) for item in (*records, invalid))
+    )
+
+    with pytest.raises(EventJournalIntegrityError):
+        journal(path)
+
+
+def test_accepted_not_started_recovery_must_preserve_snapshot_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = bootstrap(path)
+    accepted = event("accepted-recovery")
+    value.append_accepted(accepted)
+    records = value.records
+    invalid = value._make_record(
+        EventLifecycle.RECOVERY_CLASSIFIED,
+        previous_hash=records[-1].record_hash,
+        event=accepted,
+        snapshot_sequence=1,
+        snapshot_hash=HASH_1,
+        failure_category=EventFailureCategory.ACCEPTED_NOT_STARTED,
+    )
+    value.close()
+    path.write_bytes(
+        b"".join(EventJournal._record_bytes(item) for item in (*records, invalid))
+    )
+
+    with pytest.raises(EventJournalIntegrityError):
+        journal(path)
+
+
+def test_recovery_closes_processing_then_queued_events_in_fifo_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = bootstrap(path)
+    value.append_accepted(event("recover-a"))
+    value.append_started(event("recover-a", 1))
+    value.append_accepted(event("recover-b"))
+    value.append_accepted(event("recover-c"))
+    value.close()
+
+    reopened = journal(path)
+    recovery = reopened.verify_and_reconcile(0, HASH_0)
+    classifications = [
+        record
+        for record in reopened.records
+        if record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+    ]
+
+    assert recovery.processing_high_water == 1
+    assert [record.event_id for record in classifications] == [
+        event("recover-a").event_id,
+        event("recover-b").event_id,
+        event("recover-c").event_id,
+    ]
+    assert [record.failure_category for record in classifications] == [
+        EventFailureCategory.UNCOMMITTED_AFTER_CRASH,
+        EventFailureCategory.ACCEPTED_NOT_STARTED,
+        EventFailureCategory.ACCEPTED_NOT_STARTED,
+    ]
+
+
 def test_rotation_retains_verifiable_checkpoint_and_detects_missing_segment(
     tmp_path: Path,
 ) -> None:
@@ -375,6 +485,25 @@ def test_rotation_retains_verifiable_checkpoint_and_detects_missing_segment(
         rotated[-2].unlink()
         with pytest.raises(EventJournalIntegrityError):
             EventJournal(path, 1, 4, clock=lambda: NOW)
+
+
+def test_missing_sole_rotated_predecessor_is_detected(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    value = EventJournal(path, 1, 2, clock=lambda: NOW)
+    value.verify_and_reconcile(0, HASH_0)
+    append_success(value, event("rotate-once", 1), HASH_0, HASH_1)
+    value.close()
+    predecessor = tmp_path / "events.jsonl.00000000"
+    assert predecessor.exists()
+    active_checkpoint = EventJournalRecord.model_validate_json(
+        path.read_bytes().splitlines()[0]
+    )
+    assert active_checkpoint.previous_record_hash is not None
+
+    predecessor.unlink()
+
+    with pytest.raises(EventJournalIntegrityError):
+        EventJournal(path, 1, 2, clock=lambda: NOW)
 
 
 def test_interrupted_rotation_and_symlink_fail_closed(tmp_path: Path) -> None:

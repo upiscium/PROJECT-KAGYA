@@ -72,9 +72,11 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 - Treat `EventJournal` as the durable lifecycle, integrity, processing high-water, and crash-classification authority; it is not a second state store.
 - Persist strict metadata-only `accepted`, `started`, `prepared`, `completed`, `failed`, `recovery_classified`, and `checkpoint` records in a canonical SHA-256 chain.
 - Under the runtime admission lock, check status/capacity, durably append accepted, then enqueue so concurrent durable acceptance and FIFO admission have one order.
+- Verify that durable accepted order, handler start order, and processing-sequence order agree, with at most one processing event and no later start before the current event reaches a terminal lifecycle.
 - Append started after assigning sequence and before invoking the handler. Successful handlers append prepared with canonical before/after state hashes, publish only through `AgentStateStore`, then append completed before Future success.
 - A handler failure consumes its sequence. After R04 restore and durable failed evidence, later events may continue from the Journal high-water even though the snapshot sequence remains older.
 - Verify every retained segment and reconcile it with the canonical snapshot before runtime acceptance. Recovery classifies accepted-only, uncommitted started/prepared, and matching prepared-plus-snapshot outcomes without replaying handlers.
+- Require accepted-not-started recovery evidence to preserve the current canonical snapshot identity, and reject an active checkpoint that names a predecessor when no retained rotated predecessor exists.
 - Bootstrap a missing R04 snapshot only when no Journal history exists. If durable Journal history exists without its canonical snapshot, fail closed without creating state, changing the Journal, or replaying work; reconstruction remains R06 authority.
 - Fail closed without truncation or repair on malformed/partial records, unsupported versions, hash or lifecycle breaks, sequence gaps, missing rotation artifacts, or Journal/snapshot mismatch.
 - Require every persisted record to carry explicit schema version 1; never infer a missing version.
