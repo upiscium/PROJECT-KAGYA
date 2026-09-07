@@ -81,3 +81,8 @@ runtime:
 
 agent_state:
   path: .kagya/agent_state.json
+
+event_journal:
+  path: .kagya/event_journal.jsonl
+  max_bytes: 1048576
+  retained_files: 4

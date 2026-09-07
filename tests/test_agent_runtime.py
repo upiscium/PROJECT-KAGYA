@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, asdict
 from threading import Barrier, Event, Lock, Thread, current_thread
+import traceback
 
 import pytest
 
@@ -8,7 +9,9 @@ from kagya.runtime import (
     AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
-    AgentRuntime,
+    AgentRuntime as DurableAgentRuntime,
+    AgentRuntimeDurabilityError,
+    AgentRuntimeDurabilityPhase,
     AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStatus,
@@ -16,6 +19,37 @@ from kagya.runtime import (
     AgentStateSaveError,
     AgentStateSaveStage,
 )
+
+
+class AgentRuntime(DurableAgentRuntime):
+    """Explicitly volatile unit-test runtime unless callbacks are supplied."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, allow_volatile=True, **kwargs)
+
+
+def test_authoritative_runtime_requires_complete_durability_lifecycle() -> None:
+    runtime = DurableAgentRuntime(1)
+
+    with pytest.raises(RuntimeError, match="durability lifecycle"):
+        runtime.start()
+
+    def callback(_event) -> None:
+        pass
+
+    runtime.configure_durability(
+        initial_sequence=4,
+        admission_checkpoint=callback,
+        started_checkpoint=callback,
+        completion_checkpoint=callback,
+        failure_checkpoint=callback,
+    )
+    runtime.start()
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
+    ).result(timeout=2)
+    runtime.shutdown()
+    assert outcome.event.processing_sequence == 5
 
 
 def test_fifo_order_and_consumer_sequences() -> None:
@@ -90,7 +124,7 @@ def test_handler_failure_skips_checkpoint() -> None:
     assert not checkpoint_called
 
 
-def test_checkpoint_failure_preserves_cause_and_consumer_continues() -> None:
+def test_checkpoint_failure_fail_stops_runtime() -> None:
     checkpoint_calls = 0
 
     def checkpoint(_: object) -> None:
@@ -114,14 +148,19 @@ def test_checkpoint_failure_preserves_cause_and_consumer_continues() -> None:
         AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
     )
 
-    with pytest.raises(AgentRuntimeExecutionError) as error:
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
-    assert succeeding.result(timeout=2).value == "ok"
+    with pytest.raises(AgentRuntimeDurabilityError):
+        succeeding.result(timeout=2)
     runtime.shutdown()
 
     assert handler_ran.is_set()
-    assert isinstance(error.value.__cause__, AgentStateSaveError)
-    assert checkpoint_calls == 2
+    assert error.value.phase is AgentRuntimeDurabilityPhase.COMPLETION
+    assert error.value.failure_type == "AgentStateSaveError"
+    assert error.value.published is False
+    assert error.value.__cause__ is None
+    assert checkpoint_calls == 1
+    assert runtime.status is AgentRuntimeStatus.FAILED
 
 
 def test_cancelled_future_still_runs_checkpoint() -> None:
@@ -129,12 +168,23 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
     release_blocker = Event()
     cancelled_handler_ran = Event()
     checkpoint_sequences: list[int] = []
+    accepted_ids: list[str] = []
+    started_sequences: list[int] = []
 
     def checkpoint(event) -> None:
         assert event.processing_sequence is not None
         checkpoint_sequences.append(event.processing_sequence)
 
-    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    def started_checkpoint(event) -> None:
+        assert event.processing_sequence is not None
+        started_sequences.append(event.processing_sequence)
+
+    runtime = AgentRuntime(
+        1,
+        admission_checkpoint=lambda event: accepted_ids.append(event.event_id),
+        started_checkpoint=started_checkpoint,
+        completion_checkpoint=checkpoint,
+    )
     runtime.start()
     blocker = runtime.submit(
         AgentEventType.CHAT,
@@ -154,6 +204,8 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
 
     assert future.cancelled()
     assert cancelled_handler_ran.is_set()
+    assert len(accepted_ids) == 2
+    assert started_sequences == [1, 2]
     assert checkpoint_sequences == [1, 2]
 
 
@@ -408,3 +460,245 @@ def test_processing_sequence_is_process_local_to_each_runtime() -> None:
         sequences.append(outcome.event.processing_sequence)
 
     assert sequences == [1, 1]
+
+
+def test_concurrent_durable_acceptance_order_equals_execution_order() -> None:
+    accepted: list[str] = []
+    executed: list[int] = []
+    event_ids: dict[int, str] = {}
+    errors: list[BaseException] = []
+    lock = Lock()
+    barrier = Barrier(9)
+
+    def record_accepted(event) -> None:
+        accepted.append(event.event_id)
+
+    runtime = AgentRuntime(8, admission_checkpoint=record_accepted)
+    runtime.start()
+
+    def producer(number: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            outcome = runtime.submit(
+                AgentEventType.CHAT,
+                AgentEventSource.API_CHAT,
+                lambda: (executed.append(number), number)[1],
+            ).result(timeout=5)
+            with lock:
+                event_ids[number] = outcome.event.event_id
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+
+    threads = [Thread(target=producer, args=(number,)) for number in range(8)]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+    runtime.shutdown()
+
+    assert not errors
+    assert accepted == [event_ids[number] for number in executed]
+
+
+def test_queue_full_and_stopped_create_no_durable_acceptance() -> None:
+    accepted: list[str] = []
+    started = Event()
+    release = Event()
+    runtime = AgentRuntime(
+        1, admission_checkpoint=lambda event: accepted.append(event.event_id)
+    )
+    runtime.start()
+    first = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: (started.set(), release.wait())[1],
+    )
+    assert started.wait(timeout=2)
+    second = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
+    )
+    with pytest.raises(AgentRuntimeQueueFull):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+    assert len(accepted) == 2
+    release.set()
+    first.result(timeout=2)
+    second.result(timeout=2)
+    runtime.shutdown()
+    with pytest.raises(AgentRuntimeStopped):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+    assert len(accepted) == 2
+
+
+def test_admission_failure_does_not_enqueue_and_fail_stops() -> None:
+    handler_ran = Event()
+
+    def fail_admission(_event) -> None:
+        raise OSError("PRIVATE-SENTINEL-R05")
+
+    runtime = AgentRuntime(1, admission_checkpoint=fail_admission)
+    runtime.start()
+
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, handler_ran.set)
+    runtime.shutdown()
+
+    assert error.value.phase is AgentRuntimeDurabilityPhase.ADMISSION
+    assert error.value.outcome_indeterminate is False
+    assert not handler_ran.is_set()
+    assert runtime.status is AgentRuntimeStatus.FAILED
+    rendered = "".join(traceback.format_exception(error.value))
+    assert "PRIVATE-SENTINEL-R05" not in rendered
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_later_admission_failure_does_not_abandon_started_event() -> None:
+    admissions = 0
+    handler_started = Event()
+    release_handler = Event()
+    completed: list[int] = []
+
+    def admission(_event) -> None:
+        nonlocal admissions
+        admissions += 1
+        if admissions == 2:
+            raise OSError("journal unavailable")
+
+    def completion(event) -> None:
+        assert event.processing_sequence is not None
+        completed.append(event.processing_sequence)
+
+    runtime = AgentRuntime(
+        1,
+        admission_checkpoint=admission,
+        completion_checkpoint=completion,
+    )
+    runtime.start()
+    active = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: (handler_started.set(), release_handler.wait(), "done")[2],
+    )
+    assert handler_started.wait(timeout=2)
+
+    with pytest.raises(AgentRuntimeDurabilityError):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+    release_handler.set()
+
+    assert active.result(timeout=2).value == "done"
+    runtime.shutdown()
+    assert completed == [1]
+    assert runtime.status is AgentRuntimeStatus.FAILED
+
+
+def test_started_is_durable_before_handler_and_started_failure_runs_no_handler() -> (
+    None
+):
+    order: list[str] = []
+    runtime = AgentRuntime(
+        1,
+        started_checkpoint=lambda _event: order.append("started"),
+    )
+    runtime.start()
+    runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: order.append("handler"),
+    ).result(timeout=2)
+    runtime.shutdown()
+    assert order == ["started", "handler"]
+
+    handler_ran = Event()
+
+    def fail_started(_event) -> None:
+        raise OSError("storage unavailable")
+
+    failed_runtime = AgentRuntime(1, started_checkpoint=fail_started)
+    failed_runtime.start()
+    future = failed_runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, handler_ran.set
+    )
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        future.result(timeout=2)
+    failed_runtime.shutdown()
+    assert error.value.phase is AgentRuntimeDurabilityPhase.STARTED
+    assert not handler_ran.is_set()
+    assert failed_runtime.status is AgentRuntimeStatus.FAILED
+
+
+def test_full_success_protocol_precedes_future_success() -> None:
+    order: list[str] = []
+    runtime = AgentRuntime(
+        1,
+        admission_checkpoint=lambda _event: order.append("accepted"),
+        started_checkpoint=lambda _event: order.append("started"),
+        completion_checkpoint=lambda _event: order.append("completed"),
+    )
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: order.append("handler"),
+    )
+    future.add_done_callback(lambda _future: order.append("future"))
+    future.result(timeout=2)
+    runtime.shutdown()
+    assert order == ["accepted", "started", "handler", "completed", "future"]
+
+
+def test_handler_failure_checkpoint_consumes_sequence_and_runtime_continues() -> None:
+    failed_sequences: list[int] = []
+
+    def record_failure(event) -> None:
+        assert event.processing_sequence is not None
+        failed_sequences.append(event.processing_sequence)
+
+    runtime = AgentRuntime(2, failure_checkpoint=record_failure)
+    runtime.start()
+
+    def fail() -> None:
+        raise ValueError("domain failure")
+
+    failed = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, fail)
+    succeeding = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
+    )
+    with pytest.raises(AgentRuntimeExecutionError) as error:
+        failed.result(timeout=2)
+    outcome = succeeding.result(timeout=2)
+    runtime.shutdown()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert failed_sequences == [1]
+    assert outcome.event.processing_sequence == 2
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_handler_failure_checkpoint_failure_stops_later_handlers() -> None:
+    later_ran = Event()
+
+    def fail_handler_checkpoint(_event) -> None:
+        raise OSError("failed evidence unavailable")
+
+    runtime = AgentRuntime(2, failure_checkpoint=fail_handler_checkpoint)
+    runtime.start()
+
+    def fail() -> None:
+        raise ValueError("domain failure")
+
+    failed = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, fail)
+    later = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, later_ran.set
+    )
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        failed.result(timeout=2)
+    with pytest.raises(AgentRuntimeDurabilityError):
+        later.result(timeout=2)
+    runtime.shutdown()
+
+    assert error.value.phase is AgentRuntimeDurabilityPhase.HANDLER_FAILURE
+    assert error.value.outcome_indeterminate is True
+    assert not later_ran.is_set()
+    assert runtime.status is AgentRuntimeStatus.FAILED

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -361,9 +362,7 @@ def test_save_validation_detail_is_absent_from_full_exception(tmp_path: Path) ->
     raw["emotion_state"]["valence"] = PRIVATE_SENTINEL
 
     with pytest.raises(AgentStateSaveError) as error:
-        make_store(tmp_path / "agent_state.json").save(
-            cast(AgentStateSnapshot, raw)
-        )
+        make_store(tmp_path / "agent_state.json").save(cast(AgentStateSnapshot, raw))
 
     assert error.value.stage is AgentStateSaveStage.TEMP_WRITE
     assert error.value.published is False
@@ -469,7 +468,9 @@ def test_restore_failure_is_absent_from_full_exception(tmp_path: Path) -> None:
     assert_bounded_exception(error.value, PRIVATE_SENTINEL)
 
 
-def test_restore_validation_detail_is_absent_from_full_exception(tmp_path: Path) -> None:
+def test_restore_validation_detail_is_absent_from_full_exception(
+    tmp_path: Path,
+) -> None:
     class InvalidSnapshot:
         def model_dump(self, *, mode: str) -> object:
             raw = make_snapshot().model_dump(mode=mode)
@@ -483,3 +484,65 @@ def test_restore_validation_detail_is_absent_from_full_exception(tmp_path: Path)
         store.restore_into(loop, cast(AgentStateSnapshot, InvalidSnapshot()))
 
     assert_bounded_exception(error.value, PRIVATE_SENTINEL)
+
+
+def test_snapshot_hash_uses_exact_canonical_bytes_including_saved_at(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    snapshot = make_snapshot()
+
+    assert (
+        store.snapshot_hash(snapshot)
+        == hashlib.sha256(store.canonical_bytes(snapshot)).hexdigest()
+    )
+    later = snapshot.model_copy(
+        update={"saved_at": datetime(2026, 1, 2, tzinfo=timezone.utc)}
+    )
+    assert store.snapshot_hash(later) != store.snapshot_hash(snapshot)
+
+
+def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing" / "agent_state.json"
+    missing_store = make_store(missing_path)
+    bootstrap = missing_store.load()
+    missing_store.ensure_published(bootstrap)
+    assert missing_path.read_bytes() == missing_store.canonical_bytes(bootstrap)
+
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 0,
+                "last_event_sequence": 7,
+                "emotion": {
+                    "valence": 0.1,
+                    "arousal": 0.2,
+                    "optimal_loss": 0.9,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_store = make_store(legacy_path)
+    migrated = legacy_store.load()
+    legacy_store.ensure_published(migrated)
+    assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    store.save(make_snapshot())
+    original_stat = path.stat()
+
+    def fail_if_saved(_stage: AgentStateSaveStage) -> None:
+        raise AssertionError("identical snapshot must not be rewritten")
+
+    checking_store = make_store(path, hook=fail_if_saved)
+    checking_store.ensure_published(checking_store.load())
+
+    assert path.stat().st_ino == original_stat.st_ino

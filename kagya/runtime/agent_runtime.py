@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from threading import Condition, Thread, current_thread
-from typing import Callable, Generic, TypeVar, cast
+from typing import Any, Callable, Generic, TypeVar, cast
 from uuid import uuid4
 
 
@@ -38,6 +38,14 @@ class AgentRuntimeStatus(str, Enum):
     ACCEPTING = "accepting"
     DRAINING = "draining"
     STOPPED = "stopped"
+    FAILED = "failed"
+
+
+class AgentRuntimeDurabilityPhase(str, Enum):
+    ADMISSION = "admission"
+    STARTED = "started"
+    HANDLER_FAILURE = "handler_failure"
+    COMPLETION = "completion"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +86,25 @@ class AgentRuntimeExecutionError(_AgentRuntimeEventError):
     """A handler or completion checkpoint failed; the consumer remains available."""
 
 
+class AgentRuntimeDurabilityError(_AgentRuntimeEventError):
+    """A lifecycle checkpoint failed and the runtime entered fail-stop mode."""
+
+    def __init__(
+        self,
+        event: AgentEvent,
+        phase: AgentRuntimeDurabilityPhase,
+        *,
+        outcome_indeterminate: bool,
+        failure_type: str | None = None,
+        published: bool | None = None,
+    ) -> None:
+        super().__init__(event)
+        self.phase = phase
+        self.outcome_indeterminate = outcome_indeterminate
+        self.failure_type = failure_type
+        self.published = published
+
+
 @dataclass(slots=True)
 class _PendingEvent:
     event: AgentEvent
@@ -93,7 +120,11 @@ class AgentRuntime:
         queue_capacity: int,
         *,
         initial_sequence: int = 0,
+        admission_checkpoint: Callable[[AgentEvent], None] | None = None,
+        started_checkpoint: Callable[[AgentEvent], None] | None = None,
         completion_checkpoint: Callable[[AgentEvent], None] | None = None,
+        failure_checkpoint: Callable[[AgentEvent], None] | None = None,
+        allow_volatile: bool = False,
     ) -> None:
         if (
             isinstance(queue_capacity, bool)
@@ -108,12 +139,27 @@ class AgentRuntime:
         ):
             raise ValueError("initial_sequence must be a non-negative integer")
         self._queue_capacity = queue_capacity
+        self._admission_checkpoint = admission_checkpoint
+        self._started_checkpoint = started_checkpoint
         self._completion_checkpoint = completion_checkpoint
+        self._failure_checkpoint = failure_checkpoint
         self._condition = Condition()
         self._pending: deque[_PendingEvent] = deque()
         self._status = AgentRuntimeStatus.CREATED
         self._worker: Thread | None = None
         self._sequence = initial_sequence
+        self._active: tuple[_PendingEvent, AgentEvent] | None = None
+        self._failed_phase: AgentRuntimeDurabilityPhase | None = None
+        self._allow_volatile = allow_volatile
+        self._durability_configured = all(
+            callback is not None
+            for callback in (
+                admission_checkpoint,
+                started_checkpoint,
+                completion_checkpoint,
+                failure_checkpoint,
+            )
+        )
 
     @property
     def status(self) -> AgentRuntimeStatus:
@@ -125,10 +171,15 @@ class AgentRuntime:
             if self._status in {
                 AgentRuntimeStatus.DRAINING,
                 AgentRuntimeStatus.STOPPED,
+                AgentRuntimeStatus.FAILED,
             }:
                 raise RuntimeError("AgentRuntime cannot be restarted")
             if self._status is AgentRuntimeStatus.ACCEPTING:
                 return
+            if not self._durability_configured and not self._allow_volatile:
+                raise RuntimeError(
+                    "AgentRuntime durability lifecycle is not configured"
+                )
             self._status = AgentRuntimeStatus.ACCEPTING
             self._worker = Thread(
                 target=self._consume,
@@ -136,6 +187,35 @@ class AgentRuntime:
                 daemon=True,
             )
             self._worker.start()
+
+    def configure_durability(
+        self,
+        *,
+        initial_sequence: int,
+        admission_checkpoint: Callable[[AgentEvent], None],
+        started_checkpoint: Callable[[AgentEvent], None],
+        completion_checkpoint: Callable[[AgentEvent], None],
+        failure_checkpoint: Callable[[AgentEvent], None],
+    ) -> None:
+        """Bind mandatory durable lifecycle collaborators before startup."""
+
+        if (
+            isinstance(initial_sequence, bool)
+            or not isinstance(initial_sequence, int)
+            or initial_sequence < 0
+        ):
+            raise ValueError("initial_sequence must be a non-negative integer")
+        with self._condition:
+            if self._status is not AgentRuntimeStatus.CREATED:
+                raise RuntimeError(
+                    "AgentRuntime durability must be configured before start"
+                )
+            self._sequence = initial_sequence
+            self._admission_checkpoint = admission_checkpoint
+            self._started_checkpoint = started_checkpoint
+            self._completion_checkpoint = completion_checkpoint
+            self._failure_checkpoint = failure_checkpoint
+            self._durability_configured = True
 
     def submit(
         self,
@@ -164,6 +244,17 @@ class AgentRuntime:
                 raise AgentRuntimeStopped(event)
             if len(self._pending) >= self._queue_capacity:
                 raise AgentRuntimeQueueFull(event)
+            if self._admission_checkpoint is not None:
+                durability_error: AgentRuntimeDurabilityError | None = None
+                try:
+                    self._admission_checkpoint(event)
+                except Exception as error:
+                    durability_error = self._durability_error(
+                        event, AgentRuntimeDurabilityPhase.ADMISSION, error, False
+                    )
+                if durability_error is not None:
+                    self._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.ADMISSION)
+                    raise durability_error
             self._pending.append(pending)
             self._condition.notify()
         return future
@@ -189,34 +280,139 @@ class AgentRuntime:
                 ):
                     self._condition.wait()
                 if not self._pending:
+                    if self._status is AgentRuntimeStatus.FAILED:
+                        self._condition.notify_all()
+                        return
                     self._status = AgentRuntimeStatus.STOPPED
                     self._condition.notify_all()
                     return
                 pending = self._pending.popleft()
                 self._sequence += 1
                 event = replace(pending.event, processing_sequence=self._sequence)
+                self._active = (pending, event)
+            if self._started_checkpoint is not None:
+                try:
+                    self._started_checkpoint(event)
+                except Exception as error:
+                    durability_error = self._durability_error(
+                        event, AgentRuntimeDurabilityPhase.STARTED, error, False
+                    )
+                    with self._condition:
+                        self._fail_stop_locked(durability_error)
+                    return
+            with self._condition:
+                if self._status is AgentRuntimeStatus.FAILED:
+                    self._set_exception(
+                        pending.future,
+                        AgentRuntimeDurabilityError(
+                            event,
+                            self._failed_phase or AgentRuntimeDurabilityPhase.ADMISSION,
+                            outcome_indeterminate=False,
+                        ),
+                    )
+                    self._finish_active_locked()
+                    return
             try:
                 value = pending.handler()
             except Exception as error:
+                if self._failure_checkpoint is not None:
+                    try:
+                        self._failure_checkpoint(event)
+                    except Exception as checkpoint_error:
+                        durability_error = self._durability_error(
+                            event,
+                            AgentRuntimeDurabilityPhase.HANDLER_FAILURE,
+                            checkpoint_error,
+                            True,
+                        )
+                        with self._condition:
+                            self._fail_stop_locked(durability_error)
+                        return
                 wrapped = AgentRuntimeExecutionError(event)
                 wrapped.__cause__ = error
-                try:
-                    pending.future.set_exception(wrapped)
-                except InvalidStateError:
-                    pass
+                self._set_exception(pending.future, wrapped)
+                self._finish_active()
             else:
                 try:
                     if self._completion_checkpoint is not None:
                         self._completion_checkpoint(event)
                 except Exception as error:
-                    wrapped = AgentRuntimeExecutionError(event)
-                    wrapped.__cause__ = error
-                    try:
-                        pending.future.set_exception(wrapped)
-                    except InvalidStateError:
-                        pass
+                    durability_error = self._durability_error(
+                        event, AgentRuntimeDurabilityPhase.COMPLETION, error, True
+                    )
+                    with self._condition:
+                        self._fail_stop_locked(durability_error)
+                    return
                 else:
-                    try:
-                        pending.future.set_result(AgentEventOutcome(event, value))
-                    except InvalidStateError:
-                        pass
+                    self._set_result(pending.future, AgentEventOutcome(event, value))
+                    self._finish_active()
+
+    @staticmethod
+    def _durability_error(
+        event: AgentEvent,
+        phase: AgentRuntimeDurabilityPhase,
+        error: Exception,
+        outcome_indeterminate: bool,
+    ) -> AgentRuntimeDurabilityError:
+        raw_failure_type = type(error).__name__
+        failure_type = raw_failure_type if raw_failure_type.isidentifier() else None
+        published = getattr(error, "published", None)
+        if not isinstance(published, bool):
+            published = None
+        return AgentRuntimeDurabilityError(
+            event,
+            phase,
+            outcome_indeterminate=outcome_indeterminate,
+            failure_type=failure_type,
+            published=published,
+        )
+
+    def _fail_stop_locked(
+        self,
+        current_error: AgentRuntimeDurabilityError | None = None,
+        *,
+        phase: AgentRuntimeDurabilityPhase | None = None,
+    ) -> None:
+        self._status = AgentRuntimeStatus.FAILED
+        failure_phase = phase or (
+            current_error.phase
+            if current_error is not None
+            else AgentRuntimeDurabilityPhase.COMPLETION
+        )
+        self._failed_phase = failure_phase
+        if self._active is not None and current_error is not None:
+            pending, _event = self._active
+            self._set_exception(pending.future, current_error)
+        while self._pending:
+            pending = self._pending.popleft()
+            self._set_exception(
+                pending.future,
+                AgentRuntimeDurabilityError(
+                    pending.event,
+                    failure_phase,
+                    outcome_indeterminate=False,
+                ),
+            )
+        self._condition.notify_all()
+
+    def _finish_active_locked(self) -> None:
+        self._active = None
+        self._condition.notify_all()
+
+    def _finish_active(self) -> None:
+        with self._condition:
+            self._finish_active_locked()
+
+    @staticmethod
+    def _set_exception(future: Future[Any], error: BaseException) -> None:
+        try:
+            future.set_exception(error)
+        except InvalidStateError:
+            pass
+
+    @staticmethod
+    def _set_result(future: Future[Any], result: object) -> None:
+        try:
+            future.set_result(result)
+        except InvalidStateError:
+            pass

@@ -98,6 +98,12 @@ class AgentStateSettings(StrictBaseModel):
     path: Path = Path(".kagya/agent_state.json")
 
 
+class EventJournalSettings(StrictBaseModel):
+    path: Path = Path(".kagya/event_journal.jsonl")
+    max_bytes: int = Field(default=1_048_576, gt=0)
+    retained_files: int = Field(default=4, ge=2)
+
+
 class Settings(StrictBaseModel):
     project: ProjectSettings
     model: ModelSettings
@@ -111,3 +117,4 @@ class Settings(StrictBaseModel):
     frontend: FrontendSettings
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
+    event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)

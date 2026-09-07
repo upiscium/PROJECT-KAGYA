@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
 import json
 import math
 import os
@@ -204,6 +205,19 @@ class AgentStateStore:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._save_stage_hook = save_stage_hook
 
+    def snapshot_exists(self) -> bool:
+        """Inspect canonical snapshot presence without following its final path."""
+
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise AgentStateLoadError(
+                "AgentState snapshot cannot be inspected"
+            ) from None
+        return True
+
     def load(self) -> AgentStateSnapshot:
         inspection_failure: AgentStateLoadError | None = None
         try:
@@ -286,14 +300,7 @@ class AgentStateStore:
         descriptor: int | None = None
         save_failure: AgentStateSaveError | None = None
         try:
-            raw: object = (
-                snapshot.model_dump(mode="python")
-                if isinstance(snapshot, AgentStateSnapshot)
-                else snapshot
-            )
-            _reject_private_keys(raw)
-            validated = AgentStateSnapshot.model_validate(raw)
-            payload = self._canonical_bytes(validated)
+            payload = self.canonical_bytes(snapshot)
             parent = self.path.parent
             parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -339,6 +346,74 @@ class AgentStateStore:
             save_failure = AgentStateSaveError(stage, published=published)
         if save_failure is not None:
             raise save_failure
+
+    def canonical_bytes(self, snapshot: AgentStateSnapshot) -> bytes:
+        """Return the one canonical representation used for save and hashing."""
+
+        canonical_failure: AgentStateSaveError | None = None
+        try:
+            raw: object = (
+                snapshot.model_dump(mode="python")
+                if isinstance(snapshot, AgentStateSnapshot)
+                else snapshot
+            )
+            _reject_private_keys(raw)
+            validated = AgentStateSnapshot.model_validate(raw)
+            return self._canonical_bytes(validated)
+        except Exception:
+            canonical_failure = AgentStateSaveError(
+                AgentStateSaveStage.CAPTURE, published=False
+            )
+        raise canonical_failure
+
+    def snapshot_hash(self, snapshot: AgentStateSnapshot) -> str:
+        """Hash the exact canonical bytes published by this store."""
+
+        return hashlib.sha256(self.canonical_bytes(snapshot)).hexdigest()
+
+    def ensure_published(self, snapshot: AgentStateSnapshot) -> None:
+        """Publish bootstrap/migrated state while avoiding an identical rewrite."""
+
+        payload = self.canonical_bytes(snapshot)
+        inspection_failure: AgentStateSaveError | None = None
+        descriptor: int | None = None
+        try:
+            status = self.path.lstat()
+        except FileNotFoundError:
+            self.save(snapshot)
+            return
+        except OSError:
+            inspection_failure = AgentStateSaveError(
+                AgentStateSaveStage.TEMP_WRITE, published=False
+            )
+        else:
+            try:
+                if not stat.S_ISREG(status.st_mode):
+                    raise OSError("snapshot is not a regular file")
+                descriptor = os.open(
+                    self.path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("snapshot is not a regular file")
+                with os.fdopen(descriptor, "rb") as snapshot_file:
+                    descriptor = None
+                    published = snapshot_file.read()
+            except OSError:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                inspection_failure = AgentStateSaveError(
+                    AgentStateSaveStage.TEMP_WRITE, published=False
+                )
+            else:
+                if published == payload:
+                    return
+        if inspection_failure is not None:
+            raise inspection_failure
+        self.save(snapshot)
 
     def capture(self, main_loop: KagyaMainLoop, sequence: int) -> AgentStateSnapshot:
         capture_failure: AgentStateSaveError | None = None

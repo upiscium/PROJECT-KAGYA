@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -30,6 +31,12 @@ from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
+    EventFailureCategory,
+    EventJournal,
+    EventJournalAppendError,
+    EventJournalAppendStage,
+    EventJournalLoadError,
+    EventLifecycle,
 )
 
 
@@ -40,6 +47,17 @@ PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 
 class ThinkingProvider(DummyProvider):
     response_text = f"<think>{PRIVATE_SENTINEL}</think>Visible API answer."
+
+
+class FailOnceAfterEmotionProvider(ThinkingProvider):
+    def __init__(self) -> None:
+        self.failed = False
+
+    def generate(self, prompt: str) -> str:
+        if not self.failed:
+            self.failed = True
+            raise ValueError(PRIVATE_SENTINEL)
+        return super().generate(prompt)
 
 
 class RecordingRuntime(AgentRuntime):
@@ -64,6 +82,9 @@ class AdmissionRuntime:
 
     def start(self) -> None:
         self.status = AgentRuntimeStatus.ACCEPTING
+
+    def configure_durability(self, **_kwargs: object) -> None:
+        pass
 
     def shutdown(self) -> None:
         self.status = AgentRuntimeStatus.STOPPED
@@ -372,6 +393,15 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
             order.append("restore")
             super().restore_into(main_loop, snapshot)
 
+        def ensure_published(self, snapshot: AgentStateSnapshot) -> None:
+            order.append("ensure")
+            super().ensure_published(snapshot)
+
+    class TrackingJournal(EventJournal):
+        def verify_and_reconcile(self, snapshot_sequence: int, snapshot_hash: str):
+            order.append("journal")
+            return super().verify_and_reconcile(snapshot_sequence, snapshot_hash)
+
     class TrackingRuntime(RecordingRuntime):
         def start(self) -> None:
             order.append("start")
@@ -397,15 +427,28 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
     app.state.memory_system = DualMemorySystem(settings)
     app.state.adapter_registry = AdapterRegistry(settings)
     app.state.agent_state_store = store
+    tracking_journal = TrackingJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    tracking_journal.verify_and_reconcile(7, store.snapshot_hash(store.load()))
+    order.clear()
+    app.state.event_journal = tracking_journal
     app.state.agent_runtime = TrackingRuntime()
 
     with TestClient(app) as client:
-        assert order == ["load", "restore", "start"]
+        assert order == ["load", "journal", "ensure", "restore", "start"]
         assert client.app.state.main_loop.emotion_engine.state == EmotionState(
             valence=0.4,
             arousal=0.5,
             optimal_loss=0.6,
         )
+        checkpoint = client.app.state.event_journal.records[0]
+        assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+        assert checkpoint.processing_sequence == 7
+        assert checkpoint.snapshot_sequence == 7
+        assert checkpoint.snapshot_hash == store.snapshot_hash(store.load())
 
 
 def test_restored_sequence_continues_and_success_checkpoints_chat(
@@ -479,6 +522,129 @@ def test_invalid_snapshot_prevents_runtime_start_and_is_not_overwritten(
     assert settings.agent_state.path.read_bytes() == raw
 
 
+def test_existing_journal_with_missing_snapshot_fails_without_mutation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "establish history", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+
+    journal_bytes = settings.event_journal.path.read_bytes()
+    settings.agent_state.path.unlink()
+    app = create_app(settings)
+
+    with pytest.raises(AgentStateLoadError):
+        with TestClient(app):
+            pass
+
+    assert not settings.agent_state.path.exists()
+    assert settings.event_journal.path.read_bytes() == journal_bytes
+
+
+def test_journal_continuity_is_checked_before_v0_snapshot_rewrite(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    legacy = (
+        b'{"schema_version":0,"last_event_sequence":3,"emotion":'
+        b'{"valence":0.1,"arousal":0.2,"optimal_loss":0.9}}'
+    )
+    settings.agent_state.path.write_bytes(legacy)
+    store = AgentStateStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    journal = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    journal.verify_and_reconcile(3, "f" * 64)
+    journal.close()
+    journal_bytes = settings.event_journal.path.read_bytes()
+    app = create_app(settings)
+    app.state.agent_state_store = store
+
+    with pytest.raises(EventJournalLoadError):
+        with TestClient(app):
+            pass
+
+    assert settings.agent_state.path.read_bytes() == legacy
+    assert settings.event_journal.path.read_bytes() == journal_bytes
+
+
+def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    legacy = (
+        b'{"schema_version":0,"last_event_sequence":3,"emotion":'
+        b'{"valence":0.1,"arousal":0.2,"optimal_loss":0.9}}'
+    )
+    settings.agent_state.path.write_bytes(legacy)
+    store = AgentStateStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    migrated = store.load()
+    journal = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    journal.verify_and_reconcile(3, store.snapshot_hash(migrated))
+    journal.close()
+    app = create_app(settings)
+    app.state.agent_state_store = store
+
+    with TestClient(app) as client:
+        assert client.app.state.agent_state_store.load() == migrated
+
+    assert settings.agent_state.path.read_bytes() != legacy
+    assert (
+        json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
+            "schema_version"
+        ]
+        == 1
+    )
+
+
+def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = AgentStateStore(
+        settings.agent_state.path, settings.emotion.baseline_surprisal
+    )
+    snapshot = AgentStateSnapshot(
+        saved_at=datetime.now(timezone.utc),
+        last_processed_event_sequence=4,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2,
+            arousal=0.3,
+            optimal_loss=0.8,
+        ),
+    )
+    store.save(snapshot)
+    snapshot_bytes = settings.agent_state.path.read_bytes()
+    tmp_path.chmod(0o755)
+
+    with TestClient(create_app(settings)) as client:
+        assert client.app.state.agent_state_store.load() == snapshot
+        assert tmp_path.stat().st_mode & 0o777 == 0o700
+        assert settings.event_journal.path.stat().st_mode & 0o777 == 0o600
+        lock_path = tmp_path / f".{settings.event_journal.path.name}.lock"
+        assert lock_path.stat().st_mode & 0o777 == 0o600
+
+    assert settings.agent_state.path.read_bytes() == snapshot_bytes
+
+
 def test_snapshot_does_not_shadow_memory_or_adapter_registry(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
@@ -512,10 +678,12 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
 
     class FailingStore(AgentStateStore):
         def save(self, snapshot: AgentStateSnapshot) -> None:
-            raise AgentStateSaveError(
-                AgentStateSaveStage.TEMP_WRITE,
-                published=False,
-            )
+            if snapshot.last_processed_event_sequence > 0:
+                raise AgentStateSaveError(
+                    AgentStateSaveStage.TEMP_WRITE,
+                    published=False,
+                )
+            super().save(snapshot)
 
     app = create_app(settings)
     app.state.model_provider = ThinkingProvider()
@@ -533,9 +701,249 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
         )
         assert response.status_code == 500
         assert response.json() == {
-            "detail": "Agent state checkpoint could not be saved; outcome is indeterminate"
+            "detail": "Agent mutation durability is indeterminate"
         }
         assert PRIVATE_SENTINEL not in response.text
+
+
+def test_handler_failure_restores_r04_state_records_failed_and_continues(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    initial_emotion = EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0)
+    app = create_app(settings)
+    app.state.model_provider = FailOnceAfterEmotionProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+
+    with TestClient(app) as client:
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat",
+                json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+            )
+
+        assert client.app.state.main_loop.emotion_engine.state == initial_emotion
+        failed = client.app.state.event_journal.records[-1]
+        assert failed.lifecycle is EventLifecycle.FAILED
+        assert failed.processing_sequence == 1
+        assert failed.snapshot_sequence == 0
+        assert failed.failure_category is EventFailureCategory.HANDLER_FAILURE
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "retry", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        completed = client.app.state.event_journal.records[-1]
+        assert completed.lifecycle is EventLifecycle.COMPLETED
+        assert completed.processing_sequence == 2
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence == 2
+        )
+
+    journal_bytes = settings.event_journal.path.read_text(encoding="utf-8")
+    assert PRIVATE_SENTINEL not in journal_bytes
+    assert "prompt" not in journal_bytes.casefold()
+    assert "message" not in journal_bytes.casefold()
+
+
+def test_handler_failure_restore_failure_enters_fail_stop(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class RestoreFailingStore(AgentStateStore):
+        restore_calls = 0
+
+        def restore_into(self, main_loop, snapshot: AgentStateSnapshot) -> None:
+            self.restore_calls += 1
+            if self.restore_calls > 1:
+                raise AgentStateLoadError("bounded restore failure")
+            super().restore_into(main_loop, snapshot)
+
+    app = create_app(settings)
+    app.state.model_provider = FailOnceAfterEmotionProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.agent_state_store = RestoreFailingStore(
+        settings.agent_state.path, settings.emotion.baseline_surprisal
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "fail", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert (
+            client.post(
+                "/api/chat",
+                json={"message": "later", "attachments": [], "debug": False},
+            ).status_code
+            == 503
+        )
+
+
+def test_failed_append_failure_enters_fail_stop(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class FailedAppendJournal(EventJournal):
+        def append_failed(
+            self,
+            event: AgentEvent,
+            snapshot_sequence: int,
+            snapshot_hash: str,
+        ) -> None:
+            raise EventJournalAppendError(
+                EventJournalAppendStage.FILE_FSYNC, published=False
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = FailOnceAfterEmotionProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.event_journal = FailedAppendJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "fail", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 500
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+
+
+def test_accepted_append_failure_returns_bounded_503_without_handler(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    class AcceptedAppendJournal(EventJournal):
+        def append_accepted(self, event: AgentEvent) -> None:
+            raise EventJournalAppendError(
+                EventJournalAppendStage.FILE_FSYNC, published=False
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.event_journal = AcceptedAppendJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+        )
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Agent runtime durability is temporarily unavailable"
+        }
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert [
+            record.lifecycle for record in client.app.state.event_journal.records
+        ] == [EventLifecycle.CHECKPOINT]
+        assert client.app.state.main_loop.session_state.turns == []
+
+
+def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class CompletedAppendJournal(EventJournal):
+        def append_completed(
+            self,
+            event: AgentEvent,
+            snapshot_sequence: int,
+            snapshot_hash: str,
+        ) -> None:
+            raise EventJournalAppendError(
+                EventJournalAppendStage.FILE_FSYNC, published=False
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.event_journal = CompletedAppendJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "commit", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 500
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+
+    store = AgentStateStore(
+        settings.agent_state.path, settings.emotion.baseline_surprisal
+    )
+    snapshot = store.load()
+    recovery = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    ).verify_and_reconcile(
+        snapshot.last_processed_event_sequence, store.snapshot_hash(snapshot)
+    )
+
+    assert recovery.processing_high_water == 1
+    record = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    ).records[-1]
+    assert record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+    assert record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+
+
+def test_second_startup_cannot_touch_snapshot_before_journal_lease(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    first_app = create_app(settings)
+    first_app.state.model_provider = ThinkingProvider()
+    first_app.state.memory_system = DualMemorySystem(settings)
+    first_app.state.adapter_registry = AdapterRegistry(settings)
+
+    with TestClient(first_app):
+        original = settings.agent_state.path.read_bytes()
+        load_called = False
+
+        class TrackingStore(AgentStateStore):
+            def load(self) -> AgentStateSnapshot:
+                nonlocal load_called
+                load_called = True
+                return super().load()
+
+        second_app = create_app(settings)
+        second_app.state.model_provider = ThinkingProvider()
+        second_app.state.memory_system = DualMemorySystem(settings)
+        second_app.state.adapter_registry = AdapterRegistry(settings)
+        second_app.state.agent_state_store = TrackingStore(
+            settings.agent_state.path, settings.emotion.baseline_surprisal
+        )
+
+        with pytest.raises(EventJournalLoadError):
+            with TestClient(second_app):
+                pass
+
+        assert not load_called
+        assert settings.agent_state.path.read_bytes() == original
 
 
 def _client(
@@ -560,6 +968,8 @@ def _client(
 
 
 def _settings(tmp_path: Path) -> Settings:
+    tmp_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp_path.chmod(0o700)
     settings = load_settings(CONFIG_PATH)
     return settings.model_copy(
         update={
@@ -590,6 +1000,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
+            ),
+            "event_journal": settings.event_journal.model_copy(
+                update={"path": tmp_path / "event_journal.jsonl"}
             ),
         }
     )
