@@ -121,6 +121,10 @@ def test_success_lifecycle_is_durable_chained_and_private_free(tmp_path: Path) -
     ]
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert all(
+        json.loads(line)["schema_version"] == 1
+        for line in path.read_bytes().splitlines()
+    )
     assert PRIVATE_SENTINEL not in path.read_text(encoding="utf-8")
     assert value.verify_and_reconcile(1, HASH_1).processing_high_water == 1
 
@@ -136,6 +140,19 @@ def test_schema_is_strict_and_has_no_metadata_escape_hatch() -> None:
             source=AgentEventSource.API_CHAT,
             record_hash="0" * 64,
             metadata={"prompt": PRIVATE_SENTINEL},
+        )
+
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(
+            {
+                "record_id": str(uuid5(NAMESPACE_URL, "versionless-record")),
+                "timestamp": NOW,
+                "lifecycle": EventLifecycle.ACCEPTED,
+                "event_id": event().event_id,
+                "event_type": AgentEventType.CHAT,
+                "source": AgentEventSource.API_CHAT,
+                "record_hash": "0" * 64,
+            }
         )
 
 
@@ -275,6 +292,18 @@ def test_partial_unsupported_tamper_and_chain_break_fail_closed(tmp_path: Path) 
     with pytest.raises(UnsupportedEventJournalVersion):
         journal(unsupported)
 
+    versionless = tmp_path / "versionless.jsonl"
+    value = bootstrap(versionless)
+    value.close()
+    raw_record = json.loads(versionless.read_text(encoding="utf-8"))
+    raw_record.pop("schema_version")
+    versionless.write_text(
+        json.dumps(raw_record, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(EventJournalLoadError):
+        journal(versionless)
+
     tampered = tmp_path / "tampered.jsonl"
     value = bootstrap(tampered)
     value.append_accepted(event())
@@ -362,12 +391,63 @@ def test_interrupted_rotation_and_symlink_fail_closed(tmp_path: Path) -> None:
         journal(path)
 
 
-def test_permissive_parent_and_symlink_lock_are_rejected(tmp_path: Path) -> None:
+def test_owner_owned_permissive_parent_is_hardened(tmp_path: Path) -> None:
     permissive = tmp_path / "permissive"
     permissive.mkdir(mode=0o755)
     permissive.chmod(0o755)
-    with pytest.raises(EventJournalLoadError):
+
+    value = journal(permissive / "events.jsonl")
+
+    assert permissive.stat().st_mode & 0o777 == 0o700
+    assert (permissive / ".events.jsonl.lock").stat().st_mode & 0o777 == 0o600
+    value.close()
+
+
+def test_permission_hardening_failure_is_bounded_and_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    permissive = tmp_path / "permissive"
+    permissive.mkdir(mode=0o755)
+    permissive.chmod(0o755)
+    real_fchmod = os.fchmod
+
+    def fail_directory_hardening(descriptor: int, mode: int) -> None:
+        if mode == 0o700:
+            raise PermissionError(PRIVATE_SENTINEL)
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(journal_module.os, "fchmod", fail_directory_hardening)
+
+    with pytest.raises(EventJournalLoadError) as error:
         journal(permissive / "events.jsonl")
+
+    assert_bounded(error.value)
+    assert permissive.stat().st_mode & 0o777 == 0o755
+    assert not (permissive / ".events.jsonl.lock").exists()
+
+
+def test_unsafe_parent_and_lock_targets_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrong_owner = tmp_path / "wrong-owner"
+    wrong_owner.mkdir(mode=0o700)
+    effective_uid = os.geteuid()
+    monkeypatch.setattr(journal_module.os, "geteuid", lambda: effective_uid + 1)
+    with pytest.raises(EventJournalLoadError):
+        journal(wrong_owner / "events.jsonl")
+    monkeypatch.undo()
+
+    non_directory = tmp_path / "not-a-directory"
+    non_directory.write_text("state", encoding="utf-8")
+    with pytest.raises(EventJournalLoadError):
+        journal(non_directory / "events.jsonl")
+
+    target_directory = tmp_path / "target-directory"
+    target_directory.mkdir(mode=0o700)
+    linked_directory = tmp_path / "linked-directory"
+    linked_directory.symlink_to(target_directory, target_is_directory=True)
+    with pytest.raises(EventJournalLoadError):
+        journal(linked_directory / "events.jsonl")
 
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
@@ -386,10 +466,10 @@ def test_full_load_and_append_tracebacks_exclude_private_details(
     value.close()
     real_open = os.open
 
-    def fail_open(target, flags, mode=0o777):
+    def fail_open(target, flags, mode=0o777, *, dir_fd=None):
         if Path(target) == path and flags & (os.O_WRONLY | os.O_RDWR) == 0:
             raise PermissionError(PRIVATE_SENTINEL)
-        return real_open(target, flags, mode)
+        return real_open(target, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(journal_module.os, "open", fail_open)
     with pytest.raises(EventJournalLoadError) as load_error:

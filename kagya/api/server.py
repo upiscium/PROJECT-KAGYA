@@ -15,6 +15,7 @@ from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
     AgentRuntime,
+    AgentStateLoadError,
     AgentStateSnapshot,
     AgentStateStore,
     EventJournal,
@@ -30,40 +31,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.model_provider = getattr(
-            app.state, "model_provider", None
-        ) or load_model_provider(app_settings)
-        app.state.memory_system = getattr(
-            app.state, "memory_system", None
-        ) or DualMemorySystem(app_settings)
-        app.state.adapter_registry = getattr(
-            app.state, "adapter_registry", None
-        ) or AdapterRegistry(app_settings)
-        app.state.main_loop = getattr(app.state, "main_loop", None) or KagyaMainLoop(
-            app_settings, app.state.model_provider, app.state.memory_system
-        )
-        app.state.agent_state_store = getattr(
-            app.state, "agent_state_store", None
-        ) or AgentStateStore(
-            app_settings.agent_state.path,
-            app_settings.emotion.baseline_surprisal,
-        )
         existing_journal = getattr(app.state, "event_journal", None)
-        if existing_journal is None:
-            journal_lease: EventJournalLease | None = EventJournalLease(
-                app_settings.event_journal.path
-            )
-        else:
-            if not existing_journal.has_exclusive_authority:
-                raise RuntimeError("Injected EventJournal has no exclusive authority")
-            journal_lease = None
+        journal_lease: EventJournalLease | None = None
         try:
-            snapshot = app.state.agent_state_store.load()
-            app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
-            app.state.agent_state_store.ensure_published(snapshot)
-            snapshot_hash = app.state.agent_state_store.snapshot_hash(snapshot)
             if existing_journal is None:
-                assert journal_lease is not None
+                journal_lease = EventJournalLease(app_settings.event_journal.path)
                 app.state.event_journal = EventJournal(
                     app_settings.event_journal.path,
                     app_settings.event_journal.max_bytes,
@@ -71,19 +43,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     lease=journal_lease,
                 )
             else:
+                if not existing_journal.has_exclusive_authority:
+                    raise RuntimeError(
+                        "Injected EventJournal has no exclusive authority"
+                    )
                 app.state.event_journal = existing_journal
-            recovery = app.state.event_journal.verify_and_reconcile(
-                snapshot.last_processed_event_sequence,
-                snapshot_hash,
+
+            app.state.agent_state_store = getattr(
+                app.state, "agent_state_store", None
+            ) or AgentStateStore(
+                app_settings.agent_state.path,
+                app_settings.emotion.baseline_surprisal,
             )
-        except BaseException:
-            if journal_lease is not None:
-                journal_lease.close()
-            journal = getattr(app.state, "event_journal", None)
-            if journal is not None:
-                journal.close()
-            raise
-        try:
+            journal_has_history = app.state.event_journal.has_history
+            if (
+                journal_has_history
+                and not app.state.agent_state_store.snapshot_exists()
+            ):
+                raise AgentStateLoadError(
+                    "AgentState snapshot is required by EventJournal history"
+                )
+            snapshot = app.state.agent_state_store.load()
+            snapshot_hash = app.state.agent_state_store.snapshot_hash(snapshot)
+            if journal_has_history:
+                recovery = app.state.event_journal.verify_and_reconcile(
+                    snapshot.last_processed_event_sequence,
+                    snapshot_hash,
+                )
+                app.state.agent_state_store.ensure_published(snapshot)
+            else:
+                app.state.agent_state_store.ensure_published(snapshot)
+                recovery = app.state.event_journal.verify_and_reconcile(
+                    snapshot.last_processed_event_sequence,
+                    snapshot_hash,
+                )
+
+            app.state.model_provider = getattr(
+                app.state, "model_provider", None
+            ) or load_model_provider(app_settings)
+            app.state.memory_system = getattr(
+                app.state, "memory_system", None
+            ) or DualMemorySystem(app_settings)
+            app.state.adapter_registry = getattr(
+                app.state, "adapter_registry", None
+            ) or AdapterRegistry(app_settings)
+            app.state.main_loop = getattr(
+                app.state, "main_loop", None
+            ) or KagyaMainLoop(
+                app_settings, app.state.model_provider, app.state.memory_system
+            )
+            app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
             app.state.sleep_cycle_manager = getattr(
                 app.state, "sleep_cycle_manager", None
             ) or SleepCycleManager(
@@ -93,7 +102,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.adapter_registry,
             )
         except BaseException:
-            app.state.event_journal.close()
+            if journal_lease is not None:
+                journal_lease.close()
+            journal = getattr(app.state, "event_journal", None)
+            if journal is not None:
+                journal.close()
             raise
         committed_snapshot: AgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash

@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -426,15 +427,18 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
     app.state.memory_system = DualMemorySystem(settings)
     app.state.adapter_registry = AdapterRegistry(settings)
     app.state.agent_state_store = store
-    app.state.event_journal = TrackingJournal(
+    tracking_journal = TrackingJournal(
         settings.event_journal.path,
         settings.event_journal.max_bytes,
         settings.event_journal.retained_files,
     )
+    tracking_journal.verify_and_reconcile(7, store.snapshot_hash(store.load()))
+    order.clear()
+    app.state.event_journal = tracking_journal
     app.state.agent_runtime = TrackingRuntime()
 
     with TestClient(app) as client:
-        assert order == ["load", "restore", "ensure", "journal", "start"]
+        assert order == ["load", "journal", "ensure", "restore", "start"]
         assert client.app.state.main_loop.emotion_engine.state == EmotionState(
             valence=0.4,
             arousal=0.5,
@@ -516,6 +520,129 @@ def test_invalid_snapshot_prevents_runtime_start_and_is_not_overwritten(
 
     assert runtime.status is AgentRuntimeStatus.CREATED
     assert settings.agent_state.path.read_bytes() == raw
+
+
+def test_existing_journal_with_missing_snapshot_fails_without_mutation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "establish history", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+
+    journal_bytes = settings.event_journal.path.read_bytes()
+    settings.agent_state.path.unlink()
+    app = create_app(settings)
+
+    with pytest.raises(AgentStateLoadError):
+        with TestClient(app):
+            pass
+
+    assert not settings.agent_state.path.exists()
+    assert settings.event_journal.path.read_bytes() == journal_bytes
+
+
+def test_journal_continuity_is_checked_before_v0_snapshot_rewrite(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    legacy = (
+        b'{"schema_version":0,"last_event_sequence":3,"emotion":'
+        b'{"valence":0.1,"arousal":0.2,"optimal_loss":0.9}}'
+    )
+    settings.agent_state.path.write_bytes(legacy)
+    store = AgentStateStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    journal = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    journal.verify_and_reconcile(3, "f" * 64)
+    journal.close()
+    journal_bytes = settings.event_journal.path.read_bytes()
+    app = create_app(settings)
+    app.state.agent_state_store = store
+
+    with pytest.raises(EventJournalLoadError):
+        with TestClient(app):
+            pass
+
+    assert settings.agent_state.path.read_bytes() == legacy
+    assert settings.event_journal.path.read_bytes() == journal_bytes
+
+
+def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    legacy = (
+        b'{"schema_version":0,"last_event_sequence":3,"emotion":'
+        b'{"valence":0.1,"arousal":0.2,"optimal_loss":0.9}}'
+    )
+    settings.agent_state.path.write_bytes(legacy)
+    store = AgentStateStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    migrated = store.load()
+    journal = EventJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    journal.verify_and_reconcile(3, store.snapshot_hash(migrated))
+    journal.close()
+    app = create_app(settings)
+    app.state.agent_state_store = store
+
+    with TestClient(app) as client:
+        assert client.app.state.agent_state_store.load() == migrated
+
+    assert settings.agent_state.path.read_bytes() != legacy
+    assert (
+        json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
+            "schema_version"
+        ]
+        == 1
+    )
+
+
+def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    store = AgentStateStore(
+        settings.agent_state.path, settings.emotion.baseline_surprisal
+    )
+    snapshot = AgentStateSnapshot(
+        saved_at=datetime.now(timezone.utc),
+        last_processed_event_sequence=4,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2,
+            arousal=0.3,
+            optimal_loss=0.8,
+        ),
+    )
+    store.save(snapshot)
+    snapshot_bytes = settings.agent_state.path.read_bytes()
+    tmp_path.chmod(0o755)
+
+    with TestClient(create_app(settings)) as client:
+        assert client.app.state.agent_state_store.load() == snapshot
+        assert tmp_path.stat().st_mode & 0o777 == 0o700
+        assert settings.event_journal.path.stat().st_mode & 0o777 == 0o600
+        lock_path = tmp_path / f".{settings.event_journal.path.name}.lock"
+        assert lock_path.stat().st_mode & 0o777 == 0o600
+
+    assert settings.agent_state.path.read_bytes() == snapshot_bytes
 
 
 def test_snapshot_does_not_shadow_memory_or_adapter_registry(tmp_path: Path) -> None:

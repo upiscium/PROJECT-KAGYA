@@ -205,6 +205,19 @@ class AgentStateStore:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._save_stage_hook = save_stage_hook
 
+    def snapshot_exists(self) -> bool:
+        """Inspect canonical snapshot presence without following its final path."""
+
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise AgentStateLoadError(
+                "AgentState snapshot cannot be inspected"
+            ) from None
+        return True
+
     def load(self) -> AgentStateSnapshot:
         inspection_failure: AgentStateLoadError | None = None
         try:

@@ -64,7 +64,7 @@ class _JournalModel(BaseModel):
 
 
 class EventJournalRecord(_JournalModel):
-    schema_version: Literal[1] = CURRENT_EVENT_JOURNAL_SCHEMA_VERSION
+    schema_version: Literal[1]
     record_id: str = Field(min_length=1)
     timestamp: datetime
     lifecycle: EventLifecycle
@@ -265,28 +265,42 @@ class EventJournalLease:
         self._descriptor: int | None = None
         lease_failure: EventJournalLoadError | None = None
         descriptor: int | None = None
+        parent_descriptor: int | None = None
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            parent_status = self.path.parent.lstat()
+            parent_descriptor = os.open(
+                self.path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            parent_status = os.fstat(parent_descriptor)
             if (
                 not stat.S_ISDIR(parent_status.st_mode)
                 or parent_status.st_uid != os.geteuid()
-                or parent_status.st_mode & 0o077
             ):
                 raise OSError("journal directory is not private")
-            lock_path = self.path.with_name(f".{self.path.name}.lock")
+            if parent_status.st_mode & 0o077:
+                os.fchmod(parent_descriptor, 0o700)
+                if os.fstat(parent_descriptor).st_mode & 0o077:
+                    raise OSError("journal directory hardening failed")
             descriptor = os.open(
-                lock_path,
+                f".{self.path.name}.lock",
                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=parent_descriptor,
             )
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            lock_status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(lock_status.st_mode)
+                or lock_status.st_uid != os.geteuid()
+            ):
                 raise OSError("journal lock is not regular")
             os.fchmod(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._descriptor = descriptor
             descriptor = None
-            self._fsync_parent()
+            os.fsync(parent_descriptor)
         except OSError:
             if descriptor is not None:
                 try:
@@ -296,6 +310,12 @@ class EventJournalLease:
             lease_failure = EventJournalLoadError(
                 "EventJournal exclusive authority is unavailable"
             )
+        finally:
+            if parent_descriptor is not None:
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass
         if lease_failure is not None:
             raise lease_failure
 
@@ -405,6 +425,12 @@ class EventJournal:
     @property
     def has_exclusive_authority(self) -> bool:
         return self._lease.held
+
+    @property
+    def has_history(self) -> bool:
+        with self._lock:
+            self._require_authority()
+            return bool(self._read_records_unlocked())
 
     def append_accepted(self, event: AgentEvent) -> None:
         self._append_event(EventLifecycle.ACCEPTED, event)
@@ -620,6 +646,7 @@ class EventJournal:
             timestamp = self._clock()
             unsigned = EventJournalRecord.model_validate(
                 {
+                    "schema_version": CURRENT_EVENT_JOURNAL_SCHEMA_VERSION,
                     "record_id": str(uuid4()),
                     "timestamp": timestamp,
                     "lifecycle": lifecycle,
@@ -836,7 +863,9 @@ class EventJournal:
                 )
                 if not isinstance(value, dict):
                     raise ValueError("record root is invalid")
-                version = value.get("schema_version")
+                if "schema_version" not in value:
+                    raise ValueError("record schema version is missing")
+                version = value["schema_version"]
                 if (
                     isinstance(version, int)
                     and not isinstance(version, bool)
