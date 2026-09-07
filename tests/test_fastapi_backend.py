@@ -37,6 +37,8 @@ from kagya.runtime import (
     EventJournalAppendStage,
     EventJournalLoadError,
     EventLifecycle,
+    StateWAL,
+    StateWALError,
 )
 
 
@@ -522,7 +524,7 @@ def test_invalid_snapshot_prevents_runtime_start_and_is_not_overwritten(
     assert settings.agent_state.path.read_bytes() == raw
 
 
-def test_existing_journal_with_missing_snapshot_fails_without_mutation(
+def test_existing_journal_with_missing_snapshot_is_reconstructed_from_wal(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -533,16 +535,101 @@ def test_existing_journal_with_missing_snapshot_fails_without_mutation(
         )
         assert response.status_code == 200
 
-    journal_bytes = settings.event_journal.path.read_bytes()
+    expected = client.app.state.agent_state_store.load()
     settings.agent_state.path.unlink()
     app = create_app(settings)
 
-    with pytest.raises(AgentStateLoadError):
+    with TestClient(app) as restarted:
+        assert restarted.app.state.agent_state_store.load() == expected
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+
+    assert settings.agent_state.path.exists()
+
+
+def test_successful_chat_is_reconstructable_without_private_payloads(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    with _client(tmp_path, settings=settings) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        committed = client.app.state.agent_state_store.load()
+        assert (
+            client.app.state.state_wal.reconstruct(
+                sequence=committed.last_processed_event_sequence
+            )
+            == committed
+        )
+
+    persisted = b"".join(
+        path.read_bytes()
+        for path in settings.state_wal.directory.rglob("*")
+        if path.is_file()
+    )
+    assert PRIVATE_SENTINEL.encode() not in persisted
+    assert b"Visible API answer" not in persisted
+    assert b"prompt" not in persisted.lower()
+    assert b"hidden" not in persisted.lower()
+
+
+def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert (
+            client.post(
+                "/api/chat", json={"message": "advance", "attachments": []}
+            ).status_code
+            == 200
+        )
+        wal: StateWAL = client.app.state.state_wal
+        manifest = wal.inspect().active_manifest
+        assert manifest is not None
+        generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+
+    with generation.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+
+    runtime = RecordingRuntime()
+    with _client(tmp_path, settings=settings, runtime=runtime) as gated:
+        assert runtime.status is AgentRuntimeStatus.CREATED
+        assert gated.app.state.state_wal.inspect().active_manifest is not None
+        assert gated.app.state.state_wal.inspect().active_manifest.external_reconciliation_required
+        response = gated.post(
+            "/api/chat", json={"message": "blocked", "attachments": []}
+        )
+        assert response.status_code == 503
+
+
+def test_boot_anchor_failure_prevents_lifespan_readiness(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    atomic_writes = 0
+
+    def fail_anchor(stage: str) -> None:
+        nonlocal atomic_writes
+        if stage == "temp_write":
+            atomic_writes += 1
+            if atomic_writes == 2:
+                raise OSError("private anchor failure")
+
+    runtime = RecordingRuntime()
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.agent_runtime = runtime
+    wal = StateWAL(settings.state_wal.directory, failure_hook=fail_anchor)
+    app.state.state_wal = wal
+
+    with pytest.raises(StateWALError):
         with TestClient(app):
             pass
 
-    assert not settings.agent_state.path.exists()
-    assert settings.event_journal.path.read_bytes() == journal_bytes
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+    assert wal.inspect_boot_anchor_optional() is None
 
 
 def test_journal_continuity_is_checked_before_v0_snapshot_rewrite(
@@ -704,6 +791,62 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
             "detail": "Agent mutation durability is indeterminate"
         }
         assert PRIVATE_SENTINEL not in response.text
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence == 0
+        )
+        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+
+    with _client(tmp_path, settings=settings) as restarted:
+        assert (
+            restarted.app.state.agent_state_store.load().last_processed_event_sequence
+            == 0
+        )
+        response = restarted.post(
+            "/api/chat", json={"message": "next", "attachments": []}
+        )
+        assert response.status_code == 200
+        assert (
+            restarted.app.state.agent_state_store.load().last_processed_event_sequence
+            == 2
+        )
+
+
+def test_wal_failure_after_prepared_prevents_snapshot_publish_and_fail_stops(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    def fail_transition(stage: str) -> None:
+        if stage == "transition_fsync":
+            raise OSError("private failure detail")
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.state_wal = StateWAL(
+        settings.state_wal.directory, failure_hook=fail_transition
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat", json={"message": PRIVATE_SENTINEL, "attachments": []}
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert "private failure detail" not in response.text
+        assert PRIVATE_SENTINEL not in response.text
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence == 0
+        )
+        assert (
+            client.app.state.event_journal.records[-1].lifecycle
+            is EventLifecycle.PREPARED
+        )
 
 
 def test_handler_failure_restores_r04_state_records_failed_and_continues(
@@ -866,6 +1009,7 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
             event: AgentEvent,
             snapshot_sequence: int,
             snapshot_hash: str,
+            **_kwargs: object,
         ) -> None:
             raise EventJournalAppendError(
                 EventJournalAppendStage.FILE_FSYNC, published=False
@@ -889,26 +1033,15 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
         assert response.status_code == 500
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
 
-    store = AgentStateStore(
-        settings.agent_state.path, settings.emotion.baseline_surprisal
-    )
-    snapshot = store.load()
-    recovery = EventJournal(
-        settings.event_journal.path,
-        settings.event_journal.max_bytes,
-        settings.event_journal.retained_files,
-    ).verify_and_reconcile(
-        snapshot.last_processed_event_sequence, store.snapshot_hash(snapshot)
-    )
-
-    assert recovery.processing_high_water == 1
-    record = EventJournal(
-        settings.event_journal.path,
-        settings.event_journal.max_bytes,
-        settings.event_journal.retained_files,
-    ).records[-1]
-    assert record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
-    assert record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+    with _client(tmp_path, settings=settings) as restarted:
+        assert (
+            restarted.app.state.agent_state_store.load().last_processed_event_sequence
+            == 1
+        )
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        record = restarted.app.state.event_journal.records[-1]
+        assert record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+        assert record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
 
 
 def test_second_startup_cannot_touch_snapshot_before_journal_lease(
@@ -1003,6 +1136,9 @@ def _settings(tmp_path: Path) -> Settings:
             ),
             "event_journal": settings.event_journal.model_copy(
                 update={"path": tmp_path / "event_journal.jsonl"}
+            ),
+            "state_wal": settings.state_wal.model_copy(
+                update={"directory": tmp_path / "private" / "state_wal"}
             ),
         }
     )

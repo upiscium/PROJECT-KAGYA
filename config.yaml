@@ -86,3 +86,6 @@ event_journal:
   path: .kagya/event_journal.jsonl
   max_bytes: 1048576
   retained_files: 4
+
+state_wal:
+  directory: .kagya/private/state_wal

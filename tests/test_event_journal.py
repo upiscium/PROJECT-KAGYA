@@ -13,6 +13,7 @@ from kagya.config import Settings, load_settings
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.event_journal import (
     EventFailureCategory,
+    EventRecoveryCategory,
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
@@ -650,3 +651,57 @@ def test_unknown_field_private_value_is_absent_from_full_traceback(
         journal(path)
 
     assert_bounded(error.value)
+
+
+def test_v2_fresh_bootstrap_and_wal_ordered_lifecycle(tmp_path: Path) -> None:
+    value = journal(tmp_path / "v2.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, "generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "wal-record"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    item = event("v2", 1)
+    value.append_accepted(AgentEvent(item.event_id, item.event_type, item.source, NOW))
+    value.append_started(item)
+    value.append_prepared(item, HASH_0, HASH_1, generation)
+    with pytest.raises(EventJournalAppendError):
+        value.append_completed(item, 1, HASH_1, generation, wal_id)
+    value.append_completed(item, 1, HASH_1, generation, wal_id, HASH_2)
+    assert all(record.schema_version == 2 for record in value.records)
+    assert value.inspect().processing_high_water == 1
+
+
+def test_v2_migration_preserves_failed_event_gap(tmp_path: Path) -> None:
+    value = bootstrap(tmp_path / "migration.jsonl")
+    item = event("failed-gap", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_failed(item, 0, HASH_0)
+    generation = str(uuid5(NAMESPACE_URL, "gap-generation"))
+    value.append_v2_migration_checkpoint(
+        0, HASH_0, generation, str(uuid5(NAMESPACE_URL, "gap-wal")), HASH_1
+    )
+    assert value.inspect().processing_high_water == 1
+
+
+def test_v2_recovery_open_pair_is_read_only_and_high_water_stable(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "recovery-v2.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, "recovery-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "recovery-wal"))
+    recovery_id = str(uuid5(NAMESPACE_URL, "recovery"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.append_recovery_prepared(
+        recovery_id, 0, HASH_0, generation, EventRecoveryCategory.UNCOMMITTED_TAIL
+    )
+    evidence = value.inspect()
+    assert [item.recovery_id for item in evidence.open_recoveries] == [recovery_id]
+    assert evidence.processing_high_water == 0
+    value.append_recovery_completed(
+        recovery_id,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.UNCOMMITTED_TAIL,
+        True,
+    )
+    assert value.inspect().open_recoveries == ()

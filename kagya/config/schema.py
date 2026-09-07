@@ -104,6 +104,10 @@ class EventJournalSettings(StrictBaseModel):
     retained_files: int = Field(default=4, ge=2)
 
 
+class StateWALSettings(StrictBaseModel):
+    directory: Path = Path(".kagya/private/state_wal")
+
+
 class Settings(StrictBaseModel):
     project: ProjectSettings
     model: ModelSettings
@@ -118,3 +122,4 @@ class Settings(StrictBaseModel):
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
+    state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
