@@ -162,6 +162,55 @@ def test_fresh_r06_bootstrap_creates_consistent_artifacts(tmp_path: Path) -> Non
     assert wal.inspect_boot_anchor_optional() is not None
 
 
+def test_clean_v3_journal_preserves_r06_startup_recovery(tmp_path: Path) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup()
+    journal.append_v3_migration_checkpoint()
+
+    restarted = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert restarted.snapshot == initial.snapshot
+    assert restarted.processing_high_water == initial.processing_high_water
+    assert journal.inspect().schema_version == 3
+
+
+def test_v3_committed_crash_recovery_publishes_current_checkpoint(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    journal.append_v3_migration_checkpoint()
+    migration_anchor = journal.records[-1].v3_migration_anchor_hash
+    item = event("v3-committed-crash", 1)
+    candidate = snapshot(1, 0.4)
+    start_event(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=uuid5(NAMESPACE_URL, "v3-committed-crash"),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+
+    reconciled = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    checkpoint = journal.records[-1]
+    assert reconciled.snapshot == candidate
+    assert checkpoint.schema_version == 3
+    assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.v3_migration_anchor_hash == migration_anchor
+
+
 def test_r05_migration_preserves_high_water_above_snapshot_sequence(
     tmp_path: Path,
 ) -> None:

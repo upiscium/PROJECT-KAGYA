@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from itertools import pairwise
@@ -22,6 +23,10 @@ from kagya.runtime.event_journal import (
     EventJournalRecord,
     EventLifecycle,
     UnsupportedEventJournalVersion,
+    ParticipantOutcome,
+    ParticipantRequirement,
+    ReconciliationReason,
+    TransactionKind,
 )
 import kagya.runtime.event_journal as journal_module
 
@@ -52,6 +57,37 @@ def bootstrap(path: Path, snapshot_hash: str = HASH_0) -> EventJournal:
     value = journal(path)
     value.verify_and_reconcile(0, snapshot_hash)
     return value
+
+
+PARTICIPANTS = ("memory.episodic", "session.turns")
+TX_ID = str(uuid5(NAMESPACE_URL, "transaction"))
+
+
+def bootstrap_v3(path: Path) -> EventJournal:
+    value = journal(path)
+    generation = str(uuid5(NAMESPACE_URL, "v2-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "v2-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.append_v3_migration_checkpoint()
+    return value
+
+
+def transaction_requirements() -> tuple[ParticipantRequirement, ...]:
+    return tuple(
+        ParticipantRequirement(participant_id=participant, operation_digest=digest)
+        for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
+    )
+
+
+def prepared_transaction(value: EventJournal, name: str = "transaction") -> AgentEvent:
+    item = event(name, 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+    )
+    value.append_prepared(item, HASH_0, HASH_1, value.records[0].wal_generation_id)
+    return item
 
 
 def append_success(
@@ -979,3 +1015,636 @@ def test_rotation_defers_when_committed_crash_classification_lacks_wal_anchor(
     assert recovery.snapshot_sequence == 1
     assert value.records[-1].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
     assert not list(tmp_path.glob("classification-rotation.jsonl.[0-9]*"))
+
+
+def test_v3_bootstrap_helper_preserves_v2_records_and_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "v3.jsonl"
+    value = journal(path)
+    generation = str(uuid5(NAMESPACE_URL, "migration-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "migration-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    v2_records = value.records
+    v2_bytes = path.read_bytes()
+    assert all(record.schema_version == 2 for record in v2_records)
+    assert all(
+        "transaction_id" not in json.loads(line) for line in v2_bytes.splitlines()
+    )
+
+    value.append_v3_migration_checkpoint()
+
+    assert value.records[:-1] == v2_records
+    assert path.read_bytes().startswith(v2_bytes)
+    assert value.records[-1].migration_previous_v2_hash == v2_records[-1].record_hash
+    assert value.records[-1].schema_version == 3
+
+
+def test_v1_v2_hash_and_byte_semantics_match_pre_v3_golden_values() -> None:
+    v1 = EventJournalRecord(
+        schema_version=1,
+        record_id=str(uuid5(NAMESPACE_URL, "golden-v1")),
+        timestamp=NOW,
+        lifecycle=EventLifecycle.CHECKPOINT,
+        processing_sequence=0,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+        record_hash="0" * 64,
+    )
+    v2 = EventJournalRecord(
+        schema_version=2,
+        record_id=str(uuid5(NAMESPACE_URL, "golden-v2")),
+        timestamp=NOW,
+        lifecycle=EventLifecycle.CHECKPOINT,
+        processing_sequence=0,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+        record_hash="0" * 64,
+        wal_generation_id=str(uuid5(NAMESPACE_URL, "golden-gen")),
+        wal_record_id=str(uuid5(NAMESPACE_URL, "golden-wal")),
+        wal_record_hash=HASH_1,
+        journal_lineage_id=str(uuid5(NAMESPACE_URL, "golden-lineage")),
+        external_reconciliation_required=False,
+    )
+
+    assert EventJournal._record_hash(v1) == (
+        "a4cec00324ac08ebf043a6e5b3ece3bf8f83482e847409fceb0214d0def5169b"
+    )
+    assert EventJournal._record_hash(v2) == (
+        "85fe822fa2841e479979ffead740bcbbcd7bd0bb3796b937092b69063d21cf64"
+    )
+    assert hashlib.sha256(EventJournal._record_bytes(v1)).hexdigest() == (
+        "0b979ab3aeec278248c86d81647346522cb3e0a48e7064f1786bfbc4ad4caf30"
+    )
+    assert hashlib.sha256(EventJournal._record_bytes(v2)).hexdigest() == (
+        "14eb5b1692c84eab12df5730029b1ef9dcfa08d4463f5b5bba3727d7dbf838d9"
+    )
+
+
+def test_u1_f1_transaction_and_overall_terminal_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "transaction.jsonl"
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value)
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.ALREADY_CONSISTENT
+    )
+    value.append_transaction_completed(item, TX_ID)
+    anchor = value.records[0]
+    value.append_completed(
+        item,
+        1,
+        HASH_1,
+        anchor.wal_generation_id,
+        anchor.wal_record_id,
+        anchor.wal_record_hash,
+    )
+    assert value.records[-2].lifecycle is EventLifecycle.TRANSACTION_COMPLETED
+    assert value.records[-1].lifecycle is EventLifecycle.COMPLETED
+    hashes = [record.record_hash for record in value.records]
+    value.close()
+
+    reopened = journal(path)
+    inspection = reopened.inspect()
+    assert inspection.processing_high_water == 1
+    assert inspection.open_transactions == ()
+    assert inspection.completed_transactions[0].transaction_id == TX_ID
+    assert inspection.completed_transactions[0].participant_outcomes == (
+        (PARTICIPANTS[0], ParticipantOutcome.FINALIZED),
+        (PARTICIPANTS[1], ParticipantOutcome.ALREADY_CONSISTENT),
+    )
+    assert [record.record_hash for record in reopened.records] == hashes
+
+
+def test_u1_f2_prepared_transaction_restarts_open_without_high_water_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "open.jsonl"
+    value = bootstrap_v3(path)
+    prepared_transaction(value, "open")
+    value.close()
+    reopened = journal(path)
+    inspection = reopened.inspect()
+    assert inspection.processing_high_water == 1
+    assert inspection.open_transactions[0].transaction_id == TX_ID
+    assert (
+        tuple(
+            item.participant_id
+            for item in inspection.open_transactions[0].required_participants
+        )
+        == PARTICIPANTS
+    )
+    assert inspection.open_transactions[0].participant_outcomes == ()
+
+
+def test_u1_f3_unknown_participant_is_rejected_before_append(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "unknown.jsonl")
+    item = prepared_transaction(value, "unknown")
+    before = value.records
+    with pytest.raises(EventJournalAppendError) as error:
+        value.append_participant_finalized(
+            item, TX_ID, "unknown.participant", HASH_1, ParticipantOutcome.FINALIZED
+        )
+    assert error.value.stage is EventJournalAppendStage.VALIDATE
+    assert error.value.published is False
+    assert value.records == before
+
+
+def test_u1_f4_completion_before_all_outcomes_is_rejected(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "premature.jsonl")
+    item = prepared_transaction(value, "premature")
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    before = value.records
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_completed(item, TX_ID)
+    assert value.records == before
+
+
+def test_u1_f5_conflicting_duplicate_outcome_is_rejected(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "duplicate.jsonl")
+    item = prepared_transaction(value, "duplicate")
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    before = value.records
+    with pytest.raises(EventJournalAppendError):
+        value.append_participant_finalized(
+            item,
+            TX_ID,
+            PARTICIPANTS[0],
+            HASH_1,
+            ParticipantOutcome.COMPENSATED,
+        )
+    assert value.records == before
+
+
+def test_duplicate_transaction_identity_is_rejected_before_append(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "duplicate-transaction.jsonl")
+    item = event("duplicate-transaction", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+    )
+    before = value.records
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_prepared(
+            item,
+            TX_ID,
+            TransactionKind.EVENT_MUTATION,
+            (
+                ParticipantRequirement(
+                    participant_id="other.store", operation_digest=HASH_0
+                ),
+            ),
+        )
+
+    assert value.records == before
+
+
+def test_participant_terminal_evidence_requires_internal_prepare_boundary(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "participant-before-internal.jsonl")
+    item = event("participant-before-internal", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+    )
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_participant_finalized(
+            item,
+            TX_ID,
+            PARTICIPANTS[0],
+            HASH_1,
+            ParticipantOutcome.FINALIZED,
+        )
+
+
+def test_transaction_prepare_cannot_follow_internal_prepare_boundary(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "transaction-after-internal.jsonl")
+    item = event("transaction-after-internal", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_prepared(item, HASH_0, HASH_1, value.records[0].wal_generation_id)
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_prepared(
+            item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+        )
+
+
+def test_reconciliation_evidence_cannot_precede_internal_prepare_boundary(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "reconciliation-before-internal.jsonl")
+    item = event("reconciliation-before-internal", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+    )
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_reconciliation_required(
+            item,
+            TX_ID,
+            ReconciliationReason.PARTICIPANT_FINALIZATION_INCOMPLETE,
+            PARTICIPANTS,
+        )
+
+
+def test_overall_completion_cannot_hide_unterminated_transaction(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "overall-before-transaction.jsonl")
+    item = prepared_transaction(value, "overall-before-transaction")
+    records = value.records
+    anchor = records[0]
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_completed(
+            item,
+            1,
+            HASH_1,
+            anchor.wal_generation_id,
+            anchor.wal_record_id,
+            anchor.wal_record_hash,
+        )
+
+    impossible = value._make_record(
+        EventLifecycle.COMPLETED,
+        previous_hash=records[-1].record_hash,
+        event=item,
+        schema_version=3,
+        processing_sequence=1,
+        snapshot_sequence=1,
+        snapshot_hash=HASH_1,
+        wal_generation_id=anchor.wal_generation_id,
+        wal_record_id=anchor.wal_record_id,
+        wal_record_hash=anchor.wal_record_hash,
+    )
+    assert impossible.record_hash == EventJournal._record_hash(impossible)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, impossible))
+
+
+def test_u1_f6_canonically_hashed_impossible_transaction_fails_verify(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "impossible.jsonl")
+    item = prepared_transaction(value, "impossible")
+    records = value.records
+    transaction_index = next(
+        index
+        for index, record in enumerate(records)
+        if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED
+    )
+    impossible = records[transaction_index].model_copy(
+        update={"event_id": event("other").event_id, "processing_sequence": 2}
+    )
+    impossible = impossible.model_copy(
+        update={"record_hash": EventJournal._record_hash(impossible)}
+    )
+    assert impossible.record_hash == EventJournal._record_hash(impossible)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records[:transaction_index], impossible))
+
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    records = value.records
+    impossible_reconciliation = value._make_record(
+        EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED,
+        previous_hash=records[-1].record_hash,
+        event=item,
+        schema_version=3,
+        processing_sequence=1,
+        transaction_id=TX_ID,
+        reconciliation_reason=ReconciliationReason.PARTICIPANT_FINALIZATION_INCOMPLETE,
+        unresolved_participants=(PARTICIPANTS[0],),
+    )
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, impossible_reconciliation))
+
+
+def test_u1_f7_v3_boundary_binds_exact_v2_tail(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "boundary.jsonl")
+    boundary = value.records[-1]
+    assert boundary.migration_previous_v2_hash == boundary.previous_record_hash
+    assert boundary.v3_migration_anchor_hash == boundary.previous_record_hash
+    assert value.records[-2].schema_version == 2
+    assert boundary.record_hash == EventJournal._record_hash(boundary)
+
+
+def test_u1_f8_v3_history_rejects_canonically_hashed_v2_downgrade(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "downgrade-v3.jsonl")
+    records = value.records
+    downgrade = value._make_record(
+        EventLifecycle.CHECKPOINT,
+        previous_hash=records[-1].record_hash,
+        schema_version=2,
+        processing_sequence=0,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+        wal_generation_id=records[-1].wal_generation_id,
+        wal_record_id=records[-1].wal_record_id,
+        wal_record_hash=records[-1].wal_record_hash,
+        journal_lineage_id=records[-1].journal_lineage_id,
+        external_reconciliation_required=False,
+    )
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, downgrade))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 3},
+        {"schema_version": 4},
+        {"schema_version": 3, "unexpected": PRIVATE_SENTINEL},
+    ],
+)
+def test_u1_f9_malformed_future_and_unexpected_v3_records_fail_closed(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    path = tmp_path / "malformed.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    error_type = (
+        UnsupportedEventJournalVersion
+        if payload["schema_version"] == 4
+        else EventJournalLoadError
+    )
+    with pytest.raises(error_type) as error:
+        journal(path)
+    assert_bounded(error.value)
+
+
+def test_u1_f10_transaction_evidence_never_advances_processing_high_water(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "high-water.jsonl")
+    item = prepared_transaction(value, "high-water")
+    for append in (
+        lambda: value.append_participant_finalized(
+            item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+        ),
+        lambda: value.append_participant_finalized(
+            item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
+        ),
+        lambda: value.append_transaction_completed(item, TX_ID),
+    ):
+        append()
+        assert value.inspect().processing_high_water == 1
+
+
+def test_u1_f11_invalid_transaction_fields_are_bounded_and_private_free(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private-tx.jsonl"
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value, "private-tx")
+    before = value.records
+    raw_transaction = next(
+        record.model_dump(mode="python")
+        for record in before
+        if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED
+    )
+    raw_transaction["raw_payload"] = PRIVATE_SENTINEL
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(raw_transaction)
+    for transaction_id, participant, digest, outcome in (
+        ("not-a-uuid", PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED),
+        (TX_ID, "Bad.Participant", HASH_1, ParticipantOutcome.FINALIZED),
+        (TX_ID, PARTICIPANTS[0], "not-a-digest", ParticipantOutcome.FINALIZED),
+        (TX_ID, PARTICIPANTS[0], HASH_1, "not-a-status"),
+    ):
+        with pytest.raises(EventJournalAppendError) as error:
+            value.append_participant_finalized(
+                item,
+                transaction_id,
+                participant,
+                digest,
+                outcome,  # type: ignore[arg-type]
+            )
+        assert_bounded(error.value)
+    assert value.records == before
+
+    def fail_transaction_append(
+        lifecycle: EventLifecycle, stage: EventJournalAppendStage
+    ) -> None:
+        if (
+            lifecycle is EventLifecycle.PARTICIPANT_FINALIZED
+            and stage is EventJournalAppendStage.WRITE
+        ):
+            raise OSError(PRIVATE_SENTINEL)
+
+    value._append_stage_hook = fail_transaction_append
+    with pytest.raises(EventJournalAppendError) as write_error:
+        value.append_participant_finalized(
+            item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+        )
+    assert_bounded(write_error.value)
+    assert PRIVATE_SENTINEL not in path.read_text(encoding="utf-8")
+
+
+def test_uncommitted_event_recovery_cannot_orphan_open_transaction(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "open-transaction-recovery.jsonl")
+    prepared_transaction(value, "open-transaction-recovery")
+    before = value.records
+
+    with pytest.raises(EventJournalIntegrityError):
+        value.verify_and_reconcile(0, HASH_0)
+
+    assert value.records == before
+    assert value.inspect().open_transactions[0].transaction_id == TX_ID
+
+
+def test_compensation_requires_reconciliation_and_cannot_complete_normally(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "compensation.jsonl")
+    item = prepared_transaction(value, "compensation")
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_participant_finalized(
+            item,
+            TX_ID,
+            PARTICIPANTS[0],
+            HASH_1,
+            ParticipantOutcome.COMPENSATED,
+        )
+
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_transaction_reconciliation_required(
+        item,
+        TX_ID,
+        ReconciliationReason.PARTICIPANT_FINALIZATION_INCOMPLETE,
+        (PARTICIPANTS[1],),
+    )
+    value.append_participant_finalized(
+        item,
+        TX_ID,
+        PARTICIPANTS[1],
+        HASH_2,
+        ParticipantOutcome.COMPENSATED,
+    )
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_completed(item, TX_ID)
+    value.append_transaction_reconciled(item, TX_ID)
+
+
+def test_reconciliation_lifecycle_survives_restart_and_becomes_reconciled(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reconcile.jsonl"
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value, "reconcile")
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_transaction_reconciliation_required(
+        item,
+        TX_ID,
+        ReconciliationReason.PARTICIPANT_FINALIZATION_INCOMPLETE,
+        (PARTICIPANTS[1],),
+    )
+    value.close()
+    reopened = journal(path)
+    inspection = reopened.inspect()
+    assert inspection.internally_committed_transactions[0].unresolved_participants == (
+        PARTICIPANTS[1],
+    )
+    assert inspection.reconciliation_required_transactions[0].transaction_id == TX_ID
+    reopened.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
+    )
+    reopened.append_transaction_reconciled(item, TX_ID)
+    anchor = reopened.records[0]
+    reopened.append_completed(
+        item,
+        1,
+        HASH_1,
+        anchor.wal_generation_id,
+        anchor.wal_record_id,
+        anchor.wal_record_hash,
+    )
+    final = reopened.inspect()
+    assert final.reconciled_transactions[0].transaction_id == TX_ID
+    assert final.internally_committed_transactions == ()
+    assert final.reconciliation_required_transactions == ()
+    assert final.open_transactions == ()
+    assert final.records[-1].lifecycle is EventLifecycle.COMPLETED
+
+
+def test_v3_recovery_remains_valid_and_rotation_defers_for_open_transaction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rotation-v3.jsonl"
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value, "rotation-v3")
+    value.max_bytes = 1
+    assert not list(tmp_path.glob("rotation-v3.jsonl.[0-9]*"))
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
+    )
+    value.append_transaction_completed(item, TX_ID)
+    anchor = value.records[0]
+    value.append_completed(
+        item,
+        1,
+        HASH_1,
+        anchor.wal_generation_id,
+        anchor.wal_record_id,
+        anchor.wal_record_hash,
+    )
+    assert list(tmp_path.glob("rotation-v3.jsonl.[0-9]*"))
+
+    recovery_path = tmp_path / "recovery-v3.jsonl"
+    recovery = bootstrap_v3(recovery_path)
+    interrupted = event("v3-recovery", 1)
+    recovery.append_accepted(interrupted)
+    recovery.append_started(interrupted)
+    recovery.close()
+    reopened = journal(recovery_path)
+    result = reopened.verify_and_reconcile(0, HASH_0)
+    assert result.processing_high_water == 1
+    assert reopened.records[-1].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+
+
+def test_v3_rotation_remains_readable_after_migration_segment_is_pruned(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bounded-v3.jsonl"
+    value = EventJournal(path, 100_000, 2, clock=lambda: NOW)
+    generation = str(uuid5(NAMESPACE_URL, "bounded-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "bounded-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.append_v3_migration_checkpoint()
+    migration_anchor = value.records[-1].v3_migration_anchor_hash
+    assert migration_anchor is not None
+    value.max_bytes = 1
+    current_hash = HASH_0
+
+    for sequence, next_hash in enumerate((HASH_1, HASH_2, HASH_0, HASH_1), start=1):
+        item = event(f"bounded-{sequence}", sequence)
+        transaction_id = str(uuid5(NAMESPACE_URL, f"bounded-transaction-{sequence}"))
+        participant = ParticipantRequirement(
+            participant_id="memory.episodic", operation_digest=HASH_2
+        )
+        value.append_accepted(item)
+        value.append_started(item)
+        value.append_transaction_prepared(
+            item, transaction_id, TransactionKind.EVENT_MUTATION, (participant,)
+        )
+        value.append_prepared(item, current_hash, next_hash, generation)
+        value.append_participant_finalized(
+            item,
+            transaction_id,
+            participant.participant_id,
+            participant.operation_digest,
+            ParticipantOutcome.FINALIZED,
+        )
+        value.append_transaction_completed(item, transaction_id)
+        value.append_completed(
+            item,
+            sequence,
+            next_hash,
+            generation,
+            str(uuid5(NAMESPACE_URL, f"bounded-wal-{sequence}")),
+            HASH_1,
+        )
+        current_hash = next_hash
+
+    value.close()
+    rotated = sorted(tmp_path.glob("bounded-v3.jsonl.[0-9]*"))
+    assert len(rotated) == 1
+    retained_root = EventJournalRecord.model_validate_json(
+        rotated[0].read_bytes().splitlines()[0]
+    )
+    assert retained_root.schema_version == 3
+    assert retained_root.v3_migration_anchor_hash == migration_anchor
+
+    reopened = EventJournal(path, 1, 2, clock=lambda: NOW)
+    inspection = reopened.inspect()
+    assert inspection.schema_version == 3
+    assert inspection.processing_high_water == 4
+    assert inspection.snapshot_hash == HASH_1

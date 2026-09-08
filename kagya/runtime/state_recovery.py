@@ -108,7 +108,7 @@ class StateRecoveryCoordinator:
                 bound_current = self._recover_journal_bound_current(journal_inspection)
                 if bound_current is not None:
                     return bound_current
-            if snapshot is not None and journal_inspection.schema_version == 2:
+            if snapshot is not None and (journal_inspection.schema_version or 0) >= 2:
                 return self._repair_v2_invalid_current(snapshot)
             if (
                 snapshot is not None
@@ -160,7 +160,7 @@ class StateRecoveryCoordinator:
                 bound_current = self._recover_journal_bound_current(journal_inspection)
                 if bound_current is not None:
                     return bound_current
-            if journal_inspection.schema_version == 2:
+            if (journal_inspection.schema_version or 0) >= 2:
                 if snapshot is not None:
                     return self._repair_v2_invalid_current(snapshot)
                 if anchor is not None:
@@ -353,7 +353,7 @@ class StateRecoveryCoordinator:
         journal: EventJournalInspection,
     ) -> AgentStateSnapshot | None:
         if (
-            journal.schema_version != 2
+            (journal.schema_version or 0) < 2
             or journal.wal_generation_id is None
             or journal.wal_record_id is None
             or journal.wal_record_hash is None
@@ -1010,7 +1010,7 @@ class StateRecoveryCoordinator:
         anchor: tuple[int, int] | None = None
         for journal_index, evidence in enumerate(journal.records):
             if (
-                evidence.schema_version != 2
+                evidence.schema_version < 2
                 or evidence.lifecycle
                 not in {
                     EventLifecycle.CHECKPOINT,
@@ -1126,7 +1126,7 @@ class StateRecoveryCoordinator:
     ) -> str | None:
         for record in reversed(journal.records):
             if (
-                record.schema_version == 2
+                record.schema_version >= 2
                 and record.wal_generation_id is not None
                 and record.lifecycle
                 in {
