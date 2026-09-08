@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import traceback
 from typing import cast
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -21,6 +21,7 @@ from kagya.runtime import (
     TransactionFinalizationError,
     TransactionParticipant,
     TransactionPreparationError,
+    TransactionKind,
 )
 
 
@@ -276,6 +277,55 @@ def test_prepare_failure_aborts_all_abort_capable_participants(tmp_path: Path) -
     assert {participant for participant, _ in transaction.abort_outcomes} == {"a", "b"}
 
 
+def test_prepare_failure_without_abort_capability_terminalizes_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("zero-abort")
+    start(value, item)
+    participant = FakeParticipant("participant", fail_prepare=True)
+
+    with pytest.raises(TransactionPreparationError):
+        coordinator(value).prepare_result(
+            item, CoordinatedResult("public", (participant,))
+        )
+
+    assert participant.calls == ["prepare"]
+    transaction = value.inspect().aborted_transactions[0]
+    assert transaction.terminal_lifecycle is EventLifecycle.TRANSACTION_ABORTED
+    assert transaction.abort_outcomes == ()
+    assert not any(
+        record.lifecycle is EventLifecycle.PARTICIPANT_ABORTED
+        for record in value.records
+    )
+    assert not any(
+        record.lifecycle is EventLifecycle.PREPARED for record in value.records
+    )
+    assert "finalize" not in participant.calls
+
+
+def test_mixed_abort_capabilities_require_cleanup_only_for_declared_abort(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("mixed-abort")
+    start(value, item)
+    abortable = FakeParticipant("a", capabilities=ABORT_CAPABILITIES)
+    non_abortable = FakeParticipant("b", fail_prepare=True)
+
+    with pytest.raises(TransactionPreparationError):
+        coordinator(value).prepare_result(
+            item, CoordinatedResult("public", (non_abortable, abortable))
+        )
+
+    assert abortable.calls == ["prepare", "abort"]
+    assert non_abortable.calls == ["prepare"]
+    transaction = value.inspect().aborted_transactions[0]
+    assert tuple(participant for participant, _ in transaction.abort_outcomes) == (
+        "a",
+    )
+
+
 def test_partial_abort_failure_records_exact_unresolved_set(tmp_path: Path) -> None:
     value = journal(tmp_path / "events.jsonl")
     item = event()
@@ -359,3 +409,60 @@ def test_partial_finalize_failure_preserves_success_and_exact_unresolved_set(
     assert transaction.participant_outcomes == (("a", ParticipantOutcome.FINALIZED),)
     assert transaction.unresolved_participants == ("b",)
     assert transaction.reconciliation_reason is not None
+
+
+def test_transaction_identity_is_stable_across_coordinator_instances(
+    tmp_path: Path,
+) -> None:
+    item = event("stable-identity", 7)
+    first = coordinator(journal(tmp_path / "first.jsonl"))
+    second = coordinator(journal(tmp_path / "second.jsonl"))
+
+    assert first.derive_transaction_id(item, TransactionKind.EVENT_MUTATION) == (
+        second.derive_transaction_id(item, TransactionKind.EVENT_MUTATION)
+    )
+
+
+def test_transaction_identity_binds_event_sequence_and_kind(tmp_path: Path) -> None:
+    value = coordinator(journal(tmp_path / "events.jsonl"))
+    original = value.derive_transaction_id(
+        event("identity", 1), TransactionKind.EVENT_MUTATION
+    )
+
+    assert original != value.derive_transaction_id(
+        event("other-identity", 1), TransactionKind.EVENT_MUTATION
+    )
+    assert original != value.derive_transaction_id(
+        event("identity", 2), TransactionKind.EVENT_MUTATION
+    )
+    assert original != value.derive_transaction_id(
+        event("identity", 1), TransactionKind.MAINTENANCE_MUTATION
+    )
+
+
+def test_transaction_identity_ignores_participant_order_and_private_payload(
+    tmp_path: Path,
+) -> None:
+    item = event("order-independent")
+    first_journal = journal(tmp_path / "first.jsonl")
+    second_journal = journal(tmp_path / "second.jsonl")
+    start(first_journal, item)
+    start(second_journal, item)
+    a = FakeParticipant("a")
+    b = FakeParticipant("b")
+    a.private_payload = PRIVATE_SENTINEL
+    b.private_payload = PRIVATE_SENTINEL
+
+    coordinator(first_journal).prepare_result(
+        item, CoordinatedResult("first", (a, b))
+    )
+    coordinator(second_journal).prepare_result(
+        item, CoordinatedResult("second", (b, a))
+    )
+
+    first_id = first_journal.inspect().open_transactions[0].transaction_id
+    second_id = second_journal.inspect().open_transactions[0].transaction_id
+    assert first_id == second_id
+    assert first_id == "675fd3a1-4f5b-5e0c-8924-a35dd8b6234b"
+    assert str(UUID(first_id)) == first_id
+    assert PRIVATE_SENTINEL not in first_id

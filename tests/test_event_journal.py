@@ -2092,3 +2092,55 @@ def test_abort_and_finalize_branches_cannot_mix(tmp_path: Path) -> None:
         value.append_participant_finalized(
             item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
         )
+
+
+def test_zero_abort_requirement_can_terminalize_without_participant_evidence(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "zero-abort.jsonl")
+    item = event("zero-abort", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, transaction_requirements()
+    )
+
+    value.append_transaction_aborted(item, TX_ID)
+
+    transaction = value.inspect().aborted_transactions[0]
+    assert transaction.abort_outcomes == ()
+    assert transaction.abort_reason is None
+    assert not any(
+        record.lifecycle is EventLifecycle.PARTICIPANT_ABORTED
+        for record in value.records
+    )
+
+
+def test_nonempty_abort_requirement_rejects_missing_abort_evidence(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "missing-abort.jsonl")
+    item = event("missing-abort", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    requirements = tuple(
+        ParticipantRequirement(
+            participant_id=participant,
+            operation_digest=digest,
+            capabilities=(
+                ParticipantCapability.ABORT,
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
+        )
+        for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
+    )
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, requirements
+    )
+    value.append_participant_aborted(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, AbortOutcome.ABORTED
+    )
+
+    with pytest.raises(EventJournalAppendError):
+        value.append_transaction_aborted(item, TX_ID)

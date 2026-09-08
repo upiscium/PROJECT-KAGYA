@@ -62,6 +62,7 @@ class EventLifecycle(str, Enum):
 
 class TransactionKind(str, Enum):
     EVENT_MUTATION = "event_mutation"
+    MAINTENANCE_MUTATION = "maintenance_mutation"
 
 
 class ParticipantOutcome(str, Enum):
@@ -3166,10 +3167,6 @@ class EventJournal:
                         tx["abort_reason"] = record.abort_reason
                         tx["unresolved"] = missing
                     elif record.lifecycle is EventLifecycle.TRANSACTION_ABORTED:
-                        if tx["branch"] != "abort":
-                            raise EventJournalIntegrityError(
-                                "transaction abort branch is invalid"
-                            )
                         abort_ids = {
                             item.participant_id
                             for item in tx["required"]
@@ -3178,6 +3175,8 @@ class EventJournal:
                         if (
                             tx["terminal"] is not None
                             or set(tx["abort_outcomes"]) != abort_ids
+                            or (abort_ids and tx["branch"] != "abort")
+                            or (not abort_ids and tx["branch"] is not None)
                         ):
                             raise EventJournalIntegrityError(
                                 "transaction abort is incomplete"

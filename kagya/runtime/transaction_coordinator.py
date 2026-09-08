@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
-from collections.abc import Callable
 from typing import Generic, Protocol, TypeVar, cast, runtime_checkable
-from uuid import uuid4
+from uuid import UUID, uuid5
 
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.event_journal import (
@@ -24,6 +25,7 @@ from kagya.runtime.state_recovery import InternalCommitEvidence
 
 
 T = TypeVar("T")
+_TRANSACTION_ID_NAMESPACE = UUID("b27ca4e8-d34a-5e77-bfef-35f221571c4e")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +131,35 @@ class TransactionCoordinator:
         with self._lock:
             return self._prepare_result(event, raw_value)
 
+    @staticmethod
+    def derive_transaction_id(
+        event: AgentEvent, transaction_kind: TransactionKind
+    ) -> str:
+        """Derive UUIDv5 from the exact JSON array [event UUID, sequence, kind]."""
+
+        sequence = event.processing_sequence
+        identity_invalid = False
+        try:
+            parsed_event_id = UUID(event.event_id)
+            identity_invalid = str(parsed_event_id) != event.event_id
+        except (AttributeError, TypeError, ValueError):
+            identity_invalid = True
+        if (
+            identity_invalid
+            or isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence <= 0
+            or not isinstance(transaction_kind, TransactionKind)
+        ):
+            raise TransactionPreparationError("Transaction identity is invalid")
+        canonical = json.dumps(
+            [event.event_id, sequence, transaction_kind.value],
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        return str(uuid5(_TRANSACTION_ID_NAMESPACE, canonical))
+
     def _prepare_result(
         self, event: AgentEvent, result: CoordinatedResult[object]
     ) -> object:
@@ -142,7 +173,7 @@ class TransactionCoordinator:
             raise TransactionPreparationError("Transaction preparation is invalid")
 
         participants, requirements = self._validate_plan(result.participants)
-        transaction_id = str(uuid4())
+        transaction_id = self.derive_transaction_id(event, result.transaction_kind)
         bindings = tuple(
             TransactionBinding(
                 transaction_id=transaction_id,
