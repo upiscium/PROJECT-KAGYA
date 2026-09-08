@@ -47,6 +47,17 @@ class StateRecoveryResult:
     true_rollback_performed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class InternalCommitEvidence:
+    event_id: str
+    processing_sequence: int
+    snapshot_sequence: int
+    snapshot_hash: str
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+
+
 class StateRecoveryCoordinator:
     """Verify and coordinate Journal, WAL, and snapshot boundaries."""
 
@@ -457,23 +468,25 @@ class StateRecoveryCoordinator:
             )
         return self._result(snapshot, high_water)
 
-    def commit_candidate(
+    def commit_internal_candidate(
         self,
         event: AgentEvent,
         prior_snapshot: AgentStateSnapshot,
         candidate_snapshot: AgentStateSnapshot,
-    ) -> TransitionRecord:
-        """Execute prepared -> WAL -> snapshot -> completed in exact order."""
+    ) -> InternalCommitEvidence:
+        """Publish internal state without claiming overall event completion."""
 
         with self._lock:
-            return self._commit_candidate(event, prior_snapshot, candidate_snapshot)
+            return self._commit_internal_candidate(
+                event, prior_snapshot, candidate_snapshot
+            )
 
-    def _commit_candidate(
+    def _commit_internal_candidate(
         self,
         event: AgentEvent,
         prior_snapshot: AgentStateSnapshot,
         candidate_snapshot: AgentStateSnapshot,
-    ) -> TransitionRecord:
+    ) -> InternalCommitEvidence:
 
         sequence = event.processing_sequence
         if sequence is None:
@@ -500,15 +513,105 @@ class StateRecoveryCoordinator:
             candidate_snapshot=candidate_snapshot,
         )
         self.state_store.save(candidate_snapshot)
-        self.journal.append_completed(
-            event,
-            sequence,
-            after_hash,
+        return InternalCommitEvidence(
+            event_id=event.event_id,
+            processing_sequence=sequence,
+            snapshot_sequence=sequence,
+            snapshot_hash=after_hash,
             wal_generation_id=generation_id,
             wal_record_id=str(transition.record_id),
             wal_record_hash=transition.record_hash,
         )
-        return transition
+
+    def complete_committed_event(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        """Verify internal commit evidence before appending overall completion."""
+
+        with self._lock:
+            self._complete_committed_event(event, evidence)
+
+    def _complete_committed_event(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        sequence = event.processing_sequence
+        if (
+            sequence is None
+            or evidence.event_id != event.event_id
+            or evidence.processing_sequence != sequence
+            or evidence.snapshot_sequence != sequence
+        ):
+            raise StateRecoveryError("Internal commit event identity is invalid")
+
+        canonical = self.state_store.load()
+        if (
+            canonical.last_processed_event_sequence != evidence.snapshot_sequence
+            or self.state_store.snapshot_hash(canonical) != evidence.snapshot_hash
+        ):
+            raise StateRecoveryError("Canonical internal commit evidence is stale")
+
+        journal = self.journal.inspect()
+        prepared = next(
+            (
+                record
+                for record in reversed(journal.records)
+                if record.lifecycle is EventLifecycle.PREPARED
+                and record.event_id == evidence.event_id
+            ),
+            None,
+        )
+        if (
+            prepared is None
+            or prepared.event_type is not event.event_type
+            or prepared.source is not event.source
+            or prepared.processing_sequence != evidence.processing_sequence
+            or prepared.state_hash_after != evidence.snapshot_hash
+            or prepared.wal_generation_id != evidence.wal_generation_id
+        ):
+            raise StateRecoveryError("Journal internal commit evidence is stale")
+
+        wal = self.wal.inspect()
+        manifest = wal.active_manifest
+        transition = next(
+            (
+                record
+                for record in reversed(wal.records)
+                if isinstance(record, TransitionRecord)
+                and str(record.record_id) == evidence.wal_record_id
+            ),
+            None,
+        )
+        if (
+            manifest is None
+            or manifest.external_reconciliation_required
+            or str(manifest.active_generation_id) != evidence.wal_generation_id
+            or wal.latest_snapshot_sequence != evidence.snapshot_sequence
+            or wal.latest_snapshot_hash != evidence.snapshot_hash
+            or transition is None
+            or not wal.records
+            or wal.records[-1] != transition
+            or transition.record_hash != evidence.wal_record_hash
+            or str(transition.event_id) != event.event_id
+            or transition.event_type != event.event_type.value
+            or transition.event_source != event.source.value
+            or transition.processing_sequence != evidence.processing_sequence
+            or transition.candidate_snapshot_sequence != evidence.snapshot_sequence
+            or transition.candidate_snapshot_hash != evidence.snapshot_hash
+        ):
+            raise StateRecoveryError("StateWAL internal commit evidence is stale")
+
+        self.journal.append_completed(
+            event,
+            evidence.snapshot_sequence,
+            evidence.snapshot_hash,
+            wal_generation_id=evidence.wal_generation_id,
+            wal_record_id=evidence.wal_record_id,
+            wal_record_hash=evidence.wal_record_hash,
+        )
 
     def publish_boot_anchor(self, result: StateRecoveryResult) -> None:
         """Mark bootability only after the runtime graph has started."""

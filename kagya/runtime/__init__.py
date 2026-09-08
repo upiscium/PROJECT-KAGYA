@@ -70,6 +70,7 @@ from kagya.runtime.state_wal import (
     TransitionRecord,
 )
 from kagya.runtime.state_recovery import (
+    InternalCommitEvidence,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
@@ -128,6 +129,7 @@ __all__ = [
     "BootAnchor",
     "DryRunDiff",
     "Manifest",
+    "InternalCommitEvidence",
     "RecoveryReason",
     "StateWAL",
     "StateWALConflictError",

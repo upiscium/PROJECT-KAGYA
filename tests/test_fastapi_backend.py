@@ -417,6 +417,10 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
             order.append("journal")
             return super().verify_and_reconcile(snapshot_sequence, snapshot_hash)
 
+        def append_v3_migration_checkpoint(self) -> None:
+            order.append("v3")
+            super().append_v3_migration_checkpoint()
+
     class TrackingRuntime(RecordingRuntime):
         def start(self) -> None:
             order.append("start")
@@ -453,7 +457,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
     app.state.agent_runtime = TrackingRuntime()
 
     with TestClient(app) as client:
-        assert order == ["load", "journal", "ensure", "restore", "start"]
+        assert order == ["load", "journal", "ensure", "v3", "restore", "start"]
         assert client.app.state.main_loop.emotion_engine.state == EmotionState(
             valence=0.4,
             arousal=0.5,
@@ -464,6 +468,34 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
         assert checkpoint.processing_sequence == 7
         assert checkpoint.snapshot_sequence == 7
         assert checkpoint.snapshot_hash == store.snapshot_hash(store.load())
+        inspection = client.app.state.event_journal.inspect()
+        assert inspection.schema_version == 3
+        assert inspection.processing_high_water == 7
+
+
+def test_v3_migration_failure_prevents_runtime_start(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    class MigrationFailingJournal(EventJournal):
+        def append_v3_migration_checkpoint(self) -> None:
+            raise EventJournalAppendError(
+                EventJournalAppendStage.FILE_FSYNC, published=False
+            )
+
+    runtime = RecordingRuntime()
+    app = create_app(settings)
+    app.state.event_journal = MigrationFailingJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    app.state.agent_runtime = runtime
+
+    with pytest.raises(EventJournalAppendError):
+        with TestClient(app):
+            pass
+
+    assert runtime.status is AgentRuntimeStatus.CREATED
 
 
 def test_restored_sequence_continues_and_success_checkpoints_chat(
@@ -622,6 +654,7 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(
     with _client(tmp_path, settings=settings, runtime=runtime) as gated:
         assert runtime.status is AgentRuntimeStatus.CREATED
         assert gated.app.state.external_reconciliation_required is True
+        assert gated.app.state.event_journal.inspect().schema_version == 3
         assert gated.app.state.state_wal.inspect().active_manifest is not None
         assert gated.app.state.state_wal.inspect().active_manifest.external_reconciliation_required
         monkeypatch.setattr(
@@ -644,6 +677,7 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(
     second_runtime = RecordingRuntime()
     with _client(tmp_path, settings=settings, runtime=second_runtime) as still_gated:
         assert second_runtime.status is AgentRuntimeStatus.CREATED
+        assert still_gated.app.state.event_journal.inspect().schema_version == 3
         manifest = still_gated.app.state.state_wal.inspect().active_manifest
         assert manifest is not None
         assert manifest.external_reconciliation_required
@@ -1086,8 +1120,58 @@ def test_accepted_append_failure_returns_bounded_503_without_handler(
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
         assert [
             record.lifecycle for record in client.app.state.event_journal.records
-        ] == [EventLifecycle.CHECKPOINT]
+        ] == [EventLifecycle.CHECKPOINT, EventLifecycle.CHECKPOINT]
         assert client.app.state.main_loop.session_state.turns == []
+
+
+def test_finalization_failure_preserves_internal_commit_without_restore(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    class TrackingStore(AgentStateStore):
+        restore_calls = 0
+
+        def restore_into(self, main_loop, snapshot: AgentStateSnapshot) -> None:
+            self.restore_calls += 1
+            super().restore_into(main_loop, snapshot)
+
+    class FinalizationFailingRuntime(RecordingRuntime):
+        def configure_durability(self, **kwargs: Any) -> None:
+            def fail_finalization(_event: AgentEvent) -> NoReturn:
+                raise OSError("private finalization failure")
+
+            kwargs["finalization_checkpoint"] = fail_finalization
+            super().configure_durability(**kwargs)
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.agent_state_store = TrackingStore(
+        settings.agent_state.path, settings.emotion.baseline_surprisal
+    )
+    app.state.agent_runtime = FinalizationFailingRuntime()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat", json={"message": PRIVATE_SENTINEL, "attachments": []}
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert PRIVATE_SENTINEL not in response.text
+        assert "private finalization failure" not in response.text
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert client.app.state.agent_state_store.load().last_processed_event_sequence == 1
+        assert client.app.state.agent_state_store.restore_calls == 1
+        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+        records = client.app.state.event_journal.records
+        assert records[-1].lifecycle is EventLifecycle.PREPARED
+        assert not any(
+            record.lifecycle is EventLifecycle.COMPLETED for record in records
+        )
 
 
 def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> None:
@@ -1122,6 +1206,14 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
         )
         assert response.status_code == 500
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence == 1
+        )
+        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+        assert (
+            client.app.state.event_journal.records[-1].lifecycle
+            is EventLifecycle.PREPARED
+        )
 
     with _client(tmp_path, settings=settings) as restarted:
         assert (

@@ -19,8 +19,10 @@ from kagya.runtime import (
     AgentStateStore,
     EventJournal,
     EventJournalLease,
+    InternalCommitEvidence,
     KagyaMainLoop,
     StateRecoveryCoordinator,
+    StateRecoveryError,
     StateWAL,
 )
 
@@ -65,6 +67,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.state_wal,
             )
             recovery = app.state.state_recovery.prepare_startup()
+            journal_schema = app.state.event_journal.inspect().schema_version
+            if journal_schema == 2:
+                app.state.event_journal.append_v3_migration_checkpoint()
+                journal_schema = app.state.event_journal.inspect().schema_version
+            if journal_schema != 3:
+                raise StateRecoveryError("Runtime requires EventJournal schema 3")
             app.state.external_reconciliation_required = (
                 recovery.external_reconciliation_required
             )
@@ -103,6 +111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         committed_snapshot: AgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
+        pending_internal_commit: InternalCommitEvidence | None = None
 
         def admission_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_accepted(event)
@@ -110,19 +119,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def started_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_started(event)
 
-        def completion_checkpoint(event: AgentEvent) -> None:
-            nonlocal committed_snapshot, committed_snapshot_hash
+        def internal_commit_checkpoint(event: AgentEvent) -> None:
+            nonlocal committed_snapshot, committed_snapshot_hash, pending_internal_commit
             sequence = event.processing_sequence
             assert sequence is not None
             candidate = app.state.agent_state_store.capture(
                 app.state.main_loop, sequence
             )
             candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
-            app.state.state_recovery.commit_candidate(
+            evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
+            pending_internal_commit = evidence
+
+        def finalization_checkpoint(_event: AgentEvent) -> None:
+            """Reserved for the U3 participant coordinator."""
+
+        def terminal_completion_checkpoint(event: AgentEvent) -> None:
+            nonlocal pending_internal_commit
+            evidence = pending_internal_commit
+            if evidence is None or evidence.event_id != event.event_id:
+                raise StateRecoveryError("Internal commit evidence is unavailable")
+            app.state.state_recovery.complete_committed_event(event, evidence)
+            pending_internal_commit = None
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
@@ -141,7 +162,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     initial_sequence=recovery.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
-                    completion_checkpoint=completion_checkpoint,
+                    internal_commit_checkpoint=internal_commit_checkpoint,
+                    finalization_checkpoint=finalization_checkpoint,
+                    terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
             else:
@@ -149,7 +172,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     initial_sequence=recovery.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
-                    completion_checkpoint=completion_checkpoint,
+                    internal_commit_checkpoint=internal_commit_checkpoint,
+                    finalization_checkpoint=finalization_checkpoint,
+                    terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
         except BaseException:
