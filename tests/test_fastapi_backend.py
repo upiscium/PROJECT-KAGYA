@@ -590,8 +590,12 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> Non
         assert manifest is not None
         generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
 
-    with generation.open("ab") as output:
-        output.write(b"corrupt-tail\n")
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
     settings.agent_state.path.unlink()
 
     runtime = RecordingRuntime()

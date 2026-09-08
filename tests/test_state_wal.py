@@ -307,6 +307,48 @@ def test_boot_anchor_and_corrupt_tail_prefix(tmp_path: Path) -> None:
     assert anchor.snapshot_sequence == snapshot.last_processed_event_sequence == 10
 
 
+def test_journal_bound_prefix_returns_record_before_corrupt_tail(
+    tmp_path: Path,
+) -> None:
+    wal, manifest = bootstrap(tmp_path)
+    transition = append(wal, 10, 12)
+    path = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    with path.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+
+    reconstructed = wal.inspect_bound_prefix(
+        generation_id=manifest.active_generation_id,
+        record_id=transition.record_id,
+        record_hash=transition.record_hash,
+        snapshot_sequence=transition.candidate_snapshot_sequence,
+        snapshot_hash=transition.candidate_snapshot_hash,
+    )
+
+    assert reconstructed == transition.candidate_snapshot
+    assert path.read_bytes().endswith(b"corrupt-tail\n")
+
+
+def test_journal_bound_prefix_rejects_tamper_at_bound_record(tmp_path: Path) -> None:
+    wal, manifest = bootstrap(tmp_path)
+    transition = append(wal, 10, 12)
+    path = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = path.read_bytes().splitlines(keepends=True)
+    raw = json.loads(lines[1])
+    raw["record_hash"] = "0" * 64
+    lines[1] = json.dumps(raw, separators=(",", ":")).encode() + b"\n"
+    path.write_bytes(b"".join(lines))
+    path.chmod(0o600)
+
+    with pytest.raises(StateWALIntegrityError):
+        wal.inspect_bound_prefix(
+            generation_id=manifest.active_generation_id,
+            record_id=transition.record_id,
+            record_hash=transition.record_hash,
+            snapshot_sequence=transition.candidate_snapshot_sequence,
+            snapshot_hash=transition.candidate_snapshot_hash,
+        )
+
+
 def test_external_reconciliation_gate_is_durable(tmp_path: Path) -> None:
     wal = make_wal(tmp_path)
     manifest = wal.bootstrap(make_snapshot(0), 0, external_reconciliation_required=True)

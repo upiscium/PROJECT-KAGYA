@@ -1104,15 +1104,38 @@ class StateWAL:
 
     def inspect_anchored_prefix(self) -> tuple[BootAnchor, AgentStateSnapshot]:
         anchor = self.inspect_boot_anchor()
+        snapshot = self.inspect_bound_prefix(
+            generation_id=anchor.generation_id,
+            record_id=anchor.anchored_record_id,
+            record_hash=anchor.anchored_record_hash,
+            snapshot_sequence=anchor.snapshot_sequence,
+            snapshot_hash=anchor.snapshot_hash,
+        )
+        return anchor, snapshot
+
+    def inspect_bound_prefix(
+        self,
+        *,
+        generation_id: UUID,
+        record_id: UUID,
+        record_hash: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+    ) -> AgentStateSnapshot:
+        """Verify through an exact externally bound record, ignoring later bytes."""
+
+        if not _HASH_RE.fullmatch(record_hash) or not _HASH_RE.fullmatch(snapshot_hash):
+            raise StateWALFormatError("bound WAL identity is invalid")
         if not self._prepare_for_read():
             raise StateWALMissing("WAL is absent")
-        path = self._generation_path(anchor.generation_id)
+        path = self._generation_path(generation_id)
         lines = self._read_regular(path).splitlines(keepends=True)
         previous_hash: str | None = None
         previous_snapshot_sequence: int | None = None
         previous_state_hash: str | None = None
         previous_processing_sequence: int | None = None
         seen: set[UUID] = set()
+        seen_events: set[UUID] = set()
         for line in lines:
             try:
                 if not line.endswith(b"\n"):
@@ -1129,14 +1152,18 @@ class StateWAL:
                 if model is None:
                     raise ValueError
                 record = model.model_validate_json(_canonical(raw))
-                record_hash = _record_json(record, f"kagya.state-wal.{kind}")[1]
+                computed_hash = _record_json(record, f"kagya.state-wal.{kind}")[1]
                 if (
                     record.record_id in seen
                     or not _HASH_RE.fullmatch(record.record_hash)
-                    or record.record_hash != record_hash
+                    or record.record_hash != computed_hash
+                    or (
+                        isinstance(record, TransitionRecord)
+                        and record.event_id in seen_events
+                    )
                 ):
                     raise ValueError
-                if record.generation_id != anchor.generation_id:
+                if record.generation_id != generation_id:
                     raise ValueError
                 if not seen and not isinstance(record, BaselineRecord):
                     raise ValueError
@@ -1155,11 +1182,14 @@ class StateWAL:
                         != record.candidate_snapshot.last_processed_event_sequence
                         or record.candidate_snapshot_hash
                         != self._snapshot_hash_value(record.candidate_snapshot)
+                        or record.candidate_snapshot_sequence
+                        <= previous_snapshot_sequence
                     ):
                         raise ValueError
                 else:
                     if (
-                        record.previous_record_hash is not None
+                        seen
+                        or record.previous_record_hash is not None
                         or record.baseline_snapshot_sequence
                         != record.baseline_snapshot.last_processed_event_sequence
                         or record.baseline_snapshot_hash
@@ -1169,6 +1199,8 @@ class StateWAL:
                     ):
                         raise ValueError
                 seen.add(record.record_id)
+                if isinstance(record, TransitionRecord):
+                    seen_events.add(record.event_id)
                 snapshot = (
                     record.baseline_snapshot
                     if isinstance(record, BaselineRecord)
@@ -1186,16 +1218,17 @@ class StateWAL:
                     else record.journal_processing_high_water
                 )
                 previous_hash = record.record_hash
-                if record.record_id == anchor.anchored_record_id:
+                if record.record_id == record_id:
                     if (
-                        record_hash != anchor.anchored_record_hash
-                        or self._snapshot_hash_value(snapshot) != anchor.snapshot_hash
+                        computed_hash != record_hash
+                        or snapshot.last_processed_event_sequence != snapshot_sequence
+                        or self._snapshot_hash_value(snapshot) != snapshot_hash
                     ):
                         raise ValueError
-                    return anchor, snapshot
+                    return snapshot
             except Exception:
-                raise StateWALIntegrityError("anchored WAL prefix is invalid") from None
-        raise StateWALConflictError("boot anchor record is not retained")
+                raise StateWALIntegrityError("bound WAL prefix is invalid") from None
+        raise StateWALConflictError("bound WAL record is not retained")
 
     def reconstruct(
         self,

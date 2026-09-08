@@ -94,9 +94,20 @@ class StateRecoveryCoordinator:
                     and pending.snapshot_hash
                     == self.state_store.snapshot_hash(snapshot)
                 ):
-                    return self._resume_invalid_current_recovery(
-                        journal_inspection, snapshot, snapshot
+                    return self._finish_event_reconciliation(
+                        self._resume_invalid_current_recovery(
+                            journal_inspection, snapshot, snapshot
+                        )
                     )
+                bound_resume = self._resume_journal_bound_open_recovery(
+                    journal_inspection
+                )
+                if bound_resume is not None:
+                    return bound_resume
+            if not journal_inspection.open_recoveries and snapshot is None:
+                bound_current = self._recover_journal_bound_current(journal_inspection)
+                if bound_current is not None:
+                    return bound_current
             if snapshot is not None and journal_inspection.schema_version == 2:
                 return self._repair_v2_invalid_current(snapshot)
             if (
@@ -127,9 +138,16 @@ class StateRecoveryCoordinator:
                     and pending.snapshot_hash
                     == self.state_store.snapshot_hash(snapshot)
                 ):
-                    return self._resume_invalid_current_recovery(
-                        journal_inspection, snapshot, snapshot
+                    return self._finish_event_reconciliation(
+                        self._resume_invalid_current_recovery(
+                            journal_inspection, snapshot, snapshot
+                        )
                     )
+                bound_resume = self._resume_journal_bound_open_recovery(
+                    journal_inspection
+                )
+                if bound_resume is not None:
+                    return bound_resume
                 if anchor is not None:
                     return self._recover_from_anchor(
                         journal_inspection,
@@ -138,6 +156,10 @@ class StateRecoveryCoordinator:
                         wal_error=None,
                     )
                 raise StateRecoveryError("Prepared recovery target is unavailable")
+            if snapshot is None:
+                bound_current = self._recover_journal_bound_current(journal_inspection)
+                if bound_current is not None:
+                    return bound_current
             if journal_inspection.schema_version == 2:
                 if snapshot is not None:
                     return self._repair_v2_invalid_current(snapshot)
@@ -285,6 +307,71 @@ class StateRecoveryCoordinator:
             external=journal_inspection.external_reconciliation_required,
         )
         return self._finish_event_reconciliation(result)
+
+    def _recover_journal_bound_current(
+        self,
+        journal: EventJournalInspection,
+    ) -> StateRecoveryResult | None:
+        target = self._inspect_journal_bound_current(journal)
+        if target is None:
+            return None
+        result = self._start_recovery(
+            journal,
+            None,
+            target,
+            EventRecoveryCategory.EXACT_CURRENT,
+            RecoveryReason.EXACT_CURRENT_REPAIR,
+            external=journal.external_reconciliation_required,
+            invalid_current=True,
+        )
+        return self._finish_event_reconciliation(result)
+
+    def _resume_journal_bound_open_recovery(
+        self,
+        journal: EventJournalInspection,
+    ) -> StateRecoveryResult | None:
+        if len(journal.open_recoveries) != 1:
+            return None
+        pending = journal.open_recoveries[0]
+        if pending.category not in {
+            EventRecoveryCategory.EXACT_CURRENT,
+            EventRecoveryCategory.UNCOMMITTED_TAIL,
+        }:
+            return None
+        target = self._inspect_journal_bound_current(journal)
+        if (
+            target is None
+            or target.last_processed_event_sequence != pending.snapshot_sequence
+            or self.state_store.snapshot_hash(target) != pending.snapshot_hash
+        ):
+            return None
+        result = self._resume_invalid_current_recovery(journal, target, None)
+        return self._finish_event_reconciliation(result)
+
+    def _inspect_journal_bound_current(
+        self,
+        journal: EventJournalInspection,
+    ) -> AgentStateSnapshot | None:
+        if (
+            journal.schema_version != 2
+            or journal.wal_generation_id is None
+            or journal.wal_record_id is None
+            or journal.wal_record_hash is None
+            or journal.wal_snapshot_sequence != journal.snapshot_sequence
+            or journal.wal_snapshot_hash != journal.snapshot_hash
+        ):
+            return None
+        try:
+            target = self.wal.inspect_bound_prefix(
+                generation_id=UUID(journal.wal_generation_id),
+                record_id=UUID(journal.wal_record_id),
+                record_hash=journal.wal_record_hash,
+                snapshot_sequence=journal.snapshot_sequence,
+                snapshot_hash=journal.snapshot_hash,
+            )
+        except (StateWALError, ValueError):
+            return None
+        return target
 
     def _repair_v2_invalid_current(
         self,
@@ -807,17 +894,21 @@ class StateRecoveryCoordinator:
                 or pending.snapshot_hash != target_hash
             ):
                 raise StateRecoveryError("Open recovery does not match boot anchor")
-            return self._resume_invalid_current_recovery(
-                journal,
-                target,
-                snapshot,
+            return self._finish_event_reconciliation(
+                self._resume_invalid_current_recovery(
+                    journal,
+                    target,
+                    snapshot,
+                )
             )
         target_hash = self.state_store.snapshot_hash(target)
         exact_current = (
             target.last_processed_event_sequence == journal.snapshot_sequence
             and target_hash == journal.snapshot_hash
         )
-        return self._start_recovery(
+        if journal.open_events:
+            self.journal.inspect(target.last_processed_event_sequence, target_hash)
+        result = self._start_recovery(
             journal,
             None,
             target,
@@ -836,6 +927,7 @@ class StateRecoveryCoordinator:
             ),
             invalid_current=exact_current,
         )
+        return self._finish_event_reconciliation(result)
 
     def _finish_event_reconciliation(
         self, result: StateRecoveryResult

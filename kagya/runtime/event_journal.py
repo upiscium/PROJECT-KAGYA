@@ -461,6 +461,9 @@ class _VerifiedJournal:
     wal_snapshot_sequence: int | None
     wal_snapshot_hash: str | None
     open_recoveries: tuple[EventJournalRecord, ...]
+    wal_generation_id: str | None
+    wal_record_id: str | None
+    wal_record_hash: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +503,9 @@ class EventJournalInspection:
     external_reconciliation_required: bool
     wal_snapshot_sequence: int | None
     wal_snapshot_hash: str | None
+    wal_generation_id: str | None
+    wal_record_id: str | None
+    wal_record_hash: str | None
 
 
 class EventJournalLease:
@@ -688,21 +694,24 @@ class EventJournal:
             records = self._read_records_unlocked()
             if not records:
                 return EventJournalInspection(
-                    (),
-                    None,
-                    None,
-                    None,
-                    0,
-                    0,
-                    "0" * 64,
-                    (),
-                    (),
-                    (),
-                    (),
-                    None,
-                    False,
-                    None,
-                    None,
+                    records=(),
+                    tail_record_id=None,
+                    tail_record_hash=None,
+                    schema_version=None,
+                    processing_high_water=0,
+                    snapshot_sequence=0,
+                    snapshot_hash="0" * 64,
+                    open_events=(),
+                    classification_plan=(),
+                    open_recoveries=(),
+                    sequence_evidence=(),
+                    journal_lineage_id=None,
+                    external_reconciliation_required=False,
+                    wal_snapshot_sequence=None,
+                    wal_snapshot_hash=None,
+                    wal_generation_id=None,
+                    wal_record_id=None,
+                    wal_record_hash=None,
                 )
             verified = self._verify_records(records)
             classification_sequence = (
@@ -753,6 +762,9 @@ class EventJournal:
                 ),
                 wal_snapshot_sequence=verified.wal_snapshot_sequence,
                 wal_snapshot_hash=verified.wal_snapshot_hash,
+                wal_generation_id=verified.wal_generation_id,
+                wal_record_id=verified.wal_record_id,
+                wal_record_hash=verified.wal_record_hash,
             )
 
     def apply_planned_reconciliation(
@@ -2097,6 +2109,9 @@ class EventJournal:
             wal_snapshot_sequence,
             wal_snapshot_hash,
             tuple(recovery_open.values()),
+            wal_generation_id,
+            wal_record_id,
+            wal_record_hash,
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:
