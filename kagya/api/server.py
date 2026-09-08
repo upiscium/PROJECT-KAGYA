@@ -15,12 +15,13 @@ from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
     AgentRuntime,
-    AgentStateLoadError,
     AgentStateSnapshot,
     AgentStateStore,
     EventJournal,
     EventJournalLease,
     KagyaMainLoop,
+    StateRecoveryCoordinator,
+    StateWAL,
 )
 
 
@@ -55,28 +56,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app_settings.agent_state.path,
                 app_settings.emotion.baseline_surprisal,
             )
-            journal_has_history = app.state.event_journal.has_history
-            if (
-                journal_has_history
-                and not app.state.agent_state_store.snapshot_exists()
-            ):
-                raise AgentStateLoadError(
-                    "AgentState snapshot is required by EventJournal history"
-                )
-            snapshot = app.state.agent_state_store.load()
-            snapshot_hash = app.state.agent_state_store.snapshot_hash(snapshot)
-            if journal_has_history:
-                recovery = app.state.event_journal.verify_and_reconcile(
-                    snapshot.last_processed_event_sequence,
-                    snapshot_hash,
-                )
-                app.state.agent_state_store.ensure_published(snapshot)
-            else:
-                app.state.agent_state_store.ensure_published(snapshot)
-                recovery = app.state.event_journal.verify_and_reconcile(
-                    snapshot.last_processed_event_sequence,
-                    snapshot_hash,
-                )
+            app.state.state_wal = getattr(app.state, "state_wal", None) or StateWAL(
+                app_settings.state_wal.directory
+            )
+            app.state.state_recovery = StateRecoveryCoordinator(
+                app.state.agent_state_store,
+                app.state.event_journal,
+                app.state.state_wal,
+            )
+            recovery = app.state.state_recovery.prepare_startup()
+            app.state.external_reconciliation_required = (
+                recovery.external_reconciliation_required
+            )
+            snapshot = recovery.snapshot
+            snapshot_hash = recovery.snapshot_hash
 
             app.state.model_provider = getattr(
                 app.state, "model_provider", None
@@ -125,16 +118,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.main_loop, sequence
             )
             candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
-            app.state.event_journal.append_prepared(
-                event,
-                committed_snapshot_hash,
-                candidate_hash,
-            )
-            app.state.agent_state_store.save(candidate)
-            app.state.event_journal.append_completed(
-                event,
-                sequence,
-                candidate_hash,
+            app.state.state_recovery.commit_candidate(
+                event, committed_snapshot, candidate
             )
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
@@ -170,11 +155,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException:
             app.state.event_journal.close()
             raise
-        try:
-            app.state.agent_runtime.start()
-        except BaseException:
-            app.state.event_journal.close()
-            raise
+        if not recovery.external_reconciliation_required:
+            try:
+                app.state.agent_runtime.start()
+                app.state.state_recovery.publish_boot_anchor(recovery)
+            except BaseException:
+                app.state.agent_runtime.shutdown()
+                app.state.event_journal.close()
+                raise
         try:
             yield
         finally:
@@ -193,6 +181,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
+        if app.state.external_reconciliation_required:
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "external_reconciliation_required",
+            }
         return {"status": "ok", "project": app_settings.project.name}
 
     app.include_router(chat.router)

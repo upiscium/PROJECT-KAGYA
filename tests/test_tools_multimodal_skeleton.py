@@ -147,6 +147,9 @@ def _settings(tmp_path: Path) -> Settings:
             "event_journal": settings.event_journal.model_copy(
                 update={"path": tmp_path / "event_journal.jsonl"}
             ),
+            "state_wal": settings.state_wal.model_copy(
+                update={"directory": tmp_path / "private" / "state_wal"}
+            ),
             "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
         }
     )
