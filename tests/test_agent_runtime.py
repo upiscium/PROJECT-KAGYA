@@ -42,9 +42,10 @@ def test_authoritative_runtime_requires_complete_durability_lifecycle() -> None:
         initial_sequence=4,
         admission_checkpoint=callback,
         started_checkpoint=callback,
+        preparation_checkpoint=lambda _event, value: value,
         internal_commit_checkpoint=callback,
-        finalization_checkpoint=callback,
-        terminal_completion_checkpoint=callback,
+        finalization_checkpoint=lambda _event, _evidence: None,
+        terminal_completion_checkpoint=lambda _event, _evidence: None,
         failure_checkpoint=callback,
     )
     runtime.start()
@@ -86,7 +87,7 @@ def test_initial_sequence_is_used_for_first_event() -> None:
 def test_checkpoint_runs_before_future_success_is_observable() -> None:
     observations: list[str] = []
 
-    def checkpoint(event: object) -> None:
+    def checkpoint(event: object, _evidence: object) -> None:
         assert event is not None
         observations.append("checkpoint")
 
@@ -108,7 +109,7 @@ def test_checkpoint_runs_before_future_success_is_observable() -> None:
 def test_handler_failure_skips_checkpoint() -> None:
     checkpoint_called = False
 
-    def checkpoint(_: object) -> None:
+    def checkpoint(_: object, _evidence: object) -> None:
         nonlocal checkpoint_called
         checkpoint_called = True
 
@@ -184,7 +185,7 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
         assert event.processing_sequence is not None
         internal_commit_sequences.append(event.processing_sequence)
 
-    def finalization(event) -> None:
+    def finalization(event, _evidence) -> None:
         assert event.processing_sequence is not None
         finalization_sequences.append(event.processing_sequence)
 
@@ -198,7 +199,7 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
         started_checkpoint=started_checkpoint,
         internal_commit_checkpoint=internal_commit,
         finalization_checkpoint=finalization,
-        terminal_completion_checkpoint=checkpoint,
+        terminal_completion_checkpoint=lambda event, _evidence: checkpoint(event),
     )
     runtime.start()
     blocker = runtime.submit(
@@ -583,7 +584,7 @@ def test_later_admission_failure_does_not_abandon_started_event() -> None:
         if admissions == 2:
             raise OSError("journal unavailable")
 
-    def completion(event) -> None:
+    def completion(event, _evidence) -> None:
         assert event.processing_sequence is not None
         completed.append(event.processing_sequence)
 
@@ -651,9 +652,13 @@ def test_full_success_protocol_precedes_future_success() -> None:
         1,
         admission_checkpoint=lambda _event: order.append("accepted"),
         started_checkpoint=lambda _event: order.append("started"),
+        preparation_checkpoint=lambda _event, value: (
+            order.append("transaction_preparation"),
+            value,
+        )[1],
         internal_commit_checkpoint=lambda _event: order.append("internal_commit"),
-        finalization_checkpoint=lambda _event: order.append("finalization"),
-        terminal_completion_checkpoint=lambda _event: order.append(
+        finalization_checkpoint=lambda _event, _evidence: order.append("finalization"),
+        terminal_completion_checkpoint=lambda _event, _evidence: order.append(
             "terminal_completion"
         ),
     )
@@ -670,6 +675,7 @@ def test_full_success_protocol_precedes_future_success() -> None:
         "accepted",
         "started",
         "handler",
+        "transaction_preparation",
         "internal_commit",
         "finalization",
         "terminal_completion",
@@ -677,13 +683,46 @@ def test_full_success_protocol_precedes_future_success() -> None:
     ]
 
 
+def test_preparation_separates_handler_result_and_hands_internal_proof_forward() -> (
+    None
+):
+    private_result = object()
+    proof = object()
+    observed_proofs: list[object] = []
+
+    def prepare(_event: object, value: object) -> str:
+        assert value is private_result
+        return "public"
+
+    runtime = AgentRuntime(
+        1,
+        preparation_checkpoint=prepare,
+        internal_commit_checkpoint=lambda _event: proof,
+        finalization_checkpoint=lambda _event, evidence: observed_proofs.append(
+            evidence
+        ),
+        terminal_completion_checkpoint=lambda _event, evidence: observed_proofs.append(
+            evidence
+        ),
+    )
+    runtime.start()
+
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: private_result
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.value == "public"
+    assert observed_proofs == [proof, proof]
+
+
 def test_success_phases_have_exact_future_observable_order() -> None:
     order: list[str] = []
     runtime = AgentRuntime(
         1,
         internal_commit_checkpoint=lambda _event: order.append("internal_commit"),
-        finalization_checkpoint=lambda _event: order.append("finalization"),
-        terminal_completion_checkpoint=lambda _event: order.append(
+        finalization_checkpoint=lambda _event, _evidence: order.append("finalization"),
+        terminal_completion_checkpoint=lambda _event, _evidence: order.append(
             "terminal_completion"
         ),
     )
@@ -711,7 +750,7 @@ def test_future_is_not_done_while_terminal_completion_is_blocked() -> None:
     terminal_started = Event()
     release_terminal = Event()
 
-    def terminal_completion(_event: object) -> None:
+    def terminal_completion(_event: object, _evidence: object) -> None:
         terminal_started.set()
         assert release_terminal.wait(timeout=2)
 
@@ -731,6 +770,10 @@ def test_future_is_not_done_while_terminal_completion_is_blocked() -> None:
 @pytest.mark.parametrize(
     ("failed_phase", "callback_name"),
     [
+        (
+            AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION,
+            "transaction_preparation",
+        ),
         (AgentRuntimeDurabilityPhase.INTERNAL_COMMIT, "internal_commit"),
         (AgentRuntimeDurabilityPhase.FINALIZATION, "finalization"),
         (AgentRuntimeDurabilityPhase.TERMINAL_COMPLETION, "terminal_completion"),
@@ -742,8 +785,8 @@ def test_each_success_phase_failure_fail_stops_and_skips_later_phases(
     calls: list[str] = []
     failure_checkpoint_called = False
 
-    def phase_callback(name: str) -> Callable[[object], None]:
-        def callback(_event: object) -> None:
+    def phase_callback(name: str) -> Callable[..., None]:
+        def callback(*_args: object) -> None:
             calls.append(name)
             if name == callback_name:
                 raise OSError(f"{name} failed")
@@ -756,18 +799,23 @@ def test_each_success_phase_failure_fail_stops_and_skips_later_phases(
 
     runtime = AgentRuntime(
         2,
+        preparation_checkpoint=phase_callback("transaction_preparation"),
         internal_commit_checkpoint=phase_callback("internal_commit"),
         finalization_checkpoint=phase_callback("finalization"),
         terminal_completion_checkpoint=phase_callback("terminal_completion"),
         failure_checkpoint=failure_checkpoint,
     )
     runtime.start()
+    handler_started = Event()
+    release_handler = Event()
     failed = runtime.submit(
-        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: (handler_started.set(), release_handler.wait())[1],
     )
-    later = runtime.submit(
-        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
-    )
+    assert handler_started.wait(timeout=2)
+    later = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+    release_handler.set()
 
     with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
@@ -776,19 +824,24 @@ def test_each_success_phase_failure_fail_stops_and_skips_later_phases(
     runtime.shutdown()
 
     assert error.value.phase is failed_phase
-    phase_order = ["internal_commit", "finalization", "terminal_completion"]
+    phase_order = [
+        "transaction_preparation",
+        "internal_commit",
+        "finalization",
+        "terminal_completion",
+    ]
     assert calls == phase_order[: phase_order.index(callback_name) + 1]
     assert not failure_checkpoint_called
     assert runtime.status is AgentRuntimeStatus.FAILED
 
 
 def test_processing_sequences_are_unchanged_by_success_phases() -> None:
-    def callback(_event) -> None:
+    def callback(_event, _evidence) -> None:
         pass
 
     runtime = AgentRuntime(
         2,
-        internal_commit_checkpoint=callback,
+        internal_commit_checkpoint=lambda _event: None,
         finalization_checkpoint=callback,
         terminal_completion_checkpoint=callback,
     )

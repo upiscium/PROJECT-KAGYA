@@ -533,7 +533,32 @@ class StateRecoveryCoordinator:
         with self._lock:
             self._complete_committed_event(event, evidence)
 
+    def verify_internal_commit(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        """Verify that canonical state, Journal, and WAL still bind this commit."""
+
+        with self._lock:
+            self._verify_internal_commit(event, evidence)
+
     def _complete_committed_event(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        self._verify_internal_commit(event, evidence)
+        self.journal.append_completed(
+            event,
+            evidence.snapshot_sequence,
+            evidence.snapshot_hash,
+            wal_generation_id=evidence.wal_generation_id,
+            wal_record_id=evidence.wal_record_id,
+            wal_record_hash=evidence.wal_record_hash,
+        )
+
+    def _verify_internal_commit(
         self,
         event: AgentEvent,
         evidence: InternalCommitEvidence,
@@ -603,15 +628,6 @@ class StateRecoveryCoordinator:
             or transition.candidate_snapshot_hash != evidence.snapshot_hash
         ):
             raise StateRecoveryError("StateWAL internal commit evidence is stale")
-
-        self.journal.append_completed(
-            event,
-            evidence.snapshot_sequence,
-            evidence.snapshot_hash,
-            wal_generation_id=evidence.wal_generation_id,
-            wal_record_id=evidence.wal_record_id,
-            wal_record_hash=evidence.wal_record_hash,
-        )
 
     def publish_boot_anchor(self, result: StateRecoveryResult) -> None:
         """Mark bootability only after the runtime graph has started."""

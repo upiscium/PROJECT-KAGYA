@@ -28,6 +28,7 @@ from kagya.runtime.agent_state import (
     default_agent_state_snapshot,
 )
 from kagya.runtime.event_journal import (
+    AbortOutcome,
     CURRENT_EVENT_JOURNAL_SCHEMA_VERSION,
     EventFailureCategory,
     EventJournal,
@@ -47,11 +48,26 @@ from kagya.runtime.event_journal import (
     EventRecoveryCategory,
     EventLifecycle,
     ParticipantOutcome,
+    ParticipantCapability,
     StartupParticipantOutcome,
     ParticipantRequirement,
     ReconciliationReason,
     TransactionKind,
     UnsupportedEventJournalVersion,
+)
+from kagya.runtime.transaction_coordinator import (
+    AbortableTransactionParticipant,
+    CoordinatedResult,
+    ParticipantDivergedError,
+    ParticipantUnavailableError,
+    ReconcilableTransactionParticipant,
+    TransactionBinding,
+    TransactionCoordinator,
+    TransactionCoordinatorError,
+    TransactionFinalizationError,
+    TransactionParticipant,
+    TransactionPreparationError,
+    UnsupportedParticipantReconciliationError,
 )
 from kagya.runtime.state_wal import (
     BaselineRecord,
@@ -77,6 +93,8 @@ from kagya.runtime.state_recovery import (
 )
 
 __all__ = [
+    "AbortOutcome",
+    "AbortableTransactionParticipant",
     "AgentEvent",
     "AgentEventOutcome",
     "AgentEventSource",
@@ -97,6 +115,7 @@ __all__ = [
     "CURRENT_AGENT_STATE_SCHEMA_VERSION",
     "CURRENT_EVENT_JOURNAL_SCHEMA_VERSION",
     "ChatResult",
+    "CoordinatedResult",
     "KagyaMainLoop",
     "SessionState",
     "SessionTurn",
@@ -119,10 +138,21 @@ __all__ = [
     "EventRecoveryCategory",
     "EventLifecycle",
     "ParticipantOutcome",
+    "ParticipantCapability",
+    "ParticipantDivergedError",
+    "ParticipantUnavailableError",
     "StartupParticipantOutcome",
     "ParticipantRequirement",
     "ReconciliationReason",
+    "ReconcilableTransactionParticipant",
+    "TransactionBinding",
+    "TransactionCoordinator",
+    "TransactionCoordinatorError",
+    "TransactionFinalizationError",
     "TransactionKind",
+    "TransactionParticipant",
+    "TransactionPreparationError",
+    "UnsupportedParticipantReconciliationError",
     "UnsupportedAgentStateVersion",
     "UnsupportedEventJournalVersion",
     "BaselineRecord",

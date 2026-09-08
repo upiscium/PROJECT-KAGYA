@@ -416,6 +416,21 @@ def test_internal_commit_publishes_state_but_leaves_event_prepared(
     assert evidence.snapshot_hash == store.snapshot_hash(candidate)
 
 
+def test_internal_commit_verification_is_read_only(tmp_path: Path) -> None:
+    recovery, _store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("verified-internal-commit", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    before = journal.path.read_bytes()
+
+    recovery.verify_internal_commit(item, evidence)
+
+    assert journal.path.read_bytes() == before
+    assert journal.inspect().records[-1].lifecycle is EventLifecycle.PREPARED
+
+
 def test_terminal_completion_only_appends_completed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -481,9 +496,7 @@ def test_completion_rejects_stale_journal_prepared_proof(
     evidence = recovery.commit_internal_candidate(item, initial, candidate)
     original_inspect = journal.inspect
 
-    def tampered_inspect(
-        *args: object, **kwargs: object
-    ) -> EventJournalInspection:
+    def tampered_inspect(*args: object, **kwargs: object) -> EventJournalInspection:
         inspection = original_inspect(*args, **kwargs)
         records = list(inspection.records)
         prepared_index = next(

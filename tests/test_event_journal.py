@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from kagya.config import Settings, load_settings
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.event_journal import (
+    AbortOutcome,
     EventFailureCategory,
     EventRecoveryCategory,
     EventJournal,
@@ -22,6 +23,7 @@ from kagya.runtime.event_journal import (
     EventJournalLoadError,
     EventJournalRecord,
     EventLifecycle,
+    ParticipantCapability,
     UnsupportedEventJournalVersion,
     ParticipantOutcome,
     ParticipantRequirement,
@@ -108,7 +110,14 @@ def startup_reconciliation_journal(path: Path) -> EventJournal:
 
 def transaction_requirements() -> tuple[ParticipantRequirement, ...]:
     return tuple(
-        ParticipantRequirement(participant_id=participant, operation_digest=digest)
+        ParticipantRequirement(
+            participant_id=participant,
+            operation_digest=digest,
+            capabilities=(
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
+        )
         for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
     )
 
@@ -1233,7 +1242,12 @@ def test_duplicate_transaction_identity_is_rejected_before_append(
             TransactionKind.EVENT_MUTATION,
             (
                 ParticipantRequirement(
-                    participant_id="other.store", operation_digest=HASH_0
+                    participant_id="other.store",
+                    operation_digest=HASH_0,
+                    capabilities=(
+                        ParticipantCapability.IDEMPOTENT_FINALIZE,
+                        ParticipantCapability.PREPARE,
+                    ),
                 ),
             ),
         )
@@ -1629,7 +1643,12 @@ def test_v3_rotation_remains_readable_after_migration_segment_is_pruned(
         item = event(f"bounded-{sequence}", sequence)
         transaction_id = str(uuid5(NAMESPACE_URL, f"bounded-transaction-{sequence}"))
         participant = ParticipantRequirement(
-            participant_id="memory.episodic", operation_digest=HASH_2
+            participant_id="memory.episodic",
+            operation_digest=HASH_2,
+            capabilities=(
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
         )
         value.append_accepted(item)
         value.append_started(item)
@@ -1797,9 +1816,7 @@ def test_startup_reconciliation_rejects_identity_tampering_and_invalid_participa
     lines = path.read_bytes().splitlines()
     tampered = json.loads(lines[-1])
     tampered["snapshot_hash"] = HASH_1
-    path.write_bytes(
-        b"\n".join((*lines[:-1], json.dumps(tampered).encode())) + b"\n"
-    )
+    path.write_bytes(b"\n".join((*lines[:-1], json.dumps(tampered).encode())) + b"\n")
     with pytest.raises(EventJournalLoadError) as load_error:
         journal(path)
     assert_bounded(load_error.value)
@@ -1975,3 +1992,103 @@ def test_startup_reconciliation_completion_unblocks_rotation(
                 lineage,
                 transaction_requirements(),
             )
+
+
+def test_participant_capabilities_are_sorted_unique_and_minimal() -> None:
+    with pytest.raises(ValidationError):
+        ParticipantRequirement(
+            participant_id="memory.episodic",
+            operation_digest=HASH_1,
+            capabilities=(ParticipantCapability.PREPARE,),
+        )
+    with pytest.raises(ValidationError):
+        ParticipantRequirement(
+            participant_id="memory.episodic",
+            operation_digest=HASH_1,
+            capabilities=(
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
+        )
+
+
+def test_abort_branch_is_durable_and_restarts_without_high_water_change(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "abort.jsonl"
+    value = bootstrap_v3(path)
+    item = event("abort", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    requirements = tuple(
+        ParticipantRequirement(
+            participant_id=participant,
+            operation_digest=digest,
+            capabilities=(
+                ParticipantCapability.ABORT,
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
+        )
+        for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
+    )
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, requirements
+    )
+    value.append_participant_aborted(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, AbortOutcome.ABORTED
+    )
+    value.append_transaction_abort_required(
+        item,
+        TX_ID,
+        ReconciliationReason.PARTICIPANT_UNAVAILABLE,
+        (PARTICIPANTS[1],),
+    )
+    assert value.inspect().processing_high_water == 1
+    value.close()
+
+    reopened = journal(path)
+    assert reopened.inspect().abort_required_transactions[0].abort_reason is (
+        ReconciliationReason.PARTICIPANT_UNAVAILABLE
+    )
+    reopened.append_participant_aborted(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, AbortOutcome.ALREADY_ABSENT
+    )
+    reopened.append_transaction_aborted(item, TX_ID)
+    inspection = reopened.inspect()
+    assert inspection.processing_high_water == 1
+    assert inspection.abort_required_transactions == ()
+    assert inspection.aborted_transactions[0].abort_outcomes == (
+        (PARTICIPANTS[0], AbortOutcome.ABORTED),
+        (PARTICIPANTS[1], AbortOutcome.ALREADY_ABSENT),
+    )
+
+
+def test_abort_and_finalize_branches_cannot_mix(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "abort-mix.jsonl")
+    item = event("abort-mix", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    requirements = tuple(
+        ParticipantRequirement(
+            participant_id=participant,
+            operation_digest=digest,
+            capabilities=(
+                ParticipantCapability.ABORT,
+                ParticipantCapability.IDEMPOTENT_FINALIZE,
+                ParticipantCapability.PREPARE,
+            ),
+        )
+        for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
+    )
+    value.append_transaction_prepared(
+        item, TX_ID, TransactionKind.EVENT_MUTATION, requirements
+    )
+    value.append_participant_aborted(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, AbortOutcome.ABORTED
+    )
+    with pytest.raises(EventJournalAppendError):
+        value.append_participant_finalized(
+            item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
+        )

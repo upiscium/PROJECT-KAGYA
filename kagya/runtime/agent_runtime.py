@@ -45,6 +45,7 @@ class AgentRuntimeDurabilityPhase(str, Enum):
     ADMISSION = "admission"
     STARTED = "started"
     HANDLER_FAILURE = "handler_failure"
+    TRANSACTION_PREPARATION = "transaction_preparation"
     INTERNAL_COMMIT = "internal_commit"
     FINALIZATION = "finalization"
     TERMINAL_COMPLETION = "terminal_completion"
@@ -128,9 +129,12 @@ class AgentRuntime:
         initial_sequence: int = 0,
         admission_checkpoint: Callable[[AgentEvent], None] | None = None,
         started_checkpoint: Callable[[AgentEvent], None] | None = None,
-        internal_commit_checkpoint: Callable[[AgentEvent], None] | None = None,
-        finalization_checkpoint: Callable[[AgentEvent], None] | None = None,
-        terminal_completion_checkpoint: Callable[[AgentEvent], None] | None = None,
+        preparation_checkpoint: Callable[[AgentEvent, object], object] | None = None,
+        internal_commit_checkpoint: Callable[[AgentEvent], object] | None = None,
+        finalization_checkpoint: Callable[[AgentEvent, object], None] | None = None,
+        terminal_completion_checkpoint: (
+            Callable[[AgentEvent, object], None] | None
+        ) = None,
         failure_checkpoint: Callable[[AgentEvent], None] | None = None,
         allow_volatile: bool = False,
     ) -> None:
@@ -149,6 +153,7 @@ class AgentRuntime:
         self._queue_capacity = queue_capacity
         self._admission_checkpoint = admission_checkpoint
         self._started_checkpoint = started_checkpoint
+        self._preparation_checkpoint = preparation_checkpoint
         self._internal_commit_checkpoint = internal_commit_checkpoint
         self._finalization_checkpoint = finalization_checkpoint
         self._terminal_completion_checkpoint = terminal_completion_checkpoint
@@ -166,6 +171,7 @@ class AgentRuntime:
             for callback in (
                 admission_checkpoint,
                 started_checkpoint,
+                preparation_checkpoint,
                 internal_commit_checkpoint,
                 finalization_checkpoint,
                 terminal_completion_checkpoint,
@@ -206,9 +212,10 @@ class AgentRuntime:
         initial_sequence: int,
         admission_checkpoint: Callable[[AgentEvent], None],
         started_checkpoint: Callable[[AgentEvent], None],
-        internal_commit_checkpoint: Callable[[AgentEvent], None],
-        finalization_checkpoint: Callable[[AgentEvent], None],
-        terminal_completion_checkpoint: Callable[[AgentEvent], None],
+        preparation_checkpoint: Callable[[AgentEvent, object], object],
+        internal_commit_checkpoint: Callable[[AgentEvent], object],
+        finalization_checkpoint: Callable[[AgentEvent, object], None],
+        terminal_completion_checkpoint: Callable[[AgentEvent, object], None],
         failure_checkpoint: Callable[[AgentEvent], None],
     ) -> None:
         """Bind mandatory durable lifecycle collaborators before startup."""
@@ -227,6 +234,7 @@ class AgentRuntime:
             self._sequence = initial_sequence
             self._admission_checkpoint = admission_checkpoint
             self._started_checkpoint = started_checkpoint
+            self._preparation_checkpoint = preparation_checkpoint
             self._internal_commit_checkpoint = internal_commit_checkpoint
             self._finalization_checkpoint = finalization_checkpoint
             self._terminal_completion_checkpoint = terminal_completion_checkpoint
@@ -349,11 +357,39 @@ class AgentRuntime:
                 self._set_exception(pending.future, wrapped)
                 self._finish_active()
             else:
-                checkpoints = (
-                    (
+                try:
+                    public_value = (
+                        self._preparation_checkpoint(event, value)
+                        if self._preparation_checkpoint is not None
+                        else value
+                    )
+                except Exception as error:
+                    durability_error = self._durability_error(
+                        event,
+                        AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION,
+                        error,
+                        True,
+                    )
+                    with self._condition:
+                        self._fail_stop_locked(durability_error)
+                    return
+                try:
+                    evidence = (
+                        self._internal_commit_checkpoint(event)
+                        if self._internal_commit_checkpoint is not None
+                        else None
+                    )
+                except Exception as error:
+                    durability_error = self._durability_error(
+                        event,
                         AgentRuntimeDurabilityPhase.INTERNAL_COMMIT,
-                        self._internal_commit_checkpoint,
-                    ),
+                        error,
+                        True,
+                    )
+                    with self._condition:
+                        self._fail_stop_locked(durability_error)
+                    return
+                for phase, checkpoint in (
                     (
                         AgentRuntimeDurabilityPhase.FINALIZATION,
                         self._finalization_checkpoint,
@@ -362,11 +398,10 @@ class AgentRuntime:
                         AgentRuntimeDurabilityPhase.TERMINAL_COMPLETION,
                         self._terminal_completion_checkpoint,
                     ),
-                )
-                for phase, checkpoint in checkpoints:
+                ):
                     try:
                         if checkpoint is not None:
-                            checkpoint(event)
+                            checkpoint(event, evidence)
                     except Exception as error:
                         durability_error = self._durability_error(
                             event, phase, error, True
@@ -374,7 +409,7 @@ class AgentRuntime:
                         with self._condition:
                             self._fail_stop_locked(durability_error)
                         return
-                self._set_result(pending.future, AgentEventOutcome(event, value))
+                self._set_result(pending.future, AgentEventOutcome(event, public_value))
                 self._finish_active()
 
     @staticmethod

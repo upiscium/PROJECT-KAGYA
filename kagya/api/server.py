@@ -24,6 +24,7 @@ from kagya.runtime import (
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateWAL,
+    TransactionCoordinator,
 )
 
 
@@ -111,7 +112,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         committed_snapshot: AgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
-        pending_internal_commit: InternalCommitEvidence | None = None
+        app.state.transaction_coordinator = TransactionCoordinator(
+            app.state.event_journal,
+            app.state.state_recovery.verify_internal_commit,
+        )
 
         def admission_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_accepted(event)
@@ -119,8 +123,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         def started_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_started(event)
 
-        def internal_commit_checkpoint(event: AgentEvent) -> None:
-            nonlocal committed_snapshot, committed_snapshot_hash, pending_internal_commit
+        def preparation_checkpoint(event: AgentEvent, value: object) -> object:
+            return app.state.transaction_coordinator.prepare_result(event, value)
+
+        def internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
+            nonlocal committed_snapshot, committed_snapshot_hash
             sequence = event.processing_sequence
             assert sequence is not None
             candidate = app.state.agent_state_store.capture(
@@ -132,18 +139,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
-            pending_internal_commit = evidence
+            return evidence
 
-        def finalization_checkpoint(_event: AgentEvent) -> None:
-            """Reserved for the U3 participant coordinator."""
+        def finalization_checkpoint(event: AgentEvent, evidence: object) -> None:
+            if not isinstance(evidence, InternalCommitEvidence):
+                raise StateRecoveryError("Internal commit evidence is unavailable")
+            app.state.transaction_coordinator.finalize_event(event, evidence)
 
-        def terminal_completion_checkpoint(event: AgentEvent) -> None:
-            nonlocal pending_internal_commit
-            evidence = pending_internal_commit
-            if evidence is None or evidence.event_id != event.event_id:
+        def terminal_completion_checkpoint(event: AgentEvent, evidence: object) -> None:
+            if not isinstance(evidence, InternalCommitEvidence):
                 raise StateRecoveryError("Internal commit evidence is unavailable")
             app.state.state_recovery.complete_committed_event(event, evidence)
-            pending_internal_commit = None
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
@@ -162,6 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     initial_sequence=recovery.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
+                    preparation_checkpoint=preparation_checkpoint,
                     internal_commit_checkpoint=internal_commit_checkpoint,
                     finalization_checkpoint=finalization_checkpoint,
                     terminal_completion_checkpoint=terminal_completion_checkpoint,
@@ -172,6 +179,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     initial_sequence=recovery.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
+                    preparation_checkpoint=preparation_checkpoint,
                     internal_commit_checkpoint=internal_commit_checkpoint,
                     finalization_checkpoint=finalization_checkpoint,
                     terminal_completion_checkpoint=terminal_completion_checkpoint,
