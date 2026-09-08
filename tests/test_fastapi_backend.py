@@ -101,6 +101,19 @@ class AdmissionRuntime:
         raise self.error_type(event)
 
 
+def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    with _client(tmp_path, settings=settings) as client:
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "project": settings.project.name,
+        }
+
+
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.post(
@@ -542,6 +555,11 @@ def test_existing_journal_with_missing_snapshot_is_reconstructed_from_wal(
     with TestClient(app) as restarted:
         assert restarted.app.state.agent_state_store.load() == expected
         assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert restarted.app.state.external_reconciliation_required is False
+        assert restarted.get("/health").json() == {
+            "status": "ok",
+            "project": settings.project.name,
+        }
 
     assert settings.agent_state.path.exists()
 
@@ -576,7 +594,9 @@ def test_successful_chat_is_reconstructable_without_private_payloads(
     assert b"hidden" not in persisted.lower()
 
 
-def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> None:
+def test_true_rollback_keeps_runtime_reconciliation_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
         assert (
@@ -601,8 +621,21 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> Non
     runtime = RecordingRuntime()
     with _client(tmp_path, settings=settings, runtime=runtime) as gated:
         assert runtime.status is AgentRuntimeStatus.CREATED
+        assert gated.app.state.external_reconciliation_required is True
         assert gated.app.state.state_wal.inspect().active_manifest is not None
         assert gated.app.state.state_wal.inspect().active_manifest.external_reconciliation_required
+        monkeypatch.setattr(
+            gated.app.state.state_wal,
+            "inspect",
+            lambda: pytest.fail("health re-inspected WAL authority"),
+        )
+        health = gated.get("/health")
+        assert health.status_code == 200
+        assert health.json() == {
+            "status": "degraded",
+            "project": settings.project.name,
+            "reason": "external_reconciliation_required",
+        }
         response = gated.post(
             "/api/chat", json={"message": "blocked", "attachments": []}
         )
@@ -717,6 +750,7 @@ def test_journal_continuity_is_checked_before_v0_snapshot_rewrite(
         with TestClient(app):
             pass
 
+    assert not hasattr(app.state, "external_reconciliation_required")
     assert settings.agent_state.path.read_bytes() == legacy
     assert settings.event_journal.path.read_bytes() == journal_bytes
 

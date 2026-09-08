@@ -65,6 +65,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.state_wal,
             )
             recovery = app.state.state_recovery.prepare_startup()
+            app.state.external_reconciliation_required = (
+                recovery.external_reconciliation_required
+            )
             snapshot = recovery.snapshot
             snapshot_hash = recovery.snapshot_hash
 
@@ -178,6 +181,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
+        if app.state.external_reconciliation_required:
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "external_reconciliation_required",
+            }
         return {"status": "ok", "project": app_settings.project.name}
 
     app.include_router(chat.router)
