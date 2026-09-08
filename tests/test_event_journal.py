@@ -802,6 +802,91 @@ def test_canonically_hashed_semantically_impossible_recovery_fails_closed(
         value._verify_records((*records, impossible))
 
 
+@pytest.mark.parametrize(
+    "lifecycle",
+    [EventLifecycle.RECOVERY_PREPARED, EventLifecycle.RECOVERY_COMPLETED],
+)
+def test_recovery_lifecycle_forbids_normal_event_identity(
+    tmp_path: Path, lifecycle: EventLifecycle
+) -> None:
+    value = journal(tmp_path / f"recovery-identity-{lifecycle.value}.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, "recovery-identity-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "recovery-identity-wal"))
+    recovery_id = str(uuid5(NAMESPACE_URL, "recovery-identity-recovery"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.append_recovery_prepared(
+        recovery_id,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.EXACT_CURRENT,
+    )
+    if lifecycle is EventLifecycle.RECOVERY_COMPLETED:
+        value.append_recovery_completed(
+            recovery_id,
+            0,
+            HASH_0,
+            generation,
+            EventRecoveryCategory.EXACT_CURRENT,
+            False,
+            wal_record_id=wal_id,
+            wal_record_hash=HASH_1,
+        )
+    raw = value.records[-1].model_dump(mode="python")
+    item = event("forbidden-recovery-identity")
+    raw.update(
+        {
+            "event_id": item.event_id,
+            "event_type": item.event_type,
+            "source": item.source,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(raw)
+
+
+def test_canonically_hashed_reused_recovery_id_fails_closed(tmp_path: Path) -> None:
+    value = journal(tmp_path / "reused-recovery.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, "reused-recovery-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "reused-recovery-wal"))
+    recovery_id = str(uuid5(NAMESPACE_URL, "reused-recovery-id"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.append_recovery_prepared(
+        recovery_id,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.EXACT_CURRENT,
+    )
+    value.append_recovery_completed(
+        recovery_id,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.EXACT_CURRENT,
+        False,
+        wal_record_id=wal_id,
+        wal_record_hash=HASH_1,
+    )
+    records = value.records
+    reused = value._make_record(
+        EventLifecycle.RECOVERY_PREPARED,
+        previous_hash=records[-1].record_hash,
+        schema_version=2,
+        recovery_id=recovery_id,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+        wal_generation_id=generation,
+        recovery_category=EventRecoveryCategory.EXACT_CURRENT,
+        recovery_processing_high_water=0,
+    )
+
+    assert reused.record_hash == EventJournal._record_hash(reused)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, reused))
+
+
 def test_v2_history_rejects_canonically_hashed_schema_downgrade(tmp_path: Path) -> None:
     value = journal(tmp_path / "downgrade.jsonl")
     generation = str(uuid5(NAMESPACE_URL, "downgrade-generation"))

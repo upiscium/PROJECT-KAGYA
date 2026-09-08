@@ -533,3 +533,30 @@ def test_prepared_rebaseline_preserves_invalid_manifest_bytes(tmp_path: Path) ->
     preserved = list(wal.root.glob(f".manifest.json.{recovery_id}.*.invalid"))
     assert len(preserved) == 1
     assert preserved[0].read_bytes() == invalid
+
+
+def test_provisional_replacement_rejects_corrupt_boot_anchored_wal(
+    tmp_path: Path,
+) -> None:
+    wal, manifest = bootstrap(tmp_path)
+    inspection = wal.inspect()
+    wal.publish_boot_anchor(
+        snapshot_sequence=10,
+        snapshot_hash=inspection.latest_snapshot_hash,
+        generation_id=manifest.active_generation_id,
+        anchored_record_id=manifest.active_baseline_record_id,
+        anchored_record_hash=manifest.active_baseline_record_hash,
+        journal_processing_high_water=10,
+        journal_lineage_id=uuid4(),
+    )
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    with generation.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+    generation_before = generation.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+
+    with pytest.raises(StateWALConflictError):
+        wal.replace_unanchored_provisional(make_snapshot(10), 10)
+
+    assert generation.read_bytes() == generation_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -15,14 +15,17 @@ from kagya.runtime.agent_state import (
     EmotionStateSnapshot,
 )
 from kagya.runtime.event_journal import (
+    EventFailureCategory,
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
+    EventJournalLoadError,
     EventLifecycle,
 )
 from kagya.runtime.state_recovery import (
     StateRecoveryCoordinator,
     StateRecoveryError,
+    StateRecoveryResult,
 )
 from kagya.runtime.state_wal import (
     RecoveryReason,
@@ -45,7 +48,7 @@ def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshot:
     )
 
 
-def event(name: str, sequence: int) -> AgentEvent:
+def event(name: str, sequence: int | None) -> AgentEvent:
     return AgentEvent(
         str(uuid5(NAMESPACE_URL, name)),
         AgentEventType.CHAT,
@@ -104,6 +107,42 @@ def append_uncommitted_candidate(
         candidate_snapshot=candidate,
     )
     return initial, candidate
+
+
+def corrupt_active_generation(wal: StateWAL) -> tuple[UUID, Path, bytes]:
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    with generation.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+    return manifest.active_generation_id, generation, generation.read_bytes()
+
+
+def assert_completed_recovery_binding(
+    journal: EventJournal,
+    result: StateRecoveryResult,
+    recovery_id: str,
+    high_water: int,
+) -> None:
+    records = journal.inspect().records
+    prepared = next(
+        record
+        for record in records
+        if record.lifecycle is EventLifecycle.RECOVERY_PREPARED
+        and record.recovery_id == recovery_id
+    )
+    completed = next(
+        record
+        for record in records
+        if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+        and record.recovery_id == recovery_id
+    )
+    assert prepared.recovery_processing_high_water == high_water
+    assert completed.recovery_processing_high_water == high_water
+    assert prepared.wal_generation_id == completed.wal_generation_id
+    assert completed.wal_generation_id == str(result.manifest.active_generation_id)
+    assert completed.wal_record_id == str(result.manifest.active_baseline_record_id)
+    assert completed.wal_record_hash == result.manifest.active_baseline_record_hash
 
 
 def test_fresh_r06_bootstrap_creates_consistent_artifacts(tmp_path: Path) -> None:
@@ -174,6 +213,7 @@ def test_partial_v1_migration_reconstructs_missing_or_corrupt_current(
     assert inspection.schema_version == 2
     checkpoint = inspection.records[-1]
     assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.migration_previous_v1_hash is not None
     assert checkpoint.wal_generation_id == str(baseline.active_generation_id)
     assert checkpoint.wal_record_id == str(baseline.active_baseline_record_id)
     assert checkpoint.wal_record_hash == baseline.active_baseline_record_hash
@@ -193,6 +233,7 @@ def test_partial_fresh_bootstrap_reconstructs_wal_before_snapshot_checkpoint(
     assert store.load() == expected
     checkpoint = journal.inspect().records[-1]
     assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.migration_previous_v1_hash is None
     assert checkpoint.wal_generation_id == str(baseline.active_generation_id)
     assert checkpoint.wal_record_id == str(baseline.active_baseline_record_id)
 
@@ -356,6 +397,7 @@ def test_corrupt_active_wal_rebaselines_valid_canonical_current_without_gate(
     generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
     with generation.open("ab") as output:
         output.write(b"corrupt-tail\n")
+    generation_bytes = generation.read_bytes()
 
     recovered = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
     restarted = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
@@ -367,7 +409,257 @@ def test_corrupt_active_wal_rebaselines_valid_canonical_current_without_gate(
     assert recovered.manifest.active_generation_id != manifest.active_generation_id
     assert restarted.snapshot == result.snapshot
     assert not restarted.external_reconciliation_required
-    assert generation.read_bytes().endswith(b"corrupt-tail\n")
+    assert generation.read_bytes() == generation_bytes
+
+
+def test_committed_before_crash_with_corrupt_wal_keeps_canonical_current(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("corrupt-wal-committed", 1)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    start_event(journal, item)
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=uuid5(NAMESPACE_URL, "corrupt-wal-committed"),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+    old_generation_id, old_generation, old_generation_bytes = corrupt_active_generation(
+        wal
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == candidate
+    assert result.processing_high_water == 1
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    records = journal.inspect().records
+    assert any(
+        record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+        and record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+        for record in records
+    )
+    assert records[-1].wal_generation_id == str(result.manifest.active_generation_id)
+    assert wal.inspect().records[0].baseline_snapshot == candidate
+
+
+def test_v2_missing_manifest_without_open_recovery_repairs_current(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    old_manifest = wal.inspect().active_manifest
+    assert old_manifest is not None
+    old_generation = (
+        wal.root / "generations" / f"{old_manifest.active_generation_id}.jsonl"
+    )
+    old_generation_bytes = old_generation.read_bytes()
+    (wal.root / "manifest.json").unlink()
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == initial
+    assert result.exact_current_reconstructed
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_manifest.active_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    assert journal.inspect().records[-1].wal_generation_id == str(
+        result.manifest.active_generation_id
+    )
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_uncommitted_event_with_corrupt_wal_keeps_old_canonical_snapshot(
+    tmp_path: Path, prepared: bool
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    item = event(f"corrupt-wal-uncommitted-{prepared}", 1)
+    start_event(journal, item)
+    if prepared:
+        manifest = wal.inspect().active_manifest
+        assert manifest is not None
+        candidate = snapshot(1, 0.4)
+        journal.append_prepared(
+            item,
+            store.snapshot_hash(initial),
+            store.snapshot_hash(candidate),
+            str(manifest.active_generation_id),
+        )
+        wal.append_transition(
+            event_id=UUID(item.event_id),
+            event_type=item.event_type.value,
+            event_source=item.source.value,
+            processing_sequence=1,
+            prior_snapshot=initial,
+            candidate_snapshot=candidate,
+        )
+    old_generation_id, old_generation, old_generation_bytes = corrupt_active_generation(
+        wal
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == initial
+    assert result.processing_high_water == 1
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    assert any(
+        record.failure_category is EventFailureCategory.UNCOMMITTED_AFTER_CRASH
+        for record in journal.inspect().records
+    )
+
+
+def test_accepted_only_with_corrupt_wal_keeps_current_without_consuming_sequence(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    journal.append_accepted(event("corrupt-wal-accepted-only", None))
+    old_generation_id, old_generation, old_generation_bytes = corrupt_active_generation(
+        wal
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == initial
+    assert result.processing_high_water == 0
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    assert any(
+        record.failure_category is EventFailureCategory.ACCEPTED_NOT_STARTED
+        for record in journal.inspect().records
+    )
+
+
+def test_v1_migration_replaces_corrupt_unanchored_provisional_wal(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    current = snapshot(3, 0.3)
+    store.save(current)
+    journal.verify_and_reconcile(3, store.snapshot_hash(current))
+    wal.bootstrap(current, 3)
+    old_generation_id, old_generation, old_generation_bytes = corrupt_active_generation(
+        wal
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == current
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    checkpoint = journal.inspect().records[-1]
+    assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.migration_previous_v1_hash is not None
+    assert checkpoint.wal_generation_id == str(result.manifest.active_generation_id)
+
+
+def test_fresh_bootstrap_replaces_corrupt_unanchored_provisional_wal(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    current = snapshot(0, 0.3)
+    store.save(current)
+    wal.bootstrap(current, 0)
+    old_generation_id, old_generation, old_generation_bytes = corrupt_active_generation(
+        wal
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == current
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.manifest.active_generation_id != old_generation_id
+    assert old_generation.read_bytes() == old_generation_bytes
+    checkpoint = journal.inspect().records[-1]
+    assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.migration_previous_v1_hash is None
+    assert checkpoint.wal_generation_id == str(result.manifest.active_generation_id)
+
+
+def test_mismatching_snapshot_does_not_authorize_corrupt_wal_rebaseline(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("corrupt-wal-mismatch", 1)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    start_event(journal, item)
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    store.save(snapshot(1, 0.9))
+    _old_generation_id, old_generation, _old_generation_bytes = (
+        corrupt_active_generation(wal)
+    )
+    journal_before = journal.path.read_bytes()
+    generation_before = old_generation.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+
+    with pytest.raises(EventJournalLoadError):
+        StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert journal.path.read_bytes() == journal_before
+    assert old_generation.read_bytes() == generation_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before
+
+
+def test_corrupt_journal_never_authorizes_snapshot_or_wal_rewrite(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+    _old_generation_id, old_generation, _old_generation_bytes = (
+        corrupt_active_generation(wal)
+    )
+    with journal.path.open("ab") as output:
+        output.write(b"corrupt-journal\n")
+    snapshot_before = store.path.read_bytes()
+    journal_before = journal.path.read_bytes()
+    generation_before = old_generation.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+    anchor_path = wal.root / "boot_anchor.json"
+    anchor_before = anchor_path.read_bytes()
+
+    with pytest.raises(EventJournalLoadError):
+        StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert store.path.read_bytes() == snapshot_before
+    assert journal.path.read_bytes() == journal_before
+    assert old_generation.read_bytes() == generation_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before
+    assert anchor_path.read_bytes() == anchor_before
 
 
 def test_boot_anchor_survives_rotation_of_its_original_journal_record(
@@ -398,6 +690,7 @@ def test_boot_anchor_survives_rotation_of_its_original_journal_record(
     generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
     with generation.open("ab") as output:
         output.write(b"corrupt-tail\n")
+    generation_bytes = generation.read_bytes()
 
     recovered = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
@@ -405,6 +698,7 @@ def test_boot_anchor_survives_rotation_of_its_original_journal_record(
     assert recovered.processing_high_water == 20
     assert recovered.exact_current_reconstructed
     assert not recovered.external_reconciliation_required
+    assert generation.read_bytes() == generation_bytes
 
 
 def test_retained_checkpoint_replaces_old_lifecycle_cross_validation(
@@ -554,6 +848,7 @@ def test_missing_current_with_corrupt_wal_rolls_back_to_older_boot_anchor(
     )
     with corrupt_generation.open("ab") as output:
         output.write(b"corrupt-tail\n")
+    corrupt_generation_bytes = corrupt_generation.read_bytes()
     store.path.unlink()
 
     rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
@@ -566,6 +861,7 @@ def test_missing_current_with_corrupt_wal_rolls_back_to_older_boot_anchor(
         rolled_back.manifest.active_generation_id
         != current_manifest.active_generation_id
     )
+    assert corrupt_generation.read_bytes() == corrupt_generation_bytes
     rolled_back_generation = (
         wal.root
         / "generations"
@@ -573,12 +869,14 @@ def test_missing_current_with_corrupt_wal_rolls_back_to_older_boot_anchor(
     )
     with rolled_back_generation.open("ab") as output:
         output.write(b"corrupt-again\n")
+    rolled_back_generation_bytes = rolled_back_generation.read_bytes()
 
     still_gated = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert still_gated.exact_current_reconstructed
     assert not still_gated.true_rollback_performed
     assert still_gated.external_reconciliation_required
+    assert rolled_back_generation.read_bytes() == rolled_back_generation_bytes
     store.path.unlink()
 
     reconstructed_gated = StateRecoveryCoordinator(
@@ -624,21 +922,82 @@ def test_recovery_prepared_crash_resumes_same_id_without_open_recovery_accumulat
         StateRecoveryCoordinator(store, journal, failing_wal).prepare_startup()
     pending = journal.inspect().open_recoveries
     assert len(pending) == 1
+    assert pending[0].processing_high_water == 1
     recovery_id = pending[0].recovery_id
     partial = wal.root / "generations" / f"{pending[0].wal_generation_id}.jsonl"
     partial.write_bytes(b'{"partial":')
     partial.chmod(0o600)
+    partial_bytes = partial.read_bytes()
 
     resumed = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
     records = journal.inspect().records
     assert resumed.snapshot == initial
+    assert resumed.processing_high_water == 1
     assert journal.inspect().open_recoveries == ()
     assert [
         record.recovery_id
         for record in records
         if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
     ] == [recovery_id]
-    assert list((wal.root / "generations").glob(f".{partial.name}.*.invalid"))
+    prepared = next(
+        record
+        for record in records
+        if record.lifecycle is EventLifecycle.RECOVERY_PREPARED
+        and record.recovery_id == recovery_id
+    )
+    completed = next(
+        record
+        for record in records
+        if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+        and record.recovery_id == recovery_id
+    )
+    assert prepared.recovery_processing_high_water == 1
+    assert completed.recovery_processing_high_water == 1
+    assert completed.wal_generation_id == str(resumed.manifest.active_generation_id)
+    assert prepared.wal_generation_id == completed.wal_generation_id
+    assert completed.wal_record_id == str(resumed.manifest.active_baseline_record_id)
+    assert completed.wal_record_hash == resumed.manifest.active_baseline_record_hash
+    preserved_partial = list(
+        (wal.root / "generations").glob(f".{partial.name}.*.invalid")
+    )
+    assert len(preserved_partial) == 1
+    assert preserved_partial[0].read_bytes() == partial_bytes
+
+
+def test_invalid_wal_repair_resumes_after_manifest_was_preserved(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    _old_generation_id, old_generation, old_generation_bytes = (
+        corrupt_active_generation(wal)
+    )
+    manifest_bytes = (wal.root / "manifest.json").read_bytes()
+
+    def fail_manifest(stage: str) -> None:
+        if stage == "temp_write":
+            raise OSError("injected crash")
+
+    failing_wal = StateWAL(wal.root, failure_hook=fail_manifest)
+    with pytest.raises(StateWALError):
+        StateRecoveryCoordinator(store, journal, failing_wal).prepare_startup()
+    pending = journal.inspect().open_recoveries
+    assert len(pending) == 1
+    assert not (wal.root / "manifest.json").exists()
+    preserved_manifests = list(
+        wal.root.glob(f".manifest.json.{pending[0].recovery_id}.*.invalid")
+    )
+    assert len(preserved_manifests) == 1
+    assert preserved_manifests[0].read_bytes() == manifest_bytes
+
+    resumed = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert resumed.snapshot == initial
+    assert resumed.processing_high_water == 0
+    assert not resumed.external_reconciliation_required
+    assert journal.inspect().open_recoveries == ()
+    assert old_generation.read_bytes() == old_generation_bytes
+    assert_completed_recovery_binding(journal, resumed, pending[0].recovery_id, 0)
 
 
 def test_recovery_resumes_after_new_generation_before_snapshot_publication(
@@ -661,6 +1020,7 @@ def test_recovery_resumes_after_new_generation_before_snapshot_publication(
         StateRecoveryCoordinator(failing_store, journal, wal).prepare_startup()
     pending = journal.inspect().open_recoveries
     assert len(pending) == 1
+    assert pending[0].processing_high_water == 1
     recovery_id = pending[0].recovery_id
     assert wal.inspect().latest_snapshot_sequence == 0
     assert store.load() == initial
@@ -668,12 +1028,14 @@ def test_recovery_resumes_after_new_generation_before_snapshot_publication(
     resumed = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert resumed.snapshot == initial
+    assert resumed.processing_high_water == 1
     assert journal.inspect().open_recoveries == ()
     assert any(
         record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
         and record.recovery_id == recovery_id
         for record in journal.inspect().records
     )
+    assert_completed_recovery_binding(journal, resumed, recovery_id, 1)
 
 
 def test_recovery_resumes_after_snapshot_before_recovery_completed(
@@ -696,13 +1058,16 @@ def test_recovery_resumes_after_snapshot_before_recovery_completed(
         StateRecoveryCoordinator(store, journal, wal).prepare_startup()
     pending = journal.inspect().open_recoveries
     assert len(pending) == 1
+    assert pending[0].processing_high_water == 1
     assert store.load() == initial
 
     monkeypatch.setattr(journal, "append_recovery_completed", append_completed)
     resumed = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert resumed.snapshot == initial
+    assert resumed.processing_high_water == 1
     assert journal.inspect().open_recoveries == ()
+    assert_completed_recovery_binding(journal, resumed, pending[0].recovery_id, 1)
 
 
 def test_stale_recovery_result_is_rejected_when_publishing_boot_anchor(

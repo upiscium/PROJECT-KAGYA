@@ -97,30 +97,15 @@ class StateRecoveryCoordinator:
                     return self._resume_invalid_current_recovery(
                         journal_inspection, snapshot, snapshot
                     )
+            if snapshot is not None and journal_inspection.schema_version == 2:
+                return self._repair_v2_invalid_current(snapshot)
             if (
                 snapshot is not None
-                and journal_inspection.schema_version == 2
-                and snapshot.last_processed_event_sequence
-                == journal_inspection.snapshot_sequence
-                and self.state_store.snapshot_hash(snapshot)
-                == journal_inspection.snapshot_hash
+                and anchor is None
+                and journal_inspection.schema_version in {None, 1}
             ):
-                self.journal.inspect(
-                    snapshot.last_processed_event_sequence,
-                    self.state_store.snapshot_hash(snapshot),
-                )
-                self.journal.apply_planned_reconciliation(
-                    snapshot.last_processed_event_sequence,
-                    self.state_store.snapshot_hash(snapshot),
-                )
-                return self._start_recovery(
-                    self.journal.inspect(),
-                    None,
-                    snapshot,
-                    EventRecoveryCategory.EXACT_CURRENT,
-                    RecoveryReason.EXACT_CURRENT_REPAIR,
-                    external=journal_inspection.external_reconciliation_required,
-                    invalid_current=True,
+                return self._replace_unanchored_provisional(
+                    journal_inspection, snapshot
                 )
             if anchor is None:
                 raise StateRecoveryError("StateWAL is invalid and unanchored") from None
@@ -131,6 +116,39 @@ class StateRecoveryCoordinator:
                 wal_error=wal_error,
             )
         if not wal_inspection.exists:
+            if journal_inspection.open_recoveries:
+                if len(journal_inspection.open_recoveries) != 1:
+                    raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
+                pending = journal_inspection.open_recoveries[0]
+                if (
+                    snapshot is not None
+                    and pending.snapshot_sequence
+                    == snapshot.last_processed_event_sequence
+                    and pending.snapshot_hash
+                    == self.state_store.snapshot_hash(snapshot)
+                ):
+                    return self._resume_invalid_current_recovery(
+                        journal_inspection, snapshot, snapshot
+                    )
+                if anchor is not None:
+                    return self._recover_from_anchor(
+                        journal_inspection,
+                        snapshot,
+                        anchor_expected=True,
+                        wal_error=None,
+                    )
+                raise StateRecoveryError("Prepared recovery target is unavailable")
+            if journal_inspection.schema_version == 2:
+                if snapshot is not None:
+                    return self._repair_v2_invalid_current(snapshot)
+                if anchor is not None:
+                    return self._recover_from_anchor(
+                        journal_inspection,
+                        snapshot,
+                        anchor_expected=True,
+                        wal_error=None,
+                    )
+                raise StateRecoveryError("StateWAL is missing and unanchored")
             return self._bootstrap_r06(journal_inspection, snapshot, snapshot_error)
 
         if journal_inspection.schema_version in {None, 1}:
@@ -267,6 +285,90 @@ class StateRecoveryCoordinator:
             external=journal_inspection.external_reconciliation_required,
         )
         return self._finish_event_reconciliation(result)
+
+    def _repair_v2_invalid_current(
+        self,
+        snapshot: AgentStateSnapshot,
+    ) -> StateRecoveryResult:
+        snapshot_hash = self.state_store.snapshot_hash(snapshot)
+        self.journal.inspect(snapshot.last_processed_event_sequence, snapshot_hash)
+        recovery = self.journal.apply_planned_reconciliation(
+            snapshot.last_processed_event_sequence, snapshot_hash
+        )
+        reconciled = self.journal.inspect()
+        if (
+            recovery.snapshot_sequence != snapshot.last_processed_event_sequence
+            or recovery.snapshot_hash != snapshot_hash
+            or reconciled.snapshot_sequence != snapshot.last_processed_event_sequence
+            or reconciled.snapshot_hash != snapshot_hash
+        ):
+            raise StateRecoveryError("Journal reconciliation selected another snapshot")
+        return self._start_recovery(
+            reconciled,
+            None,
+            snapshot,
+            EventRecoveryCategory.EXACT_CURRENT,
+            RecoveryReason.EXACT_CURRENT_REPAIR,
+            external=reconciled.external_reconciliation_required,
+            invalid_current=True,
+        )
+
+    def _replace_unanchored_provisional(
+        self,
+        journal: EventJournalInspection,
+        snapshot: AgentStateSnapshot,
+    ) -> StateRecoveryResult:
+        """Finish bootstrap/migration when no v2 evidence anchors provisional WAL."""
+
+        snapshot_hash = self.state_store.snapshot_hash(snapshot)
+        if journal.schema_version is None:
+            if journal.records or snapshot.last_processed_event_sequence != 0:
+                raise StateRecoveryError(
+                    "provisional bootstrap state is not authoritative"
+                )
+            high_water = 0
+        else:
+            self.journal.inspect(
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+            )
+            recovery = self.journal.apply_planned_reconciliation(
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+            )
+            if (
+                recovery.snapshot_sequence != snapshot.last_processed_event_sequence
+                or recovery.snapshot_hash != snapshot_hash
+            ):
+                raise StateRecoveryError("R05 reconciliation selected another snapshot")
+            high_water = recovery.processing_high_water
+            journal = self.journal.inspect()
+        manifest = self.wal.replace_unanchored_provisional(snapshot, high_water)
+        inspection = self.wal.inspect()
+        if (
+            inspection.baseline_record_id is None
+            or inspection.baseline_record_hash is None
+        ):
+            raise StateRecoveryError("replacement WAL baseline is incomplete")
+        self.state_store.ensure_published(snapshot)
+        if journal.schema_version == 1:
+            self.journal.append_v2_migration_checkpoint(
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+                str(manifest.active_generation_id),
+                str(inspection.baseline_record_id),
+                inspection.baseline_record_hash,
+            )
+        else:
+            self.journal.append_v2_bootstrap_checkpoint(
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+                str(manifest.active_generation_id),
+                str(inspection.baseline_record_id),
+                inspection.baseline_record_hash,
+                processing_high_water=high_water,
+            )
+        return self._result(snapshot, high_water)
 
     def commit_candidate(
         self,
@@ -423,10 +525,17 @@ class StateRecoveryCoordinator:
         if not self._wal_latest_matches(wal, snapshot) or len(wal.records) != 1:
             raise StateRecoveryError("R05 migration WAL baseline is inconsistent")
         snapshot_hash = self.state_store.snapshot_hash(snapshot)
-        recovery = self.journal.apply_planned_reconciliation(
-            snapshot.last_processed_event_sequence, snapshot_hash
-        )
-        post = self.journal.inspect()
+        if journal.schema_version == 1:
+            recovery = self.journal.apply_planned_reconciliation(
+                snapshot.last_processed_event_sequence, snapshot_hash
+            )
+            high_water = recovery.processing_high_water
+            post = self.journal.inspect()
+        else:
+            baseline = wal.records[0]
+            assert isinstance(baseline, BaselineRecord)
+            high_water = baseline.journal_processing_high_water
+            post = journal
         manifest = wal.active_manifest
         if (
             manifest is None
@@ -450,11 +559,9 @@ class StateRecoveryCoordinator:
                 str(manifest.active_generation_id),
                 str(wal.baseline_record_id),
                 wal.baseline_record_hash,
-                processing_high_water=recovery.processing_high_water,
+                processing_high_water=high_water,
             )
-        return self._result(
-            snapshot, recovery.processing_high_water, exact=reconstructed
-        )
+        return self._result(snapshot, high_water, exact=reconstructed)
 
     def _start_recovery(
         self,

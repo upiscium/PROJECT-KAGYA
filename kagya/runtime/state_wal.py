@@ -725,6 +725,34 @@ class StateWAL:
                 allow_invalid_current=True,
             )
 
+    def replace_unanchored_provisional(
+        self,
+        snapshot: AgentStateSnapshot,
+        journal_processing_high_water: int,
+    ) -> Manifest:
+        """Replace WAL bytes proven not to be anchored by a v2 Journal."""
+
+        with self._lock:
+            try:
+                current = self.inspect_optional()
+            except StateWALError:
+                current = None
+            if current is not None and current.exists:
+                raise StateWALConflictError("provisional WAL is still valid")
+            if self.inspect_boot_anchor_optional() is not None:
+                raise StateWALConflictError("provisional WAL has a boot anchor")
+            return self._begin_generation(
+                snapshot,
+                journal_processing_high_water,
+                reason=RecoveryReason.BOOTSTRAP,
+                generation_id=uuid4(),
+                predecessor_generation_id=None,
+                predecessor_generation_hash=None,
+                external_reconciliation_required=False,
+                prepared_recovery_id=uuid4(),
+                allow_invalid_current=True,
+            )
+
     bootstrap = begin_generation
 
     def exists(self) -> bool:

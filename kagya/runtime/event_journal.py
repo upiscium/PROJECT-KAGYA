@@ -294,7 +294,7 @@ class EventJournalRecord(_JournalModel):
                 }
             )
         elif self.lifecycle is EventLifecycle.RECOVERY_PREPARED:
-            if self.schema_version != 2 or self.recovery_id is None:
+            if self.schema_version != 2 or self.recovery_id is None or not no_identity:
                 raise ValueError("v2 recovery preparation is invalid")
             self._require_snapshot()
             if self.recovery_category is None or self.wal_generation_id is None:
@@ -315,7 +315,7 @@ class EventJournalRecord(_JournalModel):
                 }
             )
         elif self.lifecycle is EventLifecycle.RECOVERY_COMPLETED:
-            if self.schema_version != 2 or self.recovery_id is None:
+            if self.schema_version != 2 or self.recovery_id is None or not no_identity:
                 raise ValueError("v2 recovery completion is invalid")
             self._require_snapshot()
             if self.recovery_category is None or self.wal_generation_id is None:
@@ -460,6 +460,7 @@ class _VerifiedJournal:
     external_reconciliation_required: bool
     wal_snapshot_sequence: int | None
     wal_snapshot_hash: str | None
+    open_recoveries: tuple[EventJournalRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,22 +716,8 @@ class EventJournal:
             self._validate_snapshot_identity(
                 classification_sequence, classification_hash
             )
-            open_events = tuple(
-                EventJournalOpenEvent(
-                    event_id=item.event_id,
-                    lifecycle=item.lifecycle,
-                    processing_sequence=item.processing_sequence,
-                    classification=(
-                        "accepted_only"
-                        if item.lifecycle is EventLifecycle.ACCEPTED
-                        else "prepared_committed_before_crash"
-                        if item.lifecycle is EventLifecycle.PREPARED
-                        and item.processing_sequence == classification_sequence
-                        and item.state_hash_after == classification_hash
-                        else "started_or_prepared_uncommitted"
-                    ),
-                )
-                for item in verified.open_events
+            open_events = self._plan_reconciliation(
+                verified, classification_sequence, classification_hash
             )
             return EventJournalInspection(
                 records=records,
@@ -753,14 +740,7 @@ class EventJournal:
                         snapshot_hash=record.snapshot_hash or "0" * 64,
                         wal_generation_id=record.wal_generation_id or "",
                     )
-                    for record in records
-                    if record.lifecycle is EventLifecycle.RECOVERY_PREPARED
-                    and record.recovery_id
-                    not in {
-                        completed.recovery_id
-                        for completed in records
-                        if completed.lifecycle is EventLifecycle.RECOVERY_COMPLETED
-                    }
+                    for record in verified.open_recoveries
                 ),
                 sequence_evidence=tuple(
                     record.processing_sequence
@@ -780,6 +760,66 @@ class EventJournal:
     ) -> EventJournalRecovery:
         """Apply the legacy reconciliation plan; migration remains explicit."""
         return self.verify_and_reconcile(snapshot_sequence, snapshot_hash)
+
+    @staticmethod
+    def _plan_reconciliation(
+        verified: _VerifiedJournal,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+    ) -> tuple[EventJournalOpenEvent, ...]:
+        """Validate a candidate identity and return a read-only crash plan."""
+
+        processing = tuple(
+            event
+            for event in verified.open_events
+            if event.lifecycle in {EventLifecycle.STARTED, EventLifecycle.PREPARED}
+        )
+        if len(processing) > 1:
+            raise EventJournalIntegrityError(
+                "EventJournal has multiple interrupted handlers"
+            )
+        canonical_matches = (
+            snapshot_sequence == verified.snapshot_sequence
+            and snapshot_hash == verified.snapshot_hash
+        )
+        committed_event_id: str | None = None
+        if processing:
+            interrupted = processing[0]
+            if interrupted.lifecycle is EventLifecycle.PREPARED:
+                if (
+                    snapshot_sequence == interrupted.processing_sequence
+                    and snapshot_hash == interrupted.state_hash_after
+                ):
+                    committed_event_id = interrupted.event_id
+                elif not (
+                    canonical_matches and snapshot_hash == interrupted.state_hash_before
+                ):
+                    raise EventJournalIntegrityError(
+                        "Prepared transition does not match canonical snapshot"
+                    )
+            elif not canonical_matches:
+                raise EventJournalIntegrityError(
+                    "Started event does not match canonical snapshot"
+                )
+        elif not canonical_matches:
+            raise EventJournalIntegrityError(
+                "Journal and canonical snapshot are inconsistent"
+            )
+        return tuple(
+            EventJournalOpenEvent(
+                event_id=item.event_id,
+                lifecycle=item.lifecycle,
+                processing_sequence=item.processing_sequence,
+                classification=(
+                    "accepted_only"
+                    if item.lifecycle is EventLifecycle.ACCEPTED
+                    else "prepared_committed_before_crash"
+                    if item.event_id == committed_event_id
+                    else "started_or_prepared_uncommitted"
+                ),
+            )
+            for item in verified.open_events
+        )
 
     def append_v2_migration_checkpoint(
         self,
@@ -1036,6 +1076,7 @@ class EventJournal:
                 )
 
             verified = self._verify_records(records)
+            self._plan_reconciliation(verified, snapshot_sequence, snapshot_hash)
             processing = tuple(
                 event
                 for event in verified.open_events
@@ -1378,16 +1419,7 @@ class EventJournal:
         if size <= self.max_bytes:
             return
         verified = self._verify_records(self._read_records_unlocked())
-        open_recovery_ids = {
-            record.recovery_id
-            for record in verified.records
-            if record.lifecycle is EventLifecycle.RECOVERY_PREPARED
-        } - {
-            record.recovery_id
-            for record in verified.records
-            if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
-        }
-        if verified.open_events or open_recovery_ids:
+        if verified.open_events or verified.open_recoveries:
             return
         if verified.records[-1].schema_version == 2 and not any(
             record.lifecycle
@@ -1720,6 +1752,7 @@ class EventJournal:
         seen_event_ids: set[str] = set()
         seen_record_ids: set[str] = set()
         recovery_open: dict[str, EventJournalRecord] = {}
+        seen_recovery_ids: set[str] = set()
         v2_seen = checkpoint.schema_version == 2
 
         for record in records:
@@ -1806,7 +1839,7 @@ class EventJournal:
                     raise EventJournalIntegrityError("recovery high-water is invalid")
                 prior = recovery_open.get(record.recovery_id)
                 if record.lifecycle is EventLifecycle.RECOVERY_PREPARED:
-                    if prior is not None:
+                    if prior is not None or record.recovery_id in seen_recovery_ids:
                         raise EventJournalIntegrityError("recovery is duplicated")
                     if record.recovery_category in {
                         EventRecoveryCategory.EXACT_CURRENT,
@@ -1827,6 +1860,7 @@ class EventJournal:
                             "prepared rollback semantics are invalid"
                         )
                     recovery_open[record.recovery_id] = record
+                    seen_recovery_ids.add(record.recovery_id)
                 else:
                     if prior is None or (
                         prior.wal_generation_id != record.wal_generation_id
@@ -2062,6 +2096,7 @@ class EventJournal:
             external_reconciliation_required,
             wal_snapshot_sequence,
             wal_snapshot_hash,
+            tuple(recovery_open.values()),
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:
