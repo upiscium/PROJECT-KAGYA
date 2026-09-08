@@ -26,6 +26,7 @@ from kagya.runtime.event_journal import (
     ParticipantOutcome,
     ParticipantRequirement,
     ReconciliationReason,
+    StartupParticipantOutcome,
     TransactionKind,
 )
 import kagya.runtime.event_journal as journal_module
@@ -69,6 +70,39 @@ def bootstrap_v3(path: Path) -> EventJournal:
     wal_id = str(uuid5(NAMESPACE_URL, "v2-wal"))
     value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
     value.append_v3_migration_checkpoint()
+    return value
+
+
+STARTUP_RECONCILIATION_ID = str(uuid5(NAMESPACE_URL, "startup-reconciliation"))
+STARTUP_RECOVERY_ID = str(uuid5(NAMESPACE_URL, "startup-recovery"))
+
+
+def startup_reconciliation_journal(path: Path) -> EventJournal:
+    value = journal(path)
+    generation = str(uuid5(NAMESPACE_URL, "startup-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "startup-wal"))
+    value.append_v2_bootstrap_checkpoint(1, HASH_1, generation, wal_id, HASH_2)
+    value.append_v3_migration_checkpoint()
+    anchor = value.records[0]
+    value.append_recovery_prepared(
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.TRUE_ROLLBACK,
+        processing_high_water=1,
+    )
+    value.append_recovery_completed(
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.TRUE_ROLLBACK,
+        True,
+        processing_high_water=1,
+        wal_record_id=anchor.wal_record_id or wal_id,
+        wal_record_hash=anchor.wal_record_hash or HASH_2,
+    )
     return value
 
 
@@ -1175,7 +1209,7 @@ def test_u1_f5_conflicting_duplicate_outcome_is_rejected(tmp_path: Path) -> None
             TX_ID,
             PARTICIPANTS[0],
             HASH_1,
-            ParticipantOutcome.COMPENSATED,
+            ParticipantOutcome.ALREADY_CONSISTENT,
         )
     assert value.records == before
 
@@ -1473,20 +1507,11 @@ def test_uncommitted_event_recovery_cannot_orphan_open_transaction(
     assert value.inspect().open_transactions[0].transaction_id == TX_ID
 
 
-def test_compensation_requires_reconciliation_and_cannot_complete_normally(
+def test_reconciliation_requires_explicit_terminal_transition(
     tmp_path: Path,
 ) -> None:
     value = bootstrap_v3(tmp_path / "compensation.jsonl")
     item = prepared_transaction(value, "compensation")
-
-    with pytest.raises(EventJournalAppendError):
-        value.append_participant_finalized(
-            item,
-            TX_ID,
-            PARTICIPANTS[0],
-            HASH_1,
-            ParticipantOutcome.COMPENSATED,
-        )
 
     value.append_participant_finalized(
         item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
@@ -1502,7 +1527,7 @@ def test_compensation_requires_reconciliation_and_cannot_complete_normally(
         TX_ID,
         PARTICIPANTS[1],
         HASH_2,
-        ParticipantOutcome.COMPENSATED,
+        ParticipantOutcome.FINALIZED,
     )
     with pytest.raises(EventJournalAppendError):
         value.append_transaction_completed(item, TX_ID)
@@ -1527,9 +1552,6 @@ def test_reconciliation_lifecycle_survives_restart_and_becomes_reconciled(
     value.close()
     reopened = journal(path)
     inspection = reopened.inspect()
-    assert inspection.internally_committed_transactions[0].unresolved_participants == (
-        PARTICIPANTS[1],
-    )
     assert inspection.reconciliation_required_transactions[0].transaction_id == TX_ID
     reopened.append_participant_finalized(
         item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.FINALIZED
@@ -1546,7 +1568,6 @@ def test_reconciliation_lifecycle_survives_restart_and_becomes_reconciled(
     )
     final = reopened.inspect()
     assert final.reconciled_transactions[0].transaction_id == TX_ID
-    assert final.internally_committed_transactions == ()
     assert final.reconciliation_required_transactions == ()
     assert final.open_transactions == ()
     assert final.records[-1].lifecycle is EventLifecycle.COMPLETED
@@ -1648,3 +1669,309 @@ def test_v3_rotation_remains_readable_after_migration_segment_is_pruned(
     assert inspection.schema_version == 3
     assert inspection.processing_high_water == 4
     assert inspection.snapshot_hash == HASH_1
+
+
+def test_startup_reconciliation_is_metadata_free_and_does_not_consume_sequence(
+    tmp_path: Path,
+) -> None:
+    value = startup_reconciliation_journal(tmp_path / "startup.jsonl")
+    before = value.inspect()
+    value.append_startup_reconciliation_prepared(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        value.records[0].wal_generation_id or "",
+        value.records[0].wal_record_id or "",
+        value.records[0].wal_record_hash or "",
+        before.journal_lineage_id or "",
+        transaction_requirements(),
+    )
+
+    record = value.records[-1]
+    assert record.event_id is None
+    assert record.event_type is None
+    assert record.source is None
+    assert record.processing_sequence is None
+    assert value.inspect().processing_high_water == before.processing_high_water == 1
+    assert value.inspect().open_startup_reconciliations[0].recovery_id == (
+        STARTUP_RECOVERY_ID
+    )
+
+
+def test_startup_reconciliation_binds_recovery_wal_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "startup-restart.jsonl"
+    value = startup_reconciliation_journal(path)
+    anchor = value.records[0]
+    lineage = value.inspect().journal_lineage_id or ""
+    requirements = transaction_requirements()
+    value.append_startup_reconciliation_prepared(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        anchor.wal_generation_id or "",
+        anchor.wal_record_id or "",
+        anchor.wal_record_hash or "",
+        lineage,
+        requirements,
+    )
+    value.close()
+
+    reopened = journal(path)
+    startup = reopened.inspect().open_startup_reconciliations[0]
+    recovery = next(
+        record
+        for record in reopened.records
+        if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+    )
+    assert startup.required_participants == requirements
+    assert startup.snapshot_hash == HASH_0
+    assert startup.recovery_processing_high_water == 1
+    assert startup.wal_generation_id == recovery.wal_generation_id
+    assert startup.wal_record_id == recovery.wal_record_id
+    assert startup.wal_record_hash == recovery.wal_record_hash
+    assert startup.journal_lineage_id == lineage
+    assert recovery.wal_record_id is not None
+    assert recovery.wal_record_hash == HASH_2
+
+
+def test_startup_reconciliation_rejects_identity_tampering_and_invalid_participant(
+    tmp_path: Path,
+) -> None:
+    value = startup_reconciliation_journal(tmp_path / "startup-invalid.jsonl")
+    lineage = value.inspect().journal_lineage_id or ""
+    generation = value.records[0].wal_generation_id or ""
+    wal_record_id = value.records[0].wal_record_id or ""
+    wal_record_hash = value.records[0].wal_record_hash or ""
+    value.append_startup_reconciliation_prepared(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        generation,
+        wal_record_id,
+        wal_record_hash,
+        lineage,
+        transaction_requirements(),
+    )
+    with pytest.raises(EventJournalAppendError) as error:
+        value.append_startup_participant_reconciled(
+            STARTUP_RECONCILIATION_ID,
+            str(uuid5(NAMESPACE_URL, "wrong-recovery")),
+            0,
+            HASH_0,
+            1,
+            generation,
+            wal_record_id,
+            wal_record_hash,
+            lineage,
+            PARTICIPANTS[0],
+            HASH_1,
+            StartupParticipantOutcome.VERIFIED_CONSISTENT,
+        )
+    assert_bounded(error.value)
+    with pytest.raises(EventJournalAppendError):
+        value.append_startup_participant_reconciled(
+            STARTUP_RECONCILIATION_ID,
+            STARTUP_RECOVERY_ID,
+            0,
+            HASH_0,
+            1,
+            generation,
+            wal_record_id,
+            wal_record_hash,
+            lineage,
+            "unknown.participant",
+            HASH_1,
+            StartupParticipantOutcome.VERIFIED_CONSISTENT,
+        )
+
+    path = value.path
+    value.close()
+    lines = path.read_bytes().splitlines()
+    tampered = json.loads(lines[-1])
+    tampered["snapshot_hash"] = HASH_1
+    path.write_bytes(
+        b"\n".join((*lines[:-1], json.dumps(tampered).encode())) + b"\n"
+    )
+    with pytest.raises(EventJournalLoadError) as load_error:
+        journal(path)
+    assert_bounded(load_error.value)
+
+
+def test_startup_reconciliation_rejects_duplicate_and_premature_completion(
+    tmp_path: Path,
+) -> None:
+    value = startup_reconciliation_journal(tmp_path / "startup-completion.jsonl")
+    generation = value.records[0].wal_generation_id or ""
+    wal_record_id = value.records[0].wal_record_id or ""
+    wal_record_hash = value.records[0].wal_record_hash or ""
+    lineage = value.inspect().journal_lineage_id or ""
+    requirements = transaction_requirements()
+    value.append_startup_reconciliation_prepared(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        generation,
+        wal_record_id,
+        wal_record_hash,
+        lineage,
+        requirements,
+    )
+    with pytest.raises(EventJournalAppendError):
+        value.append_startup_reconciliation_prepared(
+            str(uuid5(NAMESPACE_URL, "duplicate-startup-recovery")),
+            STARTUP_RECOVERY_ID,
+            0,
+            HASH_0,
+            1,
+            generation,
+            wal_record_id,
+            wal_record_hash,
+            lineage,
+            requirements,
+        )
+    with pytest.raises(EventJournalAppendError):
+        value.append_startup_reconciliation_completed(
+            STARTUP_RECONCILIATION_ID,
+            STARTUP_RECOVERY_ID,
+            0,
+            HASH_0,
+            1,
+            generation,
+            wal_record_id,
+            wal_record_hash,
+            lineage,
+        )
+    value.append_startup_participant_reconciled(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        generation,
+        wal_record_id,
+        wal_record_hash,
+        lineage,
+        PARTICIPANTS[0],
+        HASH_1,
+        StartupParticipantOutcome.VERIFIED_CONSISTENT,
+    )
+    with pytest.raises(EventJournalAppendError):
+        value.append_startup_participant_reconciled(
+            STARTUP_RECONCILIATION_ID,
+            STARTUP_RECOVERY_ID,
+            0,
+            HASH_0,
+            1,
+            generation,
+            wal_record_id,
+            wal_record_hash,
+            lineage,
+            PARTICIPANTS[0],
+            HASH_1,
+            StartupParticipantOutcome.VERIFIED_CONSISTENT,
+        )
+
+
+def test_startup_reconciliation_completion_unblocks_rotation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "startup-rotation.jsonl"
+    value = EventJournal(path, 1, 2, clock=lambda: NOW)
+    generation = str(uuid5(NAMESPACE_URL, "startup-rotation-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "startup-rotation-wal"))
+    value.append_v2_bootstrap_checkpoint(1, HASH_1, generation, wal_id, HASH_2)
+    value.append_v3_migration_checkpoint()
+    anchor = value.records[0]
+    value.append_recovery_prepared(
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.TRUE_ROLLBACK,
+        processing_high_water=1,
+    )
+    value.append_recovery_completed(
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.TRUE_ROLLBACK,
+        True,
+        processing_high_water=1,
+        wal_record_id=anchor.wal_record_id or wal_id,
+        wal_record_hash=anchor.wal_record_hash or HASH_2,
+    )
+    lineage = value.inspect().journal_lineage_id or ""
+    rotations_before = set(tmp_path.glob("startup-rotation.jsonl.[0-9]*"))
+    value.append_startup_reconciliation_prepared(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        generation,
+        anchor.wal_record_id or wal_id,
+        anchor.wal_record_hash or HASH_2,
+        lineage,
+        transaction_requirements(),
+    )
+    assert set(tmp_path.glob("startup-rotation.jsonl.[0-9]*")) == rotations_before
+    for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True):
+        value.append_startup_participant_reconciled(
+            STARTUP_RECONCILIATION_ID,
+            STARTUP_RECOVERY_ID,
+            0,
+            HASH_0,
+            1,
+            generation,
+            anchor.wal_record_id or wal_id,
+            anchor.wal_record_hash or HASH_2,
+            lineage,
+            participant,
+            digest,
+            StartupParticipantOutcome.ROLLED_FORWARD,
+        )
+    value.append_startup_reconciliation_completed(
+        STARTUP_RECONCILIATION_ID,
+        STARTUP_RECOVERY_ID,
+        0,
+        HASH_0,
+        1,
+        generation,
+        anchor.wal_record_id or wal_id,
+        anchor.wal_record_hash or HASH_2,
+        lineage,
+    )
+    assert set(tmp_path.glob("startup-rotation.jsonl.[0-9]*")) != rotations_before
+    assert all(
+        record.lifecycle is not EventLifecycle.RECOVERY_COMPLETED
+        for record in value.records
+    )
+    assert value.inspect().open_startup_reconciliations == ()
+    for recovery_id in (
+        STARTUP_RECOVERY_ID,
+        str(uuid5(NAMESPACE_URL, "invented-pruned-recovery")),
+    ):
+        with pytest.raises(EventJournalAppendError):
+            value.append_startup_reconciliation_prepared(
+                str(uuid5(NAMESPACE_URL, f"retry-{recovery_id}")),
+                recovery_id,
+                0,
+                HASH_0,
+                1,
+                generation,
+                anchor.wal_record_id or wal_id,
+                anchor.wal_record_hash or HASH_2,
+                lineage,
+                transaction_requirements(),
+            )

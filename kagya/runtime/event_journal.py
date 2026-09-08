@@ -52,6 +52,9 @@ class EventLifecycle(str, Enum):
     TRANSACTION_COMPLETED = "transaction_completed"
     TRANSACTION_RECONCILIATION_REQUIRED = "transaction_reconciliation_required"
     TRANSACTION_RECONCILED = "transaction_reconciled"
+    STARTUP_RECONCILIATION_PREPARED = "startup_reconciliation_prepared"
+    STARTUP_PARTICIPANT_RECONCILED = "startup_participant_reconciled"
+    STARTUP_RECONCILIATION_COMPLETED = "startup_reconciliation_completed"
 
 
 class TransactionKind(str, Enum):
@@ -61,7 +64,11 @@ class TransactionKind(str, Enum):
 class ParticipantOutcome(str, Enum):
     FINALIZED = "finalized"
     ALREADY_CONSISTENT = "already_consistent"
-    COMPENSATED = "compensated"
+
+
+class StartupParticipantOutcome(str, Enum):
+    VERIFIED_CONSISTENT = "verified_consistent"
+    ROLLED_FORWARD = "rolled_forward"
 
 
 class ReconciliationReason(str, Enum):
@@ -141,6 +148,8 @@ class EventJournalRecord(_JournalModel):
     participant_id: str | None = None
     operation_digest: str | None = None
     participant_outcome: ParticipantOutcome | None = None
+    reconciliation_id: str | None = None
+    startup_participant_outcome: StartupParticipantOutcome | None = None
     reconciliation_reason: ReconciliationReason | None = None
     unresolved_participants: tuple[str, ...] | None = None
 
@@ -181,6 +190,7 @@ class EventJournalRecord(_JournalModel):
             self.wal_generation_id,
             self.wal_record_id,
             self.recovery_id,
+            self.reconciliation_id,
             self.journal_lineage_id,
         ):
             if value is not None:
@@ -233,6 +243,8 @@ class EventJournalRecord(_JournalModel):
             self.participant_outcome,
             self.reconciliation_reason,
             self.unresolved_participants,
+            self.reconciliation_id,
+            self.startup_participant_outcome,
         )
         if self.schema_version in {1, 2} and any(
             value is not None for value in v3_fields
@@ -328,6 +340,60 @@ class EventJournalRecord(_JournalModel):
                 )
             ):
                 raise ValueError("transaction reconciliation is incomplete")
+            return self
+        startup_lifecycles = {
+            EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+            EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+        }
+        if self.lifecycle in startup_lifecycles:
+            if (
+                self.schema_version != 3
+                or not no_identity
+                or self.processing_sequence is not None
+                or self.reconciliation_id is None
+                or self.recovery_id is None
+                or self.snapshot_sequence is None
+                or self.snapshot_hash is None
+                or self.recovery_processing_high_water is None
+                or self.wal_generation_id is None
+                or self.wal_record_id is None
+                or self.wal_record_hash is None
+                or self.journal_lineage_id is None
+            ):
+                raise ValueError("startup reconciliation binding is incomplete")
+            allowed = {
+                EventLifecycle.STARTUP_RECONCILIATION_PREPARED: {
+                    "reconciliation_id", "recovery_id", "snapshot_sequence",
+                    "snapshot_hash", "recovery_processing_high_water",
+                    "wal_generation_id", "wal_record_id", "wal_record_hash",
+                    "journal_lineage_id", "required_participants",
+                },
+                EventLifecycle.STARTUP_PARTICIPANT_RECONCILED: {
+                    "reconciliation_id", "recovery_id", "snapshot_sequence",
+                    "snapshot_hash", "recovery_processing_high_water",
+                    "wal_generation_id", "wal_record_id", "wal_record_hash",
+                    "journal_lineage_id", "participant_id",
+                    "operation_digest", "startup_participant_outcome",
+                },
+                EventLifecycle.STARTUP_RECONCILIATION_COMPLETED: {
+                    "reconciliation_id", "recovery_id", "snapshot_sequence",
+                    "snapshot_hash", "recovery_processing_high_water",
+                    "wal_generation_id", "wal_record_id", "wal_record_hash",
+                    "journal_lineage_id",
+                },
+            }[self.lifecycle]
+            self._forbid_irrelevant_fields(allowed)
+            if self.lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED:
+                if not self.required_participants:
+                    raise ValueError("startup preparation participants are missing")
+            elif self.lifecycle is EventLifecycle.STARTUP_PARTICIPANT_RECONCILED:
+                if (
+                    self.participant_id is None
+                    or self.operation_digest is None
+                    or self.startup_participant_outcome is None
+                ):
+                    raise ValueError("startup participant evidence is incomplete")
             return self
         if self.lifecycle is EventLifecycle.CHECKPOINT:
             if not no_identity or self.processing_sequence is None:
@@ -562,6 +628,8 @@ class EventJournalRecord(_JournalModel):
             "participant_id",
             "operation_digest",
             "participant_outcome",
+            "reconciliation_id",
+            "startup_participant_outcome",
             "reconciliation_reason",
             "unresolved_participants",
         )
@@ -648,6 +716,30 @@ class EventJournalTransaction:
 
 
 @dataclass(frozen=True, slots=True)
+class EventJournalStartupReconciliation:
+    reconciliation_id: str
+    recovery_id: str
+    snapshot_sequence: int
+    snapshot_hash: str
+    recovery_processing_high_water: int
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+    journal_lineage_id: str
+    required_participants: tuple[ParticipantRequirement, ...]
+    participant_outcomes: tuple[
+        tuple[str, str, StartupParticipantOutcome], ...
+    ]
+    completed: bool
+
+    @property
+    def known_outcomes(
+        self,
+    ) -> tuple[tuple[str, str, StartupParticipantOutcome], ...]:
+        return self.participant_outcomes
+
+
+@dataclass(frozen=True, slots=True)
 class _VerifiedJournal:
     records: tuple[EventJournalRecord, ...]
     processing_high_water: int
@@ -663,6 +755,7 @@ class _VerifiedJournal:
     wal_record_id: str | None
     wal_record_hash: str | None
     transactions: tuple[EventJournalTransaction, ...] = ()
+    startup_reconciliations: tuple[EventJournalStartupReconciliation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -706,10 +799,13 @@ class EventJournalInspection:
     wal_record_id: str | None
     wal_record_hash: str | None
     open_transactions: tuple[EventJournalTransaction, ...] = ()
-    internally_committed_transactions: tuple[EventJournalTransaction, ...] = ()
     reconciliation_required_transactions: tuple[EventJournalTransaction, ...] = ()
     completed_transactions: tuple[EventJournalTransaction, ...] = ()
     reconciled_transactions: tuple[EventJournalTransaction, ...] = ()
+    open_startup_reconciliations: tuple[EventJournalStartupReconciliation, ...] = ()
+    completed_startup_reconciliations: tuple[
+        EventJournalStartupReconciliation, ...
+    ] = ()
 
 
 class EventJournalLease:
@@ -917,10 +1013,11 @@ class EventJournal:
                     wal_record_id=None,
                     wal_record_hash=None,
                     open_transactions=(),
-                    internally_committed_transactions=(),
                     reconciliation_required_transactions=(),
                     completed_transactions=(),
                     reconciled_transactions=(),
+                    open_startup_reconciliations=(),
+                    completed_startup_reconciliations=(),
                 )
             verified = self._verify_records(records)
             classification_sequence = (
@@ -977,12 +1074,6 @@ class EventJournal:
                 open_transactions=tuple(
                     t for t in verified.transactions if t.terminal_lifecycle is None
                 ),
-                internally_committed_transactions=tuple(
-                    t
-                    for t in verified.transactions
-                    if t.terminal_lifecycle is None
-                    and (t.participant_outcomes or t.reconciliation_reason is not None)
-                ),
                 reconciliation_required_transactions=tuple(
                     t
                     for t in verified.transactions
@@ -998,6 +1089,14 @@ class EventJournal:
                     t
                     for t in verified.transactions
                     if t.terminal_lifecycle is EventLifecycle.TRANSACTION_RECONCILED
+                ),
+                open_startup_reconciliations=tuple(
+                    item
+                    for item in verified.startup_reconciliations
+                    if not item.completed
+                ),
+                completed_startup_reconciliations=tuple(
+                    item for item in verified.startup_reconciliations if item.completed
                 ),
             )
 
@@ -1120,6 +1219,7 @@ class EventJournal:
                 verified.open_events
                 or verified.open_recoveries
                 or verified.transactions
+                or any(not item.completed for item in verified.startup_reconciliations)
             ):
                 raise EventJournalIntegrityError(
                     "v3 migration requires a closed v2 journal"
@@ -1235,6 +1335,129 @@ class EventJournal:
     ) -> None:
         self._append_transaction(
             EventLifecycle.TRANSACTION_RECONCILED, event, transaction_id=transaction_id
+        )
+
+    def _append_startup_reconciliation(
+        self, lifecycle: EventLifecycle, **fields: object
+    ) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 3:
+                raise EventJournalIntegrityError(
+                    "startup reconciliation evidence requires schema 3"
+                )
+            validation_failure: EventJournalAppendError | None = None
+            try:
+                if (
+                    lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED
+                    and not any(
+                        record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                        and record.recovery_id == fields.get("recovery_id")
+                        for record in records
+                    )
+                ):
+                    raise EventJournalIntegrityError(
+                        "startup reconciliation recovery evidence is unknown"
+                    )
+                record = self._make_record(
+                    lifecycle,
+                    previous_hash=records[-1].record_hash,
+                    schema_version=3,
+                    event=None,
+                    **fields,
+                )
+                self._verify_records((*records, record))
+            except (ValidationError, ValueError, EventJournalIntegrityError):
+                validation_failure = EventJournalAppendError(
+                    EventJournalAppendStage.VALIDATE, published=False
+                )
+            if validation_failure is not None:
+                raise validation_failure
+            self._append_record_unlocked(record)
+            self._maybe_rotate_unlocked()
+
+    def append_startup_reconciliation_prepared(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+        required_participants: tuple[ParticipantRequirement, ...],
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
+            required_participants=required_participants,
+        )
+
+    def append_startup_participant_reconciled(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+        participant_id: str,
+        operation_digest: str,
+        outcome: StartupParticipantOutcome,
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
+            participant_id=participant_id,
+            operation_digest=operation_digest,
+            startup_participant_outcome=outcome,
+        )
+
+    def append_startup_reconciliation_completed(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
         )
 
     def append_v2_bootstrap_checkpoint(
@@ -1726,6 +1949,8 @@ class EventJournal:
                 "participant_outcome",
                 "reconciliation_reason",
                 "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
             }
             if record.schema_version == 1
             else {
@@ -1739,6 +1964,8 @@ class EventJournal:
                 "participant_outcome",
                 "reconciliation_reason",
                 "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
             }
             if record.schema_version in {1, 2}
             else set()
@@ -1782,6 +2009,8 @@ class EventJournal:
                 "participant_outcome",
                 "reconciliation_reason",
                 "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
             }
             if record.schema_version == 1
             else {
@@ -1795,6 +2024,8 @@ class EventJournal:
                 "participant_outcome",
                 "reconciliation_reason",
                 "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
             }
             if record.schema_version in {1, 2}
             else set()
@@ -1867,6 +2098,7 @@ class EventJournal:
             verified.open_events
             or verified.open_recoveries
             or any(t.terminal_lifecycle is None for t in verified.transactions)
+            or any(not item.completed for item in verified.startup_reconciliations)
         ):
             return
         if verified.records[-1].schema_version >= 2 and not any(
@@ -2219,6 +2451,11 @@ class EventJournal:
         seen_record_ids: set[str] = set()
         recovery_open: dict[str, EventJournalRecord] = {}
         seen_recovery_ids: set[str] = set()
+        completed_recoveries: dict[str, EventJournalRecord] = {}
+        startup_open: dict[str, dict[str, Any]] = {}
+        startup_seen_ids: set[str] = set()
+        startup_seen_recovery_ids: set[str] = set()
+        startup_completed: list[dict[str, Any]] = []
         v2_seen = checkpoint.schema_version == 2
         v3_seen = checkpoint.schema_version == 3
         v3_migration_anchor_hash = checkpoint.v3_migration_anchor_hash
@@ -2270,6 +2507,10 @@ class EventJournal:
                 if any(t["terminal"] is None for t in transactions.values()):
                     raise EventJournalIntegrityError(
                         "Checkpoint cannot hide open transaction lifecycle"
+                    )
+                if startup_open:
+                    raise EventJournalIntegrityError(
+                        "Checkpoint cannot hide open startup reconciliation"
                     )
                 if (
                     record.processing_sequence != high_water
@@ -2418,7 +2659,131 @@ class EventJournal:
                     wal_record_hash = record.wal_record_hash
                     wal_snapshot_sequence = record.snapshot_sequence
                     wal_snapshot_hash = record.snapshot_hash
+                    completed_recoveries[record.recovery_id] = record
                     del recovery_open[record.recovery_id]
+                continue
+            if record.lifecycle in {
+                EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+                EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+                EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            }:
+                rid = record.reconciliation_id
+                assert rid is not None
+                if record.lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED:
+                    recovery = completed_recoveries.get(record.recovery_id or "")
+                    recovery_binding = (
+                        recovery.external_reconciliation_required,
+                        recovery.snapshot_sequence,
+                        recovery.snapshot_hash,
+                        recovery.recovery_processing_high_water,
+                        recovery.wal_generation_id,
+                        recovery.wal_record_id,
+                        recovery.wal_record_hash,
+                    ) if recovery is not None else (
+                        external_reconciliation_required,
+                        snapshot_sequence,
+                        snapshot_hash,
+                        high_water,
+                        wal_generation_id,
+                        wal_record_id,
+                        wal_record_hash,
+                    )
+                    if recovery_binding != (
+                        True,
+                        record.snapshot_sequence,
+                        record.snapshot_hash,
+                        record.recovery_processing_high_water,
+                        record.wal_generation_id,
+                        record.wal_record_id,
+                        record.wal_record_hash,
+                    ) or record.journal_lineage_id != journal_lineage_id:
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation binding is invalid"
+                        )
+                    if (
+                        rid in startup_seen_ids
+                        or rid in startup_open
+                        or record.recovery_id in startup_seen_recovery_ids
+                    ):
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation is duplicated"
+                        )
+                    assert record.required_participants is not None
+                    startup_open[rid] = {
+                        "record": record,
+                        "required": record.required_participants,
+                        "outcomes": {},
+                        "completed": False,
+                    }
+                    startup_seen_ids.add(rid)
+                    assert record.recovery_id is not None
+                    startup_seen_recovery_ids.add(record.recovery_id)
+                else:
+                    state = startup_open.get(rid)
+                    if state is None:
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation is not open"
+                        )
+                    prior = state["record"]
+                    common = (
+                        record.recovery_id,
+                        record.snapshot_sequence,
+                        record.snapshot_hash,
+                        record.recovery_processing_high_water,
+                        record.wal_generation_id,
+                        record.wal_record_id,
+                        record.wal_record_hash,
+                        record.journal_lineage_id,
+                    )
+                    expected = (
+                        prior.recovery_id,
+                        prior.snapshot_sequence,
+                        prior.snapshot_hash,
+                        prior.recovery_processing_high_water,
+                        prior.wal_generation_id,
+                        prior.wal_record_id,
+                        prior.wal_record_hash,
+                        prior.journal_lineage_id,
+                    )
+                    if common != expected:
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation binding changed"
+                        )
+                    if (
+                        record.lifecycle
+                        is EventLifecycle.STARTUP_PARTICIPANT_RECONCILED
+                    ):
+                        assert record.participant_id is not None
+                        assert record.operation_digest is not None
+                        required = {
+                            item.participant_id: item.operation_digest
+                            for item in state["required"]
+                        }
+                        if (
+                            record.participant_id not in required
+                            or record.operation_digest
+                            != required[record.participant_id]
+                            or record.participant_id in state["outcomes"]
+                        ):
+                            raise EventJournalIntegrityError(
+                                "startup participant evidence is invalid"
+                            )
+                        assert record.startup_participant_outcome is not None
+                        state["outcomes"][record.participant_id] = (
+                            record.operation_digest,
+                            record.startup_participant_outcome,
+                        )
+                    else:
+                        required_ids = {
+                            item.participant_id for item in state["required"]
+                        }
+                        if set(state["outcomes"]) != required_ids:
+                            raise EventJournalIntegrityError(
+                                "startup reconciliation completion is premature"
+                            )
+                        state["completed"] = True
+                        startup_completed.append(state)
+                        del startup_open[rid]
                 continue
             if record.lifecycle in {
                 EventLifecycle.TRANSACTION_PREPARED,
@@ -2495,11 +2860,6 @@ class EventJournal:
                             != required.get(record.participant_id)
                             or record.participant_id in tx["outcomes"]
                             or tx["terminal"] is not None
-                            or (
-                                record.participant_outcome
-                                is ParticipantOutcome.COMPENSATED
-                                and tx["reason"] is None
-                            )
                         ):
                             raise EventJournalIntegrityError(
                                 "participant finalization is invalid"
@@ -2532,7 +2892,6 @@ class EventJournal:
                             tx["terminal"] is not None
                             or tx["reason"] is not None
                             or set(tx["outcomes"]) != set(required)
-                            or ParticipantOutcome.COMPENSATED in tx["outcomes"].values()
                         ):
                             raise EventJournalIntegrityError(
                                 "transaction completion is premature"
@@ -2758,6 +3117,36 @@ class EventJournal:
             )
             for transaction_id, value in transactions.items()
         )
+        startup_views = tuple(
+            EventJournalStartupReconciliation(
+                reconciliation_id=rid,
+                recovery_id=state["record"].recovery_id or "",
+                snapshot_sequence=state["record"].snapshot_sequence or 0,
+                snapshot_hash=state["record"].snapshot_hash or "0" * 64,
+                recovery_processing_high_water=(
+                    state["record"].recovery_processing_high_water or 0
+                ),
+                wal_generation_id=state["record"].wal_generation_id or "",
+                wal_record_id=state["record"].wal_record_id or "",
+                wal_record_hash=state["record"].wal_record_hash or "0" * 64,
+                journal_lineage_id=state["record"].journal_lineage_id or "",
+                required_participants=state["required"],
+                participant_outcomes=tuple(
+                    (participant, digest, outcome)
+                    for participant, (digest, outcome) in sorted(
+                        state["outcomes"].items()
+                    )
+                ),
+                completed=state["completed"],
+            )
+            for rid, state in [
+                *startup_open.items(),
+                *[
+                    (item["record"].reconciliation_id, item)
+                    for item in startup_completed
+                ],
+            ]
+        )
         return _VerifiedJournal(
             records,
             high_water,
@@ -2773,6 +3162,7 @@ class EventJournal:
             wal_record_id,
             wal_record_hash,
             transaction_views,
+            startup_views,
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:
