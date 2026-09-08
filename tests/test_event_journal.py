@@ -702,6 +702,195 @@ def test_v2_recovery_open_pair_is_read_only_and_high_water_stable(
         HASH_0,
         generation,
         EventRecoveryCategory.UNCOMMITTED_TAIL,
-        True,
+        False,
+        wal_record_id=wal_id,
+        wal_record_hash=HASH_1,
     )
     assert value.inspect().open_recoveries == ()
+
+
+def test_v2_rotation_waits_for_recovery_and_uses_completed_wal_anchor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rotation-v2.jsonl"
+    value = EventJournal(path, 100_000, 4, clock=lambda: NOW)
+    generation = str(uuid5(NAMESPACE_URL, "rotation-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "rotation-wal"))
+    recovery_id = str(uuid5(NAMESPACE_URL, "rotation-recovery"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.max_bytes = 1
+    value.append_recovery_prepared(
+        recovery_id, 0, HASH_0, generation, EventRecoveryCategory.EXACT_CURRENT
+    )
+    assert not list(tmp_path.glob("rotation-v2.jsonl.[0-9]*"))
+    value.append_recovery_completed(
+        recovery_id,
+        0,
+        HASH_0,
+        generation,
+        EventRecoveryCategory.EXACT_CURRENT,
+        False,
+        wal_record_id=wal_id,
+        wal_record_hash=HASH_1,
+    )
+    assert list(tmp_path.glob("rotation-v2.jsonl.[0-9]*"))
+    assert value.records[-1].wal_record_id == wal_id
+    assert value.records[-1].wal_record_hash == HASH_1
+
+
+def test_canonically_hashed_v2_lifecycle_cannot_hide_irrelevant_recovery_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "invalid-v2.jsonl"
+    value = journal(path)
+    generation = str(uuid5(NAMESPACE_URL, "invalid-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "invalid-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    records = value.records
+    valid = value._make_record(
+        EventLifecycle.ACCEPTED,
+        previous_hash=records[-1].record_hash,
+        event=event("invalid-fields"),
+        schema_version=2,
+    )
+    invalid = valid.model_copy(
+        update={"recovery_id": str(uuid5(NAMESPACE_URL, "invalid-recovery"))}
+    )
+    invalid = invalid.model_copy(
+        update={"record_hash": EventJournal._record_hash(invalid)}
+    )
+    value.close()
+    path.write_bytes(
+        b"".join(EventJournal._record_bytes(item) for item in (*records, invalid))
+    )
+    with pytest.raises(EventJournalLoadError):
+        journal(path)
+
+
+@pytest.mark.parametrize(
+    ("category", "target_sequence"),
+    [
+        (EventRecoveryCategory.EXACT_CURRENT, 1),
+        (EventRecoveryCategory.UNCOMMITTED_TAIL, 1),
+        (EventRecoveryCategory.TRUE_ROLLBACK, 0),
+    ],
+)
+def test_canonically_hashed_semantically_impossible_recovery_fails_closed(
+    tmp_path: Path,
+    category: EventRecoveryCategory,
+    target_sequence: int,
+) -> None:
+    value = journal(tmp_path / f"invalid-{category.value}.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, f"invalid-{category.value}-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, f"invalid-{category.value}-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    records = value.records
+    impossible = value._make_record(
+        EventLifecycle.RECOVERY_PREPARED,
+        previous_hash=records[-1].record_hash,
+        schema_version=2,
+        recovery_id=str(uuid5(NAMESPACE_URL, f"invalid-{category.value}-recovery")),
+        snapshot_sequence=target_sequence,
+        snapshot_hash=HASH_1 if target_sequence else HASH_0,
+        wal_generation_id=generation,
+        recovery_category=category,
+        recovery_processing_high_water=0,
+    )
+
+    assert impossible.record_hash == EventJournal._record_hash(impossible)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, impossible))
+
+
+def test_v2_history_rejects_canonically_hashed_schema_downgrade(tmp_path: Path) -> None:
+    value = journal(tmp_path / "downgrade.jsonl")
+    generation = str(uuid5(NAMESPACE_URL, "downgrade-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "downgrade-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    records = value.records
+    downgrade = value._make_record(
+        EventLifecycle.CHECKPOINT,
+        previous_hash=records[-1].record_hash,
+        schema_version=1,
+        processing_sequence=0,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+    )
+    assert downgrade.record_hash == EventJournal._record_hash(downgrade)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, downgrade))
+
+
+def test_v2_history_rejects_repeated_migration_anchor(tmp_path: Path) -> None:
+    value = journal(tmp_path / "repeated-migration.jsonl")
+    value.verify_and_reconcile(0, HASH_0)
+    generation = str(uuid5(NAMESPACE_URL, "repeated-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "repeated-wal"))
+    value.append_v2_migration_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    records = value.records
+    repeated = value._make_record(
+        EventLifecycle.CHECKPOINT,
+        previous_hash=records[-1].record_hash,
+        schema_version=2,
+        processing_sequence=0,
+        snapshot_sequence=0,
+        snapshot_hash=HASH_0,
+        migration_previous_v1_hash=records[-1].record_hash,
+        wal_generation_id=generation,
+        wal_record_id=wal_id,
+        wal_record_hash=HASH_1,
+        journal_lineage_id=records[-1].journal_lineage_id,
+        external_reconciliation_required=False,
+    )
+    assert repeated.record_hash == EventJournal._record_hash(repeated)
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, repeated))
+
+
+def test_rotation_resumes_from_fsynced_checkpoint_after_archive_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "rotation-crash.jsonl"
+    value = journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    original_replace = os.replace
+
+    def interrupt_replacement(source, destination, *args, **kwargs) -> None:
+        if (
+            Path(source).name == f".{path.name}.rotation.tmp"
+            and Path(destination) == path
+        ):
+            raise OSError("simulated crash")
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", interrupt_replacement)
+    with pytest.raises(EventJournalAppendError):
+        value._rotate_unlocked(value._verify_records(value.records))
+    value.close()
+    monkeypatch.setattr(os, "replace", original_replace)
+
+    recovered = journal(path)
+
+    assert recovered.inspect().snapshot_sequence == 0
+    assert not (tmp_path / f".{path.name}.rotation.tmp").exists()
+
+
+def test_rotation_defers_when_committed_crash_classification_lacks_wal_anchor(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "classification-rotation.jsonl"
+    value = journal(path)
+    generation = str(uuid5(NAMESPACE_URL, "classification-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "classification-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_1)
+    value.max_bytes = 1
+    item = event("classification", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_prepared(item, HASH_0, HASH_1, generation)
+
+    recovery = value.apply_planned_reconciliation(1, HASH_1)
+
+    assert recovery.snapshot_sequence == 1
+    assert value.records[-1].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+    assert not list(tmp_path.glob("classification-rotation.jsonl.[0-9]*"))

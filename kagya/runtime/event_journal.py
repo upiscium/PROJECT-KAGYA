@@ -92,8 +92,6 @@ class EventJournalRecord(_JournalModel):
     wal_record_id: str | None = None
     wal_record_hash: str | None = None
     migration_previous_v1_hash: str | None = None
-    wal_baseline_record_id: str | None = None
-    wal_baseline_record_hash: str | None = None
     journal_lineage_id: str | None = None
     recovery_id: str | None = None
     recovery_processing_high_water: int | None = Field(default=None, ge=0)
@@ -149,7 +147,6 @@ class EventJournalRecord(_JournalModel):
         for value in (
             self.wal_record_hash,
             self.migration_previous_v1_hash,
-            self.wal_baseline_record_hash,
         ):
             if value is not None and _HASH_PATTERN.fullmatch(value) is None:
                 raise ValueError("hash must be lowercase SHA-256")
@@ -161,8 +158,6 @@ class EventJournalRecord(_JournalModel):
                 self.wal_record_id,
                 self.wal_record_hash,
                 self.migration_previous_v1_hash,
-                self.wal_baseline_record_id,
-                self.wal_baseline_record_hash,
                 self.journal_lineage_id,
                 self.recovery_id,
                 self.recovery_processing_high_water,
@@ -178,6 +173,26 @@ class EventJournalRecord(_JournalModel):
             self._forbid_state_and_failure()
             if self.schema_version == 2 and self.journal_lineage_id is None:
                 raise ValueError("v2 checkpoint lineage is missing")
+            if self.schema_version == 2 and (
+                self.wal_generation_id is None
+                or self.wal_record_id is None
+                or self.wal_record_hash is None
+                or self.external_reconciliation_required is None
+            ):
+                raise ValueError("v2 checkpoint WAL identity is incomplete")
+            self._forbid_irrelevant_fields(
+                {
+                    "processing_sequence",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "wal_generation_id",
+                    "wal_record_id",
+                    "wal_record_hash",
+                    "migration_previous_v1_hash",
+                    "journal_lineage_id",
+                    "external_reconciliation_required",
+                }
+            )
         elif not has_identity and self.lifecycle not in {
             EventLifecycle.RECOVERY_PREPARED,
             EventLifecycle.RECOVERY_COMPLETED,
@@ -185,10 +200,12 @@ class EventJournalRecord(_JournalModel):
             raise ValueError("event lifecycle requires identity")
         elif self.lifecycle is EventLifecycle.ACCEPTED:
             self._require_only()
+            self._forbid_irrelevant_fields(set())
         elif self.lifecycle is EventLifecycle.STARTED:
             if self.processing_sequence is None:
                 raise ValueError("started requires processing sequence")
             self._forbid_state_snapshot_failure()
+            self._forbid_irrelevant_fields({"processing_sequence"})
         elif self.lifecycle is EventLifecycle.PREPARED:
             if (
                 self.processing_sequence is None
@@ -211,6 +228,14 @@ class EventJournalRecord(_JournalModel):
                 self.wal_record_id is not None or self.wal_record_hash is not None
             ):
                 raise ValueError("v2 prepared cannot bind appended WAL record")
+            self._forbid_irrelevant_fields(
+                {
+                    "processing_sequence",
+                    "state_hash_before",
+                    "state_hash_after",
+                    "wal_generation_id",
+                }
+            )
         elif self.lifecycle is EventLifecycle.COMPLETED:
             if self.processing_sequence is None:
                 raise ValueError("completed requires processing sequence")
@@ -222,6 +247,16 @@ class EventJournalRecord(_JournalModel):
                 or self.wal_record_hash is None
             ):
                 raise ValueError("v2 completed WAL identity is incomplete")
+            self._forbid_irrelevant_fields(
+                {
+                    "processing_sequence",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "wal_generation_id",
+                    "wal_record_id",
+                    "wal_record_hash",
+                }
+            )
         elif self.lifecycle is EventLifecycle.FAILED:
             if self.processing_sequence is None:
                 raise ValueError("failed requires processing sequence")
@@ -229,6 +264,14 @@ class EventJournalRecord(_JournalModel):
             if self.failure_category is not EventFailureCategory.HANDLER_FAILURE:
                 raise ValueError("failed category is invalid")
             self._forbid_state()
+            self._forbid_irrelevant_fields(
+                {
+                    "processing_sequence",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "failure_category",
+                }
+            )
         elif self.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED:
             self._require_snapshot()
             self._forbid_state()
@@ -242,6 +285,14 @@ class EventJournalRecord(_JournalModel):
                 raise ValueError("recovery category is invalid")
             elif self.processing_sequence is None:
                 raise ValueError("processing recovery requires sequence")
+            self._forbid_irrelevant_fields(
+                {
+                    "processing_sequence",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "failure_category",
+                }
+            )
         elif self.lifecycle is EventLifecycle.RECOVERY_PREPARED:
             if self.schema_version != 2 or self.recovery_id is None:
                 raise ValueError("v2 recovery preparation is invalid")
@@ -253,6 +304,16 @@ class EventJournalRecord(_JournalModel):
             if self.external_reconciliation_required is not None:
                 raise ValueError("recovery preparation has forbidden fields")
             self._forbid_state()
+            self._forbid_irrelevant_fields(
+                {
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "wal_generation_id",
+                    "recovery_id",
+                    "recovery_processing_high_water",
+                    "recovery_category",
+                }
+            )
         elif self.lifecycle is EventLifecycle.RECOVERY_COMPLETED:
             if self.schema_version != 2 or self.recovery_id is None:
                 raise ValueError("v2 recovery completion is invalid")
@@ -263,7 +324,22 @@ class EventJournalRecord(_JournalModel):
                 raise ValueError("recovery completion high-water is missing")
             if self.external_reconciliation_required is None:
                 raise ValueError("recovery completion requires reconciliation flag")
+            if self.wal_record_id is None or self.wal_record_hash is None:
+                raise ValueError("recovery completion WAL identity is incomplete")
             self._forbid_state()
+            self._forbid_irrelevant_fields(
+                {
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "wal_generation_id",
+                    "recovery_id",
+                    "recovery_processing_high_water",
+                    "recovery_category",
+                    "external_reconciliation_required",
+                    "wal_record_id",
+                    "wal_record_hash",
+                }
+            )
         return self
 
     def _require_only(self) -> None:
@@ -287,6 +363,33 @@ class EventJournalRecord(_JournalModel):
     def _forbid_state(self) -> None:
         if self.state_hash_before is not None or self.state_hash_after is not None:
             raise ValueError("state hashes are forbidden")
+
+    def _forbid_irrelevant_fields(self, allowed: set[str]) -> None:
+        allowed = allowed | {"event_id", "event_type", "source"}
+        fields = (
+            "event_id",
+            "event_type",
+            "source",
+            "processing_sequence",
+            "state_hash_before",
+            "state_hash_after",
+            "snapshot_sequence",
+            "snapshot_hash",
+            "failure_category",
+            "wal_generation_id",
+            "wal_record_id",
+            "wal_record_hash",
+            "migration_previous_v1_hash",
+            "journal_lineage_id",
+            "recovery_id",
+            "recovery_processing_high_water",
+            "recovery_category",
+            "external_reconciliation_required",
+        )
+        if any(
+            getattr(self, field) is not None for field in fields if field not in allowed
+        ):
+            raise ValueError(f"{self.lifecycle.value} has forbidden fields")
 
     def _forbid_state_and_failure(self) -> None:
         self._forbid_state()
@@ -354,6 +457,9 @@ class _VerifiedJournal:
     snapshot_hash: str
     open_events: tuple[_EventState, ...]
     journal_lineage_id: str | None
+    external_reconciliation_required: bool
+    wal_snapshot_sequence: int | None
+    wal_snapshot_hash: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +496,9 @@ class EventJournalInspection:
     open_recoveries: tuple[EventJournalOpenRecovery, ...]
     sequence_evidence: tuple[int, ...]
     journal_lineage_id: str | None
+    external_reconciliation_required: bool
+    wal_snapshot_sequence: int | None
+    wal_snapshot_hash: str | None
 
 
 class EventJournalLease:
@@ -578,7 +687,21 @@ class EventJournal:
             records = self._read_records_unlocked()
             if not records:
                 return EventJournalInspection(
-                    (), None, None, None, 0, 0, "0" * 64, (), (), (), (), None
+                    (),
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    "0" * 64,
+                    (),
+                    (),
+                    (),
+                    (),
+                    None,
+                    False,
+                    None,
+                    None,
                 )
             verified = self._verify_records(records)
             classification_sequence = (
@@ -645,6 +768,11 @@ class EventJournal:
                     if record.processing_sequence is not None
                 ),
                 journal_lineage_id=verified.journal_lineage_id,
+                external_reconciliation_required=(
+                    verified.external_reconciliation_required
+                ),
+                wal_snapshot_sequence=verified.wal_snapshot_sequence,
+                wal_snapshot_hash=verified.wal_snapshot_hash,
             )
 
     def apply_planned_reconciliation(
@@ -658,8 +786,8 @@ class EventJournal:
         snapshot_sequence: int,
         snapshot_hash: str,
         wal_generation_id: str,
-        wal_baseline_record_id: str,
-        wal_baseline_record_hash: str,
+        wal_record_id: str,
+        wal_record_hash: str,
     ) -> None:
         self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
         with self._lock:
@@ -684,9 +812,10 @@ class EventJournal:
                 schema_version=2,
                 migration_previous_v1_hash=records[-1].record_hash,
                 wal_generation_id=wal_generation_id,
-                wal_baseline_record_id=wal_baseline_record_id,
-                wal_baseline_record_hash=wal_baseline_record_hash,
+                wal_record_id=wal_record_id,
+                wal_record_hash=wal_record_hash,
                 journal_lineage_id=str(uuid4()),
+                external_reconciliation_required=False,
             )
             self._append_record_unlocked(checkpoint)
             self._maybe_rotate_unlocked()
@@ -699,8 +828,8 @@ class EventJournal:
         snapshot_sequence: int,
         snapshot_hash: str,
         wal_generation_id: str,
-        wal_baseline_record_id: str,
-        wal_baseline_record_hash: str,
+        wal_record_id: str,
+        wal_record_hash: str,
         processing_high_water: int | None = None,
     ) -> None:
         self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
@@ -723,10 +852,56 @@ class EventJournal:
                 snapshot_hash=snapshot_hash,
                 schema_version=2,
                 wal_generation_id=wal_generation_id,
-                wal_baseline_record_id=wal_baseline_record_id,
-                wal_baseline_record_hash=wal_baseline_record_hash,
+                wal_record_id=wal_record_id,
+                wal_record_hash=wal_record_hash,
                 journal_lineage_id=str(uuid4()),
+                external_reconciliation_required=False,
             )
+            self._append_record_unlocked(checkpoint)
+            self._maybe_rotate_unlocked()
+
+    def append_v2_current_checkpoint(
+        self,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+    ) -> None:
+        """Bind reconciled current state to exact WAL evidence."""
+
+        self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or records[-1].schema_version != 2:
+                raise EventJournalIntegrityError(
+                    "current checkpoint requires v2 history"
+                )
+            verified = self._verify_records(records)
+            if (
+                verified.open_events
+                or verified.snapshot_sequence != snapshot_sequence
+                or verified.snapshot_hash != snapshot_hash
+                or verified.journal_lineage_id is None
+            ):
+                raise EventJournalIntegrityError("current checkpoint is inconsistent")
+            checkpoint = self._make_record(
+                EventLifecycle.CHECKPOINT,
+                previous_hash=records[-1].record_hash,
+                processing_sequence=verified.processing_high_water,
+                snapshot_sequence=snapshot_sequence,
+                snapshot_hash=snapshot_hash,
+                schema_version=2,
+                wal_generation_id=wal_generation_id,
+                wal_record_id=wal_record_id,
+                wal_record_hash=wal_record_hash,
+                journal_lineage_id=verified.journal_lineage_id,
+                external_reconciliation_required=(
+                    verified.external_reconciliation_required
+                ),
+            )
+            self._verify_records((*records, checkpoint))
             self._append_record_unlocked(checkpoint)
             self._maybe_rotate_unlocked()
 
@@ -805,6 +980,9 @@ class EventJournal:
         category: EventRecoveryCategory,
         external_reconciliation_required: bool,
         processing_high_water: int | None = None,
+        *,
+        wal_record_id: str,
+        wal_record_hash: str,
     ) -> None:
         self._append_v2_recovery(
             EventLifecycle.RECOVERY_COMPLETED,
@@ -815,6 +993,8 @@ class EventJournal:
             category,
             external_reconciliation_required,
             processing_high_water,
+            wal_record_id,
+            wal_record_hash,
         )
 
     def append_failed(
@@ -964,6 +1144,8 @@ class EventJournal:
         category: EventRecoveryCategory,
         external: bool | None,
         processing_high_water: int | None,
+        wal_record_id: str | None = None,
+        wal_record_hash: str | None = None,
     ) -> None:
         self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
         with self._lock:
@@ -976,6 +1158,30 @@ class EventJournal:
                 processing_high_water = verified.processing_high_water
             if processing_high_water != verified.processing_high_water:
                 raise EventJournalIntegrityError("recovery high-water changed")
+            current = (verified.snapshot_sequence, verified.snapshot_hash)
+            target = (snapshot_sequence, snapshot_hash)
+            if category in {
+                EventRecoveryCategory.EXACT_CURRENT,
+                EventRecoveryCategory.UNCOMMITTED_TAIL,
+            }:
+                if target != current or (
+                    external is not None
+                    and external is not verified.external_reconciliation_required
+                ):
+                    raise EventJournalIntegrityError(
+                        "current recovery anchor is invalid"
+                    )
+            elif category is EventRecoveryCategory.TRUE_ROLLBACK:
+                if snapshot_sequence >= verified.snapshot_sequence or (
+                    external is not None and external is not True
+                ):
+                    raise EventJournalIntegrityError(
+                        "rollback recovery anchor is invalid"
+                    )
+            if lifecycle is EventLifecycle.RECOVERY_COMPLETED and (
+                wal_record_id is None or wal_record_hash is None
+            ):
+                raise EventJournalIntegrityError("recovery WAL identity is incomplete")
             kwargs: dict[str, Any] = {
                 "schema_version": 2,
                 "recovery_id": recovery_id,
@@ -987,6 +1193,10 @@ class EventJournal:
             }
             if external is not None:
                 kwargs["external_reconciliation_required"] = external
+            if wal_record_id is not None:
+                kwargs["wal_record_id"] = wal_record_id
+            if wal_record_hash is not None:
+                kwargs["wal_record_hash"] = wal_record_hash
             record = self._make_record(
                 lifecycle, previous_hash=records[-1].record_hash, **kwargs
             )
@@ -1068,8 +1278,6 @@ class EventJournal:
                 "wal_record_id",
                 "wal_record_hash",
                 "migration_previous_v1_hash",
-                "wal_baseline_record_id",
-                "wal_baseline_record_hash",
                 "journal_lineage_id",
                 "recovery_id",
                 "recovery_category",
@@ -1097,8 +1305,6 @@ class EventJournal:
                 "wal_record_id",
                 "wal_record_hash",
                 "migration_previous_v1_hash",
-                "wal_baseline_record_id",
-                "wal_baseline_record_hash",
                 "journal_lineage_id",
                 "recovery_id",
                 "recovery_category",
@@ -1172,7 +1378,32 @@ class EventJournal:
         if size <= self.max_bytes:
             return
         verified = self._verify_records(self._read_records_unlocked())
-        if verified.open_events:
+        open_recovery_ids = {
+            record.recovery_id
+            for record in verified.records
+            if record.lifecycle is EventLifecycle.RECOVERY_PREPARED
+        } - {
+            record.recovery_id
+            for record in verified.records
+            if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+        }
+        if verified.open_events or open_recovery_ids:
+            return
+        if verified.records[-1].schema_version == 2 and not any(
+            record.lifecycle
+            in {
+                EventLifecycle.CHECKPOINT,
+                EventLifecycle.COMPLETED,
+                EventLifecycle.RECOVERY_COMPLETED,
+            }
+            and record.schema_version == 2
+            and record.snapshot_sequence == verified.snapshot_sequence
+            and record.snapshot_hash == verified.snapshot_hash
+            and record.wal_generation_id is not None
+            and record.wal_record_id is not None
+            and record.wal_record_hash is not None
+            for record in reversed(verified.records)
+        ):
             return
         self._rotate_unlocked(verified)
 
@@ -1182,32 +1413,39 @@ class EventJournal:
             rotated = self._rotated_paths_unlocked()
             next_index = rotated[-1][0] + 1 if rotated else 0
             archived = self._segment_path(next_index)
-            os.replace(self.path, archived)
-            self._fsync_parent()
             wal_generation_id: str | None = None
-            wal_baseline_record_id: str | None = None
-            wal_baseline_record_hash: str | None = None
+            wal_record_id: str | None = None
+            wal_record_hash: str | None = None
             journal_lineage_id: str | None = None
             if verified.records[-1].schema_version == 2:
                 anchor = next(
                     (
                         record
                         for record in reversed(verified.records)
-                        if record.lifecycle is EventLifecycle.CHECKPOINT
+                        if record.lifecycle
+                        in {
+                            EventLifecycle.CHECKPOINT,
+                            EventLifecycle.COMPLETED,
+                            EventLifecycle.RECOVERY_COMPLETED,
+                        }
                         and record.schema_version == 2
                         and record.wal_generation_id is not None
-                        and record.wal_baseline_record_id is not None
-                        and record.wal_baseline_record_hash is not None
-                        and record.journal_lineage_id is not None
+                        and record.wal_record_id is not None
+                        and record.wal_record_hash is not None
                     ),
                     None,
                 )
                 if anchor is None:
                     raise EventJournalIntegrityError("v2 Journal lacks WAL anchor")
+                if (
+                    anchor.snapshot_sequence != verified.snapshot_sequence
+                    or anchor.snapshot_hash != verified.snapshot_hash
+                ):
+                    raise EventJournalIntegrityError("v2 Journal anchor is stale")
                 wal_generation_id = anchor.wal_generation_id
-                wal_baseline_record_id = anchor.wal_baseline_record_id
-                wal_baseline_record_hash = anchor.wal_baseline_record_hash
-                journal_lineage_id = anchor.journal_lineage_id
+                wal_record_id = anchor.wal_record_id
+                wal_record_hash = anchor.wal_record_hash
+                journal_lineage_id = verified.journal_lineage_id
             checkpoint = self._make_record(
                 EventLifecycle.CHECKPOINT,
                 previous_hash=verified.records[-1].record_hash,
@@ -1216,9 +1454,14 @@ class EventJournal:
                 snapshot_hash=verified.snapshot_hash,
                 schema_version=verified.records[-1].schema_version,
                 wal_generation_id=wal_generation_id,
-                wal_baseline_record_id=wal_baseline_record_id,
-                wal_baseline_record_hash=wal_baseline_record_hash,
+                wal_record_id=wal_record_id,
+                wal_record_hash=wal_record_hash,
                 journal_lineage_id=journal_lineage_id,
+                external_reconciliation_required=(
+                    verified.external_reconciliation_required
+                    if verified.records[-1].schema_version == 2
+                    else None
+                ),
             )
             temporary = self.path.with_name(f".{self.path.name}.rotation.tmp")
             descriptor = os.open(
@@ -1230,6 +1473,8 @@ class EventJournal:
                 segment_file.write(self._record_bytes(checkpoint))
                 segment_file.flush()
                 os.fsync(segment_file.fileno())
+            os.replace(self.path, archived)
+            self._fsync_parent()
             os.replace(temporary, self.path)
             self._fsync_parent()
             rotated = self._rotated_paths_unlocked()
@@ -1377,9 +1622,34 @@ class EventJournal:
         if interrupted_failure is not None:
             raise interrupted_failure
         if interrupted:
-            raise EventJournalIntegrityError(
-                "EventJournal has an interrupted rotation artifact"
-            )
+            temporary = self.path.with_name(f".{self.path.name}.rotation.tmp")
+            try:
+                active_exists = self.path.lstat() is not None
+            except FileNotFoundError:
+                active_exists = False
+            if (
+                len(interrupted) == 1
+                and interrupted[0] == temporary
+                and not active_exists
+            ):
+                try:
+                    status = temporary.lstat()
+                    if (
+                        not stat.S_ISREG(status.st_mode)
+                        or status.st_uid != os.geteuid()
+                        or stat.S_IMODE(status.st_mode) != 0o600
+                    ):
+                        raise OSError
+                    os.replace(temporary, self.path)
+                    self._fsync_parent()
+                except OSError:
+                    raise EventJournalIntegrityError(
+                        "EventJournal interrupted rotation is unsafe"
+                    ) from None
+            else:
+                raise EventJournalIntegrityError(
+                    "EventJournal has an interrupted rotation artifact"
+                )
         for candidate in candidates:
             suffix = candidate.name.removeprefix(f"{self.path.name}.")
             if not re.fullmatch(r"\d{8}", suffix):
@@ -1426,10 +1696,18 @@ class EventJournal:
         snapshot_sequence = checkpoint.snapshot_sequence
         snapshot_hash = checkpoint.snapshot_hash
         journal_lineage_id = checkpoint.journal_lineage_id
+        wal_generation_id = checkpoint.wal_generation_id
+        wal_record_id = checkpoint.wal_record_id
+        wal_record_hash = checkpoint.wal_record_hash
+        wal_snapshot_sequence = snapshot_sequence
+        wal_snapshot_hash = snapshot_hash
+        external_reconciliation_required = bool(
+            checkpoint.external_reconciliation_required
+        )
         if checkpoint.schema_version == 2 and (
             checkpoint.wal_generation_id is None
-            or checkpoint.wal_baseline_record_id is None
-            or checkpoint.wal_baseline_record_hash is None
+            or checkpoint.wal_record_id is None
+            or checkpoint.wal_record_hash is None
             or checkpoint.journal_lineage_id is None
             or checkpoint.migration_previous_v1_hash is not None
         ):
@@ -1442,15 +1720,24 @@ class EventJournal:
         seen_event_ids: set[str] = set()
         seen_record_ids: set[str] = set()
         recovery_open: dict[str, EventJournalRecord] = {}
-        v2_seen = False
+        v2_seen = checkpoint.schema_version == 2
 
         for record in records:
             if record.record_id in seen_record_ids:
                 raise EventJournalIntegrityError("Record identifier is duplicated")
             seen_record_ids.add(record.record_id)
 
-        for record in records[1:]:
+        for index, record in enumerate(records[1:], start=1):
             if record.schema_version == 2:
+                if not v2_seen and (
+                    record.lifecycle is not EventLifecycle.CHECKPOINT
+                    or record.migration_previous_v1_hash
+                    != records[index - 1].record_hash
+                    or records[index - 1].schema_version != 1
+                ):
+                    raise EventJournalIntegrityError("v2 migration boundary is invalid")
+                if v2_seen and record.migration_previous_v1_hash is not None:
+                    raise EventJournalIntegrityError("v2 migration is duplicated")
                 v2_seen = True
             elif v2_seen:
                 raise EventJournalIntegrityError("v1 record follows v2 migration")
@@ -1458,6 +1745,10 @@ class EventJournal:
                 if open_events:
                     raise EventJournalIntegrityError(
                         "Checkpoint cannot hide open event lifecycle"
+                    )
+                if recovery_open:
+                    raise EventJournalIntegrityError(
+                        "Checkpoint cannot hide open recovery lifecycle"
                     )
                 if (
                     record.processing_sequence != high_water
@@ -1467,14 +1758,29 @@ class EventJournal:
                     raise EventJournalIntegrityError("Checkpoint continuity is invalid")
                 if (
                     record.schema_version == 2
+                    and record.migration_previous_v1_hash is None
+                    and record.snapshot_sequence == wal_snapshot_sequence
+                    and record.snapshot_hash == wal_snapshot_hash
+                    and (
+                        record.wal_generation_id != wal_generation_id
+                        or record.wal_record_id != wal_record_id
+                        or record.wal_record_hash != wal_record_hash
+                        or record.external_reconciliation_required
+                        is not external_reconciliation_required
+                    )
+                ):
+                    raise EventJournalIntegrityError("v2 checkpoint anchor changed")
+                if (
+                    record.schema_version == 2
                     and record.migration_previous_v1_hash is not None
                 ):
                     if (
                         record.migration_previous_v1_hash
-                        != records[records.index(record) - 1].record_hash
+                        != records[index - 1].record_hash
+                        or records[index - 1].schema_version != 1
                         or record.wal_generation_id is None
-                        or record.wal_baseline_record_id is None
-                        or record.wal_baseline_record_hash is None
+                        or record.wal_record_id is None
+                        or record.wal_record_hash is None
                     ):
                         raise EventJournalIntegrityError(
                             "v2 migration anchor is invalid"
@@ -1484,6 +1790,11 @@ class EventJournal:
                         journal_lineage_id = record.journal_lineage_id
                     elif record.journal_lineage_id != journal_lineage_id:
                         raise EventJournalIntegrityError("v2 Journal lineage changed")
+                    wal_generation_id = record.wal_generation_id
+                    wal_record_id = record.wal_record_id
+                    wal_record_hash = record.wal_record_hash
+                    wal_snapshot_sequence = record.snapshot_sequence
+                    wal_snapshot_hash = record.snapshot_hash
                 continue
             if record.lifecycle in {
                 EventLifecycle.RECOVERY_PREPARED,
@@ -1497,10 +1808,35 @@ class EventJournal:
                 if record.lifecycle is EventLifecycle.RECOVERY_PREPARED:
                     if prior is not None:
                         raise EventJournalIntegrityError("recovery is duplicated")
+                    if record.recovery_category in {
+                        EventRecoveryCategory.EXACT_CURRENT,
+                        EventRecoveryCategory.UNCOMMITTED_TAIL,
+                    } and (
+                        record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                    ):
+                        raise EventJournalIntegrityError(
+                            "prepared current recovery semantics are invalid"
+                        )
+                    assert record.snapshot_sequence is not None
+                    if (
+                        record.recovery_category is EventRecoveryCategory.TRUE_ROLLBACK
+                        and record.snapshot_sequence >= snapshot_sequence
+                    ):
+                        raise EventJournalIntegrityError(
+                            "prepared rollback semantics are invalid"
+                        )
                     recovery_open[record.recovery_id] = record
                 else:
                     if prior is None or (
                         prior.wal_generation_id != record.wal_generation_id
+                        or (
+                            prior.wal_record_id is not None
+                            and (
+                                prior.wal_record_id != record.wal_record_id
+                                or prior.wal_record_hash != record.wal_record_hash
+                            )
+                        )
                         or prior.recovery_processing_high_water
                         != record.recovery_processing_high_water
                         or prior.snapshot_sequence != record.snapshot_sequence
@@ -1508,10 +1844,41 @@ class EventJournal:
                         or prior.recovery_category != record.recovery_category
                     ):
                         raise EventJournalIntegrityError("recovery pair is invalid")
+                    if record.recovery_category in {
+                        EventRecoveryCategory.EXACT_CURRENT,
+                        EventRecoveryCategory.UNCOMMITTED_TAIL,
+                    } and (
+                        record.external_reconciliation_required
+                        is not external_reconciliation_required
+                        or record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                    ):
+                        raise EventJournalIntegrityError(
+                            "current recovery semantics are invalid"
+                        )
+                    assert record.snapshot_sequence is not None
+                    if (
+                        record.recovery_category is EventRecoveryCategory.TRUE_ROLLBACK
+                        and (
+                            record.external_reconciliation_required is not True
+                            or record.snapshot_sequence >= snapshot_sequence
+                        )
+                    ):
+                        raise EventJournalIntegrityError(
+                            "rollback recovery semantics are invalid"
+                        )
                     assert record.snapshot_sequence is not None
                     assert record.snapshot_hash is not None
                     snapshot_sequence = record.snapshot_sequence
                     snapshot_hash = record.snapshot_hash
+                    external_reconciliation_required = bool(
+                        record.external_reconciliation_required
+                    )
+                    wal_generation_id = record.wal_generation_id
+                    wal_record_id = record.wal_record_id
+                    wal_record_hash = record.wal_record_hash
+                    wal_snapshot_sequence = record.snapshot_sequence
+                    wal_snapshot_hash = record.snapshot_hash
                     del recovery_open[record.recovery_id]
                 continue
             assert record.event_id is not None
@@ -1602,6 +1969,11 @@ class EventJournal:
                 assert record.snapshot_hash is not None
                 snapshot_sequence = record.snapshot_sequence
                 snapshot_hash = record.snapshot_hash
+                wal_generation_id = record.wal_generation_id
+                wal_record_id = record.wal_record_id
+                wal_record_hash = record.wal_record_hash
+                wal_snapshot_sequence = record.snapshot_sequence
+                wal_snapshot_hash = record.snapshot_hash
                 del open_events[record.event_id]
                 accepted_queue.pop(0)
                 processing_event_id = None
@@ -1687,6 +2059,9 @@ class EventJournal:
             snapshot_hash,
             tuple(open_events.values()),
             journal_lineage_id,
+            external_reconciliation_required,
+            wal_snapshot_sequence,
+            wal_snapshot_hash,
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:

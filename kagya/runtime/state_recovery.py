@@ -83,6 +83,45 @@ class StateRecoveryCoordinator:
             raise StateRecoveryError("StateWAL boot anchor is invalid") from None
 
         if wal_inspection is None:
+            if journal_inspection.open_recoveries:
+                if len(journal_inspection.open_recoveries) != 1:
+                    raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
+                pending = journal_inspection.open_recoveries[0]
+                if (
+                    snapshot is not None
+                    and pending.snapshot_sequence
+                    == snapshot.last_processed_event_sequence
+                    and pending.snapshot_hash
+                    == self.state_store.snapshot_hash(snapshot)
+                ):
+                    return self._resume_invalid_current_recovery(
+                        journal_inspection, snapshot, snapshot
+                    )
+            if (
+                snapshot is not None
+                and journal_inspection.schema_version == 2
+                and snapshot.last_processed_event_sequence
+                == journal_inspection.snapshot_sequence
+                and self.state_store.snapshot_hash(snapshot)
+                == journal_inspection.snapshot_hash
+            ):
+                self.journal.inspect(
+                    snapshot.last_processed_event_sequence,
+                    self.state_store.snapshot_hash(snapshot),
+                )
+                self.journal.apply_planned_reconciliation(
+                    snapshot.last_processed_event_sequence,
+                    self.state_store.snapshot_hash(snapshot),
+                )
+                return self._start_recovery(
+                    self.journal.inspect(),
+                    None,
+                    snapshot,
+                    EventRecoveryCategory.EXACT_CURRENT,
+                    RecoveryReason.EXACT_CURRENT_REPAIR,
+                    external=journal_inspection.external_reconciliation_required,
+                    invalid_current=True,
+                )
             if anchor is None:
                 raise StateRecoveryError("StateWAL is invalid and unanchored") from None
             return self._recover_from_anchor(
@@ -95,12 +134,52 @@ class StateRecoveryCoordinator:
             return self._bootstrap_r06(journal_inspection, snapshot, snapshot_error)
 
         if journal_inspection.schema_version in {None, 1}:
-            if snapshot is None:
+            reconstructed = False
+            baseline = (
+                wal_inspection.records[0]
+                if len(wal_inspection.records) == 1
+                and isinstance(wal_inspection.records[0], BaselineRecord)
+                else None
+            )
+            if journal_inspection.schema_version is None and (
+                baseline is None
+                or baseline.reason is not RecoveryReason.BOOTSTRAP
+                or baseline.journal_processing_high_water
+                != baseline.baseline_snapshot_sequence
+                or wal_inspection.active_manifest is None
+                or wal_inspection.active_manifest.external_reconciliation_required
+            ):
                 raise StateRecoveryError(
-                    "R05 migration requires a valid canonical snapshot"
+                    "partial bootstrap WAL baseline is inconsistent"
                 ) from None
+            if snapshot is None:
+                try:
+                    snapshot = self.wal.reconstruct(
+                        sequence=(
+                            journal_inspection.snapshot_sequence
+                            if journal_inspection.schema_version == 1
+                            else baseline.baseline_snapshot_sequence
+                            if baseline is not None
+                            else None
+                        ),
+                        snapshot_hash=(
+                            journal_inspection.snapshot_hash
+                            if journal_inspection.schema_version == 1
+                            else baseline.baseline_snapshot_hash
+                            if baseline is not None
+                            else None
+                        ),
+                    )
+                except StateWALError:
+                    raise StateRecoveryError(
+                        "R05 migration state cannot be reconstructed"
+                    ) from None
+                reconstructed = True
             return self._finish_v1_migration(
-                journal_inspection, wal_inspection, snapshot
+                journal_inspection,
+                wal_inspection,
+                snapshot,
+                reconstructed=reconstructed,
             )
 
         self._validate_cross_authority(journal_inspection, wal_inspection)
@@ -127,6 +206,25 @@ class StateRecoveryCoordinator:
                     "Journal reconciliation selected another snapshot"
                 )
             if self._wal_latest_matches(wal_inspection, snapshot):
+                if (
+                    reconciled.wal_snapshot_sequence
+                    != snapshot.last_processed_event_sequence
+                    or reconciled.wal_snapshot_hash
+                    != self.state_store.snapshot_hash(snapshot)
+                ):
+                    wal_record, wal_record_hash = self._record_for_snapshot(
+                        wal_inspection,
+                        snapshot,
+                        self.state_store.snapshot_hash(snapshot),
+                    )
+                    assert wal_inspection.active_manifest is not None
+                    self.journal.append_v2_current_checkpoint(
+                        snapshot.last_processed_event_sequence,
+                        self.state_store.snapshot_hash(snapshot),
+                        str(wal_inspection.active_manifest.active_generation_id),
+                        str(wal_record.record_id),
+                        wal_record_hash,
+                    )
                 return self._result(snapshot, recovery.processing_high_water)
             return self._start_recovery(
                 reconciled,
@@ -166,7 +264,7 @@ class StateRecoveryCoordinator:
             target,
             category,
             reason,
-            external=False,
+            external=journal_inspection.external_reconciliation_required,
         )
         return self._finish_event_reconciliation(result)
 
@@ -294,6 +392,7 @@ class StateRecoveryCoordinator:
         inspection = self.wal.inspect()
         assert inspection.baseline_record_id is not None
         assert inspection.baseline_record_hash is not None
+        self.state_store.ensure_published(snapshot)
         if journal.records:
             self.journal.append_v2_migration_checkpoint(
                 snapshot.last_processed_event_sequence,
@@ -311,7 +410,6 @@ class StateRecoveryCoordinator:
                 inspection.baseline_record_hash,
                 processing_high_water=high_water,
             )
-        self.state_store.ensure_published(snapshot)
         return self._result(snapshot, high_water)
 
     def _finish_v1_migration(
@@ -319,6 +417,8 @@ class StateRecoveryCoordinator:
         journal: EventJournalInspection,
         wal: StateWALInspection,
         snapshot: AgentStateSnapshot,
+        *,
+        reconstructed: bool = False,
     ) -> StateRecoveryResult:
         if not self._wal_latest_matches(wal, snapshot) or len(wal.records) != 1:
             raise StateRecoveryError("R05 migration WAL baseline is inconsistent")
@@ -334,6 +434,7 @@ class StateRecoveryCoordinator:
             or wal.baseline_record_hash is None
         ):
             raise StateRecoveryError("R05 migration WAL baseline is incomplete")
+        self.state_store.ensure_published(snapshot)
         if post.schema_version == 1:
             self.journal.append_v2_migration_checkpoint(
                 snapshot.last_processed_event_sequence,
@@ -351,8 +452,9 @@ class StateRecoveryCoordinator:
                 wal.baseline_record_hash,
                 processing_high_water=recovery.processing_high_water,
             )
-        self.state_store.ensure_published(snapshot)
-        return self._result(snapshot, recovery.processing_high_water)
+        return self._result(
+            snapshot, recovery.processing_high_water, exact=reconstructed
+        )
 
     def _start_recovery(
         self,
@@ -364,6 +466,7 @@ class StateRecoveryCoordinator:
         *,
         external: bool,
         generation_id: UUID | None = None,
+        invalid_current: bool = False,
     ) -> StateRecoveryResult:
         target_hash = self.state_store.snapshot_hash(target)
         recovery_id = str(uuid4())
@@ -391,16 +494,29 @@ class StateRecoveryCoordinator:
             predecessor_hash = (
                 wal.record_hashes[-1] if wal is not None and wal.record_hashes else None
             )
-            self.wal.resume_prepared_generation(
-                target,
-                journal.processing_high_water,
-                recovery_id=UUID(recovery_id),
-                reason=reason,
-                generation_id=target_generation,
-                predecessor_generation_id=predecessor_id,
-                predecessor_generation_hash=predecessor_hash,
-                external_reconciliation_required=external,
-            )
+            if invalid_current:
+                self.wal.rebaseline_prepared_current(
+                    target,
+                    journal.processing_high_water,
+                    recovery_id=UUID(recovery_id),
+                    generation_id=target_generation,
+                    external_reconciliation_required=external,
+                )
+            else:
+                self.wal.resume_prepared_generation(
+                    target,
+                    journal.processing_high_water,
+                    recovery_id=UUID(recovery_id),
+                    reason=reason,
+                    generation_id=target_generation,
+                    predecessor_generation_id=predecessor_id,
+                    predecessor_generation_hash=predecessor_hash,
+                    external_reconciliation_required=external,
+                )
+        post_wal = self.wal.inspect()
+        wal_record, wal_record_hash = self._record_for_snapshot(
+            post_wal, target, target_hash
+        )
         self.state_store.save(target)
         self.journal.append_recovery_completed(
             recovery_id,
@@ -410,12 +526,14 @@ class StateRecoveryCoordinator:
             category,
             external,
             processing_high_water=journal.processing_high_water,
+            wal_record_id=str(wal_record.record_id),
+            wal_record_hash=wal_record_hash,
         )
         return self._result(
             target,
             journal.processing_high_water,
             exact=category is EventRecoveryCategory.EXACT_CURRENT,
-            rollback=external,
+            rollback=category is EventRecoveryCategory.TRUE_ROLLBACK,
         )
 
     def _resume_recovery(
@@ -456,11 +574,19 @@ class StateRecoveryCoordinator:
                 ),
                 external_reconciliation_required=(
                     pending.category is EventRecoveryCategory.TRUE_ROLLBACK
+                    or journal.external_reconciliation_required
                 ),
             )
         if snapshot != target:
             self.state_store.save(target)
-        external = pending.category is EventRecoveryCategory.TRUE_ROLLBACK
+        external = (
+            pending.category is EventRecoveryCategory.TRUE_ROLLBACK
+            or journal.external_reconciliation_required
+        )
+        post_wal = self.wal.inspect()
+        wal_record, wal_record_hash = self._record_for_snapshot(
+            post_wal, target, pending.snapshot_hash
+        )
         self.journal.append_recovery_completed(
             pending.recovery_id,
             pending.snapshot_sequence,
@@ -469,12 +595,72 @@ class StateRecoveryCoordinator:
             pending.category,
             external,
             processing_high_water=pending.processing_high_water,
+            wal_record_id=str(wal_record.record_id),
+            wal_record_hash=wal_record_hash,
         )
         return self._result(
             target,
             pending.processing_high_water,
             exact=pending.category is EventRecoveryCategory.EXACT_CURRENT,
-            rollback=external,
+            rollback=pending.category is EventRecoveryCategory.TRUE_ROLLBACK,
+        )
+
+    def _resume_invalid_current_recovery(
+        self,
+        journal: EventJournalInspection,
+        target: AgentStateSnapshot,
+        current_snapshot: AgentStateSnapshot | None,
+    ) -> StateRecoveryResult:
+        if len(journal.open_recoveries) != 1:
+            raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
+        pending = journal.open_recoveries[0]
+        recovery_id = UUID(pending.recovery_id)
+        generation_id = UUID(pending.wal_generation_id)
+        external = (
+            pending.category is EventRecoveryCategory.TRUE_ROLLBACK
+            or journal.external_reconciliation_required
+        )
+        if external:
+            self.wal.resume_prepared_generation(
+                target,
+                pending.processing_high_water,
+                recovery_id=recovery_id,
+                reason=RecoveryReason.TRUE_ROLLBACK,
+                generation_id=generation_id,
+                predecessor_generation_id=None,
+                predecessor_generation_hash=None,
+                external_reconciliation_required=True,
+            )
+        else:
+            self.wal.rebaseline_prepared_current(
+                target,
+                pending.processing_high_water,
+                recovery_id=recovery_id,
+                generation_id=generation_id,
+                external_reconciliation_required=external,
+            )
+        if current_snapshot != target:
+            self.state_store.save(target)
+        inspection = self.wal.inspect()
+        wal_record, wal_record_hash = self._record_for_snapshot(
+            inspection, target, pending.snapshot_hash
+        )
+        self.journal.append_recovery_completed(
+            pending.recovery_id,
+            pending.snapshot_sequence,
+            pending.snapshot_hash,
+            pending.wal_generation_id,
+            pending.category,
+            external,
+            processing_high_water=pending.processing_high_water,
+            wal_record_id=str(wal_record.record_id),
+            wal_record_hash=wal_record_hash,
+        )
+        return self._result(
+            target,
+            pending.processing_high_water,
+            exact=pending.category is EventRecoveryCategory.EXACT_CURRENT,
+            rollback=pending.category is EventRecoveryCategory.TRUE_ROLLBACK,
         )
 
     def _recover_from_anchor(
@@ -510,45 +696,38 @@ class StateRecoveryCoordinator:
             pending = journal.open_recoveries[0]
             target_hash = self.state_store.snapshot_hash(target)
             if (
-                pending.category is not EventRecoveryCategory.TRUE_ROLLBACK
-                or pending.snapshot_sequence != target.last_processed_event_sequence
+                pending.snapshot_sequence != target.last_processed_event_sequence
                 or pending.snapshot_hash != target_hash
             ):
                 raise StateRecoveryError("Open recovery does not match boot anchor")
-            target_generation = UUID(pending.wal_generation_id)
-            self.wal.resume_prepared_generation(
+            return self._resume_invalid_current_recovery(
+                journal,
                 target,
-                pending.processing_high_water,
-                recovery_id=UUID(pending.recovery_id),
-                reason=RecoveryReason.TRUE_ROLLBACK,
-                generation_id=target_generation,
-                predecessor_generation_id=None,
-                predecessor_generation_hash=None,
-                external_reconciliation_required=True,
+                snapshot,
             )
-            if snapshot != target:
-                self.state_store.save(target)
-            self.journal.append_recovery_completed(
-                pending.recovery_id,
-                pending.snapshot_sequence,
-                pending.snapshot_hash,
-                pending.wal_generation_id,
-                pending.category,
-                True,
-                processing_high_water=pending.processing_high_water,
-            )
-            return self._result(
-                target,
-                pending.processing_high_water,
-                rollback=True,
-            )
+        target_hash = self.state_store.snapshot_hash(target)
+        exact_current = (
+            target.last_processed_event_sequence == journal.snapshot_sequence
+            and target_hash == journal.snapshot_hash
+        )
         return self._start_recovery(
             journal,
             None,
             target,
-            EventRecoveryCategory.TRUE_ROLLBACK,
-            RecoveryReason.TRUE_ROLLBACK,
-            external=True,
+            (
+                EventRecoveryCategory.EXACT_CURRENT
+                if exact_current
+                else EventRecoveryCategory.TRUE_ROLLBACK
+            ),
+            (
+                RecoveryReason.EXACT_CURRENT_REPAIR
+                if exact_current
+                else RecoveryReason.TRUE_ROLLBACK
+            ),
+            external=(
+                journal.external_reconciliation_required if exact_current else True
+            ),
+            invalid_current=exact_current,
         )
 
     def _finish_event_reconciliation(
@@ -616,9 +795,62 @@ class StateRecoveryCoordinator:
                 for pending in journal.open_recoveries
             ):
                 raise StateRecoveryError("Journal and WAL generations diverge")
+        if len(journal.open_recoveries) == 1:
+            pending = journal.open_recoveries[0]
+            baseline = wal.records[0]
+            if (
+                pending.wal_generation_id == str(manifest.active_generation_id)
+                and len(wal.records) == 1
+                and isinstance(baseline, BaselineRecord)
+                and baseline.baseline_snapshot_sequence == pending.snapshot_sequence
+                and baseline.baseline_snapshot_hash == pending.snapshot_hash
+                and baseline.journal_processing_high_water
+                == pending.processing_high_water
+            ):
+                return
+        anchor: tuple[int, int] | None = None
+        for journal_index, evidence in enumerate(journal.records):
+            if (
+                evidence.schema_version != 2
+                or evidence.lifecycle
+                not in {
+                    EventLifecycle.CHECKPOINT,
+                    EventLifecycle.COMPLETED,
+                    EventLifecycle.RECOVERY_COMPLETED,
+                }
+                or evidence.wal_generation_id != str(manifest.active_generation_id)
+                or evidence.wal_record_id is None
+                or evidence.wal_record_hash is None
+                or evidence.snapshot_sequence is None
+                or evidence.snapshot_hash is None
+            ):
+                continue
+            for wal_index, (record, record_hash) in enumerate(
+                zip(wal.records, wal.record_hashes)
+            ):
+                state = (
+                    record.baseline_snapshot
+                    if isinstance(record, BaselineRecord)
+                    else record.candidate_snapshot
+                )
+                if (
+                    evidence.wal_record_id == str(record.record_id)
+                    and evidence.wal_record_hash == record_hash
+                    and evidence.snapshot_sequence
+                    == state.last_processed_event_sequence
+                    and evidence.snapshot_hash == self.state_store.snapshot_hash(state)
+                ):
+                    anchor = (journal_index, wal_index)
+                    break
+            if anchor is not None:
+                break
+        if anchor is None:
+            raise StateRecoveryError("Retained Journal lacks current WAL anchor")
+        journal_index, wal_index = anchor
+        retained = journal.records[journal_index + 1 :]
         noncommitting = {
             record.processing_sequence
-            for record in journal.records
+            for record in retained
             if record.processing_sequence is not None
             and (
                 record.lifecycle is EventLifecycle.FAILED
@@ -629,11 +861,17 @@ class StateRecoveryCoordinator:
                 )
             )
         }
-        baseline = wal.records[0]
-        if not isinstance(baseline, BaselineRecord):
-            raise StateRecoveryError("StateWAL baseline is invalid")
-        prior_processing = baseline.journal_processing_high_water
-        for index, record in enumerate(wal.records[1:], start=1):
+        anchor_evidence = journal.records[journal_index]
+        prior_processing = (
+            anchor_evidence.recovery_processing_high_water
+            if anchor_evidence.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+            else anchor_evidence.processing_sequence
+        )
+        if prior_processing is None:
+            raise StateRecoveryError("Retained Journal WAL anchor is incomplete")
+        for index, record in enumerate(
+            wal.records[wal_index + 1 :], start=wal_index + 1
+        ):
             if not isinstance(record, TransitionRecord):
                 raise StateRecoveryError("StateWAL transition is invalid")
             if any(
@@ -644,7 +882,7 @@ class StateRecoveryCoordinator:
             prepared = next(
                 (
                     item
-                    for item in journal.records
+                    for item in retained
                     if item.lifecycle is EventLifecycle.PREPARED
                     and item.event_id == str(record.event_id)
                     and item.processing_sequence == record.processing_sequence
@@ -661,7 +899,7 @@ class StateRecoveryCoordinator:
             completed = next(
                 (
                     item
-                    for item in journal.records
+                    for item in retained
                     if item.lifecycle is EventLifecycle.COMPLETED
                     and item.event_id == str(record.event_id)
                     and item.wal_record_id == str(record.record_id)
@@ -673,7 +911,7 @@ class StateRecoveryCoordinator:
                 item.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
                 and item.event_id == str(record.event_id)
                 and item.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
-                for item in journal.records
+                for item in retained
             )
             if (
                 index < len(wal.records) - 1

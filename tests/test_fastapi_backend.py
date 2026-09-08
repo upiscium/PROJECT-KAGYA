@@ -592,6 +592,7 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> Non
 
     with generation.open("ab") as output:
         output.write(b"corrupt-tail\n")
+    settings.agent_state.path.unlink()
 
     runtime = RecordingRuntime()
     with _client(tmp_path, settings=settings, runtime=runtime) as gated:
@@ -602,6 +603,57 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(tmp_path: Path) -> Non
             "/api/chat", json={"message": "blocked", "attachments": []}
         )
         assert response.status_code == 503
+
+    second_runtime = RecordingRuntime()
+    with _client(tmp_path, settings=settings, runtime=second_runtime) as still_gated:
+        assert second_runtime.status is AgentRuntimeStatus.CREATED
+        manifest = still_gated.app.state.state_wal.inspect().active_manifest
+        assert manifest is not None
+        assert manifest.external_reconciliation_required
+        assert still_gated.post(
+            "/api/chat", json={"message": "still-blocked", "attachments": []}
+        ).status_code == 503
+
+
+def test_corrupt_wal_keeps_valid_canonical_current_accepting(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.post(
+            "/api/chat", json={"message": "advance", "attachments": []}
+        ).status_code == 200
+        expected = client.app.state.agent_state_store.load()
+        wal: StateWAL = client.app.state.state_wal
+        old_manifest = wal.inspect().active_manifest
+        assert old_manifest is not None
+        generation = (
+            wal.root / "generations" / f"{old_manifest.active_generation_id}.jsonl"
+        )
+
+    with generation.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+
+    with _client(tmp_path, settings=settings) as recovered:
+        assert recovered.app.state.agent_state_store.load() == expected
+        assert recovered.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert not (
+            recovered.app.state.state_wal.inspect()
+            .active_manifest.external_reconciliation_required
+        )
+        assert (
+            recovered.app.state.state_wal.inspect().active_manifest.active_generation_id
+            != old_manifest.active_generation_id
+        )
+        assert recovered.post(
+            "/api/chat", json={"message": "continue", "attachments": []}
+        ).status_code == 200
+        continued = recovered.app.state.agent_state_store.load()
+        wal_inspection = recovered.app.state.state_wal.inspect()
+        assert continued.last_processed_event_sequence == 2
+        assert wal_inspection.latest_snapshot_sequence == 2
+        assert wal_inspection.latest_snapshot_hash == (
+            recovered.app.state.agent_state_store.snapshot_hash(continued)
+        )
+    assert generation.read_bytes().endswith(b"corrupt-tail\n")
 
 
 def test_boot_anchor_failure_prevents_lifespan_readiness(tmp_path: Path) -> None:
@@ -1039,9 +1091,14 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
             == 1
         )
         assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
-        record = restarted.app.state.event_journal.records[-1]
-        assert record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
-        assert record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+        records = restarted.app.state.event_journal.records
+        assert records[-2].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
+        assert (
+            records[-2].failure_category
+            is EventFailureCategory.COMMITTED_BEFORE_CRASH
+        )
+        assert records[-1].lifecycle is EventLifecycle.CHECKPOINT
+        assert records[-1].wal_record_id is not None
 
 
 def test_second_startup_cannot_touch_snapshot_before_journal_lease(

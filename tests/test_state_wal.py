@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -402,9 +403,7 @@ def test_corrupt_existing_wal_cannot_be_replaced_by_ordinary_generation(
     tmp_path: Path,
 ) -> None:
     wal = make_wal(tmp_path)
-    active = wal.bootstrap(
-        make_snapshot(0), 0, external_reconciliation_required=True
-    )
+    active = wal.bootstrap(make_snapshot(0), 0, external_reconciliation_required=True)
     predecessor_hash = wal.inspect().record_hashes[-1]
     manifest_path = wal.root / "manifest.json"
     manifest_path.write_bytes(b"corrupt\n")
@@ -433,3 +432,104 @@ def test_generation_record_without_final_newline_is_partial(tmp_path: Path) -> N
 
     with pytest.raises(StateWALError):
         wal.inspect()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is not supported")
+def test_non_regular_artifacts_fail_closed(tmp_path: Path) -> None:
+    wal, manifest = bootstrap(tmp_path)
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    generation.unlink()
+    os.mkfifo(generation)
+    with pytest.raises(StateWALError):
+        wal.inspect()
+
+    generation.unlink()
+    generation.write_bytes(b"not used\n")
+    generation.chmod(0o600)
+    manifest_path = wal.root / "manifest.json"
+    manifest_path.unlink()
+    os.mkfifo(manifest_path)
+    with pytest.raises(StateWALError):
+        wal.inspect()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is not supported")
+def test_anchor_substitution_fails_closed(tmp_path: Path) -> None:
+    wal, manifest = bootstrap(tmp_path)
+    inspection = wal.inspect()
+    wal.publish_boot_anchor(
+        snapshot_sequence=10,
+        snapshot_hash=inspection.latest_snapshot_hash,
+        generation_id=manifest.active_generation_id,
+        anchored_record_id=manifest.active_baseline_record_id,
+        anchored_record_hash=manifest.active_baseline_record_hash,
+        journal_processing_high_water=10,
+        journal_lineage_id=uuid4(),
+    )
+    anchor = wal.root / "boot_anchor.json"
+    anchor.unlink()
+    os.mkfifo(anchor)
+    with pytest.raises(StateWALError):
+        wal.inspect_boot_anchor()
+
+
+def test_fresh_directory_entries_are_fsynced(tmp_path: Path, monkeypatch) -> None:
+    calls: list[int] = []
+    original_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        calls.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    bootstrap(tmp_path)
+    assert len(calls) >= 6
+
+
+def test_permissive_private_parent_is_hardened(tmp_path: Path) -> None:
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o755)
+    wal = StateWAL(parent / "wal")
+    wal.bootstrap(make_snapshot(0), 0)
+    assert parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_missing_private_parent_chain_is_created_and_durable(tmp_path: Path) -> None:
+    private = tmp_path / "state" / ".kagya" / "private"
+    wal = StateWAL(private / "state_wal")
+
+    wal.bootstrap(make_snapshot(0), 0)
+
+    assert private.stat().st_mode & 0o777 == 0o700
+    assert wal.root.stat().st_mode & 0o777 == 0o700
+    assert (wal.root / "generations").stat().st_mode & 0o777 == 0o700
+
+
+def test_intermediate_directory_symlink_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(StateWALError):
+        StateWAL(linked / "wal").bootstrap(make_snapshot(0), 0)
+    assert not (target / "wal").exists()
+
+
+def test_prepared_rebaseline_preserves_invalid_manifest_bytes(tmp_path: Path) -> None:
+    wal, _manifest = bootstrap(tmp_path)
+    manifest_path = wal.root / "manifest.json"
+    invalid = b"corrupt-manifest\n"
+    manifest_path.write_bytes(invalid)
+    recovery_id = uuid4()
+
+    wal.rebaseline_prepared_current(
+        make_snapshot(10),
+        10,
+        recovery_id=recovery_id,
+        generation_id=uuid4(),
+    )
+
+    preserved = list(wal.root.glob(f".manifest.json.{recovery_id}.*.invalid"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == invalid

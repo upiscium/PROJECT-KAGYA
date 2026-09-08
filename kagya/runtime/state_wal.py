@@ -229,25 +229,97 @@ class StateWAL:
 
     @staticmethod
     def _check_dir(path: Path, *, create: bool) -> None:
+        descriptor = -1
         try:
-            if create:
-                path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            status = path.lstat()
+            descriptor = (
+                StateWAL._open_or_create_private_dir(path)
+                if create
+                else StateWAL._open_private_dir(path, require_private=False)
+            )
+            status = os.fstat(descriptor)
+            if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
+                raise OSError
+            if stat.S_IMODE(status.st_mode) != 0o700:
+                os.fchmod(descriptor, 0o700)
+                os.fsync(descriptor)
+                if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+                    raise OSError
+        except Exception:
+            raise StateWALPermissionError("WAL directory is unsafe") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    @staticmethod
+    def _validate_descriptor(descriptor: int, *, regular: bool = True) -> None:
+        status = os.fstat(descriptor)
+        if (
+            (regular and not stat.S_ISREG(status.st_mode))
+            or status.st_uid != os.geteuid()
+            or stat.S_IMODE(status.st_mode) != 0o600
+        ):
+            raise OSError
+
+    @staticmethod
+    def _open_private_dir(path: Path, *, require_private: bool = True) -> int:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        absolute = path.absolute()
+        descriptor = os.open(absolute.anchor, flags)
+        try:
+            for component in absolute.parts[1:]:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            status = os.fstat(descriptor)
             if (
                 not stat.S_ISDIR(status.st_mode)
                 or status.st_uid != os.geteuid()
-                or stat.S_IMODE(status.st_mode) != 0o700
+                or (require_private and stat.S_IMODE(status.st_mode) != 0o700)
             ):
                 raise OSError
+            return descriptor
         except Exception:
-            raise StateWALPermissionError("WAL directory is unsafe") from None
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _open_or_create_private_dir(path: Path) -> int:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        absolute = path.absolute()
+        descriptor = os.open(absolute.anchor, flags)
+        try:
+            for component in absolute.parts[1:]:
+                try:
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
 
     def _prepare_for_write(self) -> None:
+        self._check_dir(self.root.parent, create=True)
         self._check_dir(self.root, create=True)
         self._check_dir(self.root / "generations", create=True)
 
     def _prepare_for_read(self) -> bool:
         try:
+            self._check_dir(self.root.parent, create=False)
             self._check_dir(self.root, create=False)
             self._check_dir(self.root / "generations", create=False)
         except StateWALPermissionError:
@@ -258,32 +330,35 @@ class StateWAL:
 
     @staticmethod
     def _read_regular(path: Path) -> bytes:
+        parent_descriptor = -1
+        descriptor = -1
         try:
-            status = path.lstat()
-            if (
-                not stat.S_ISREG(status.st_mode)
-                or status.st_uid != os.geteuid()
-                or stat.S_IMODE(status.st_mode) != 0o600
-            ):
-                raise OSError
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise OSError
-                with os.fdopen(descriptor, "rb") as source:
-                    descriptor = -1
-                    return source.read()
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
+            parent_descriptor = StateWAL._open_private_dir(path.parent)
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_descriptor,
+            )
+            StateWAL._validate_descriptor(descriptor)
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = -1
+                return source.read()
         except FileNotFoundError:
             raise StateWALMissing("WAL artifact is absent") from None
         except Exception:
             raise StateWALFormatError("WAL artifact is invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        descriptor = StateWAL._open_private_dir(path, require_private=False)
         try:
             os.fsync(descriptor)
         finally:
@@ -291,28 +366,56 @@ class StateWAL:
 
     def _atomic_write(self, path: Path, value: dict[str, Any]) -> None:
         temporary = path.with_name(f".{path.name}.{uuid4()}.tmp")
+        parent_descriptor = -1
+        descriptor = -1
         try:
+            parent_descriptor = self._open_private_dir(path.parent)
+            try:
+                existing = os.stat(
+                    path.name, dir_fd=parent_descriptor, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    not stat.S_ISREG(existing.st_mode)
+                    or existing.st_uid != os.geteuid()
+                    or stat.S_IMODE(existing.st_mode) != 0o600
+                ):
+                    raise OSError
             self._stage("temp_write")
             descriptor = os.open(
-                temporary,
+                temporary.name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=parent_descriptor,
             )
             with os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
                 output.write(_canonical(value))
                 output.flush()
                 self._stage("temp_fsync")
                 os.fsync(output.fileno())
             self._stage("atomic_replace")
-            os.replace(temporary, path)
+            os.replace(
+                temporary.name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
             self._stage("parent_fsync")
-            self._fsync_dir(path.parent)
+            os.fsync(parent_descriptor)
         except Exception:
             try:
-                temporary.unlink()
+                os.unlink(temporary.name, dir_fd=parent_descriptor)
             except OSError:
                 pass
             raise StateWALError("WAL durable write failed") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
 
     def _snapshot_hash_value(self, snapshot: AgentStateSnapshot) -> str:
         try:
@@ -342,14 +445,19 @@ class StateWAL:
         predecessor_generation_hash: str | None = None,
         external_reconciliation_required: bool = False,
         prepared_recovery_id: UUID | None = None,
+        allow_invalid_current: bool = False,
     ) -> Manifest:
         self._prepare_for_write()
+        invalid_current_detected = False
         try:
             current = self.inspect_optional()
         except StateWALError:
-            if prepared_recovery_id is None or not external_reconciliation_required:
+            if prepared_recovery_id is None or not (
+                external_reconciliation_required or allow_invalid_current
+            ):
                 raise
             current = None
+            invalid_current_detected = True
         if (
             current is not None
             and current.active_manifest is not None
@@ -415,32 +523,77 @@ class StateWAL:
             record_hash="0" * 64,
         )
         raw, baseline_hash = _record_json(baseline, "kagya.state-wal.baseline")
+        parent_descriptor = -1
+        descriptor = -1
         try:
             self._stage("generation_write")
+            parent_descriptor = self._open_private_dir(path.parent)
             descriptor = os.open(
-                path,
+                path.name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=parent_descriptor,
             )
             with os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
+                self._validate_descriptor(output.fileno())
                 output.write(_canonical(raw))
                 output.flush()
                 self._stage("generation_fsync")
                 os.fsync(output.fileno())
-            self._fsync_dir(path.parent)
+            os.fsync(parent_descriptor)
         except Exception:
             raise StateWALError("WAL generation write failed") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+        if invalid_current_detected:
+            assert prepared_recovery_id is not None
+            self._preserve_invalid_manifest(prepared_recovery_id)
         return self._publish_manifest(
             baseline, baseline_hash, external_reconciliation_required
         )
 
     def _preserve_partial_generation(self, path: Path, recovery_id: UUID) -> None:
         preserved = path.with_name(f".{path.name}.{recovery_id}.{uuid4()}.invalid")
+        parent_descriptor = -1
         try:
-            os.replace(path, preserved)
-            self._fsync_dir(path.parent)
+            parent_descriptor = self._open_private_dir(path.parent)
+            os.replace(
+                path.name,
+                preserved.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            os.fsync(parent_descriptor)
         except Exception:
             raise StateWALError("partial WAL generation cannot be preserved") from None
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+
+    def _preserve_invalid_manifest(self, recovery_id: UUID) -> None:
+        path = self.root / "manifest.json"
+        preserved = self.root / f".manifest.json.{recovery_id}.{uuid4()}.invalid"
+        parent_descriptor = -1
+        try:
+            parent_descriptor = self._open_private_dir(self.root)
+            os.replace(
+                path.name,
+                preserved.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            os.fsync(parent_descriptor)
+        except FileNotFoundError:
+            return
+        except Exception:
+            raise StateWALError("invalid WAL manifest cannot be preserved") from None
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
 
     def _publish_manifest(
         self,
@@ -546,6 +699,30 @@ class StateWAL:
                 predecessor_generation_hash=predecessor_generation_hash,
                 external_reconciliation_required=external_reconciliation_required,
                 prepared_recovery_id=recovery_id,
+            )
+
+    def rebaseline_prepared_current(
+        self,
+        snapshot: AgentStateSnapshot,
+        journal_processing_high_water: int,
+        *,
+        recovery_id: UUID,
+        generation_id: UUID,
+        external_reconciliation_required: bool = False,
+    ) -> Manifest:
+        """Replace invalid active WAL metadata from Journal-confirmed current state."""
+
+        with self._lock:
+            return self._begin_generation(
+                snapshot,
+                journal_processing_high_water,
+                reason=RecoveryReason.EXACT_CURRENT_REPAIR,
+                generation_id=generation_id,
+                predecessor_generation_id=None,
+                predecessor_generation_hash=None,
+                external_reconciliation_required=external_reconciliation_required,
+                prepared_recovery_id=recovery_id,
+                allow_invalid_current=True,
             )
 
     bootstrap = begin_generation
@@ -781,18 +958,30 @@ class StateWAL:
         raw, record_hash = _record_json(record, "kagya.state-wal.transition")
         record = record.model_copy(update={"record_hash": record_hash})
         path = self._generation_path(inspection.active_manifest.active_generation_id)
+        parent_descriptor = -1
+        descriptor = -1
         try:
+            parent_descriptor = self._open_private_dir(path.parent)
             descriptor = os.open(
-                path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                path.name,
+                os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
             )
             with os.fdopen(descriptor, "ab") as output:
+                descriptor = -1
+                self._validate_descriptor(output.fileno())
                 output.write(_canonical(raw))
                 output.flush()
                 self._stage("transition_fsync")
                 os.fsync(output.fileno())
-            self._fsync_dir(path.parent)
+            os.fsync(parent_descriptor)
         except Exception:
             raise StateWALError("WAL transition write failed") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
         return record
 
     def append_transition(self, **kwargs: Any) -> TransitionRecord:
