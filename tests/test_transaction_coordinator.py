@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import traceback
@@ -16,7 +17,14 @@ from kagya.runtime import (
     EventLifecycle,
     InternalCommitEvidence,
     ParticipantCapability,
+    ParticipantDivergedError,
     ParticipantOutcome,
+    SessionState,
+    SessionTurnOperation,
+    SessionTurnParticipant,
+    StartupParticipantOutcome,
+    TransactionBinding,
+    TransactionBoundValue,
     TransactionCoordinator,
     TransactionFinalizationError,
     TransactionParticipant,
@@ -40,6 +48,8 @@ ABORT_CAPABILITIES = (
 
 
 class FakeParticipant:
+    prepare_is_read_only = True
+
     def __init__(
         self,
         participant_id: str,
@@ -256,6 +266,24 @@ def test_declared_abort_must_be_callable_before_durable_declaration(
     assert not any(record.transaction_id for record in value.records)
 
 
+def test_non_abortable_participant_must_declare_read_only_prepare(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("effectful-without-abort")
+    start(value, item)
+    participant = FakeParticipant("participant")
+    participant.prepare_is_read_only = False
+
+    with pytest.raises(TransactionPreparationError):
+        coordinator(value).prepare_result(
+            item, CoordinatedResult("public", (participant,))
+        )
+
+    assert participant.calls == []
+    assert not any(record.transaction_id for record in value.records)
+
+
 def test_prepare_failure_aborts_all_abort_capable_participants(tmp_path: Path) -> None:
     value = journal(tmp_path / "events.jsonl")
     item = event()
@@ -466,3 +494,100 @@ def test_transaction_identity_ignores_participant_order_and_private_payload(
     assert first_id == "675fd3a1-4f5b-5e0c-8924-a35dd8b6234b"
     assert str(UUID(first_id)) == first_id
     assert PRIVATE_SENTINEL not in first_id
+
+
+def test_transaction_bound_value_materializes_after_prepare(tmp_path: Path) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("bound-value")
+    start(value, item)
+    participant = FakeParticipant("participant")
+    observed: list[tuple[str, list[str]]] = []
+
+    public = coordinator(value).prepare_result(
+        item,
+        CoordinatedResult(
+            TransactionBoundValue(
+                lambda transaction_id: observed.append(
+                    (transaction_id, list(participant.calls))
+                )
+                or "public"
+            ),
+            (participant,),
+        ),
+    )
+
+    assert public == "public"
+    assert observed == [
+        (value.inspect().open_transactions[0].transaction_id, ["prepare"])
+    ]
+
+
+def test_session_participant_prepare_is_read_only_and_finalize_is_idempotent() -> (
+    None
+):
+    state = SessionState()
+    participant = SessionTurnParticipant(
+        state, SessionTurnOperation("user", "visible")
+    )
+    binding = TransactionBinding(
+        transaction_id="9d137f0a-399c-50d0-b5f2-5a0d11adf0c7",
+        event_id="bb56f861-af77-52ba-90ef-6e584952e64a",
+        processing_sequence=1,
+        participant_id=participant.participant_id,
+        operation_digest=participant.operation_digest,
+        transaction_kind=TransactionKind.EVENT_MUTATION,
+    )
+
+    participant.prepare(binding)
+    assert state.turns == []
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+    assert participant.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    assert len(state.turns) == 1
+    assert state.context_text() == "User: user\nAssistant: visible"
+
+
+def test_fresh_session_epoch_reports_no_stale_effect() -> None:
+    participant = SessionTurnParticipant(
+        SessionState(), SessionTurnOperation("user", "visible")
+    )
+    binding = TransactionBinding(
+        transaction_id="9d137f0a-399c-50d0-b5f2-5a0d11adf0c7",
+        event_id="bb56f861-af77-52ba-90ef-6e584952e64a",
+        processing_sequence=1,
+        participant_id=participant.participant_id,
+        operation_digest=participant.operation_digest,
+        transaction_kind=TransactionKind.EVENT_MUTATION,
+    )
+
+    assert participant.inspect_reconciliation(binding) is (
+        StartupParticipantOutcome.VERIFIED_CONSISTENT
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"transaction_id": "51a4f602-b878-52f7-b925-50b03247817e"},
+        {"event_id": "e33d48f6-7f10-5756-8613-259fca776c14"},
+        {"processing_sequence": 2},
+        {"transaction_kind": TransactionKind.MAINTENANCE_MUTATION},
+    ],
+)
+def test_session_participant_rejects_tampered_transaction_identity(
+    change: dict[str, object],
+) -> None:
+    participant = SessionTurnParticipant(
+        SessionState(), SessionTurnOperation("user", "visible")
+    )
+    binding = TransactionBinding(
+        transaction_id="9d137f0a-399c-50d0-b5f2-5a0d11adf0c7",
+        event_id="bb56f861-af77-52ba-90ef-6e584952e64a",
+        processing_sequence=1,
+        participant_id=participant.participant_id,
+        operation_digest=participant.operation_digest,
+        transaction_kind=TransactionKind.EVENT_MUTATION,
+    )
+
+    with pytest.raises(ParticipantDivergedError):
+        participant.prepare(replace(binding, **change))
+    assert participant.session_state.turns == []

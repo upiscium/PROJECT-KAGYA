@@ -1,7 +1,5 @@
 """Runtime loop for PROJECT-KAGYA."""
 
-from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
-from kagya.runtime.session_state import SessionTurn, SessionState
 from kagya.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -62,6 +60,7 @@ from kagya.runtime.transaction_coordinator import (
     ParticipantUnavailableError,
     ReconcilableTransactionParticipant,
     TransactionBinding,
+    TransactionBoundValue,
     TransactionCoordinator,
     TransactionCoordinatorError,
     TransactionFinalizationError,
@@ -91,6 +90,15 @@ from kagya.runtime.state_recovery import (
     StateRecoveryError,
     StateRecoveryResult,
 )
+from kagya.runtime.session_state import SessionState, SessionTurn
+from kagya.runtime.session_participant import (
+    SESSION_TURN_PARTICIPANT_ID,
+    SessionTurnOperation,
+    SessionTurnParticipant,
+    inspect_reset_session_operation,
+    session_turn_operation_digest,
+)
+from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
 
 __all__ = [
     "AbortOutcome",
@@ -119,6 +127,9 @@ __all__ = [
     "KagyaMainLoop",
     "SessionState",
     "SessionTurn",
+    "SESSION_TURN_PARTICIPANT_ID",
+    "SessionTurnOperation",
+    "SessionTurnParticipant",
     "EmotionStateSnapshot",
     "EventFailureCategory",
     "EventJournal",
@@ -146,6 +157,7 @@ __all__ = [
     "ReconciliationReason",
     "ReconcilableTransactionParticipant",
     "TransactionBinding",
+    "TransactionBoundValue",
     "TransactionCoordinator",
     "TransactionCoordinatorError",
     "TransactionFinalizationError",
@@ -174,4 +186,6 @@ __all__ = [
     "StateRecoveryResult",
     "TransitionRecord",
     "default_agent_state_snapshot",
+    "inspect_reset_session_operation",
+    "session_turn_operation_digest",
 ]

@@ -1,7 +1,7 @@
 """Small boundary between HTTP handlers and the serialized agent runtime."""
 
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TypeVar, overload
 
 from fastapi import HTTPException, status
 
@@ -13,18 +13,37 @@ from kagya.runtime import (
     AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
+    CoordinatedResult,
 )
 
 
 T = TypeVar("T")
 
 
+@overload
+def execute(
+    runtime: AgentRuntime,
+    event_type: AgentEventType,
+    source: AgentEventSource,
+    handler: Callable[[], CoordinatedResult[T]],
+) -> T: ...
+
+
+@overload
 def execute(
     runtime: AgentRuntime,
     event_type: AgentEventType,
     source: AgentEventSource,
     handler: Callable[[], T],
-) -> T:
+) -> T: ...
+
+
+def execute(
+    runtime: AgentRuntime,
+    event_type: AgentEventType,
+    source: AgentEventSource,
+    handler: Callable[[], object],
+) -> object:
     """Submit one request handler, translating only runtime-boundary failures."""
 
     try:

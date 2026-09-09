@@ -15,8 +15,10 @@ from kagya.body import EmotionState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem
+from kagya.memory.episodic_participant import MemoryEpisodicParticipant
 from kagya.models import DummyProvider
 from kagya.runtime import (
+    AbortOutcome,
     AgentEvent,
     AgentEventOutcome,
     AgentEventSource,
@@ -35,10 +37,14 @@ from kagya.runtime import (
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
+    EventJournalIntegrityError,
     EventJournalLoadError,
     EventLifecycle,
+    ParticipantOutcome,
     StateWAL,
     StateWALError,
+    SessionTurnParticipant,
+    TransactionBinding,
 )
 
 
@@ -115,7 +121,8 @@ def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
 
 
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
         response = client.post(
             "/api/chat", json={"message": "hello", "attachments": [], "debug": False}
         )
@@ -127,6 +134,29 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert "prompt" not in data
         assert "<think>" not in str(data)
         assert PRIVATE_SENTINEL not in str(data)
+        episode = client.app.state.memory_system.get_episodic_record(
+            data["episode_id"]
+        )
+        assert episode is not None
+        assert episode.response == "Visible API answer."
+        assert len(client.app.state.main_loop.session_state.turns) == 1
+        records = client.app.state.event_journal.records
+        assert [record.lifecycle for record in records[-8:]] == [
+            EventLifecycle.ACCEPTED,
+            EventLifecycle.STARTED,
+            EventLifecycle.TRANSACTION_PREPARED,
+            EventLifecycle.PREPARED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.TRANSACTION_COMPLETED,
+            EventLifecycle.COMPLETED,
+        ]
+        assert [record.participant_id for record in records[-4:-2]] == [
+            "memory.episodic",
+            "session.turn",
+        ]
+        pending = settings.memory.persist_directory / ".r07-episodic-pending"
+        assert list(pending.glob("*.json")) == []
 
 
 def test_api_chat_debug_requires_explicit_opt_in(tmp_path: Path) -> None:
@@ -141,7 +171,8 @@ def test_api_chat_debug_requires_explicit_opt_in(tmp_path: Path) -> None:
 
 
 def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
         response = client.post(
             "/api/chat/debug",
             headers=admin_headers(),
@@ -160,6 +191,14 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
         )
         assert PRIVATE_SENTINEL not in str(stored)
         assert "hidden_thought" not in stored["metadatas"][0]
+        assert PRIVATE_SENTINEL not in settings.event_journal.path.read_text()
+        assert PRIVATE_SENTINEL not in settings.agent_state.path.read_text()
+        assert all(
+            PRIVATE_SENTINEL.encode() not in path.read_bytes()
+            for path in settings.state_wal.directory.iterdir()
+            if path.is_file()
+        )
+        assert len(client.app.state.main_loop.session_state.turns) == 1
 
 
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
@@ -908,7 +947,7 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
     with TestClient(app) as client:
         response = client.post(
             "/api/chat",
-            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
+            json={"message": "visible request", "attachments": [], "debug": False},
         )
         assert response.status_code == 500
         assert response.json() == {
@@ -920,20 +959,28 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
             client.app.state.agent_state_store.load().last_processed_event_sequence == 0
         )
         assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+        assert client.app.state.main_loop.session_state.turns == []
+        assert client.app.state.memory_system.db1.get()["ids"] == []
+        transaction = client.app.state.event_journal.inspect().open_transactions[0]
+        assert transaction.terminal_lifecycle is None
+        pending_path = (
+            settings.memory.persist_directory
+            / ".r07-episodic-pending"
+            / f"{transaction.transaction_id}.json"
+        )
+        assert pending_path.exists()
+        assert PRIVATE_SENTINEL not in pending_path.read_text()
+        assert PRIVATE_SENTINEL not in settings.event_journal.path.read_text()
+        assert PRIVATE_SENTINEL not in settings.agent_state.path.read_text()
+        assert all(
+            PRIVATE_SENTINEL.encode() not in path.read_bytes()
+            for path in settings.state_wal.directory.iterdir()
+            if path.is_file()
+        )
 
-    with _client(tmp_path, settings=settings) as restarted:
-        assert (
-            restarted.app.state.agent_state_store.load().last_processed_event_sequence
-            == 0
-        )
-        response = restarted.post(
-            "/api/chat", json={"message": "next", "attachments": []}
-        )
-        assert response.status_code == 200
-        assert (
-            restarted.app.state.agent_state_store.load().last_processed_event_sequence
-            == 2
-        )
+    with pytest.raises(EventJournalIntegrityError):
+        with _client(tmp_path, settings=settings):
+            pass
 
 
 def test_wal_failure_after_prepared_prevents_snapshot_publish_and_fail_stops(
@@ -1124,6 +1171,77 @@ def test_accepted_append_failure_returns_bounded_503_without_handler(
         assert client.app.state.main_loop.session_state.turns == []
 
 
+def test_memory_prepare_failure_aborts_before_internal_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    original_prepare = MemoryEpisodicParticipant.prepare
+
+    def fail_prepare(
+        participant: MemoryEpisodicParticipant, binding: TransactionBinding
+    ) -> NoReturn:
+        original_prepare(participant, binding)
+        raise OSError("private Memory prepare failure")
+
+    monkeypatch.setattr(MemoryEpisodicParticipant, "prepare", fail_prepare)
+    with _client(tmp_path, settings=settings) as client:
+        response = client.post(
+            "/api/chat", json={"message": "prepare", "attachments": []}
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert client.app.state.agent_state_store.load().last_processed_event_sequence == 0
+        assert client.app.state.memory_system.db1.get()["ids"] == []
+        assert client.app.state.main_loop.session_state.turns == []
+        inspection = client.app.state.event_journal.inspect()
+        assert inspection.aborted_transactions[0].abort_outcomes == (
+            ("memory.episodic", AbortOutcome.ABORTED),
+        )
+        assert not any(
+            record.lifecycle is EventLifecycle.PREPARED
+            for record in inspection.records
+        )
+
+
+def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+
+    def fail_session(
+        _participant: SessionTurnParticipant, _binding: object
+    ) -> NoReturn:
+        raise OSError("private Session finalize failure")
+
+    monkeypatch.setattr(SessionTurnParticipant, "finalize", fail_session)
+    with _client(tmp_path, settings=settings) as client:
+        response = client.post(
+            "/api/chat", json={"message": "partial", "attachments": []}
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert client.app.state.agent_state_store.load().last_processed_event_sequence == 1
+        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+        assert client.app.state.main_loop.session_state.turns == []
+        assert len(client.app.state.memory_system.db1.get()["ids"]) == 1
+        transaction = client.app.state.event_journal.inspect().open_transactions[0]
+        assert transaction.participant_outcomes == (
+            ("memory.episodic", ParticipantOutcome.FINALIZED),
+        )
+        assert transaction.unresolved_participants == ("session.turn",)
+        assert transaction.reconciliation_reason is not None
+        assert not any(
+            record.lifecycle is EventLifecycle.COMPLETED
+            for record in client.app.state.event_journal.records
+        )
+
+
 def test_finalization_failure_preserves_internal_commit_without_restore(
     tmp_path: Path,
 ) -> None:
@@ -1138,7 +1256,9 @@ def test_finalization_failure_preserves_internal_commit_without_restore(
 
     class FinalizationFailingRuntime(RecordingRuntime):
         def configure_durability(self, **kwargs: Any) -> None:
-            def fail_finalization(_event: AgentEvent) -> NoReturn:
+            def fail_finalization(
+                _event: AgentEvent, _evidence: object
+            ) -> NoReturn:
                 raise OSError("private finalization failure")
 
             kwargs["finalization_checkpoint"] = fail_finalization
@@ -1210,9 +1330,8 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
             client.app.state.agent_state_store.load().last_processed_event_sequence == 1
         )
         assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
-        assert (
-            client.app.state.event_journal.records[-1].lifecycle
-            is EventLifecycle.PREPARED
+        assert client.app.state.event_journal.records[-1].lifecycle is (
+            EventLifecycle.TRANSACTION_COMPLETED
         )
 
     with _client(tmp_path, settings=settings) as restarted:

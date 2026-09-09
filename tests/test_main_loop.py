@@ -3,11 +3,16 @@ from pathlib import Path
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem
 from kagya.models import DummyProvider
-from kagya.runtime import KagyaMainLoop
+from kagya.runtime import (
+    CoordinatedResult,
+    KagyaMainLoop,
+    TransactionBoundValue,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
+TRANSACTION_ID = "d16db71e-0d94-5c0a-b827-375a90ab6404"
 
 
 class ThinkingDummyProvider(DummyProvider):
@@ -29,7 +34,8 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     memory = DualMemorySystem(settings)
     loop = KagyaMainLoop(settings, provider, memory)
 
-    result = loop.chat("hello")
+    plan = loop.chat("hello")
+    result = _materialize(plan)
 
     assert result.response == "Visible runtime answer."
     assert result.loss == DummyProvider.loss_value
@@ -49,7 +55,7 @@ def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) ->
         DualMemorySystem(settings),
     )
 
-    result, trace = loop.chat_debug("inspect this turn")
+    result, trace = _materialize(loop.chat_debug("inspect this turn"))
 
     assert result.response == "Visible runtime answer."
     assert trace.hidden_thought == PRIVATE_SENTINEL
@@ -57,21 +63,20 @@ def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) ->
     assert "Assistant:" in trace.prompt
 
 
-def test_db1_never_persists_extracted_private_thought(tmp_path: Path) -> None:
+def test_computation_does_not_write_memory_or_session(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
-    result, trace = loop.chat_debug("remember this")
-    stored = memory.db1.get(
-        ids=[result.episode_id], include=["documents", "metadatas"]
-    )
+    plan = loop.chat_debug("remember this")
+    result, trace = _materialize(plan)
+    stored = memory.db1.get(include=["documents", "metadatas"])
 
     assert trace.hidden_thought == PRIVATE_SENTINEL
-    assert stored["ids"] == [result.episode_id]
-    assert stored["metadatas"][0]["user_input"] == "remember this"
-    assert stored["metadatas"][0]["response"] == "Visible runtime answer."
-    assert "hidden_thought" not in stored["metadatas"][0]
+    assert result.episode_id.startswith("episode-")
+    assert stored["ids"] == []
+    assert loop.session_state.turns == []
+    assert not (settings.memory.persist_directory / ".r07-episodic-pending").exists()
     assert PRIVATE_SENTINEL not in str(stored)
 
 
@@ -79,11 +84,13 @@ def test_visible_response_does_not_contain_think_tags_or_private_sentinel(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    result = KagyaMainLoop(
-        settings,
-        ThinkingDummyProvider(),
-        DualMemorySystem(settings),
-    ).chat("hello")
+    result = _materialize(
+        KagyaMainLoop(
+            settings,
+            ThinkingDummyProvider(),
+            DualMemorySystem(settings),
+        ).chat("hello")
+    )
 
     assert "<think>" not in result.response
     assert "</think>" not in result.response
@@ -95,7 +102,7 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     before = loop.emotion_engine.state
 
-    result = loop.chat("emotion update")
+    result = _materialize(loop.chat("emotion update"))
 
     assert result.arousal != before.arousal
     assert result.optimal_loss != before.optimal_loss
@@ -109,7 +116,7 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     memory.save_semantic("stable semantic memory")
     loop = KagyaMainLoop(settings, provider, memory)
 
-    _result, trace = loop.chat_debug("old semantic query")
+    _result, trace = _materialize(loop.chat_debug("old semantic query"))
 
     assert "valence:" in trace.prompt
     assert "arousal:" in trace.prompt
@@ -125,16 +132,36 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
 
 def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    _result, trace = KagyaMainLoop(
-        settings,
-        ThinkingDummyProvider(),
-        DualMemorySystem(settings),
-    ).chat_debug("answer naturally")
+    _result, trace = _materialize(
+        KagyaMainLoop(
+            settings,
+            ThinkingDummyProvider(),
+            DualMemorySystem(settings),
+        ).chat_debug("answer naturally")
+    )
 
     assert trace.prompt.startswith("Context: PROJECT-KAGYA")
     assert "private local AI assistant" in trace.prompt
     assert "Private runtime data below is for tone and context only" in trace.prompt
     assert "User: answer naturally\nAssistant:" in trace.prompt
+
+
+def test_chat_plan_has_fixed_memory_then_session_participants(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+
+    plan = loop.chat("plan")
+
+    assert [participant.participant_id for participant in plan.participants] == [
+        "memory.episodic",
+        "session.turn",
+    ]
+    assert loop.session_state.turns == []
+
+
+def _materialize(plan: CoordinatedResult[object]):
+    assert isinstance(plan.value, TransactionBoundValue)
+    return plan.value.materialize(TRANSACTION_ID)
 
 
 def _settings_for_tmp_memory(tmp_path: Path) -> Settings:

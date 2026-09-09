@@ -38,6 +38,33 @@ class TransactionBinding:
     transaction_kind: TransactionKind
 
 
+def validate_transaction_binding(binding: TransactionBinding) -> bool:
+    """Return whether all fields match the canonical transaction identity."""
+
+    sequence = binding.processing_sequence
+    try:
+        parsed_event_id = UUID(binding.event_id)
+        parsed_transaction_id = UUID(binding.transaction_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (
+        str(parsed_event_id) != binding.event_id
+        or str(parsed_transaction_id) != binding.transaction_id
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence <= 0
+        or not isinstance(binding.transaction_kind, TransactionKind)
+    ):
+        return False
+    canonical = json.dumps(
+        [binding.event_id, sequence, binding.transaction_kind.value],
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return binding.transaction_id == str(uuid5(_TRANSACTION_ID_NAMESPACE, canonical))
+
+
 @runtime_checkable
 class TransactionParticipant(Protocol):
     @property
@@ -70,9 +97,16 @@ class ReconcilableTransactionParticipant(TransactionParticipant, Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CoordinatedResult(Generic[T]):
-    value: T
+    value: T | TransactionBoundValue[T]
     participants: tuple[TransactionParticipant, ...]
     transaction_kind: TransactionKind = TransactionKind.EVENT_MUTATION
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionBoundValue(Generic[T]):
+    """Process-local public value construction after transaction ID allocation."""
+
+    materialize: Callable[[str], T]
 
 
 class TransactionCoordinatorError(Exception):
@@ -169,6 +203,10 @@ class TransactionCoordinator:
             or event.event_id in self._live
             or not isinstance(result.transaction_kind, TransactionKind)
             or not isinstance(result.participants, tuple)
+            or (
+                isinstance(result.value, TransactionBoundValue)
+                and not callable(result.value.materialize)
+            )
         ):
             raise TransactionPreparationError("Transaction preparation is invalid")
 
@@ -207,7 +245,16 @@ class TransactionCoordinator:
                 preparation_failed = True
                 break
         if not preparation_failed:
-            return result.value
+            if not isinstance(result.value, TransactionBoundValue):
+                return result.value
+            materialization_failed = False
+            materialized: object | None = None
+            try:
+                materialized = result.value.materialize(transaction_id)
+            except Exception:
+                materialization_failed = True
+            if not materialization_failed:
+                return materialized
 
         self._abort_after_preparation_failure(event, live)
         raise TransactionPreparationError("Transaction preparation failed")
@@ -243,6 +290,9 @@ class TransactionCoordinator:
                         )
                         or not callable(getattr(participant, "reconcile", None))
                     )
+                ) or (
+                    ParticipantCapability.ABORT not in capabilities
+                    and getattr(participant, "prepare_is_read_only", False) is not True
                 ):
                     raise TypeError
                 validated.append((participant, requirement))

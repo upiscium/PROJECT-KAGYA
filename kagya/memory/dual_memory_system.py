@@ -88,7 +88,68 @@ class DualMemorySystem:
         extra_metadata = metadata or {}
         reject_private_fields(extra_metadata, context="Episodic memory metadata")
         episode_id = f"episode-{uuid4()}"
-        created_at = _now_iso()
+        self._add_episodic(
+            episode_id,
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=_now_iso(),
+            metadata=extra_metadata,
+        )
+        return episode_id
+
+    def get_episodic_record(self, episode_id: str) -> EpisodicMemoryRecord | None:
+        """Return one committed DB1 record without consulting pending staging."""
+
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        ids = result.get("ids") or []
+        metadatas = result.get("metadatas") or []
+        if not ids or not metadatas:
+            return None
+        return _episodic_record_from_metadata(str(ids[0]), dict(metadatas[0] or {}))
+
+    def publish_coordinated_episodic(
+        self,
+        episode_id: str,
+        user_input: str,
+        response: str,
+        *,
+        loss: float,
+        emotion_valence: float,
+        emotion_arousal: float,
+        record_type: MemoryRecordType,
+        created_at: str,
+    ) -> None:
+        """Publish one already-validated deterministic coordinated record to DB1."""
+
+        self._add_episodic(
+            episode_id,
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=created_at,
+            metadata={},
+        )
+
+    def _add_episodic(
+        self,
+        episode_id: str,
+        user_input: str,
+        response: str,
+        *,
+        loss: float,
+        emotion_valence: float,
+        emotion_arousal: float,
+        record_type: MemoryRecordType,
+        created_at: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
         record_metadata: Metadata = {
             "user_input": user_input,
             "response": response,
@@ -98,14 +159,13 @@ class DualMemorySystem:
             "record_type": record_type.value,
             "archived": False,
             "created_at": created_at,
-            "extra": json.dumps(extra_metadata),
+            "extra": json.dumps(dict(metadata)),
         }
         self.db1.add(
             ids=[episode_id],
             documents=[_episodic_document(user_input, response)],
             metadatas=[record_metadata],
         )
-        return episode_id
 
     def save_semantic(
         self,
