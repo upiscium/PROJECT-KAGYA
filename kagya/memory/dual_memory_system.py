@@ -1,6 +1,7 @@
 """ChromaDB-backed dual memory implementation."""
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from typing import Any
@@ -49,6 +50,23 @@ def _resolve_embedding_function(embedding_function: Any | None) -> Any:
     if embedding_function is None:
         return DeterministicEmbeddingFunction()
     return embedding_function
+
+
+class EpisodicMemoryReadError(Exception):
+    """A bounded failure to read committed episodic Memory."""
+
+
+class EpisodicMemoryFormatError(Exception):
+    """Committed episodic Memory has malformed domain content."""
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedEpisodicMemory:
+    """One committed DB1 document and its parsed metadata projection."""
+
+    document: str
+    metadata: dict[str, Any]
+    record: EpisodicMemoryRecord
 
 
 class DualMemorySystem:
@@ -104,12 +122,50 @@ class DualMemorySystem:
     def get_episodic_record(self, episode_id: str) -> EpisodicMemoryRecord | None:
         """Return one committed DB1 record without consulting pending staging."""
 
-        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        committed = self.get_committed_episodic(episode_id)
+        return None if committed is None else committed.record
+
+    def get_committed_episodic(
+        self, episode_id: str
+    ) -> CommittedEpisodicMemory | None:
+        """Read one DB1 document and metadata together without repairing either."""
+
+        try:
+            result = self.db1.get(
+                ids=[episode_id], include=["documents", "metadatas"]
+            )
+        except Exception:
+            raise EpisodicMemoryReadError(
+                "Committed episodic Memory is unavailable"
+            ) from None
         ids = result.get("ids") or []
+        documents = result.get("documents") or []
         metadatas = result.get("metadatas") or []
-        if not ids or not metadatas:
+        if not ids:
+            if documents or metadatas:
+                raise EpisodicMemoryFormatError(
+                    "Committed episodic Memory is invalid"
+                )
             return None
-        return _episodic_record_from_metadata(str(ids[0]), dict(metadatas[0] or {}))
+        try:
+            if (
+                len(ids) != 1
+                or len(documents) != 1
+                or len(metadatas) != 1
+                or str(ids[0]) != episode_id
+                or not isinstance(documents[0], str)
+            ):
+                raise ValueError
+            record = _episodic_record_from_metadata(
+                str(ids[0]), dict(metadatas[0] or {})
+            )
+        except Exception:
+            raise EpisodicMemoryFormatError(
+                "Committed episodic Memory is invalid"
+            ) from None
+        return CommittedEpisodicMemory(
+            document=documents[0], metadata=dict(metadatas[0] or {}), record=record
+        )
 
     def publish_coordinated_episodic(
         self,
@@ -135,6 +191,7 @@ class DualMemorySystem:
             record_type=record_type,
             created_at=created_at,
             metadata={},
+            coordinated=True,
         )
 
     def _add_episodic(
@@ -149,21 +206,22 @@ class DualMemorySystem:
         record_type: MemoryRecordType,
         created_at: str,
         metadata: Mapping[str, Any],
+        coordinated: bool = False,
     ) -> None:
-        record_metadata: Metadata = {
-            "user_input": user_input,
-            "response": response,
-            "loss": float(loss),
-            "emotion_valence": float(emotion_valence),
-            "emotion_arousal": float(emotion_arousal),
-            "record_type": record_type.value,
-            "archived": False,
-            "created_at": created_at,
-            "extra": json.dumps(dict(metadata)),
-        }
+        record_metadata = canonical_episodic_metadata(
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=created_at,
+            metadata=metadata,
+            coordinated=coordinated,
+        )
         self.db1.add(
             ids=[episode_id],
-            documents=[_episodic_document(user_input, response)],
+            documents=[canonical_episodic_document(user_input, response)],
             metadatas=[record_metadata],
         )
 
@@ -243,10 +301,16 @@ class DualMemorySystem:
         ):
             metadata = dict(raw_metadata or {})
             sanitized = _sanitize_persisted_metadata(metadata)
-            visible_document = _episodic_document(
+            visible_document = canonical_episodic_document(
                 str(sanitized.get("user_input", "")),
                 str(sanitized.get("response", "")),
             )
+            if _is_coordinated_episodic_metadata(metadata):
+                if sanitized != metadata or document != visible_document:
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    )
+                continue
             if sanitized == metadata and document == visible_document:
                 continue
             self.db1.delete(ids=[str(record_id)])
@@ -280,8 +344,47 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _episodic_document(user_input: str, response: str) -> str:
+def canonical_episodic_document(user_input: str, response: str) -> str:
+    """Build the authoritative visible DB1 episodic document."""
+
     return f"User: {user_input}\nAssistant: {response}".strip()
+
+
+def canonical_episodic_metadata(
+    user_input: str,
+    response: str,
+    *,
+    loss: float,
+    emotion_valence: float,
+    emotion_arousal: float,
+    record_type: MemoryRecordType,
+    created_at: str,
+    metadata: Mapping[str, Any],
+    coordinated: bool = False,
+) -> Metadata:
+    """Build the authoritative DB1 metadata map for one episodic record."""
+
+    result: dict[str, str | int | float | bool] = {
+        "user_input": user_input,
+        "response": response,
+        "loss": float(loss),
+        "emotion_valence": float(emotion_valence),
+        "emotion_arousal": float(emotion_arousal),
+        "record_type": record_type.value,
+        "archived": False,
+        "created_at": created_at,
+        "extra": json.dumps(dict(metadata)),
+    }
+    if coordinated:
+        result["coordination_schema"] = 1
+    return result
+
+
+def _is_coordinated_episodic_metadata(metadata: Mapping[str, Any]) -> bool:
+    return (
+        type(metadata.get("coordination_schema")) is int
+        and metadata["coordination_schema"] == 1
+    )
 
 
 def _sanitize_persisted_metadata(metadata: Mapping[str, Any]) -> Metadata:

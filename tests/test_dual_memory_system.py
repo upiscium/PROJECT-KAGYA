@@ -6,6 +6,7 @@ import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem, MemoryRecordType
+from kagya.memory.dual_memory_system import EpisodicMemoryFormatError
 from kagya.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     EpisodicWrite,
@@ -14,6 +15,7 @@ from kagya.memory.episodic_participant import (
 from kagya.models import DummyProvider
 from kagya.runtime import (
     AbortOutcome,
+    ParticipantDivergedError,
     ParticipantOutcome,
     ParticipantUnavailableError,
     StartupParticipantOutcome,
@@ -73,8 +75,9 @@ def test_new_memory_metadata_rejects_private_fields(tmp_path: Path) -> None:
 def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
+    legacy_id = f"episode-{TRANSACTION_ID}"
     memory.db1.add(
-        ids=["legacy-private"],
+        ids=[legacy_id],
         documents=[
             f"User: legacy user\nAssistant: visible answer\nThought: {PRIVATE_SENTINEL}"
         ],
@@ -98,7 +101,7 @@ def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> N
 
     reopened = DualMemorySystem(settings)
     stored = reopened.db1.get(
-        ids=["legacy-private"], include=["documents", "metadatas"]
+        ids=[legacy_id], include=["documents", "metadatas"]
     )
 
     assert stored["documents"] == ["User: legacy user\nAssistant: visible answer"]
@@ -219,6 +222,133 @@ def test_finalize_is_idempotent_when_committed_record_and_pending_both_exist(
     assert memory.db1.get(ids=[episode_id])["ids"] == [episode_id]
 
 
+def test_committed_only_reconstruction_rejects_conflicting_document(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    participant = _participant(memory)
+    binding = _binding(participant)
+    participant.prepare(binding)
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+
+    reconstructed = MemoryEpisodicParticipant.from_pending(
+        memory,
+        binding.transaction_id,
+        participant.participant_id,
+        participant.operation_digest,
+    )
+
+    assert (
+        reconstructed.inspect_reconciliation(binding)
+        is StartupParticipantOutcome.VERIFIED_CONSISTENT
+    )
+    assert reconstructed.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    episode_id = participant.episode_id(binding.transaction_id)
+    memory.db1.update(ids=[episode_id], documents=["conflicting DB1 document"])
+
+    with pytest.raises(ParticipantDivergedError):
+        MemoryEpisodicParticipant.from_pending(
+            memory,
+            binding.transaction_id,
+            participant.participant_id,
+            participant.operation_digest,
+        )
+    assert memory.db1.get(ids=[episode_id], include=["documents"])["documents"] == [
+        "conflicting DB1 document"
+    ]
+    with pytest.raises(EpisodicMemoryFormatError):
+        DualMemorySystem(memory.settings)
+
+
+def test_reconciliation_inspection_rejects_conflicting_committed_document(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    participant = _participant(memory)
+    binding = _binding(participant)
+    participant.prepare(binding)
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+    episode_id = participant.episode_id(binding.transaction_id)
+    memory.db1.update(ids=[episode_id], documents=["conflicting DB1 document"])
+
+    with pytest.raises(ParticipantDivergedError):
+        participant.inspect_reconciliation(binding)
+    assert memory.db1.get(ids=[episode_id], include=["documents"])["documents"] == [
+        "conflicting DB1 document"
+    ]
+
+
+def test_finalize_rejects_conflicting_committed_document_with_matching_pending(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    participant = _participant(memory)
+    binding = _binding(participant)
+    participant.prepare(binding)
+    _publish_participant(memory, participant, binding)
+    episode_id = participant.episode_id(binding.transaction_id)
+    memory.db1.update(ids=[episode_id], documents=["conflicting DB1 document"])
+
+    with pytest.raises(ParticipantDivergedError):
+        participant.finalize(binding)
+
+    assert participant.pending_path(binding).exists()
+
+
+def test_valid_committed_document_and_metadata_are_consistent(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    participant = _participant(memory)
+    binding = _binding(participant)
+    participant.prepare(binding)
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+
+    reconstructed = MemoryEpisodicParticipant.from_pending(
+        memory,
+        binding.transaction_id,
+        participant.participant_id,
+        participant.operation_digest,
+    )
+
+    assert (
+        reconstructed.inspect_reconciliation(binding)
+        is StartupParticipantOutcome.VERIFIED_CONSISTENT
+    )
+    assert reconstructed.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+
+
+def test_all_committed_verification_paths_reject_raw_metadata_conflict(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    participant = _participant(memory)
+    binding = _binding(participant)
+    participant.prepare(binding)
+    _publish_participant(memory, participant, binding)
+    episode_id = participant.episode_id(binding.transaction_id)
+    stored = memory.db1.get(ids=[episode_id], include=["metadatas"])
+    conflicting = dict(stored["metadatas"][0] or {})
+    conflicting["unexpected"] = "conflict"
+    memory.db1.update(ids=[episode_id], metadatas=[conflicting])
+
+    for operation in (
+        lambda: participant.prepare(binding),
+        lambda: participant.finalize(binding),
+        lambda: participant.inspect_reconciliation(binding),
+        lambda: participant.reconcile(binding),
+        lambda: MemoryEpisodicParticipant.from_pending(
+            memory,
+            binding.transaction_id,
+            participant.participant_id,
+            participant.operation_digest,
+        ),
+    ):
+        with pytest.raises(ParticipantDivergedError):
+            operation()
+
+    assert participant.pending_path(binding).exists()
+
 def test_abort_removes_only_pending_and_never_committed_memory(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
     pending = _participant(memory)
@@ -301,6 +431,24 @@ def _participant(
             record_type=MemoryRecordType.EPISODIC_LOG,
             created_at=datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
         ),
+    )
+
+
+def _publish_participant(
+    memory: DualMemorySystem,
+    participant: MemoryEpisodicParticipant,
+    binding: TransactionBinding,
+) -> None:
+    operation = participant.operation
+    memory.publish_coordinated_episodic(
+        participant.episode_id(binding.transaction_id),
+        operation.user_input,
+        operation.response,
+        loss=operation.loss,
+        emotion_valence=operation.emotion_valence,
+        emotion_arousal=operation.emotion_arousal,
+        record_type=operation.record_type,
+        created_at=operation.created_at,
     )
 
 

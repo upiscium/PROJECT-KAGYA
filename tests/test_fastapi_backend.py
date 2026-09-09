@@ -663,6 +663,10 @@ def test_successful_chat_is_reconstructable_without_private_payloads(
     assert b"Visible API answer" not in persisted
     assert b"prompt" not in persisted.lower()
     assert b"hidden" not in persisted.lower()
+    assert PRIVATE_SENTINEL not in settings.event_journal.path.read_text()
+    assert "Visible API answer" not in settings.event_journal.path.read_text()
+    assert PRIVATE_SENTINEL not in settings.agent_state.path.read_text()
+    assert "Visible API answer" not in settings.agent_state.path.read_text()
 
 
 def test_true_rollback_keeps_runtime_reconciliation_gated(

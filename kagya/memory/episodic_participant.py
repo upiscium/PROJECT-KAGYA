@@ -15,7 +15,14 @@ from threading import RLock
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
-from kagya.memory.dual_memory_system import DualMemorySystem
+from kagya.memory.dual_memory_system import (
+    CommittedEpisodicMemory,
+    DualMemorySystem,
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+    canonical_episodic_document,
+    canonical_episodic_metadata,
+)
 from kagya.memory.memory_schema import EpisodicMemoryRecord, MemoryRecordType
 from kagya.runtime.event_journal import (
     AbortOutcome,
@@ -125,24 +132,25 @@ class MemoryEpisodicParticipant:
             or re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None
         ):
             raise ParticipantDivergedError("Pending Memory identity is invalid")
+        episode_id = _episode_id(transaction_id, participant_id, operation_digest)
         loaded = cls._load_memory_optional(memory, f"{transaction_id}.json")
+        committed = cls._get_committed(memory, episode_id)
         if loaded is None:
-            episode_id = _episode_id(transaction_id, participant_id, operation_digest)
-            committed = memory.get_episodic_record(episode_id)
             if committed is None:
                 raise UnsupportedParticipantReconciliationError(
                     "Memory operation evidence is absent"
                 )
-            operation = _operation_from_record(committed)
+            operation = _operation_from_record(committed.record)
         else:
             operation = _operation_from_dict(loaded.get("operation"))
         participant = cls(memory, operation)
         if participant.operation_digest != operation_digest:
             raise ParticipantDivergedError("Pending Memory digest conflicts")
+        if committed is not None and not participant._committed_matches(
+            committed, episode_id
+        ):
+            raise ParticipantDivergedError("Committed Memory record conflicts")
         if loaded is None:
-            assert committed is not None
-            if not participant._record_matches(committed, episode_id):
-                raise ParticipantDivergedError("Committed Memory record conflicts")
             return participant
         expected = {
             "schema_version": _PENDING_SCHEMA_VERSION,
@@ -174,9 +182,13 @@ class MemoryEpisodicParticipant:
             expected = self._artifact(binding)
             path = self.pending_path(binding)
             existing = self._load_optional(path)
-            committed = self.memory.get_episodic_record(str(expected["episode_id"]))
+            committed = self._get_committed(
+                self.memory, str(expected["episode_id"])
+            )
             if committed is not None:
-                if not self._record_matches(committed, str(expected["episode_id"])):
+                if not self._committed_matches(
+                    committed, str(expected["episode_id"])
+                ):
                     raise ParticipantDivergedError("Committed Memory record conflicts")
                 if existing is not None and existing != expected:
                     raise ParticipantDivergedError("Pending Memory record conflicts")
@@ -192,9 +204,13 @@ class MemoryEpisodicParticipant:
             expected = self._artifact(binding)
             path = self.pending_path(binding)
             existing = self._load_optional(path)
-            committed = self.memory.get_episodic_record(str(expected["episode_id"]))
+            committed = self._get_committed(
+                self.memory, str(expected["episode_id"])
+            )
             if committed is not None:
-                if not self._record_matches(committed, str(expected["episode_id"])):
+                if not self._committed_matches(
+                    committed, str(expected["episode_id"])
+                ):
                     raise ParticipantDivergedError("Committed Memory record conflicts")
                 if existing is not None:
                     if existing != expected:
@@ -215,11 +231,13 @@ class MemoryEpisodicParticipant:
                 record_type=self.operation.record_type,
                 created_at=self.operation.created_at,
             )
-            committed = self.memory.get_episodic_record(str(expected["episode_id"]))
-            if committed is None or not self._record_matches(
-                committed, str(expected["episode_id"])
-            ):
+            committed = self._get_committed(
+                self.memory, str(expected["episode_id"])
+            )
+            if committed is None:
                 raise ParticipantUnavailableError("Memory publication is unverified")
+            if not self._committed_matches(committed, str(expected["episode_id"])):
+                raise ParticipantDivergedError("Committed Memory record conflicts")
             self._remove_artifact(path)
             return ParticipantOutcome.FINALIZED
 
@@ -240,9 +258,13 @@ class MemoryEpisodicParticipant:
     ) -> StartupParticipantOutcome:
         with self._lock:
             expected = self._artifact(binding)
-            committed = self.memory.get_episodic_record(str(expected["episode_id"]))
+            committed = self._get_committed(
+                self.memory, str(expected["episode_id"])
+            )
             if committed is not None:
-                if not self._record_matches(committed, str(expected["episode_id"])):
+                if not self._committed_matches(
+                    committed, str(expected["episode_id"])
+                ):
                     raise ParticipantDivergedError("Committed Memory record conflicts")
                 return StartupParticipantOutcome.VERIFIED_CONSISTENT
             pending = self._load_optional(self.pending_path(binding))
@@ -256,9 +278,11 @@ class MemoryEpisodicParticipant:
 
     def reconcile(self, binding: TransactionBinding) -> StartupParticipantOutcome:
         expected = self._artifact(binding)
-        committed = self.memory.get_episodic_record(str(expected["episode_id"]))
+        committed = self._get_committed(self.memory, str(expected["episode_id"]))
         if committed is not None:
-            if not self._record_matches(committed, str(expected["episode_id"])):
+            if not self._committed_matches(
+                committed, str(expected["episode_id"])
+            ):
                 raise ParticipantDivergedError("Committed Memory record conflicts")
             pending = self._load_optional(self.pending_path(binding))
             if pending is not None:
@@ -288,11 +312,43 @@ class MemoryEpisodicParticipant:
             "operation": self.operation.canonical_dict(),
         }
 
-    def _record_matches(
-        self, record: EpisodicMemoryRecord, expected_episode_id: str
+    @staticmethod
+    def _get_committed(
+        memory: DualMemorySystem, episode_id: str
+    ) -> CommittedEpisodicMemory | None:
+        try:
+            return memory.get_committed_episodic(episode_id)
+        except EpisodicMemoryReadError:
+            raise ParticipantUnavailableError(
+                "Committed Memory is unavailable"
+            ) from None
+        except EpisodicMemoryFormatError:
+            raise ParticipantDivergedError(
+                "Committed Memory record conflicts"
+            ) from None
+
+    def _committed_matches(
+        self, committed: CommittedEpisodicMemory, expected_episode_id: str
     ) -> bool:
+        record = committed.record
         return (
-            record.id == expected_episode_id
+            committed.document
+            == canonical_episodic_document(
+                self.operation.user_input, self.operation.response
+            )
+            and committed.metadata
+            == canonical_episodic_metadata(
+                self.operation.user_input,
+                self.operation.response,
+                loss=self.operation.loss,
+                emotion_valence=self.operation.emotion_valence,
+                emotion_arousal=self.operation.emotion_arousal,
+                record_type=self.operation.record_type,
+                created_at=self.operation.created_at,
+                metadata={},
+                coordinated=True,
+            )
+            and record.id == expected_episode_id
             and record.user_input == self.operation.user_input
             and record.response == self.operation.response
             and record.loss == float(self.operation.loss)
