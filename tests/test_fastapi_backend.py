@@ -669,8 +669,8 @@ def test_successful_chat_is_reconstructable_without_private_payloads(
     assert "Visible API answer" not in settings.agent_state.path.read_text()
 
 
-def test_true_rollback_keeps_runtime_reconciliation_gated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
+    tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
@@ -694,39 +694,97 @@ def test_true_rollback_keeps_runtime_reconciliation_gated(
     settings.agent_state.path.unlink()
 
     runtime = RecordingRuntime()
-    with _client(tmp_path, settings=settings, runtime=runtime) as gated:
-        assert runtime.status is AgentRuntimeStatus.CREATED
-        assert gated.app.state.external_reconciliation_required is True
-        assert gated.app.state.event_journal.inspect().schema_version == 3
-        assert gated.app.state.state_wal.inspect().active_manifest is not None
-        assert gated.app.state.state_wal.inspect().active_manifest.external_reconciliation_required
-        monkeypatch.setattr(
-            gated.app.state.state_wal,
-            "inspect",
-            lambda: pytest.fail("health re-inspected WAL authority"),
-        )
-        health = gated.get("/health")
+    with _client(tmp_path, settings=settings, runtime=runtime) as reconciled:
+        assert runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert reconciled.app.state.external_reconciliation_required is False
+        inspection = reconciled.app.state.event_journal.inspect()
+        assert inspection.schema_version == 3
+        assert inspection.terminal_gate_clear is not None
+        assert reconciled.app.state.state_wal.inspect().active_manifest is not None
+        active_manifest = reconciled.app.state.state_wal.inspect().active_manifest
+        assert active_manifest is not None
+        assert not active_manifest.external_reconciliation_required
+        health = reconciled.get("/health")
         assert health.status_code == 200
         assert health.json() == {
-            "status": "degraded",
+            "status": "ok",
             "project": settings.project.name,
-            "reason": "external_reconciliation_required",
         }
-        response = gated.post(
-            "/api/chat", json={"message": "blocked", "attachments": []}
+        response = reconciled.post(
+            "/api/chat", json={"message": "accepted", "attachments": []}
         )
-        assert response.status_code == 503
+        assert response.status_code == 200
 
     second_runtime = RecordingRuntime()
-    with _client(tmp_path, settings=settings, runtime=second_runtime) as still_gated:
-        assert second_runtime.status is AgentRuntimeStatus.CREATED
-        assert still_gated.app.state.event_journal.inspect().schema_version == 3
-        manifest = still_gated.app.state.state_wal.inspect().active_manifest
+    with _client(tmp_path, settings=settings, runtime=second_runtime) as restarted:
+        assert second_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert restarted.app.state.event_journal.inspect().schema_version == 3
+        manifest = restarted.app.state.state_wal.inspect().active_manifest
         assert manifest is not None
-        assert manifest.external_reconciliation_required
-        assert still_gated.post(
-            "/api/chat", json={"message": "still-blocked", "attachments": []}
+        assert not manifest.external_reconciliation_required
+
+
+def test_degraded_path_a_does_not_start_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings):
+        pass
+    monkeypatch.setattr(
+        "kagya.api.server.StartupReconciliationCoordinator.reconcile_open_transactions",
+        lambda _self: (False, "external_participant_reconciliation_required"),
+    )
+    runtime = RecordingRuntime()
+
+    with _client(tmp_path, settings=settings, runtime=runtime) as degraded:
+        assert runtime.status is AgentRuntimeStatus.CREATED
+        assert degraded.get("/health").json()["status"] == "degraded"
+        assert degraded.post(
+            "/api/chat", json={"message": "blocked", "attachments": []}
         ).status_code == 503
+
+
+def test_two_true_rollbacks_preserve_reconciliation_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as first:
+        assert first.post(
+            "/api/chat", json={"message": "first", "attachments": []}
+        ).status_code == 200
+        wal: StateWAL = first.app.state.state_wal
+        manifest = wal.inspect().active_manifest
+        assert manifest is not None
+        generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    settings.agent_state.path.unlink()
+
+    with _client(tmp_path, settings=settings) as second:
+        assert second.app.state.external_reconciliation_required is False
+        assert second.post(
+            "/api/chat", json={"message": "second", "attachments": []}
+        ).status_code == 200
+        wal = second.app.state.state_wal
+        manifest = wal.inspect().active_manifest
+        assert manifest is not None
+        generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    settings.agent_state.path.unlink()
+
+    with _client(tmp_path, settings=settings) as third:
+        assert third.app.state.external_reconciliation_required is False
+        inspection = third.app.state.event_journal.inspect()
+        assert len(inspection.baselines) == 2
+        assert inspection.terminal_gate_clear is not None
+        assert third.get("/health").json()["status"] == "ok"
 
 
 def test_corrupt_wal_keeps_valid_canonical_current_accepting(tmp_path: Path) -> None:

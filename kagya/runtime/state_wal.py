@@ -45,6 +45,10 @@ class StateWALConflictError(StateWALError):
     """A requested operation conflicts with retained WAL state."""
 
 
+class StateWALGateClearProofError(StateWALConflictError):
+    """The proof-bound external reconciliation gate clear is stale."""
+
+
 class RecoveryReason(str, Enum):
     BOOTSTRAP = "bootstrap"
     EXACT_CURRENT_REPAIR = "exact_current_repair"
@@ -840,6 +844,55 @@ class StateWAL:
         if not inspection.exists:
             raise StateWALMissing("WAL is absent")
         return inspection
+
+    def clear_external_reconciliation_gate(self, expected: Manifest) -> Manifest:
+        """Clear the gate with a manifest-identity compare-and-swap.
+
+        This is deliberately separate from generation creation: a recovery
+        coordinator may only clear the exact manifest it inspected and proved.
+        """
+        with self._lock:
+            expected_raw = expected.model_dump(mode="json")
+            expected_hash = _domain_hash(
+                "kagya.state-wal.manifest",
+                {key: value for key, value in expected_raw.items()
+                 if key != "manifest_hash"},
+            )
+            if expected.manifest_hash != expected_hash:
+                raise StateWALGateClearProofError("WAL manifest proof is invalid")
+            current = self.inspect()
+            manifest = current.active_manifest
+            if manifest is None:
+                raise StateWALGateClearProofError("WAL manifest is absent")
+            if manifest.external_reconciliation_required:
+                if manifest != expected:
+                    raise StateWALGateClearProofError("WAL manifest proof is stale")
+                clear_base = manifest.model_copy(
+                    update={"external_reconciliation_required": False,
+                            "manifest_hash": "0" * 64}
+                )
+            else:
+                # A crash after the clear-prepared Journal record can leave
+                # this already applied.  Re-verify, but never rewrite it.
+                if manifest.active_generation_id != expected.active_generation_id:
+                    raise StateWALGateClearProofError("WAL generation proof is stale")
+                if (
+                    manifest.active_baseline_record_id != expected.active_baseline_record_id
+                    or manifest.active_baseline_record_hash != expected.active_baseline_record_hash
+                    or manifest.predecessor_generation_id != expected.predecessor_generation_id
+                    or manifest.predecessor_generation_hash != expected.predecessor_generation_hash
+                ):
+                    raise StateWALGateClearProofError("WAL manifest identity is stale")
+                return manifest
+            raw = clear_base.model_dump(mode="json")
+            raw["manifest_hash"] = _domain_hash(
+                "kagya.state-wal.manifest",
+                {key: value for key, value in raw.items() if key != "manifest_hash"},
+            )
+            self._atomic_write(self.root / "manifest.json", raw)
+            return Manifest.model_validate_json(_canonical(raw))
+
+    clear_gate_if_matches = clear_external_reconciliation_gate
 
     def _read_generation(
         self, manifest: Manifest

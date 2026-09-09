@@ -245,6 +245,12 @@ class MemoryEpisodicParticipant:
         with self._lock:
             expected = self._artifact(binding)
             path = self.pending_path(binding)
+            if self._get_committed(
+                self.memory, str(expected["episode_id"])
+            ) is not None:
+                raise ParticipantDivergedError(
+                    "Committed Memory cannot be classified as aborted"
+                )
             existing = self._load_optional(path)
             if existing is None:
                 return AbortOutcome.ALREADY_ABSENT
@@ -252,6 +258,40 @@ class MemoryEpisodicParticipant:
                 raise ParticipantDivergedError("Pending Memory record conflicts")
             self._remove_artifact(path)
             return AbortOutcome.ABORTED
+
+    @classmethod
+    def abort_pending(
+        cls, memory: DualMemorySystem, binding: TransactionBinding
+    ) -> AbortOutcome:
+        """Abort from public binding metadata, including after a prior removal."""
+
+        if (
+            not validate_transaction_binding(binding)
+            or binding.participant_id != MEMORY_EPISODIC_PARTICIPANT_ID
+            or re.fullmatch(r"[0-9a-f]{64}", binding.operation_digest) is None
+        ):
+            raise ParticipantDivergedError("Transaction binding is invalid")
+        episode_id = _episode_id(
+            binding.transaction_id,
+            binding.participant_id,
+            binding.operation_digest,
+        )
+        if cls._get_committed(memory, episode_id) is not None:
+            raise ParticipantDivergedError(
+                "Committed Memory cannot be classified as aborted"
+            )
+        pending = cls._load_memory_optional(
+            memory, f"{binding.transaction_id}.json"
+        )
+        if pending is None:
+            return AbortOutcome.ALREADY_ABSENT
+        participant = cls.from_pending(
+            memory,
+            binding.transaction_id,
+            binding.participant_id,
+            binding.operation_digest,
+        )
+        return participant.abort(binding)
 
     def inspect_reconciliation(
         self, binding: TransactionBinding

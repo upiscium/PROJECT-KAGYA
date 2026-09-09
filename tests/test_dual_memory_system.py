@@ -361,7 +361,11 @@ def test_abort_removes_only_pending_and_never_committed_memory(tmp_path: Path) -
     committed = _participant(memory, user_input="committed")
     committed_binding = _binding(committed)
     committed.prepare(committed_binding)
+    committed_pending = committed.pending_path(committed_binding)
+    pending_bytes = committed_pending.read_bytes()
     assert committed.finalize(committed_binding) is ParticipantOutcome.FINALIZED
+    committed_pending.write_bytes(pending_bytes)
+    committed_pending.chmod(0o600)
     episode_id = committed.episode_id(committed_binding.transaction_id)
     reconstructed = MemoryEpisodicParticipant.from_pending(
         DualMemorySystem(memory.settings),
@@ -370,7 +374,9 @@ def test_abort_removes_only_pending_and_never_committed_memory(tmp_path: Path) -
         committed.operation_digest,
     )
 
-    assert committed.abort(committed_binding) is AbortOutcome.ALREADY_ABSENT
+    with pytest.raises(ParticipantDivergedError):
+        committed.abort(committed_binding)
+    assert committed_pending.exists()
     assert memory.get_episodic_record(episode_id) is not None
     assert (
         reconstructed.inspect_reconciliation(committed_binding)

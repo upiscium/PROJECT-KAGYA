@@ -390,6 +390,22 @@ def test_existing_reconciliation_gate_cannot_be_cleared_by_new_generation(
     assert wal.inspect().active_manifest.external_reconciliation_required
 
 
+def test_proof_bound_gate_clear_is_idempotent_and_does_not_append_sequence(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    gated = wal.bootstrap(make_snapshot(0), 4, external_reconciliation_required=True)
+    before = wal.inspect()
+
+    cleared = wal.clear_external_reconciliation_gate(gated)
+    after = wal.inspect()
+
+    assert not cleared.external_reconciliation_required
+    assert after.latest_snapshot_sequence == before.latest_snapshot_sequence == 0
+    assert after.record_hashes == before.record_hashes
+    assert wal.clear_external_reconciliation_gate(gated) == cleared
+
+
 def test_prepared_recovery_preserves_and_replaces_partial_generation(
     tmp_path: Path,
 ) -> None:

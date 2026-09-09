@@ -24,8 +24,12 @@ from kagya.runtime.event_journal import (
     EventJournalAppendStage,
     EventJournalLoadError,
     EventLifecycle,
+    ParticipantCapability,
+    ParticipantRequirement,
+    TransactionKind,
 )
 from kagya.runtime.state_recovery import (
+    InternalCommitClassification,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
@@ -80,6 +84,28 @@ def coordinator(
 def start_event(journal: EventJournal, item: AgentEvent) -> None:
     journal.append_accepted(item)
     journal.append_started(item)
+
+
+def start_transaction(journal: EventJournal, item: AgentEvent) -> None:
+    if journal.inspect().schema_version == 2:
+        journal.append_v3_migration_checkpoint()
+    start_event(journal, item)
+    journal.append_transaction_prepared(
+        item,
+        str(uuid5(NAMESPACE_URL, f"transaction:{item.event_id}")),
+        TransactionKind.EVENT_MUTATION,
+        (
+            ParticipantRequirement(
+                participant_id="memory.episodic",
+                operation_digest="1" * 64,
+                capabilities=(
+                    ParticipantCapability.ABORT,
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+    )
 
 
 def commit_event(
@@ -429,6 +455,85 @@ def test_internal_commit_verification_is_read_only(tmp_path: Path) -> None:
 
     assert journal.path.read_bytes() == before
     assert journal.inspect().records[-1].lifecycle is EventLifecycle.PREPARED
+
+
+def test_transaction_classification_is_pre_internal_before_publication(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    recovery.prepare_startup()
+    item = event("classify-pre-internal", 1)
+    start_transaction(journal, item)
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.PRE_INTERNAL
+    assert proof.event_id == item.event_id
+    assert proof.processing_sequence == 1
+    assert proof.snapshot_sequence == 0
+    assert proof.snapshot_hash == store.snapshot_hash(store.load())
+    assert proof.wal_record_id is None
+    assert proof.wal_record_hash is None
+    assert wal.inspect().latest_snapshot_sequence == 0
+
+
+def test_transaction_classification_is_internally_committed(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-internally-committed", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.INTERNALLY_COMMITTED
+    assert proof.snapshot_sequence == 1
+    assert proof.snapshot_hash == store.snapshot_hash(candidate)
+    assert proof.wal_generation_id is not None
+    assert proof.wal_record_id is not None
+    assert proof.wal_record_hash is not None
+    assert wal.inspect().latest_snapshot_sequence == 1
+
+
+def test_transaction_classification_is_ambiguous_for_cross_authority_evidence(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-cross-authority-tamper", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+    store.save(snapshot(1, 0.9))
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.AMBIGUOUS
+
+
+def test_transaction_classification_is_read_only(tmp_path: Path) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-read-only", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+    snapshot_before = store.path.read_bytes()
+    journal_before = journal.path.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+
+    recovery.classify_transaction_commit(transaction)
+
+    assert store.path.read_bytes() == snapshot_before
+    assert journal.path.read_bytes() == journal_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before
 
 
 def test_terminal_completion_only_appends_completed(

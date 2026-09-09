@@ -26,6 +26,7 @@ from kagya.runtime import (
     StateWAL,
     TransactionCoordinator,
 )
+from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -67,6 +68,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.event_journal,
                 app.state.state_wal,
             )
+            journal_schema = app.state.event_journal.inspect().schema_version
+            app.state.memory_system = getattr(
+                app.state, "memory_system", None
+            ) or DualMemorySystem(app_settings)
+            app.state.startup_reconciliation = StartupReconciliationCoordinator(
+                app.state.event_journal,
+                app.state.state_recovery,
+                app.state.memory_system,
+            )
+            app.state.startup_reconciliation.resume_prepared_gate_clear()
+            participants_consistent = True
+            degraded_reason = None
+            if journal_schema == 3:
+                participants_consistent, degraded_reason = (
+                    app.state.startup_reconciliation.reconcile_open_transactions()
+                )
             recovery = app.state.state_recovery.prepare_startup()
             journal_schema = app.state.event_journal.inspect().schema_version
             if journal_schema == 2:
@@ -74,18 +91,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 journal_schema = app.state.event_journal.inspect().schema_version
             if journal_schema != 3:
                 raise StateRecoveryError("Runtime requires EventJournal schema 3")
+            if participants_consistent:
+                reconciliation = (
+                    app.state.startup_reconciliation.reconcile_recovery_gate(recovery)
+                )
+                recovery = reconciliation.recovery
+                participants_consistent = reconciliation.participants_consistent
+                degraded_reason = reconciliation.degraded_reason
             app.state.external_reconciliation_required = (
                 recovery.external_reconciliation_required
+                or not participants_consistent
             )
+            app.state.reconciliation_degraded_reason = degraded_reason
             snapshot = recovery.snapshot
             snapshot_hash = recovery.snapshot_hash
 
             app.state.model_provider = getattr(
                 app.state, "model_provider", None
             ) or load_model_provider(app_settings)
-            app.state.memory_system = getattr(
-                app.state, "memory_system", None
-            ) or DualMemorySystem(app_settings)
             app.state.adapter_registry = getattr(
                 app.state, "adapter_registry", None
             ) or AdapterRegistry(app_settings)
@@ -188,7 +211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException:
             app.state.event_journal.close()
             raise
-        if not recovery.external_reconciliation_required:
+        if not app.state.external_reconciliation_required:
             try:
                 app.state.agent_runtime.start()
                 app.state.state_recovery.publish_boot_anchor(recovery)
@@ -218,7 +241,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
-                "reason": "external_reconciliation_required",
+                "reason": app.state.reconciliation_degraded_reason
+                or "external_reconciliation_required",
             }
         return {"status": "ok", "project": app_settings.project.name}
 

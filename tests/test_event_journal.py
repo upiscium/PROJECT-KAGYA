@@ -23,7 +23,9 @@ from kagya.runtime.event_journal import (
     EventJournalLoadError,
     EventJournalRecord,
     EventLifecycle,
+    ParticipantBaseline,
     ParticipantCapability,
+    ParticipantDomain,
     UnsupportedEventJournalVersion,
     ParticipantOutcome,
     ParticipantRequirement,
@@ -119,6 +121,106 @@ def transaction_requirements() -> tuple[ParticipantRequirement, ...]:
             ),
         )
         for participant, digest in zip(PARTICIPANTS, (HASH_1, HASH_2), strict=True)
+    )
+
+
+U5_BASELINE_ID = str(uuid5(NAMESPACE_URL, "u5-baseline"))
+U5_RECONCILIATION_ID = str(uuid5(NAMESPACE_URL, "u5-reconciliation"))
+U5_RECOVERY_ID = STARTUP_RECOVERY_ID
+
+
+def u5_registry() -> tuple[ParticipantBaseline, ...]:
+    return (
+        ParticipantBaseline(
+            participant_id="memory.episodic", domain=ParticipantDomain.DURABLE_DOMAIN
+        ),
+        ParticipantBaseline(
+            participant_id="session.turn", domain=ParticipantDomain.EPHEMERAL_PROCESS
+        ),
+    )
+
+
+def append_u5_baseline(value: EventJournal) -> None:
+    anchor = next(
+        (
+            record
+            for record in reversed(value.records)
+            if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+        ),
+        value.records[0],
+    )
+    inspection = value.inspect()
+    value.append_participant_baseline(
+        U5_BASELINE_ID,
+        inspection.snapshot_sequence,
+        inspection.snapshot_hash,
+        inspection.processing_high_water,
+        anchor.wal_generation_id or "",
+        anchor.wal_record_id or "",
+        anchor.wal_record_hash or "",
+        inspection.journal_lineage_id or "",
+        u5_registry(),
+    )
+
+
+def append_u5_clear(value: EventJournal, *, terminal: bool = False) -> None:
+    inspection = value.inspect()
+    baseline = inspection.baselines[-1]
+    append = value.append_cleared if terminal else value.append_clear_prepared
+    append(
+        U5_BASELINE_ID,
+        U5_RECONCILIATION_ID,
+        U5_RECOVERY_ID,
+        inspection.snapshot_sequence,
+        inspection.snapshot_hash,
+        inspection.processing_high_water,
+        baseline.wal_generation_id,
+        baseline.wal_record_id,
+        baseline.wal_record_hash,
+        inspection.journal_lineage_id or "",
+    )
+
+
+def append_u5_reconciliation(value: EventJournal) -> None:
+    baseline = value.inspect().baselines[-1]
+    requirements = transaction_requirements()
+    value.append_startup_reconciliation_prepared(
+        U5_RECONCILIATION_ID,
+        U5_RECOVERY_ID,
+        baseline.snapshot_sequence,
+        baseline.snapshot_hash,
+        baseline.processing_high_water,
+        baseline.wal_generation_id,
+        baseline.wal_record_id,
+        baseline.wal_record_hash,
+        baseline.journal_lineage_id,
+        requirements,
+    )
+    for requirement in requirements:
+        value.append_startup_participant_reconciled(
+            U5_RECONCILIATION_ID,
+            U5_RECOVERY_ID,
+            baseline.snapshot_sequence,
+            baseline.snapshot_hash,
+            baseline.processing_high_water,
+            baseline.wal_generation_id,
+            baseline.wal_record_id,
+            baseline.wal_record_hash,
+            baseline.journal_lineage_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+            StartupParticipantOutcome.VERIFIED_CONSISTENT,
+        )
+    value.append_startup_reconciliation_completed(
+        U5_RECONCILIATION_ID,
+        U5_RECOVERY_ID,
+        baseline.snapshot_sequence,
+        baseline.snapshot_hash,
+        baseline.processing_high_water,
+        baseline.wal_generation_id,
+        baseline.wal_record_id,
+        baseline.wal_record_hash,
+        baseline.journal_lineage_id,
     )
 
 
@@ -1625,7 +1727,7 @@ def test_v3_recovery_remains_valid_and_rotation_defers_for_open_transaction(
     assert reopened.records[-1].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
 
 
-def test_v3_rotation_remains_readable_after_migration_segment_is_pruned(
+def test_v3_rotation_preserves_transaction_authority_before_first_baseline(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "bounded-v3.jsonl"
@@ -1680,14 +1782,14 @@ def test_v3_rotation_remains_readable_after_migration_segment_is_pruned(
     retained_root = EventJournalRecord.model_validate_json(
         rotated[0].read_bytes().splitlines()[0]
     )
-    assert retained_root.schema_version == 3
-    assert retained_root.v3_migration_anchor_hash == migration_anchor
+    assert retained_root.schema_version == 2
 
     reopened = EventJournal(path, 1, 2, clock=lambda: NOW)
     inspection = reopened.inspect()
     assert inspection.schema_version == 3
     assert inspection.processing_high_water == 4
     assert inspection.snapshot_hash == HASH_1
+    assert len(inspection.completed_transactions) == 4
 
 
 def test_startup_reconciliation_is_metadata_free_and_does_not_consume_sequence(
@@ -2144,3 +2246,150 @@ def test_nonempty_abort_requirement_rejects_missing_abort_evidence(
 
     with pytest.raises(EventJournalAppendError):
         value.append_transaction_aborted(item, TX_ID)
+
+
+def test_u5_participant_baseline_records_exact_registry_without_sequence_consumption(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "u5-baseline.jsonl")
+    before = value.inspect()
+
+    append_u5_baseline(value)
+
+    inspection = value.inspect()
+    assert inspection.processing_high_water == before.processing_high_water
+    assert inspection.baselines[0].baseline_id == U5_BASELINE_ID
+    assert inspection.baselines[0].participant_registry == u5_registry()
+    assert [record.lifecycle for record in value.records] == [
+        EventLifecycle.CHECKPOINT,
+        EventLifecycle.CHECKPOINT,
+        EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
+    ]
+
+
+def test_u5_baseline_rejects_any_registry_other_than_the_fixed_registry(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "u5-registry.jsonl")
+    before = value.records
+    registry = u5_registry()
+
+    with pytest.raises(ValueError):
+        value.append_participant_baseline(
+            U5_BASELINE_ID,
+            0,
+            HASH_0,
+            0,
+            value.records[0].wal_generation_id or "",
+            value.records[0].wal_record_id or "",
+            value.records[0].wal_record_hash or "",
+            value.inspect().journal_lineage_id or "",
+            (*registry, registry[0]),
+        )
+
+    assert value.records == before
+
+
+def test_u5_clear_prepared_and_cleared_are_open_then_terminal_inspection(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "u5-clear.jsonl"
+    value = startup_reconciliation_journal(path)
+    append_u5_baseline(value)
+    append_u5_reconciliation(value)
+    append_u5_clear(value)
+
+    open_inspection = value.inspect()
+    assert open_inspection.open_gate_clear is not None
+    assert open_inspection.open_gate_clear.terminal is False
+    assert open_inspection.terminal_gate_clear is None
+    assert open_inspection.processing_high_water == 1
+
+    value.close()
+    reopened = journal(path)
+    append_u5_clear(reopened, terminal=True)
+    terminal = reopened.inspect()
+    assert terminal.open_gate_clear is None
+    assert terminal.terminal_gate_clear is not None
+    assert terminal.terminal_gate_clear.terminal is True
+    assert terminal.gate_clear == terminal.terminal_gate_clear
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_u5_clear_ordering_and_binding_are_rejected(
+    tmp_path: Path, terminal: bool
+) -> None:
+    value = startup_reconciliation_journal(
+        tmp_path / f"u5-invalid-{terminal}.jsonl"
+    )
+    append = value.append_cleared if terminal else value.append_clear_prepared
+    args = (
+        U5_BASELINE_ID,
+        U5_RECONCILIATION_ID,
+        U5_RECOVERY_ID,
+        0,
+        HASH_0,
+        0,
+        value.records[0].wal_generation_id or "",
+        value.records[0].wal_record_id or "",
+        value.records[0].wal_record_hash or "",
+        value.inspect().journal_lineage_id or "",
+    )
+    with pytest.raises(EventJournalAppendError):
+        append(*args)
+
+    append_u5_baseline(value)
+    append_u5_reconciliation(value)
+    with pytest.raises(EventJournalAppendError):
+        append(
+            U5_BASELINE_ID,
+            U5_RECONCILIATION_ID,
+            str(uuid5(NAMESPACE_URL, "wrong-recovery")),
+            *args[3:],
+        )
+
+
+def test_u5_gate_hash_chain_tampering_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "u5-tampered.jsonl"
+    value = bootstrap_v3(path)
+    append_u5_baseline(value)
+    value.close()
+    lines = path.read_bytes().splitlines()
+    tampered = json.loads(lines[-1])
+    tampered["baseline_id"] = str(uuid5(NAMESPACE_URL, "tampered-baseline"))
+    path.write_bytes(b"\n".join((*lines[:-1], json.dumps(tampered).encode())) + b"\n")
+
+    with pytest.raises(EventJournalIntegrityError):
+        journal(path)
+
+
+def test_u5_rotation_preserves_baseline_and_clear_evidence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "u5-rotation.jsonl"
+    value = startup_reconciliation_journal(path)
+    value.max_bytes = 1
+    append_u5_baseline(value)
+    append_u5_reconciliation(value)
+    append_u5_clear(value)
+    assert not list(tmp_path.glob("u5-rotation.jsonl.[0-9]*"))
+    append_u5_clear(value, terminal=True)
+    current = value.inspect()
+    for _ in range(8):
+        value.append_v2_current_checkpoint(
+            current.snapshot_sequence,
+            current.snapshot_hash,
+            current.wal_generation_id or "",
+            current.wal_record_id or "",
+            current.wal_record_hash or "",
+        )
+    value.close()
+
+    rotated = list(tmp_path.glob("u5-rotation.jsonl.[0-9]*"))
+    assert rotated
+    assert len(rotated) + 1 <= value.retained_files
+    reopened = EventJournal(path, 1, 4, clock=lambda: NOW)
+    inspection = reopened.inspect()
+    assert inspection.baselines[0].baseline_id == U5_BASELINE_ID
+    assert inspection.terminal_gate_clear is not None
+    assert inspection.open_gate_clear is None
