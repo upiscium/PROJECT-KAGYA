@@ -902,7 +902,16 @@ def startup_participant_aggregate_digest(
     """Commit to a participant's complete transaction set without payloads."""
 
     rows = sorted(
-        [transaction.transaction_id, requirement.operation_digest]
+        [
+            transaction.transaction_id,
+            transaction.processing_sequence,
+            transaction.kind.value,
+            transaction.terminal_lifecycle.value
+            if transaction.terminal_lifecycle is not None
+            else None,
+            requirement.participant_id,
+            requirement.operation_digest,
+        ]
         for transaction in transactions
         for requirement in transaction.required_participants
         if requirement.participant_id == participant_id
@@ -1802,6 +1811,27 @@ class EventJournal:
             ),
         ):
             raise ValueError("participant baseline registry is incomplete")
+        inspection = self.inspect()
+        if inspection.baselines:
+            raise EventJournalIntegrityError("participant baseline already exists")
+        if (
+            inspection.open_events
+            or inspection.open_transactions
+            or inspection.open_recoveries
+            or inspection.open_startup_reconciliations
+            or inspection.open_gate_clear is not None
+            or inspection.external_reconciliation_required
+            or snapshot_sequence != inspection.snapshot_sequence
+            or snapshot_hash != inspection.snapshot_hash
+            or processing_high_water != inspection.processing_high_water
+            or wal_generation_id != inspection.wal_generation_id
+            or wal_record_id != inspection.wal_record_id
+            or wal_record_hash != inspection.wal_record_hash
+            or journal_lineage_id != inspection.journal_lineage_id
+        ):
+            raise EventJournalIntegrityError(
+                "participant baseline requires clean current authority"
+            )
         self._append_external_gate(
             EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
             baseline_id=baseline_id, snapshot_sequence=snapshot_sequence,
@@ -2500,7 +2530,7 @@ class EventJournal:
             or verified.open_recoveries
             or any(t.terminal_lifecycle is None for t in verified.transactions)
             or any(not item.completed for item in verified.startup_reconciliations)
-            or (verified.baselines and verified.terminal_gate_clear is None)
+            or verified.external_reconciliation_required
             or verified.open_gate_clear is not None
         ):
             return
@@ -3236,6 +3266,47 @@ class EventJournal:
                 EventLifecycle.CLEAR_PREPARED,
                 EventLifecycle.CLEARED,
             }:
+                if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
+                    prior_records = records[:index]
+                    if (
+                        record.schema_version != 3
+                        or external_reconciliation_required
+                        or open_events
+                        or recovery_open
+                        or any(
+                            transaction["terminal"] is None
+                            for transaction in transactions.values()
+                        )
+                        or startup_open
+                        or startup_seen_ids
+                        or any(
+                            prior.lifecycle
+                            in {
+                                EventLifecycle.CLEAR_PREPARED,
+                                EventLifecycle.CLEARED,
+                            }
+                            or (
+                                prior.lifecycle
+                                in {
+                                    EventLifecycle.RECOVERY_PREPARED,
+                                    EventLifecycle.RECOVERY_COMPLETED,
+                                }
+                                and prior.recovery_category
+                                is EventRecoveryCategory.TRUE_ROLLBACK
+                            )
+                            for prior in prior_records
+                        )
+                        or record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                        or record.recovery_processing_high_water != high_water
+                        or record.wal_generation_id != wal_generation_id
+                        or record.wal_record_id != wal_record_id
+                        or record.wal_record_hash != wal_record_hash
+                        or record.journal_lineage_id != journal_lineage_id
+                    ):
+                        raise EventJournalIntegrityError(
+                            "participant baseline authority is invalid"
+                        )
                 continue
             if record.lifecycle in {
                 EventLifecycle.TRANSACTION_PREPARED,
@@ -3741,7 +3812,7 @@ class EventJournal:
         for record in records:
             if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
                 assert record.baseline_id is not None
-                if record.baseline_id in baseline_records:
+                if baseline_records:
                     raise EventJournalIntegrityError("participant baseline is duplicated")
                 baseline_records[record.baseline_id] = record
                 assert record.participant_registry is not None
@@ -3808,7 +3879,7 @@ class EventJournal:
                     raise EventJournalIntegrityError("gate clear is duplicated")
                 if (
                     terminal_gate is not None
-                    and terminal_gate.baseline_id == view.baseline_id
+                    and terminal_gate.reconciliation_id == view.reconciliation_id
                 ):
                     raise EventJournalIntegrityError("gate clear is duplicated")
                 open_gate = view
@@ -3826,26 +3897,7 @@ class EventJournal:
                     raise EventJournalIntegrityError("gate clear completion binding changed")
                 terminal_gate = view
                 open_gate = None
-        last_baseline_index = max(
-            (
-                index
-                for index, record in enumerate(records)
-                if record.lifecycle
-                is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
-            ),
-            default=-1,
-        )
-        last_cleared_index = max(
-            (
-                index
-                for index, record in enumerate(records)
-                if record.lifecycle is EventLifecycle.CLEARED
-            ),
-            default=-1,
-        )
-        if last_baseline_index > last_cleared_index:
-            terminal_gate = None
-        if terminal_gate is not None and last_cleared_index > last_baseline_index:
+        if terminal_gate is not None:
             external_reconciliation_required = False
         return _VerifiedJournal(
             records,

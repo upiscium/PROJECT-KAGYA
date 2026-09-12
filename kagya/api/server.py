@@ -23,6 +23,7 @@ from kagya.runtime import (
     KagyaMainLoop,
     StateRecoveryCoordinator,
     StateRecoveryError,
+    StateRecoveryResult,
     StateWAL,
     TransactionCoordinator,
 )
@@ -84,27 +85,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 participants_consistent, degraded_reason = (
                     app.state.startup_reconciliation.reconcile_open_transactions()
                 )
-            recovery = app.state.state_recovery.prepare_startup()
-            journal_schema = app.state.event_journal.inspect().schema_version
-            if journal_schema == 2:
-                app.state.event_journal.append_v3_migration_checkpoint()
-                journal_schema = app.state.event_journal.inspect().schema_version
-            if journal_schema != 3:
-                raise StateRecoveryError("Runtime requires EventJournal schema 3")
+            recovery: StateRecoveryResult | None = None
             if participants_consistent:
-                reconciliation = (
-                    app.state.startup_reconciliation.reconcile_recovery_gate(recovery)
-                )
-                recovery = reconciliation.recovery
-                participants_consistent = reconciliation.participants_consistent
-                degraded_reason = reconciliation.degraded_reason
+                recovery = app.state.state_recovery.prepare_startup()
+                journal_schema = app.state.event_journal.inspect().schema_version
+                if journal_schema == 2:
+                    app.state.event_journal.append_v3_migration_checkpoint()
+                    journal_schema = app.state.event_journal.inspect().schema_version
+                if journal_schema != 3:
+                    raise StateRecoveryError("Runtime requires EventJournal schema 3")
+                if recovery.external_reconciliation_required:
+                    reconciliation = (
+                        app.state.startup_reconciliation.reconcile_recovery_gate(
+                            recovery
+                        )
+                    )
+                    recovery = reconciliation.recovery
+                    participants_consistent = reconciliation.participants_consistent
+                    degraded_reason = reconciliation.degraded_reason
+                else:
+                    app.state.startup_reconciliation.ensure_adoption_baseline(
+                        recovery
+                    )
+                startup_state = recovery
+            else:
+                if journal_schema != 3:
+                    raise StateRecoveryError("Degraded startup requires schema 3")
+                startup_state = app.state.state_recovery.inspect_degraded_startup()
             app.state.external_reconciliation_required = (
-                recovery.external_reconciliation_required
+                (recovery.external_reconciliation_required if recovery else False)
                 or not participants_consistent
             )
             app.state.reconciliation_degraded_reason = degraded_reason
-            snapshot = recovery.snapshot
-            snapshot_hash = recovery.snapshot_hash
+            snapshot = startup_state.snapshot
+            snapshot_hash = startup_state.snapshot_hash
 
             app.state.model_provider = getattr(
                 app.state, "model_provider", None
@@ -188,7 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if getattr(app.state, "agent_runtime", None) is None:
                 app.state.agent_runtime = AgentRuntime(
                     app_settings.runtime.queue_capacity,
-                    initial_sequence=recovery.processing_high_water,
+                    initial_sequence=startup_state.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
                     preparation_checkpoint=preparation_checkpoint,
@@ -199,7 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             else:
                 app.state.agent_runtime.configure_durability(
-                    initial_sequence=recovery.processing_high_water,
+                    initial_sequence=startup_state.processing_high_water,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
                     preparation_checkpoint=preparation_checkpoint,
@@ -213,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         if not app.state.external_reconciliation_required:
             try:
+                assert recovery is not None
                 app.state.agent_runtime.start()
                 app.state.state_recovery.publish_boot_anchor(recovery)
             except BaseException:

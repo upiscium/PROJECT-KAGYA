@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -31,7 +31,7 @@ from kagya.runtime.startup_reconciliation import (
     StartupReconciliationCoordinator,
     StartupReconciliationError,
 )
-from kagya.runtime.state_recovery import StateRecoveryCoordinator
+from kagya.runtime.state_recovery import StateRecoveryCoordinator, StateRecoveryError
 from kagya.runtime.state_wal import StateWAL
 from kagya.runtime.transaction_coordinator import (
     CoordinatedResult,
@@ -89,8 +89,11 @@ def _graph(tmp_path: Path):
     journal = EventJournal(tmp_path / "events.jsonl", 100_000, 4, clock=lambda: NOW)
     wal = StateWAL(tmp_path / "wal")
     recovery = StateRecoveryCoordinator(store, journal, wal)
-    recovery.prepare_startup()
+    boot = recovery.prepare_startup()
     journal.append_v3_migration_checkpoint()
+    StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).ensure_adoption_baseline(boot)
     return memory, store, journal, wal, recovery
 
 
@@ -119,6 +122,71 @@ def _prepared_transaction(
     return coordinator
 
 
+def test_clean_startup_establishes_one_adoption_baseline(tmp_path: Path) -> None:
+    memory, _store, journal, _wal, recovery = _graph(tmp_path)
+    before = journal.path.read_bytes()
+    baseline = journal.inspect().baselines[0]
+
+    current = recovery.prepare_startup()
+    repeated = StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).ensure_adoption_baseline(current)
+
+    assert repeated == baseline
+    assert len(journal.inspect().baselines) == 1
+    assert journal.path.read_bytes() == before
+
+
+def test_true_rollback_before_adoption_baseline_remains_gated(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = AgentStateStore(
+        tmp_path / "state.json", baseline_surprisal=1.0, clock=lambda: NOW
+    )
+    journal = EventJournal(tmp_path / "events.jsonl", 100_000, 4, clock=lambda: NOW)
+    wal = StateWAL(tmp_path / "wal")
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    boot = recovery.prepare_startup()
+    journal.append_v3_migration_checkpoint()
+    recovery.publish_boot_anchor(boot)
+    item = _event("pre-adoption-history")
+    participant = _participant(memory)
+    transaction_coordinator = _prepared_transaction(journal, item, participant)
+    evidence = recovery.commit_internal_candidate(item, store.load(), _snapshot(1))
+    transaction_coordinator.finalize_event(item, evidence)
+    recovery.complete_committed_event(item, evidence)
+    current = recovery.prepare_startup()
+    baseline = StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).ensure_adoption_baseline(current)
+    assert baseline.snapshot_sequence == 1
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    store.path.unlink()
+    journal_before = journal.path.read_bytes()
+    generation_before = generation.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+
+    with pytest.raises(
+        StateRecoveryError, match="recovery target predates participant baseline"
+    ):
+        StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert not store.path.exists()
+    assert journal.path.read_bytes() == journal_before
+    assert generation.read_bytes() == generation_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before
+    assert journal.inspect().open_startup_reconciliations == ()
+
+
 def test_pre_internal_aborts_and_records_terminal_evidence(tmp_path: Path) -> None:
     memory, store, journal, _wal, recovery = _graph(tmp_path)
     item = _event("startup-pre-internal")
@@ -135,6 +203,60 @@ def test_pre_internal_aborts_and_records_terminal_evidence(tmp_path: Path) -> No
     transaction = inspection.aborted_transactions[0]
     assert transaction.terminal_lifecycle is EventLifecycle.TRANSACTION_ABORTED
     assert transaction.abort_outcomes[0][1].value in {"aborted", "already_absent"}
+    assert not participant.pending_path(
+        TransactionBinding(
+            transaction_id=transaction.transaction_id,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+            participant_id=participant.participant_id,
+            operation_digest=participant.operation_digest,
+            transaction_kind=transaction.kind,
+        )
+    ).exists()
+    assert PRIVATE not in journal.path.read_text()
+
+
+def test_wal_only_tail_aborts_then_runs_r06_uncommitted_tail_recovery(
+    tmp_path: Path,
+) -> None:
+    memory, store, journal, wal, recovery = _graph(tmp_path)
+    item = _event("startup-wal-only-tail")
+    participant = _participant(memory, PRIVATE)
+    _prepared_transaction(journal, item, participant)
+    initial = store.load()
+    candidate = _snapshot(1)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=UUID(item.event_id),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    original_generation = manifest.active_generation_id
+
+    assert StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).reconcile_open_transactions() == (True, None)
+    recovered = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    inspection = journal.inspect()
+    assert recovered.snapshot == initial
+    assert store.load() == initial
+    assert not inspection.open_transactions
+    assert not inspection.open_events
+    assert len(inspection.aborted_transactions) == 1
+    assert wal.inspect().active_manifest is not None
+    assert wal.inspect().active_manifest.active_generation_id != original_generation
+    transaction = inspection.aborted_transactions[0]
     assert not participant.pending_path(
         TransactionBinding(
             transaction_id=transaction.transaction_id,
@@ -440,8 +562,6 @@ def test_gate_clear_resumes_after_wal_cas_before_journal_terminal(
     store.path.unlink()
     rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
     coordinator = StartupReconciliationCoordinator(journal, recovery, memory)
-    append_cleared = journal.append_cleared
-
     def crash_before_terminal(*_args: object, **_kwargs: object) -> None:
         raise EventJournalAppendError(EventJournalAppendStage.WRITE, published=False)
 
@@ -452,7 +572,17 @@ def test_gate_clear_resumes_after_wal_cas_before_journal_terminal(
     assert wal.inspect().active_manifest is not None
     assert not wal.inspect().active_manifest.external_reconciliation_required
 
-    monkeypatch.setattr(journal, "append_cleared", append_cleared)
-    assert coordinator.resume_prepared_gate_clear()
-    assert journal.inspect().terminal_gate_clear is not None
-    assert not coordinator.resume_prepared_gate_clear()
+    journal.close()
+    reopened = EventJournal(journal.path, 100_000, 4, clock=lambda: NOW)
+    reopened_recovery = StateRecoveryCoordinator(
+        AgentStateStore(store.path, baseline_surprisal=1.0, clock=lambda: NOW),
+        reopened,
+        StateWAL(wal.root),
+    )
+    restarted = StartupReconciliationCoordinator(
+        reopened, reopened_recovery, DualMemorySystem(_settings(tmp_path))
+    )
+
+    assert restarted.resume_prepared_gate_clear()
+    assert reopened.inspect().terminal_gate_clear is not None
+    assert not restarted.resume_prepared_gate_clear()

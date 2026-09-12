@@ -52,7 +52,6 @@ from kagya.runtime.transaction_coordinator import (
 )
 
 
-_BASELINE_NAMESPACE = UUID("f0ee9f9a-c256-5ec8-8f02-c245f9e8db04")
 _RECONCILIATION_NAMESPACE = UUID("0b941247-478c-5e32-9142-d82b165a330f")
 
 
@@ -116,6 +115,15 @@ class StartupReconciliationCoordinator:
             ):
                 return False, "external_participant_reconciliation_required"
         return True, None
+
+    def ensure_adoption_baseline(
+        self, recovery: StateRecoveryResult
+    ) -> EventJournalParticipantBaseline:
+        """Establish the fixed participant epoch before normal admission."""
+
+        return self.state_recovery.establish_participant_baseline(
+            recovery, self.participant_registry
+        )
 
     def resume_prepared_gate_clear(self) -> bool:
         """Finish a crash window after CLEAR_PREPARED, including a prior WAL CAS."""
@@ -185,12 +193,33 @@ class StartupReconciliationCoordinator:
             raise StartupReconciliationError(
                 "External gate has no true rollback completion proof"
             )
-        baseline = self._baseline(recovery, recovery_record)
+        if len(inspection.baselines) != 1:
+            return StartupReconciliationResult(
+                recovery, False, "participant_baseline_unavailable"
+            )
+        baseline = inspection.baselines[0]
+        if (
+            recovery_record.snapshot_sequence is None
+            or recovery_record.recovery_processing_high_water is None
+            or recovery_record.snapshot_sequence < baseline.snapshot_sequence
+            or recovery_record.recovery_processing_high_water
+            < baseline.processing_high_water
+            or inspection.journal_lineage_id != baseline.journal_lineage_id
+        ):
+            return StartupReconciliationResult(
+                recovery, False, "participant_history_not_provable"
+            )
         transactions = tuple(
             sorted(
                 (
-                    *inspection.completed_transactions,
-                    *inspection.reconciled_transactions,
+                    transaction
+                    for transaction in (
+                        *inspection.completed_transactions,
+                        *inspection.reconciled_transactions,
+                    )
+                    if baseline.processing_high_water
+                    < transaction.processing_sequence
+                    <= recovery_record.recovery_processing_high_water
                 ),
                 key=lambda item: item.transaction_id,
             )
@@ -329,52 +358,27 @@ class StartupReconciliationCoordinator:
         else:
             self.journal.append_transaction_reconciled(event, transaction.transaction_id)
 
-    def _baseline(
-        self, recovery: StateRecoveryResult, record: EventJournalRecord
-    ) -> EventJournalParticipantBaseline:
-        identity = ":".join(
-            (
-                record.recovery_id or "",
-                str(recovery.snapshot.last_processed_event_sequence),
-                recovery.snapshot_hash,
-            )
-        )
-        baseline_id = str(uuid5(_BASELINE_NAMESPACE, identity))
-        inspection = self.journal.inspect()
-        existing = next(
-            (item for item in inspection.baselines if item.baseline_id == baseline_id),
-            None,
-        )
-        if existing is not None:
-            return existing
-        if (
-            record.wal_generation_id is None
-            or record.wal_record_id is None
-            or record.wal_record_hash is None
-            or inspection.journal_lineage_id is None
-        ):
-            raise StartupReconciliationError("Recovery baseline evidence is incomplete")
-        self.journal.append_participant_baseline(
-            baseline_id,
-            recovery.snapshot.last_processed_event_sequence,
-            recovery.snapshot_hash,
-            recovery.processing_high_water,
-            record.wal_generation_id,
-            record.wal_record_id,
-            record.wal_record_hash,
-            inspection.journal_lineage_id,
-            self.participant_registry,
-        )
-        return self.journal.inspect().baselines[-1]
-
     def _startup_reconciliation(
         self,
         recovery: EventJournalRecord,
         baseline: EventJournalParticipantBaseline,
         requirements: tuple[ParticipantRequirement, ...],
     ) -> EventJournalStartupReconciliation:
+        if (
+            recovery.recovery_id is None
+            or recovery.snapshot_sequence is None
+            or recovery.snapshot_hash is None
+            or recovery.recovery_processing_high_water is None
+            or recovery.wal_generation_id is None
+            or recovery.wal_record_id is None
+            or recovery.wal_record_hash is None
+        ):
+            raise StartupReconciliationError("Recovery evidence is incomplete")
         reconciliation_id = str(
-            uuid5(_RECONCILIATION_NAMESPACE, baseline.baseline_id)
+            uuid5(
+                _RECONCILIATION_NAMESPACE,
+                f"{baseline.baseline_id}:{recovery.recovery_id}",
+            )
         )
         inspection = self.journal.inspect()
         existing = next(
@@ -394,16 +398,15 @@ class StartupReconciliationCoordinator:
                     "Startup reconciliation aggregate changed"
                 )
             return existing
-        assert recovery.recovery_id is not None
         self.journal.append_startup_reconciliation_prepared(
             reconciliation_id,
             recovery.recovery_id,
-            baseline.snapshot_sequence,
-            baseline.snapshot_hash,
-            baseline.processing_high_water,
-            baseline.wal_generation_id,
-            baseline.wal_record_id,
-            baseline.wal_record_hash,
+            recovery.snapshot_sequence,
+            recovery.snapshot_hash,
+            recovery.recovery_processing_high_water,
+            recovery.wal_generation_id,
+            recovery.wal_record_id,
+            recovery.wal_record_hash,
             baseline.journal_lineage_id,
             requirements,
         )

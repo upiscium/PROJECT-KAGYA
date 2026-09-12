@@ -85,8 +85,16 @@ def startup_reconciliation_journal(path: Path) -> EventJournal:
     value = journal(path)
     generation = str(uuid5(NAMESPACE_URL, "startup-generation"))
     wal_id = str(uuid5(NAMESPACE_URL, "startup-wal"))
-    value.append_v2_bootstrap_checkpoint(1, HASH_1, generation, wal_id, HASH_2)
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_2)
     value.append_v3_migration_checkpoint()
+    append_u5_baseline(value)
+    advance = event("startup-baseline-advance", 1)
+    value.append_accepted(advance)
+    value.append_started(advance)
+    value.append_prepared(advance, HASH_0, HASH_1, generation)
+    value.append_completed(
+        advance, 1, HASH_1, generation, wal_id, HASH_2
+    )
     anchor = value.records[0]
     value.append_recovery_prepared(
         STARTUP_RECOVERY_ID,
@@ -183,29 +191,41 @@ def append_u5_clear(value: EventJournal, *, terminal: bool = False) -> None:
 
 def append_u5_reconciliation(value: EventJournal) -> None:
     baseline = value.inspect().baselines[-1]
+    recovery = next(
+        record
+        for record in reversed(value.records)
+        if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+    )
+    assert recovery.recovery_id is not None
+    assert recovery.snapshot_sequence is not None
+    assert recovery.snapshot_hash is not None
+    assert recovery.recovery_processing_high_water is not None
+    assert recovery.wal_generation_id is not None
+    assert recovery.wal_record_id is not None
+    assert recovery.wal_record_hash is not None
     requirements = transaction_requirements()
     value.append_startup_reconciliation_prepared(
         U5_RECONCILIATION_ID,
-        U5_RECOVERY_ID,
-        baseline.snapshot_sequence,
-        baseline.snapshot_hash,
-        baseline.processing_high_water,
-        baseline.wal_generation_id,
-        baseline.wal_record_id,
-        baseline.wal_record_hash,
+        recovery.recovery_id,
+        recovery.snapshot_sequence,
+        recovery.snapshot_hash,
+        recovery.recovery_processing_high_water,
+        recovery.wal_generation_id,
+        recovery.wal_record_id,
+        recovery.wal_record_hash,
         baseline.journal_lineage_id,
         requirements,
     )
     for requirement in requirements:
         value.append_startup_participant_reconciled(
             U5_RECONCILIATION_ID,
-            U5_RECOVERY_ID,
-            baseline.snapshot_sequence,
-            baseline.snapshot_hash,
-            baseline.processing_high_water,
-            baseline.wal_generation_id,
-            baseline.wal_record_id,
-            baseline.wal_record_hash,
+            recovery.recovery_id,
+            recovery.snapshot_sequence,
+            recovery.snapshot_hash,
+            recovery.recovery_processing_high_water,
+            recovery.wal_generation_id,
+            recovery.wal_record_id,
+            recovery.wal_record_hash,
             baseline.journal_lineage_id,
             requirement.participant_id,
             requirement.operation_digest,
@@ -213,13 +233,13 @@ def append_u5_reconciliation(value: EventJournal) -> None:
         )
     value.append_startup_reconciliation_completed(
         U5_RECONCILIATION_ID,
-        U5_RECOVERY_ID,
-        baseline.snapshot_sequence,
-        baseline.snapshot_hash,
-        baseline.processing_high_water,
-        baseline.wal_generation_id,
-        baseline.wal_record_id,
-        baseline.wal_record_hash,
+        recovery.recovery_id,
+        recovery.snapshot_sequence,
+        recovery.snapshot_hash,
+        recovery.recovery_processing_high_water,
+        recovery.wal_generation_id,
+        recovery.wal_record_id,
+        recovery.wal_record_hash,
         baseline.journal_lineage_id,
     )
 
@@ -2001,7 +2021,7 @@ def test_startup_reconciliation_rejects_duplicate_and_premature_completion(
         )
 
 
-def test_startup_reconciliation_completion_unblocks_rotation(
+def test_startup_reconciliation_completion_stays_blocked_until_gate_clear(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "startup-rotation.jsonl"
@@ -2071,9 +2091,9 @@ def test_startup_reconciliation_completion_unblocks_rotation(
         anchor.wal_record_hash or HASH_2,
         lineage,
     )
-    assert set(tmp_path.glob("startup-rotation.jsonl.[0-9]*")) != rotations_before
-    assert all(
-        record.lifecycle is not EventLifecycle.RECOVERY_COMPLETED
+    assert set(tmp_path.glob("startup-rotation.jsonl.[0-9]*")) == rotations_before
+    assert any(
+        record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
         for record in value.records
     )
     assert value.inspect().open_startup_reconciliations == ()
@@ -2290,12 +2310,32 @@ def test_u5_baseline_rejects_any_registry_other_than_the_fixed_registry(
     assert value.records == before
 
 
+def test_u5_canonically_hashed_noncurrent_baseline_fails_replay(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "u5-forged-baseline.jsonl"
+    value = bootstrap_v3(path)
+    append_u5_baseline(value)
+    lines = path.read_bytes().splitlines()
+    baseline = EventJournalRecord.model_validate_json(lines[-1])
+    forged = baseline.model_copy(update={"snapshot_hash": HASH_1})
+    forged = forged.model_copy(
+        update={"record_hash": EventJournal._record_hash(forged)}
+    )
+    value.close()
+    path.write_bytes(b"\n".join((*lines[:-1], EventJournal._record_bytes(forged))))
+
+    with pytest.raises(
+        EventJournalIntegrityError, match="participant baseline authority is invalid"
+    ):
+        journal(path)
+
+
 def test_u5_clear_prepared_and_cleared_are_open_then_terminal_inspection(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "u5-clear.jsonl"
     value = startup_reconciliation_journal(path)
-    append_u5_baseline(value)
     append_u5_reconciliation(value)
     append_u5_clear(value)
 
@@ -2338,7 +2378,6 @@ def test_u5_clear_ordering_and_binding_are_rejected(
     with pytest.raises(EventJournalAppendError):
         append(*args)
 
-    append_u5_baseline(value)
     append_u5_reconciliation(value)
     with pytest.raises(EventJournalAppendError):
         append(
@@ -2369,7 +2408,6 @@ def test_u5_rotation_preserves_baseline_and_clear_evidence(
     path = tmp_path / "u5-rotation.jsonl"
     value = startup_reconciliation_journal(path)
     value.max_bytes = 1
-    append_u5_baseline(value)
     append_u5_reconciliation(value)
     append_u5_clear(value)
     assert not list(tmp_path.glob("u5-rotation.jsonl.[0-9]*"))

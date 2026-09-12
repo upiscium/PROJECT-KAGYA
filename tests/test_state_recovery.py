@@ -500,6 +500,41 @@ def test_transaction_classification_is_internally_committed(
     assert wal.inspect().latest_snapshot_sequence == 1
 
 
+def test_transaction_classification_treats_exact_wal_only_tail_as_pre_internal(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-wal-only-tail", 1)
+    start_transaction(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    transition = wal.append_transition(
+        event_id=UUID(item.event_id),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.PRE_INTERNAL
+    assert proof.snapshot_sequence == 0
+    assert proof.snapshot_hash == store.snapshot_hash(initial)
+    assert proof.wal_record_id == str(transition.record_id)
+    assert store.load() == initial
+
+
 def test_transaction_classification_is_ambiguous_for_cross_authority_evidence(
     tmp_path: Path,
 ) -> None:

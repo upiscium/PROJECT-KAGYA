@@ -37,7 +37,6 @@ from kagya.runtime import (
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
-    EventJournalIntegrityError,
     EventJournalLoadError,
     EventLifecycle,
     ParticipantOutcome,
@@ -496,7 +495,15 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
     app.state.agent_runtime = TrackingRuntime()
 
     with TestClient(app) as client:
-        assert order == ["load", "journal", "ensure", "v3", "restore", "start"]
+        assert order == [
+            "load",
+            "journal",
+            "ensure",
+            "v3",
+            "load",
+            "restore",
+            "start",
+        ]
         assert client.app.state.main_loop.emotion_engine.state == EmotionState(
             valence=0.4,
             arousal=0.5,
@@ -724,24 +731,69 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
         assert not manifest.external_reconciliation_required
 
 
-def test_degraded_path_a_does_not_start_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
+    tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    with _client(tmp_path, settings=settings):
-        pass
-    monkeypatch.setattr(
-        "kagya.api.server.StartupReconciliationCoordinator.reconcile_open_transactions",
-        lambda _self: (False, "external_participant_reconciliation_required"),
-    )
-    runtime = RecordingRuntime()
+    class FailingStore(AgentStateStore):
+        def save(self, snapshot: AgentStateSnapshot) -> None:
+            if snapshot.last_processed_event_sequence > 0:
+                raise AgentStateSaveError(
+                    AgentStateSaveStage.TEMP_WRITE, published=False
+                )
+            super().save(snapshot)
 
-    with _client(tmp_path, settings=settings, runtime=runtime) as degraded:
+    first = create_app(settings)
+    first.state.model_provider = ThinkingProvider()
+    first.state.memory_system = DualMemorySystem(settings)
+    first.state.adapter_registry = AdapterRegistry(settings)
+    first.state.agent_state_store = FailingStore(
+        settings.agent_state.path,
+        settings.emotion.baseline_surprisal,
+    )
+    with TestClient(first) as client:
+        assert client.post(
+            "/api/chat", json={"message": "unresolved", "attachments": []}
+        ).status_code == 500
+        transaction = client.app.state.event_journal.inspect().open_transactions[0]
+        pending = (
+            settings.memory.persist_directory
+            / ".r07-episodic-pending"
+            / f"{transaction.transaction_id}.json"
+        )
+    pending.write_text('{"conflict":"well-formed"}')
+    pending.chmod(0o600)
+    journal_before = settings.event_journal.path.read_bytes()
+    snapshot_before = settings.agent_state.path.read_bytes()
+    wal_before = {
+        path.relative_to(settings.state_wal.directory): path.read_bytes()
+        for path in settings.state_wal.directory.rglob("*")
+        if path.is_file()
+    }
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    runtime = RecordingRuntime()
+    app.state.agent_runtime = runtime
+
+    with TestClient(app) as degraded:
         assert runtime.status is AgentRuntimeStatus.CREATED
         assert degraded.get("/health").json()["status"] == "degraded"
+        assert degraded.app.state.event_journal.inspect().open_transactions
         assert degraded.post(
             "/api/chat", json={"message": "blocked", "attachments": []}
         ).status_code == 503
+        assert degraded.app.state.main_loop.session_state.turns == []
+        assert degraded.app.state.memory_system.db1.get()["ids"] == []
+        assert settings.event_journal.path.read_bytes() == journal_before
+        assert settings.agent_state.path.read_bytes() == snapshot_before
+        assert {
+            path.relative_to(settings.state_wal.directory): path.read_bytes()
+            for path in settings.state_wal.directory.rglob("*")
+            if path.is_file()
+        } == wal_before
 
 
 def test_two_true_rollbacks_preserve_reconciliation_authority(
@@ -782,7 +834,8 @@ def test_two_true_rollbacks_preserve_reconciliation_authority(
     with _client(tmp_path, settings=settings) as third:
         assert third.app.state.external_reconciliation_required is False
         inspection = third.app.state.event_journal.inspect()
-        assert len(inspection.baselines) == 2
+        assert len(inspection.baselines) == 1
+        assert len(inspection.completed_startup_reconciliations) == 2
         assert inspection.terminal_gate_clear is not None
         assert third.get("/health").json()["status"] == "ok"
 
@@ -1040,9 +1093,15 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
             if path.is_file()
         )
 
-    with pytest.raises(EventJournalIntegrityError):
-        with _client(tmp_path, settings=settings):
-            pass
+    with _client(tmp_path, settings=settings) as recovered:
+        inspection = recovered.app.state.event_journal.inspect()
+        assert not inspection.open_transactions
+        assert inspection.aborted_transactions
+        assert not pending_path.exists()
+        assert recovered.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert recovered.app.state.state_wal.inspect().latest_snapshot_sequence == 0
+        assert recovered.app.state.main_loop.session_state.turns == []
+        assert recovered.app.state.memory_system.db1.get()["ids"] == []
 
 
 def test_wal_failure_after_prepared_prevents_snapshot_publish_and_fail_stops(
@@ -1229,7 +1288,11 @@ def test_accepted_append_failure_returns_bounded_503_without_handler(
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
         assert [
             record.lifecycle for record in client.app.state.event_journal.records
-        ] == [EventLifecycle.CHECKPOINT, EventLifecycle.CHECKPOINT]
+        ] == [
+            EventLifecycle.CHECKPOINT,
+            EventLifecycle.CHECKPOINT,
+            EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
+        ]
         assert client.app.state.main_loop.session_state.turns == []
 
 
