@@ -33,9 +33,9 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 ## Main Loop Requirements
 
 - Treat `KagyaMainLoop` as the chat/cognition orchestration compatibility facade, not as the authority that orders concurrent subject mutations.
-- Implement `KagyaMainLoop.chat(user_input: str) -> ChatResult` for ordinary chat; it never returns private/debug data.
-- Implement the separate ephemeral diagnostic boundary `KagyaMainLoop.chat_debug(user_input: str) -> tuple[ChatResult, DebugChatTrace]`.
-- Process in this order: input, context, surprisal, emotion update, memory retrieval, prompt build, generation, postprocess, DB1 save, result return.
+- As of R07, `KagyaMainLoop.chat(...)` intentionally returns `CoordinatedResult[ChatResult]`; direct callers must submit that plan through `AgentRuntime` with the `TransactionCoordinator` durability callbacks rather than treating it as a committed result. There is no compatibility window for direct uncoordinated mutation.
+- The separate diagnostic boundary similarly returns `CoordinatedResult[tuple[ChatResult, DebugChatTrace]]`; the trace remains request-scoped and ephemeral while the ordinary public value is materialized only after transaction preparation.
+- `KagyaMainLoop` computes input/context/surprisal/emotion/retrieval/prompt/generation/postprocessing and typed participant plans. It does not save DB1 or mutate SessionState directly. `AgentRuntime` and `TransactionCoordinator` own prepare, internal-commit handoff, finalize, durable classification, and public-result unwrapping.
 - Store no hidden/private model reasoning in DB1 documents or metadata.
 - Keep ordinary `ChatResult` limited to visible response and explicitly public structured data such as episode ID, loss/emotion values, model ID, and adapter ID; it does not own a hidden-thought field.
 - When explicitly requested and authorized, expose private diagnostics through a separate request-scoped debug boundary that cannot be persisted or returned through the ordinary result contract.

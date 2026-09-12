@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import stat
 from threading import RLock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.agent_state import (
@@ -15,11 +16,17 @@ from kagya.runtime.agent_state import (
     AgentStateStore,
 )
 from kagya.runtime.event_journal import (
+    EventJournalGateClear,
     EventFailureCategory,
     EventJournal,
     EventJournalInspection,
+    EventJournalParticipantBaseline,
+    EventJournalStartupReconciliation,
+    EventJournalTransaction,
     EventLifecycle,
     EventRecoveryCategory,
+    ParticipantBaseline,
+    startup_participant_aggregate_digest,
 )
 from kagya.runtime.state_wal import (
     BaselineRecord,
@@ -36,6 +43,12 @@ class StateRecoveryError(Exception):
     """Cross-authority evidence cannot select one safe internal state."""
 
 
+class InternalCommitClassification(str, Enum):
+    PRE_INTERNAL = "PRE_INTERNAL"
+    INTERNALLY_COMMITTED = "INTERNALLY_COMMITTED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
 @dataclass(frozen=True, slots=True)
 class StateRecoveryResult:
     snapshot: AgentStateSnapshot
@@ -45,6 +58,56 @@ class StateRecoveryResult:
     external_reconciliation_required: bool
     exact_current_reconstructed: bool = False
     true_rollback_performed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InternalCommitEvidence:
+    event_id: str
+    processing_sequence: int
+    snapshot_sequence: int
+    snapshot_hash: str
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class InternalCommitProof:
+    """Read-only, bounded evidence for startup transaction classification."""
+
+    classification: InternalCommitClassification
+    transaction_id: str
+    event_id: str
+    processing_sequence: int
+    snapshot_sequence: int
+    snapshot_hash: str
+    wal_generation_id: str | None = None
+    wal_record_id: str | None = None
+    wal_record_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryGateClearProof:
+    """The immutable Journal proof consumed by the gate-clear operation."""
+
+    startup_reconciliation: EventJournalStartupReconciliation
+    baseline: EventJournalParticipantBaseline
+    clear_prepared: EventJournalGateClear
+
+
+@dataclass(frozen=True, slots=True)
+class DegradedStartupInspection:
+    """Read-only startup state for a non-accepting degraded application."""
+
+    snapshot: AgentStateSnapshot
+    snapshot_hash: str
+    processing_high_water: int
+    manifest: Manifest
+
+
+_PARTICIPANT_BASELINE_NAMESPACE = UUID(
+    "f0ee9f9a-c256-5ec8-8f02-c245f9e8db04"
+)
 
 
 class StateRecoveryCoordinator:
@@ -60,6 +123,451 @@ class StateRecoveryCoordinator:
         self.journal = journal
         self.wal = wal
         self._lock = RLock()
+
+    def establish_participant_baseline(
+        self,
+        result: StateRecoveryResult,
+        participant_registry: tuple[ParticipantBaseline, ...],
+    ) -> EventJournalParticipantBaseline:
+        """Establish the one adoption baseline from clean, ungated authority."""
+
+        with self._lock:
+            journal = self.journal.inspect()
+            if journal.baselines:
+                if (
+                    len(journal.baselines) != 1
+                    or journal.baselines[0].participant_registry
+                    != participant_registry
+                    or journal.baselines[0].journal_lineage_id
+                    != journal.journal_lineage_id
+                ):
+                    raise StateRecoveryError("participant baseline authority changed")
+                return journal.baselines[0]
+            snapshot = self.state_store.load()
+            snapshot_hash = self.state_store.snapshot_hash(snapshot)
+            wal = self.wal.inspect()
+            manifest = wal.active_manifest
+            if (
+                result.external_reconciliation_required
+                or result.manifest.external_reconciliation_required
+                or journal.external_reconciliation_required
+                or manifest is None
+                or manifest != result.manifest
+                or snapshot != result.snapshot
+                or snapshot_hash != result.snapshot_hash
+                or journal.snapshot_sequence
+                != snapshot.last_processed_event_sequence
+                or journal.snapshot_hash != snapshot_hash
+                or journal.processing_high_water != result.processing_high_water
+                or wal.latest_snapshot_sequence
+                != snapshot.last_processed_event_sequence
+                or wal.latest_snapshot_hash != snapshot_hash
+                or journal.wal_generation_id
+                != str(manifest.active_generation_id)
+                or journal.wal_record_id is None
+                or journal.wal_record_hash is None
+                or journal.journal_lineage_id is None
+                or journal.open_events
+                or journal.open_transactions
+                or journal.open_recoveries
+                or journal.open_startup_reconciliations
+                or journal.open_gate_clear is not None
+            ):
+                raise StateRecoveryError(
+                    "participant baseline requires clean current authority"
+                )
+            baseline_id = str(
+                uuid5(
+                    _PARTICIPANT_BASELINE_NAMESPACE,
+                    f"{journal.journal_lineage_id}:{snapshot_hash}",
+                )
+            )
+            self.journal.append_participant_baseline(
+                baseline_id,
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+                result.processing_high_water,
+                str(manifest.active_generation_id),
+                journal.wal_record_id,
+                journal.wal_record_hash,
+                journal.journal_lineage_id,
+                participant_registry,
+            )
+            established = self.journal.inspect().baselines
+            if len(established) != 1:
+                raise StateRecoveryError("participant baseline publication failed")
+            return established[0]
+
+    def inspect_degraded_startup(self) -> DegradedStartupInspection:
+        """Verify startup state without closing an unresolved transaction."""
+
+        with self._lock:
+            snapshot = self.state_store.load()
+            snapshot_hash = self.state_store.snapshot_hash(snapshot)
+            journal = self.journal.inspect(
+                snapshot.last_processed_event_sequence, snapshot_hash
+            )
+            wal = self.wal.inspect()
+            manifest = wal.active_manifest
+            proofs = tuple(
+                self.classify_transaction_commit(transaction)
+                for transaction in journal.open_transactions
+            )
+            if (
+                journal.schema_version != 3
+                or manifest is None
+                or manifest.external_reconciliation_required
+                or journal.external_reconciliation_required
+                or journal.open_recoveries
+                or journal.open_startup_reconciliations
+                or journal.open_gate_clear is not None
+            ):
+                raise StateRecoveryError("degraded startup authority is ambiguous")
+            if not proofs or any(
+                proof.classification is InternalCommitClassification.AMBIGUOUS
+                for proof in proofs
+            ):
+                raise StateRecoveryError("degraded transaction authority is ambiguous")
+            canonical_is_wal_current = (
+                wal.latest_snapshot_sequence
+                == snapshot.last_processed_event_sequence
+                and wal.latest_snapshot_hash == snapshot_hash
+            )
+            exact_preinternal_tail = (
+                len(proofs) == 1
+                and proofs[0].classification
+                is InternalCommitClassification.PRE_INTERNAL
+                and proofs[0].snapshot_sequence
+                == snapshot.last_processed_event_sequence
+                and proofs[0].snapshot_hash == snapshot_hash
+                and proofs[0].wal_record_id is not None
+                and bool(wal.records)
+                and str(wal.records[-1].record_id) == proofs[0].wal_record_id
+            )
+            if not canonical_is_wal_current and not exact_preinternal_tail:
+                raise StateRecoveryError("degraded WAL authority is ambiguous")
+            self.wal.inspect_boot_anchor_optional()
+            return DegradedStartupInspection(
+                snapshot,
+                snapshot_hash,
+                journal.processing_high_water,
+                manifest,
+            )
+
+    def classify_transaction_commit(
+        self, transaction: EventJournalTransaction
+    ) -> InternalCommitProof:
+        """Classify internal publication without appending or mutating state."""
+        base = InternalCommitProof(
+            classification=InternalCommitClassification.AMBIGUOUS,
+            transaction_id=transaction.transaction_id,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+            snapshot_sequence=transaction.processing_sequence,
+            snapshot_hash="0" * 64,
+        )
+        try:
+            journal = self.journal.inspect()
+            known_transactions = (
+                *journal.open_transactions,
+                *journal.completed_transactions,
+                *journal.reconciled_transactions,
+                *journal.reconciliation_required_transactions,
+                *journal.abort_required_transactions,
+                *journal.aborted_transactions,
+            )
+            if not any(item == transaction for item in known_transactions):
+                return base
+            prepared = [
+                record for record in journal.records
+                if record.lifecycle is EventLifecycle.PREPARED
+                and record.event_id == transaction.event_id
+                and record.processing_sequence == transaction.processing_sequence
+            ]
+            if len(prepared) > 1:
+                return base
+            canonical = self.state_store.load()
+            canonical_hash = self.state_store.snapshot_hash(canonical)
+            wal = self.wal.inspect()
+            event_transitions = [
+                record
+                for record in wal.records
+                if isinstance(record, TransitionRecord)
+                and (
+                    str(record.event_id) == transaction.event_id
+                    or record.processing_sequence == transaction.processing_sequence
+                )
+            ]
+            if not prepared:
+                if (
+                    not event_transitions
+                    and journal.snapshot_sequence
+                    == canonical.last_processed_event_sequence
+                    and journal.snapshot_hash == canonical_hash
+                    and wal.latest_snapshot_sequence
+                    == canonical.last_processed_event_sequence
+                    and wal.latest_snapshot_hash == canonical_hash
+                    and canonical.last_processed_event_sequence
+                    < transaction.processing_sequence
+                ):
+                    return InternalCommitProof(
+                        InternalCommitClassification.PRE_INTERNAL,
+                        transaction.transaction_id,
+                        transaction.event_id,
+                        transaction.processing_sequence,
+                        canonical.last_processed_event_sequence,
+                        canonical_hash,
+                        str(wal.active_manifest.active_generation_id)
+                        if wal.active_manifest is not None
+                        else None,
+                    )
+                return base
+            preparation = prepared[0]
+            if (
+                preparation.event_type is not transaction.event_type
+                or preparation.source is not transaction.source
+                or preparation.wal_generation_id is None
+                or preparation.state_hash_after is None
+            ):
+                return base
+            manifest = wal.active_manifest
+            if manifest is None or str(manifest.active_generation_id) != preparation.wal_generation_id:
+                return base
+            transitions = [
+                (record, record_hash) for record, record_hash in
+                zip(wal.records, wal.record_hashes)
+                if isinstance(record, TransitionRecord)
+                and str(record.event_id) == transaction.event_id
+                and record.processing_sequence == transaction.processing_sequence
+                and record.candidate_snapshot_hash == preparation.state_hash_after
+                and record.prior_snapshot_hash == preparation.state_hash_before
+                and str(record.generation_id) == preparation.wal_generation_id
+                and record.event_type == transaction.event_type.value
+                and record.event_source == transaction.source.value
+            ]
+            if len(event_transitions) != len(transitions):
+                return base
+            if len(transitions) > 1:
+                return base
+            if transitions:
+                transition, record_hash = transitions[0]
+                if wal.records[-1] != transition:
+                    return base
+                preceding = wal.records[-2] if len(wal.records) >= 2 else None
+                if isinstance(preceding, BaselineRecord):
+                    preceding_identity = (
+                        preceding.baseline_snapshot_sequence,
+                        preceding.baseline_snapshot_hash,
+                    )
+                elif isinstance(preceding, TransitionRecord):
+                    preceding_identity = (
+                        preceding.candidate_snapshot_sequence,
+                        preceding.candidate_snapshot_hash,
+                    )
+                else:
+                    return base
+                committed = (
+                    canonical.last_processed_event_sequence == transition.candidate_snapshot_sequence
+                    and canonical_hash == transition.candidate_snapshot_hash
+                )
+                if committed:
+                    return InternalCommitProof(
+                        InternalCommitClassification.INTERNALLY_COMMITTED,
+                        transaction.transaction_id, transaction.event_id,
+                        transaction.processing_sequence,
+                        transition.candidate_snapshot_sequence,
+                        transition.candidate_snapshot_hash,
+                        preparation.wal_generation_id,
+                        str(transition.record_id),
+                        record_hash,
+                    )
+                prior_identity = (
+                    transition.prior_snapshot_sequence,
+                    transition.prior_snapshot_hash,
+                )
+                if (
+                    canonical.last_processed_event_sequence,
+                    canonical_hash,
+                ) == prior_identity and (
+                    journal.snapshot_sequence,
+                    journal.snapshot_hash,
+                ) == prior_identity and preceding_identity == prior_identity:
+                    return InternalCommitProof(
+                        InternalCommitClassification.PRE_INTERNAL,
+                        transaction.transaction_id,
+                        transaction.event_id,
+                        transaction.processing_sequence,
+                        canonical.last_processed_event_sequence,
+                        canonical_hash,
+                        preparation.wal_generation_id,
+                        str(transition.record_id),
+                        record_hash,
+                    )
+                return base
+            if canonical_hash == preparation.state_hash_after:
+                return base
+            if canonical_hash != preparation.state_hash_before:
+                return base
+            if (
+                wal.latest_snapshot_sequence
+                != canonical.last_processed_event_sequence
+                or wal.latest_snapshot_hash != canonical_hash
+            ):
+                return base
+            return InternalCommitProof(
+                InternalCommitClassification.PRE_INTERNAL,
+                transaction.transaction_id, transaction.event_id,
+                transaction.processing_sequence,
+                canonical.last_processed_event_sequence, canonical_hash,
+                preparation.wal_generation_id,
+            )
+        except Exception:
+            return base
+
+    # Names used by startup coordinators are intentionally aliases, not new
+    # authority surfaces.
+    inspect_transaction_commit = classify_transaction_commit
+
+    def clear_recovery_gate(
+        self,
+        result: StateRecoveryResult,
+        startup_reconciliation: EventJournalStartupReconciliation,
+        baseline: EventJournalParticipantBaseline,
+        clear_prepared: EventJournalGateClear,
+    ) -> StateRecoveryResult:
+        """Clear external reconciliation only after re-verifying all proof."""
+        with self._lock:
+            journal = self.journal.inspect()
+            current = next(
+                (item for item in journal.completed_startup_reconciliations
+                 if item.reconciliation_id == startup_reconciliation.reconciliation_id), None
+            )
+            current_baseline = next(
+                (item for item in journal.baselines if item.baseline_id == baseline.baseline_id), None
+            )
+            current_clear = journal.open_gate_clear or journal.terminal_gate_clear
+            if current != startup_reconciliation or current_baseline != baseline or current_clear != clear_prepared:
+                raise StateRecoveryError("recovery gate proof is stale")
+            if (
+                startup_reconciliation.snapshot_sequence
+                < baseline.snapshot_sequence
+                or startup_reconciliation.recovery_processing_high_water
+                < baseline.processing_high_water
+                or startup_reconciliation.journal_lineage_id
+                != baseline.journal_lineage_id
+            ):
+                raise StateRecoveryError("startup reconciliation predates baseline")
+            if not startup_reconciliation.completed or not startup_reconciliation.required_participants:
+                raise StateRecoveryError("startup reconciliation is incomplete")
+            required = {item.participant_id for item in startup_reconciliation.required_participants}
+            outcomes = {item[0] for item in startup_reconciliation.participant_outcomes}
+            if outcomes != required or len(outcomes) != len(startup_reconciliation.participant_outcomes):
+                raise StateRecoveryError("startup participant evidence is incomplete")
+            if not baseline.participant_registry:
+                raise StateRecoveryError("participant baseline is incomplete")
+            baseline_participants = {
+                item.participant_id for item in baseline.participant_registry
+            }
+            if required != baseline_participants:
+                raise StateRecoveryError("startup participant registry changed")
+            covered_transactions = tuple(
+                sorted(
+                    (
+                        transaction
+                        for transaction in (
+                            *journal.completed_transactions,
+                            *journal.reconciled_transactions,
+                        )
+                        if baseline.processing_high_water
+                        < transaction.processing_sequence
+                        <= startup_reconciliation.recovery_processing_high_water
+                    ),
+                    key=lambda item: item.transaction_id,
+                )
+            )
+            if any(
+                baseline.processing_high_water < item.processing_sequence
+                <= startup_reconciliation.recovery_processing_high_water
+                for item in journal.open_transactions
+            ):
+                raise StateRecoveryError("startup transaction coverage is incomplete")
+            expected_digests = {
+                participant_id: startup_participant_aggregate_digest(
+                    covered_transactions, participant_id
+                )
+                for participant_id in baseline_participants
+            }
+            if {
+                item.participant_id: item.operation_digest
+                for item in startup_reconciliation.required_participants
+            } != expected_digests:
+                raise StateRecoveryError("startup transaction coverage changed")
+            completed = [
+                item for item in journal.records
+                if item.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                and item.recovery_id == startup_reconciliation.recovery_id
+            ]
+            if (
+                len(completed) != 1
+                or completed[0].recovery_category
+                is not EventRecoveryCategory.TRUE_ROLLBACK
+                or completed[0].external_reconciliation_required is not True
+            ):
+                raise StateRecoveryError("true rollback completion proof is required")
+            proof = completed[0]
+            expected = (
+                startup_reconciliation.snapshot_sequence,
+                startup_reconciliation.snapshot_hash,
+                startup_reconciliation.recovery_processing_high_water,
+                startup_reconciliation.wal_generation_id,
+                startup_reconciliation.wal_record_id,
+                startup_reconciliation.wal_record_hash,
+                startup_reconciliation.journal_lineage_id,
+            )
+            if (proof.snapshot_sequence, proof.snapshot_hash,
+                proof.recovery_processing_high_water, proof.wal_generation_id,
+                proof.wal_record_id, proof.wal_record_hash,
+                journal.journal_lineage_id) != expected:
+                raise StateRecoveryError("recovery proof bindings changed")
+            clear_binding = (
+                clear_prepared.snapshot_sequence,
+                clear_prepared.snapshot_hash,
+                clear_prepared.processing_high_water,
+                clear_prepared.wal_generation_id,
+                clear_prepared.wal_record_id,
+                clear_prepared.wal_record_hash,
+                clear_prepared.journal_lineage_id,
+            )
+            if clear_binding != expected or clear_prepared.baseline_id != baseline.baseline_id:
+                raise StateRecoveryError("clear-prepared proof bindings changed")
+            snapshot = self.state_store.load()
+            if (
+                snapshot.last_processed_event_sequence
+                != startup_reconciliation.snapshot_sequence
+                or self.state_store.snapshot_hash(snapshot)
+                != startup_reconciliation.snapshot_hash
+                or result.processing_high_water
+                != startup_reconciliation.recovery_processing_high_water
+                or result.manifest.active_generation_id
+                != UUID(startup_reconciliation.wal_generation_id)
+            ):
+                raise StateRecoveryError("canonical recovery target changed")
+            inspection = self.wal.inspect()
+            manifest = inspection.active_manifest
+            if (manifest is None or manifest != result.manifest
+                    or inspection.latest_snapshot_sequence
+                    != startup_reconciliation.snapshot_sequence
+                    or inspection.latest_snapshot_hash
+                    != startup_reconciliation.snapshot_hash):
+                raise StateRecoveryError("WAL recovery target changed")
+            cleared = self.wal.clear_external_reconciliation_gate(manifest)
+            return StateRecoveryResult(snapshot, startup_reconciliation.snapshot_hash,
+                startup_reconciliation.recovery_processing_high_water, cleared, False,
+                result.exact_current_reconstructed, result.true_rollback_performed)
+
+    clear_external_reconciliation_gate = clear_recovery_gate
+    clear_prepared_recovery_gate = clear_recovery_gate
+    clear_external_reconciliation = clear_recovery_gate
 
     def prepare_startup(self) -> StateRecoveryResult:
         """Inspect every authority before applying migration or recovery writes."""
@@ -108,7 +616,7 @@ class StateRecoveryCoordinator:
                 bound_current = self._recover_journal_bound_current(journal_inspection)
                 if bound_current is not None:
                     return bound_current
-            if snapshot is not None and journal_inspection.schema_version == 2:
+            if snapshot is not None and (journal_inspection.schema_version or 0) >= 2:
                 return self._repair_v2_invalid_current(snapshot)
             if (
                 snapshot is not None
@@ -160,7 +668,7 @@ class StateRecoveryCoordinator:
                 bound_current = self._recover_journal_bound_current(journal_inspection)
                 if bound_current is not None:
                     return bound_current
-            if journal_inspection.schema_version == 2:
+            if (journal_inspection.schema_version or 0) >= 2:
                 if snapshot is not None:
                     return self._repair_v2_invalid_current(snapshot)
                 if anchor is not None:
@@ -353,7 +861,7 @@ class StateRecoveryCoordinator:
         journal: EventJournalInspection,
     ) -> AgentStateSnapshot | None:
         if (
-            journal.schema_version != 2
+            (journal.schema_version or 0) < 2
             or journal.wal_generation_id is None
             or journal.wal_record_id is None
             or journal.wal_record_hash is None
@@ -457,23 +965,25 @@ class StateRecoveryCoordinator:
             )
         return self._result(snapshot, high_water)
 
-    def commit_candidate(
+    def commit_internal_candidate(
         self,
         event: AgentEvent,
         prior_snapshot: AgentStateSnapshot,
         candidate_snapshot: AgentStateSnapshot,
-    ) -> TransitionRecord:
-        """Execute prepared -> WAL -> snapshot -> completed in exact order."""
+    ) -> InternalCommitEvidence:
+        """Publish internal state without claiming overall event completion."""
 
         with self._lock:
-            return self._commit_candidate(event, prior_snapshot, candidate_snapshot)
+            return self._commit_internal_candidate(
+                event, prior_snapshot, candidate_snapshot
+            )
 
-    def _commit_candidate(
+    def _commit_internal_candidate(
         self,
         event: AgentEvent,
         prior_snapshot: AgentStateSnapshot,
         candidate_snapshot: AgentStateSnapshot,
-    ) -> TransitionRecord:
+    ) -> InternalCommitEvidence:
 
         sequence = event.processing_sequence
         if sequence is None:
@@ -500,15 +1010,121 @@ class StateRecoveryCoordinator:
             candidate_snapshot=candidate_snapshot,
         )
         self.state_store.save(candidate_snapshot)
-        self.journal.append_completed(
-            event,
-            sequence,
-            after_hash,
+        return InternalCommitEvidence(
+            event_id=event.event_id,
+            processing_sequence=sequence,
+            snapshot_sequence=sequence,
+            snapshot_hash=after_hash,
             wal_generation_id=generation_id,
             wal_record_id=str(transition.record_id),
             wal_record_hash=transition.record_hash,
         )
-        return transition
+
+    def complete_committed_event(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        """Verify internal commit evidence before appending overall completion."""
+
+        with self._lock:
+            self._complete_committed_event(event, evidence)
+
+    def verify_internal_commit(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        """Verify that canonical state, Journal, and WAL still bind this commit."""
+
+        with self._lock:
+            self._verify_internal_commit(event, evidence)
+
+    def _complete_committed_event(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        self._verify_internal_commit(event, evidence)
+        self.journal.append_completed(
+            event,
+            evidence.snapshot_sequence,
+            evidence.snapshot_hash,
+            wal_generation_id=evidence.wal_generation_id,
+            wal_record_id=evidence.wal_record_id,
+            wal_record_hash=evidence.wal_record_hash,
+        )
+
+    def _verify_internal_commit(
+        self,
+        event: AgentEvent,
+        evidence: InternalCommitEvidence,
+    ) -> None:
+        sequence = event.processing_sequence
+        if (
+            sequence is None
+            or evidence.event_id != event.event_id
+            or evidence.processing_sequence != sequence
+            or evidence.snapshot_sequence != sequence
+        ):
+            raise StateRecoveryError("Internal commit event identity is invalid")
+
+        canonical = self.state_store.load()
+        if (
+            canonical.last_processed_event_sequence != evidence.snapshot_sequence
+            or self.state_store.snapshot_hash(canonical) != evidence.snapshot_hash
+        ):
+            raise StateRecoveryError("Canonical internal commit evidence is stale")
+
+        journal = self.journal.inspect()
+        prepared = next(
+            (
+                record
+                for record in reversed(journal.records)
+                if record.lifecycle is EventLifecycle.PREPARED
+                and record.event_id == evidence.event_id
+            ),
+            None,
+        )
+        if (
+            prepared is None
+            or prepared.event_type is not event.event_type
+            or prepared.source is not event.source
+            or prepared.processing_sequence != evidence.processing_sequence
+            or prepared.state_hash_after != evidence.snapshot_hash
+            or prepared.wal_generation_id != evidence.wal_generation_id
+        ):
+            raise StateRecoveryError("Journal internal commit evidence is stale")
+
+        wal = self.wal.inspect()
+        manifest = wal.active_manifest
+        transition = next(
+            (
+                record
+                for record in reversed(wal.records)
+                if isinstance(record, TransitionRecord)
+                and str(record.record_id) == evidence.wal_record_id
+            ),
+            None,
+        )
+        if (
+            manifest is None
+            or manifest.external_reconciliation_required
+            or str(manifest.active_generation_id) != evidence.wal_generation_id
+            or wal.latest_snapshot_sequence != evidence.snapshot_sequence
+            or wal.latest_snapshot_hash != evidence.snapshot_hash
+            or transition is None
+            or not wal.records
+            or wal.records[-1] != transition
+            or transition.record_hash != evidence.wal_record_hash
+            or str(transition.event_id) != event.event_id
+            or transition.event_type != event.event_type.value
+            or transition.event_source != event.source.value
+            or transition.processing_sequence != evidence.processing_sequence
+            or transition.candidate_snapshot_sequence != evidence.snapshot_sequence
+            or transition.candidate_snapshot_hash != evidence.snapshot_hash
+        ):
+            raise StateRecoveryError("StateWAL internal commit evidence is stale")
 
     def publish_boot_anchor(self, result: StateRecoveryResult) -> None:
         """Mark bootability only after the runtime graph has started."""
@@ -662,6 +1278,9 @@ class StateRecoveryCoordinator:
         generation_id: UUID | None = None,
         invalid_current: bool = False,
     ) -> StateRecoveryResult:
+        self._ensure_participant_baseline_covers_recovery(
+            journal, target, category
+        )
         target_hash = self.state_store.snapshot_hash(target)
         recovery_id = str(uuid4())
         current_manifest = wal.active_manifest if wal is not None else None
@@ -751,6 +1370,9 @@ class StateRecoveryCoordinator:
                 or self.state_store.snapshot_hash(target) != pending.snapshot_hash
             ):
                 raise StateRecoveryError("Recovery target is unavailable") from None
+        self._ensure_participant_baseline_covers_recovery(
+            journal, target, pending.category
+        )
         target_generation = UUID(pending.wal_generation_id)
         active = wal.active_manifest
         if active is None or active.active_generation_id != target_generation:
@@ -808,6 +1430,9 @@ class StateRecoveryCoordinator:
         if len(journal.open_recoveries) != 1:
             raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
         pending = journal.open_recoveries[0]
+        self._ensure_participant_baseline_covers_recovery(
+            journal, target, pending.category
+        )
         recovery_id = UUID(pending.recovery_id)
         generation_id = UUID(pending.wal_generation_id)
         external = (
@@ -929,6 +1554,31 @@ class StateRecoveryCoordinator:
         )
         return self._finish_event_reconciliation(result)
 
+    def _ensure_participant_baseline_covers_recovery(
+        self,
+        journal: EventJournalInspection,
+        target: AgentStateSnapshot,
+        category: EventRecoveryCategory,
+    ) -> None:
+        if category is not EventRecoveryCategory.TRUE_ROLLBACK or not journal.baselines:
+            return
+        if len(journal.baselines) != 1:
+            raise StateRecoveryError("participant baseline authority is ambiguous")
+        baseline = journal.baselines[0]
+        target_sequence = target.last_processed_event_sequence
+        target_hash = self.state_store.snapshot_hash(target)
+        if (
+            target_sequence < baseline.snapshot_sequence
+            or journal.processing_high_water < baseline.processing_high_water
+            or (
+                target_sequence == baseline.snapshot_sequence
+                and target_hash != baseline.snapshot_hash
+            )
+        ):
+            raise StateRecoveryError(
+                "recovery target predates participant baseline"
+            )
+
     def _finish_event_reconciliation(
         self, result: StateRecoveryResult
     ) -> StateRecoveryResult:
@@ -1010,7 +1660,7 @@ class StateRecoveryCoordinator:
         anchor: tuple[int, int] | None = None
         for journal_index, evidence in enumerate(journal.records):
             if (
-                evidence.schema_version != 2
+                evidence.schema_version < 2
                 or evidence.lifecycle
                 not in {
                     EventLifecycle.CHECKPOINT,
@@ -1126,7 +1776,7 @@ class StateRecoveryCoordinator:
     ) -> str | None:
         for record in reversed(journal.records):
             if (
-                record.schema_version == 2
+                record.schema_version >= 2
                 and record.wal_generation_id is not None
                 and record.lifecycle
                 in {

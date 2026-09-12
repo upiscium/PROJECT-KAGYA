@@ -29,10 +29,15 @@ from pydantic import (
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 
 
-CURRENT_EVENT_JOURNAL_SCHEMA_VERSION: Literal[2] = 2
+CURRENT_EVENT_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HASH_DOMAIN_V1 = b"PROJECT-KAGYA:event-journal:v1\0"
 _HASH_DOMAIN_V2 = b"PROJECT-KAGYA:event-journal:v2\0"
+_HASH_DOMAIN_V3 = b"PROJECT-KAGYA:event-journal:v3\0"
+_STARTUP_AGGREGATE_DOMAIN = (
+    b"PROJECT-KAGYA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
+)
+_PARTICIPANT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:\.[a-z0-9]+)*$")
 
 
 class EventLifecycle(str, Enum):
@@ -45,6 +50,54 @@ class EventLifecycle(str, Enum):
     CHECKPOINT = "checkpoint"
     RECOVERY_PREPARED = "recovery_prepared"
     RECOVERY_COMPLETED = "recovery_completed"
+    TRANSACTION_PREPARED = "transaction_prepared"
+    PARTICIPANT_FINALIZED = "participant_finalized"
+    TRANSACTION_COMPLETED = "transaction_completed"
+    TRANSACTION_RECONCILIATION_REQUIRED = "transaction_reconciliation_required"
+    TRANSACTION_RECONCILED = "transaction_reconciled"
+    PARTICIPANT_ABORTED = "participant_aborted"
+    TRANSACTION_ABORT_REQUIRED = "transaction_abort_required"
+    TRANSACTION_ABORTED = "transaction_aborted"
+    STARTUP_RECONCILIATION_PREPARED = "startup_reconciliation_prepared"
+    STARTUP_PARTICIPANT_RECONCILED = "startup_participant_reconciled"
+    STARTUP_RECONCILIATION_COMPLETED = "startup_reconciliation_completed"
+    PARTICIPANT_BASELINE_ESTABLISHED = "participant_baseline_established"
+    CLEAR_PREPARED = "clear_prepared"
+    CLEARED = "cleared"
+
+
+class TransactionKind(str, Enum):
+    EVENT_MUTATION = "event_mutation"
+    MAINTENANCE_MUTATION = "maintenance_mutation"
+
+
+class ParticipantOutcome(str, Enum):
+    FINALIZED = "finalized"
+    ALREADY_CONSISTENT = "already_consistent"
+
+
+class ParticipantCapability(str, Enum):
+    PREPARE = "prepare"
+    ABORT = "abort"
+    IDEMPOTENT_FINALIZE = "idempotent_finalize"
+    INSPECT_RECONCILE = "inspect_reconcile"
+
+
+class AbortOutcome(str, Enum):
+    ABORTED = "aborted"
+    ALREADY_ABSENT = "already_absent"
+
+
+class ReconciliationReason(str, Enum):
+    PARTICIPANT_FINALIZATION_INCOMPLETE = "participant_finalization_incomplete"
+    PARTICIPANT_DIVERGED = "participant_diverged"
+    PARTICIPANT_UNAVAILABLE = "participant_unavailable"
+    UNSUPPORTED_RECONCILIATION = "unsupported_reconciliation"
+
+
+class StartupParticipantOutcome(str, Enum):
+    VERIFIED_CONSISTENT = "verified_consistent"
+    ROLLED_FORWARD = "rolled_forward"
 
 
 class EventFailureCategory(str, Enum):
@@ -60,6 +113,15 @@ class EventRecoveryCategory(str, Enum):
     UNCOMMITTED_TAIL = "uncommitted_tail"
 
 
+EventRecoveryClass = EventRecoveryCategory
+RecoveryClass = EventRecoveryCategory
+
+
+class ParticipantDomain(str, Enum):
+    DURABLE_DOMAIN = "durable_domain"
+    EPHEMERAL_PROCESS = "ephemeral_process"
+
+
 class EventJournalAppendStage(str, Enum):
     VALIDATE = "validate"
     WRITE = "write"
@@ -72,8 +134,48 @@ class _JournalModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class ParticipantBaseline(_JournalModel):
+    participant_id: str = Field(min_length=1, max_length=64)
+    domain: ParticipantDomain
+
+    @field_validator("participant_id")
+    @classmethod
+    def validate_participant_id(cls, value: str) -> str:
+        if _PARTICIPANT_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("participant identifier is invalid")
+        return value
+
+
+class ParticipantRequirement(_JournalModel):
+    participant_id: str = Field(min_length=1, max_length=64)
+    operation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    capabilities: tuple[ParticipantCapability, ...]
+
+    @field_validator("participant_id")
+    @classmethod
+    def validate_participant_id(cls, value: str) -> str:
+        if _PARTICIPANT_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("participant identifier is invalid")
+        return value
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(
+        cls, value: tuple[ParticipantCapability, ...]
+    ) -> tuple[ParticipantCapability, ...]:
+        if (
+            not value
+            or value != tuple(sorted(value, key=lambda item: item.value))
+            or len(set(value)) != len(value)
+            or ParticipantCapability.PREPARE not in value
+            or ParticipantCapability.IDEMPOTENT_FINALIZE not in value
+        ):
+            raise ValueError("participant capabilities are invalid")
+        return value
+
+
 class EventJournalRecord(_JournalModel):
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     record_id: str = Field(min_length=1)
     timestamp: datetime
     lifecycle: EventLifecycle
@@ -97,6 +199,22 @@ class EventJournalRecord(_JournalModel):
     recovery_processing_high_water: int | None = Field(default=None, ge=0)
     recovery_category: EventRecoveryCategory | None = None
     external_reconciliation_required: bool | None = None
+    migration_previous_v2_hash: str | None = None
+    v3_migration_anchor_hash: str | None = None
+    transaction_id: str | None = None
+    transaction_kind: TransactionKind | None = None
+    required_participants: tuple[ParticipantRequirement, ...] | None = None
+    participant_id: str | None = None
+    operation_digest: str | None = None
+    participant_outcome: ParticipantOutcome | None = None
+    abort_outcome: AbortOutcome | None = None
+    abort_reason: ReconciliationReason | None = None
+    reconciliation_id: str | None = None
+    startup_participant_outcome: StartupParticipantOutcome | None = None
+    reconciliation_reason: ReconciliationReason | None = None
+    unresolved_participants: tuple[str, ...] | None = None
+    baseline_id: str | None = None
+    participant_registry: tuple[ParticipantBaseline, ...] | None = None
 
     @field_validator("record_id", "event_id")
     @classmethod
@@ -109,6 +227,13 @@ class EventJournalRecord(_JournalModel):
             raise ValueError("identifier must be a UUID") from None
         if str(parsed) != value:
             raise ValueError("identifier must use canonical UUID form")
+        return value
+
+    @field_validator("participant_id")
+    @classmethod
+    def validate_record_participant_id(cls, value: str | None) -> str | None:
+        if value is not None and _PARTICIPANT_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("participant identifier is invalid")
         return value
 
     @model_validator(mode="after")
@@ -135,7 +260,9 @@ class EventJournalRecord(_JournalModel):
             self.wal_generation_id,
             self.wal_record_id,
             self.recovery_id,
+            self.reconciliation_id,
             self.journal_lineage_id,
+            self.baseline_id,
         ):
             if value is not None:
                 try:
@@ -144,6 +271,60 @@ class EventJournalRecord(_JournalModel):
                     raise ValueError("identifier must be a UUID") from None
                 if str(parsed) != value:
                     raise ValueError("identifier must use canonical UUID form")
+        if self.transaction_id is not None:
+            try:
+                parsed = UUID(self.transaction_id)
+            except ValueError:
+                raise ValueError("identifier must be a UUID") from None
+            if str(parsed) != self.transaction_id:
+                raise ValueError("identifier must use canonical UUID form")
+        for value in (
+            self.operation_digest,
+            self.migration_previous_v2_hash,
+            self.v3_migration_anchor_hash,
+        ):
+            if value is not None and _HASH_PATTERN.fullmatch(value) is None:
+                raise ValueError("hash must be lowercase SHA-256")
+        if self.required_participants is not None:
+            ids = tuple(item.participant_id for item in self.required_participants)
+            if not ids or ids != tuple(sorted(ids)) or len(set(ids)) != len(ids):
+                raise ValueError("required participants must be unique and sorted")
+        if self.unresolved_participants is not None:
+            if (
+                not self.unresolved_participants
+                or any(
+                    _PARTICIPANT_ID_PATTERN.fullmatch(x) is None
+                    for x in self.unresolved_participants
+                )
+                or self.unresolved_participants
+                != tuple(sorted(self.unresolved_participants))
+                or len(set(self.unresolved_participants))
+                != len(self.unresolved_participants)
+            ):
+                raise ValueError("unresolved participants must be unique and sorted")
+
+        v3_fields = (
+            self.migration_previous_v2_hash,
+            self.v3_migration_anchor_hash,
+            self.transaction_id,
+            self.transaction_kind,
+            self.required_participants,
+            self.participant_id,
+            self.operation_digest,
+            self.participant_outcome,
+            self.abort_outcome,
+            self.abort_reason,
+            self.reconciliation_reason,
+            self.unresolved_participants,
+            self.reconciliation_id,
+            self.startup_participant_outcome,
+            self.baseline_id,
+            self.participant_registry,
+        )
+        if self.schema_version in {1, 2} and any(
+            value is not None for value in v3_fields
+        ):
+            raise ValueError("v3 fields require schema 3")
         for value in (
             self.wal_record_hash,
             self.migration_previous_v1_hash,
@@ -166,6 +347,229 @@ class EventJournalRecord(_JournalModel):
             )
         ):
             raise ValueError("v1 has no v2 fields")
+        transaction_lifecycles = {
+            EventLifecycle.TRANSACTION_PREPARED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.TRANSACTION_COMPLETED,
+            EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED,
+            EventLifecycle.TRANSACTION_RECONCILED,
+            EventLifecycle.PARTICIPANT_ABORTED,
+            EventLifecycle.TRANSACTION_ABORT_REQUIRED,
+            EventLifecycle.TRANSACTION_ABORTED,
+        }
+        if self.lifecycle in transaction_lifecycles:
+            if (
+                self.schema_version != 3
+                or not has_identity
+                or self.processing_sequence is None
+            ):
+                raise ValueError("transaction record identity is incomplete")
+            allowed_transaction_fields = {
+                EventLifecycle.TRANSACTION_PREPARED: {
+                    "transaction_id",
+                    "transaction_kind",
+                    "required_participants",
+                },
+                EventLifecycle.PARTICIPANT_FINALIZED: {
+                    "transaction_id",
+                    "participant_id",
+                    "operation_digest",
+                    "participant_outcome",
+                },
+                EventLifecycle.TRANSACTION_COMPLETED: {"transaction_id"},
+                EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED: {
+                    "transaction_id",
+                    "reconciliation_reason",
+                    "unresolved_participants",
+                },
+                EventLifecycle.TRANSACTION_RECONCILED: {"transaction_id"},
+                EventLifecycle.PARTICIPANT_ABORTED: {
+                    "transaction_id",
+                    "participant_id",
+                    "operation_digest",
+                    "abort_outcome",
+                },
+                EventLifecycle.TRANSACTION_ABORT_REQUIRED: {
+                    "transaction_id",
+                    "abort_reason",
+                    "unresolved_participants",
+                },
+                EventLifecycle.TRANSACTION_ABORTED: {"transaction_id"},
+            }[self.lifecycle]
+            self._forbid_irrelevant_fields(
+                {"processing_sequence", *allowed_transaction_fields}
+            )
+            if self.lifecycle is EventLifecycle.TRANSACTION_PREPARED and (
+                self.transaction_id is None
+                or self.transaction_kind is None
+                or not self.required_participants
+            ):
+                raise ValueError("transaction preparation is incomplete")
+            if self.lifecycle is EventLifecycle.PARTICIPANT_FINALIZED and (
+                self.transaction_id is None
+                or self.participant_id is None
+                or self.operation_digest is None
+                or self.participant_outcome is None
+            ):
+                raise ValueError("participant finalization is incomplete")
+            if self.lifecycle is EventLifecycle.PARTICIPANT_ABORTED and (
+                self.transaction_id is None
+                or self.participant_id is None
+                or self.operation_digest is None
+                or self.abort_outcome is None
+            ):
+                raise ValueError("participant abort is incomplete")
+            if (
+                self.lifecycle
+                in {
+                    EventLifecycle.TRANSACTION_COMPLETED,
+                    EventLifecycle.TRANSACTION_RECONCILED,
+                }
+                and self.transaction_id is None
+            ):
+                raise ValueError("transaction completion is incomplete")
+            if (
+                self.lifecycle is EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED
+                and (
+                    self.transaction_id is None
+                    or self.reconciliation_reason is None
+                    or not self.unresolved_participants
+                )
+            ):
+                raise ValueError("transaction reconciliation is incomplete")
+            if self.lifecycle is EventLifecycle.TRANSACTION_ABORT_REQUIRED and (
+                self.transaction_id is None
+                or self.abort_reason is None
+                or not self.unresolved_participants
+            ):
+                raise ValueError("transaction abort is incomplete")
+            if (
+                self.lifecycle is EventLifecycle.TRANSACTION_ABORTED
+                and self.transaction_id is None
+            ):
+                raise ValueError("transaction abort completion is incomplete")
+            return self
+        startup_lifecycles = {
+            EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+            EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+        }
+        if self.lifecycle in startup_lifecycles:
+            if (
+                self.schema_version != 3
+                or not no_identity
+                or self.processing_sequence is not None
+                or self.reconciliation_id is None
+                or self.recovery_id is None
+                or self.snapshot_sequence is None
+                or self.snapshot_hash is None
+                or self.recovery_processing_high_water is None
+                or self.wal_generation_id is None
+                or self.wal_record_id is None
+                or self.wal_record_hash is None
+                or self.journal_lineage_id is None
+            ):
+                raise ValueError("startup reconciliation binding is incomplete")
+            allowed = {
+                EventLifecycle.STARTUP_RECONCILIATION_PREPARED: {
+                    "reconciliation_id",
+                    "recovery_id",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "recovery_processing_high_water",
+                    "wal_generation_id",
+                    "wal_record_id",
+                    "wal_record_hash",
+                    "journal_lineage_id",
+                    "required_participants",
+                },
+                EventLifecycle.STARTUP_PARTICIPANT_RECONCILED: {
+                    "reconciliation_id",
+                    "recovery_id",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "recovery_processing_high_water",
+                    "wal_generation_id",
+                    "wal_record_id",
+                    "wal_record_hash",
+                    "journal_lineage_id",
+                    "participant_id",
+                    "operation_digest",
+                    "startup_participant_outcome",
+                },
+                EventLifecycle.STARTUP_RECONCILIATION_COMPLETED: {
+                    "reconciliation_id",
+                    "recovery_id",
+                    "snapshot_sequence",
+                    "snapshot_hash",
+                    "recovery_processing_high_water",
+                    "wal_generation_id",
+                    "wal_record_id",
+                    "wal_record_hash",
+                    "journal_lineage_id",
+                },
+            }[self.lifecycle]
+            self._forbid_irrelevant_fields(allowed)
+            if self.lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED:
+                if not self.required_participants:
+                    raise ValueError("startup preparation participants are missing")
+            elif self.lifecycle is EventLifecycle.STARTUP_PARTICIPANT_RECONCILED:
+                if (
+                    self.participant_id is None
+                    or self.operation_digest is None
+                    or self.startup_participant_outcome is None
+                ):
+                    raise ValueError("startup participant evidence is incomplete")
+            return self
+        if self.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
+            if (
+                self.schema_version != 3
+                or not no_identity
+                or self.processing_sequence is not None
+                or self.baseline_id is None
+                or self.snapshot_sequence is None
+                or self.snapshot_hash is None
+                or self.recovery_processing_high_water is None
+                or self.wal_generation_id is None
+                or self.wal_record_id is None
+                or self.wal_record_hash is None
+                or self.journal_lineage_id is None
+            ):
+                raise ValueError("participant baseline binding is incomplete")
+            allowed = {
+                "baseline_id", "snapshot_sequence", "snapshot_hash",
+                "recovery_processing_high_water",
+                "wal_generation_id", "wal_record_id", "wal_record_hash",
+                "journal_lineage_id", "participant_registry",
+            }
+            if not self.participant_registry:
+                raise ValueError("participant baseline registry is missing")
+            self._forbid_irrelevant_fields(allowed)
+            return self
+        if self.lifecycle in {EventLifecycle.CLEAR_PREPARED, EventLifecycle.CLEARED}:
+            if (
+                self.schema_version != 3
+                or not no_identity
+                or self.processing_sequence is not None
+                or self.baseline_id is None
+                or self.recovery_id is None
+                or self.reconciliation_id is None
+                or self.snapshot_sequence is None
+                or self.snapshot_hash is None
+                or self.recovery_processing_high_water is None
+                or self.wal_generation_id is None
+                or self.wal_record_id is None
+                or self.wal_record_hash is None
+                or self.journal_lineage_id is None
+            ):
+                raise ValueError("external gate clear binding is incomplete")
+            self._forbid_irrelevant_fields({
+                "baseline_id", "recovery_id", "reconciliation_id",
+                "snapshot_sequence", "snapshot_hash",
+                "recovery_processing_high_water", "wal_generation_id",
+                "wal_record_id", "wal_record_hash", "journal_lineage_id",
+            })
+            return self
         if self.lifecycle is EventLifecycle.CHECKPOINT:
             if not no_identity or self.processing_sequence is None:
                 raise ValueError("checkpoint identity is invalid")
@@ -173,13 +577,17 @@ class EventJournalRecord(_JournalModel):
             self._forbid_state_and_failure()
             if self.schema_version == 2 and self.journal_lineage_id is None:
                 raise ValueError("v2 checkpoint lineage is missing")
-            if self.schema_version == 2 and (
+            if self.schema_version >= 2 and self.journal_lineage_id is None:
+                raise ValueError("checkpoint lineage is missing")
+            if self.schema_version >= 2 and (
                 self.wal_generation_id is None
                 or self.wal_record_id is None
                 or self.wal_record_hash is None
                 or self.external_reconciliation_required is None
             ):
                 raise ValueError("v2 checkpoint WAL identity is incomplete")
+            if self.schema_version == 3 and self.v3_migration_anchor_hash is None:
+                raise ValueError("v3 checkpoint migration anchor is missing")
             self._forbid_irrelevant_fields(
                 {
                     "processing_sequence",
@@ -189,6 +597,8 @@ class EventJournalRecord(_JournalModel):
                     "wal_record_id",
                     "wal_record_hash",
                     "migration_previous_v1_hash",
+                    "migration_previous_v2_hash",
+                    "v3_migration_anchor_hash",
                     "journal_lineage_id",
                     "external_reconciliation_required",
                 }
@@ -222,9 +632,9 @@ class EventJournalRecord(_JournalModel):
                 )
             ):
                 raise ValueError("prepared has forbidden fields")
-            if self.schema_version == 2 and (self.wal_generation_id is None):
+            if self.schema_version >= 2 and (self.wal_generation_id is None):
                 raise ValueError("v2 prepared WAL identity is incomplete")
-            if self.schema_version == 2 and (
+            if self.schema_version >= 2 and (
                 self.wal_record_id is not None or self.wal_record_hash is not None
             ):
                 raise ValueError("v2 prepared cannot bind appended WAL record")
@@ -241,7 +651,7 @@ class EventJournalRecord(_JournalModel):
                 raise ValueError("completed requires processing sequence")
             self._require_snapshot()
             self._forbid_state_and_failure()
-            if self.schema_version == 2 and (
+            if self.schema_version >= 2 and (
                 self.wal_generation_id is None
                 or self.wal_record_id is None
                 or self.wal_record_hash is None
@@ -294,7 +704,7 @@ class EventJournalRecord(_JournalModel):
                 }
             )
         elif self.lifecycle is EventLifecycle.RECOVERY_PREPARED:
-            if self.schema_version != 2 or self.recovery_id is None or not no_identity:
+            if self.schema_version < 2 or self.recovery_id is None or not no_identity:
                 raise ValueError("v2 recovery preparation is invalid")
             self._require_snapshot()
             if self.recovery_category is None or self.wal_generation_id is None:
@@ -315,7 +725,7 @@ class EventJournalRecord(_JournalModel):
                 }
             )
         elif self.lifecycle is EventLifecycle.RECOVERY_COMPLETED:
-            if self.schema_version != 2 or self.recovery_id is None or not no_identity:
+            if self.schema_version < 2 or self.recovery_id is None or not no_identity:
                 raise ValueError("v2 recovery completion is invalid")
             self._require_snapshot()
             if self.recovery_category is None or self.wal_generation_id is None:
@@ -385,6 +795,22 @@ class EventJournalRecord(_JournalModel):
             "recovery_processing_high_water",
             "recovery_category",
             "external_reconciliation_required",
+            "migration_previous_v2_hash",
+            "v3_migration_anchor_hash",
+            "transaction_id",
+            "transaction_kind",
+            "required_participants",
+            "participant_id",
+            "operation_digest",
+            "participant_outcome",
+            "abort_outcome",
+            "abort_reason",
+            "reconciliation_id",
+            "startup_participant_outcome",
+            "reconciliation_reason",
+            "unresolved_participants",
+            "baseline_id",
+            "participant_registry",
         )
         if any(
             getattr(self, field) is not None for field in fields if field not in allowed
@@ -437,6 +863,21 @@ class EventJournalAppendError(EventJournalError):
 
 
 @dataclass(frozen=True, slots=True)
+class EventJournalAdmissionStatus:
+    """Bounded, read-only evidence for mutation admission."""
+
+    available: bool
+    reason: str | None
+    active_file_bytes: int
+    max_bytes: int
+    rotated_segment_count: int
+    retained_files: int
+    safe_rotation_possible: bool
+    lifecycle_blocks_rotation: bool
+    proof_retention_blocks_safe_pruning: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _EventState:
     event_id: str
     event_type: AgentEventType
@@ -447,6 +888,110 @@ class _EventState:
     state_hash_before: str | None = None
     state_hash_after: str | None = None
     wal_generation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalTransaction:
+    transaction_id: str
+    event_id: str
+    event_type: AgentEventType
+    source: AgentEventSource
+    processing_sequence: int
+    kind: TransactionKind
+    required_participants: tuple[ParticipantRequirement, ...]
+    participant_outcomes: tuple[tuple[str, ParticipantOutcome], ...]
+    abort_outcomes: tuple[tuple[str, AbortOutcome], ...] = ()
+    reconciliation_reason: ReconciliationReason | None = None
+    abort_reason: ReconciliationReason | None = None
+    unresolved_participants: tuple[str, ...] = ()
+    terminal_lifecycle: EventLifecycle | None = None
+
+    @property
+    def known_outcomes(self) -> tuple[tuple[str, ParticipantOutcome], ...]:
+        return self.participant_outcomes
+
+
+def startup_participant_aggregate_digest(
+    transactions: tuple[EventJournalTransaction, ...], participant_id: str
+) -> str:
+    """Commit to a participant's complete transaction set without payloads."""
+
+    rows = sorted(
+        [
+            transaction.transaction_id,
+            transaction.processing_sequence,
+            transaction.kind.value,
+            transaction.terminal_lifecycle.value
+            if transaction.terminal_lifecycle is not None
+            else None,
+            requirement.participant_id,
+            requirement.operation_digest,
+        ]
+        for transaction in transactions
+        for requirement in transaction.required_participants
+        if requirement.participant_id == participant_id
+    )
+    canonical = json.dumps(
+        rows,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(_STARTUP_AGGREGATE_DOMAIN + canonical).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalStartupReconciliation:
+    reconciliation_id: str
+    recovery_id: str
+    snapshot_sequence: int
+    snapshot_hash: str
+    recovery_processing_high_water: int
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+    journal_lineage_id: str
+    required_participants: tuple[ParticipantRequirement, ...]
+    participant_outcomes: tuple[tuple[str, str, StartupParticipantOutcome], ...]
+    completed: bool
+
+    @property
+    def known_outcomes(
+        self,
+    ) -> tuple[tuple[str, str, StartupParticipantOutcome], ...]:
+        return self.participant_outcomes
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalParticipantBaseline:
+    baseline_id: str
+    snapshot_sequence: int
+    snapshot_hash: str
+    processing_high_water: int
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+    journal_lineage_id: str
+    participant_registry: tuple[ParticipantBaseline, ...]
+
+    @property
+    def registry(self) -> tuple[ParticipantBaseline, ...]:
+        return self.participant_registry
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalGateClear:
+    baseline_id: str
+    reconciliation_id: str
+    recovery_id: str
+    snapshot_sequence: int
+    snapshot_hash: str
+    processing_high_water: int
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+    journal_lineage_id: str
+    terminal: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +1009,11 @@ class _VerifiedJournal:
     wal_generation_id: str | None
     wal_record_id: str | None
     wal_record_hash: str | None
+    transactions: tuple[EventJournalTransaction, ...] = ()
+    startup_reconciliations: tuple[EventJournalStartupReconciliation, ...] = ()
+    baselines: tuple[EventJournalParticipantBaseline, ...] = ()
+    open_gate_clear: EventJournalGateClear | None = None
+    terminal_gate_clear: EventJournalGateClear | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,6 +1056,27 @@ class EventJournalInspection:
     wal_generation_id: str | None
     wal_record_id: str | None
     wal_record_hash: str | None
+    open_transactions: tuple[EventJournalTransaction, ...] = ()
+    reconciliation_required_transactions: tuple[EventJournalTransaction, ...] = ()
+    completed_transactions: tuple[EventJournalTransaction, ...] = ()
+    reconciled_transactions: tuple[EventJournalTransaction, ...] = ()
+    abort_required_transactions: tuple[EventJournalTransaction, ...] = ()
+    aborted_transactions: tuple[EventJournalTransaction, ...] = ()
+    open_startup_reconciliations: tuple[EventJournalStartupReconciliation, ...] = ()
+    completed_startup_reconciliations: tuple[
+        EventJournalStartupReconciliation, ...
+    ] = ()
+    baselines: tuple[EventJournalParticipantBaseline, ...] = ()
+    open_gate_clear: EventJournalGateClear | None = None
+    terminal_gate_clear: EventJournalGateClear | None = None
+
+    @property
+    def participant_baselines(self) -> tuple[EventJournalParticipantBaseline, ...]:
+        return self.baselines
+
+    @property
+    def gate_clear(self) -> EventJournalGateClear | None:
+        return self.terminal_gate_clear or self.open_gate_clear
 
 
 class EventJournalLease:
@@ -683,6 +1254,22 @@ class EventJournal:
             self._require_authority()
             return bool(self._read_records_unlocked())
 
+    def admission_status(self) -> EventJournalAdmissionStatus:
+        """Inspect bounded retention admission without mutating the Journal."""
+        with self._lock:
+            self._require_authority()
+            return self._admission_status_unlocked()
+
+    def append_accepted_if_admission_available(self, event: AgentEvent) -> bool:
+        """Atomically guard new admission and durably append ``ACCEPTED``."""
+
+        with self._lock:
+            self._require_authority()
+            if not self._admission_status_unlocked().available:
+                return False
+            self.append_accepted(event)
+            return True
+
     def inspect(
         self,
         snapshot_sequence: int | None = None,
@@ -712,6 +1299,17 @@ class EventJournal:
                     wal_generation_id=None,
                     wal_record_id=None,
                     wal_record_hash=None,
+                    open_transactions=(),
+                    reconciliation_required_transactions=(),
+                    completed_transactions=(),
+                    reconciled_transactions=(),
+                    abort_required_transactions=(),
+                    aborted_transactions=(),
+                    open_startup_reconciliations=(),
+                    completed_startup_reconciliations=(),
+                    baselines=(),
+                    open_gate_clear=None,
+                    terminal_gate_clear=None,
                 )
             verified = self._verify_records(records)
             classification_sequence = (
@@ -765,6 +1363,46 @@ class EventJournal:
                 wal_generation_id=verified.wal_generation_id,
                 wal_record_id=verified.wal_record_id,
                 wal_record_hash=verified.wal_record_hash,
+                open_transactions=tuple(
+                    t for t in verified.transactions if t.terminal_lifecycle is None
+                ),
+                reconciliation_required_transactions=tuple(
+                    t
+                    for t in verified.transactions
+                    if t.terminal_lifecycle is None
+                    and t.reconciliation_reason is not None
+                ),
+                completed_transactions=tuple(
+                    t
+                    for t in verified.transactions
+                    if t.terminal_lifecycle is EventLifecycle.TRANSACTION_COMPLETED
+                ),
+                reconciled_transactions=tuple(
+                    t
+                    for t in verified.transactions
+                    if t.terminal_lifecycle is EventLifecycle.TRANSACTION_RECONCILED
+                ),
+                abort_required_transactions=tuple(
+                    t
+                    for t in verified.transactions
+                    if t.abort_reason is not None and t.terminal_lifecycle is None
+                ),
+                aborted_transactions=tuple(
+                    t
+                    for t in verified.transactions
+                    if t.terminal_lifecycle is EventLifecycle.TRANSACTION_ABORTED
+                ),
+                open_startup_reconciliations=tuple(
+                    item
+                    for item in verified.startup_reconciliations
+                    if not item.completed
+                ),
+                completed_startup_reconciliations=tuple(
+                    item for item in verified.startup_reconciliations if item.completed
+                ),
+                baselines=verified.baselines,
+                open_gate_clear=verified.open_gate_clear,
+                terminal_gate_clear=verified.terminal_gate_clear,
             )
 
     def apply_planned_reconciliation(
@@ -875,6 +1513,399 @@ class EventJournal:
     # Short name retained for callers that model this as a state transition.
     migrate_v2 = append_v2_migration_checkpoint
 
+    def append_v3_migration_checkpoint(self) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 2:
+                raise EventJournalIntegrityError("v3 migration requires v2 history")
+            verified = self._verify_records(records)
+            if (
+                verified.open_events
+                or verified.open_recoveries
+                or verified.transactions
+                or any(not item.completed for item in verified.startup_reconciliations)
+            ):
+                raise EventJournalIntegrityError(
+                    "v3 migration requires a closed v2 journal"
+                )
+            prior = records[-1]
+            checkpoint = self._make_record(
+                EventLifecycle.CHECKPOINT,
+                previous_hash=prior.record_hash,
+                processing_sequence=verified.processing_high_water,
+                snapshot_sequence=verified.snapshot_sequence,
+                snapshot_hash=verified.snapshot_hash,
+                schema_version=3,
+                migration_previous_v2_hash=prior.record_hash,
+                v3_migration_anchor_hash=prior.record_hash,
+                wal_generation_id=verified.wal_generation_id,
+                wal_record_id=verified.wal_record_id,
+                wal_record_hash=verified.wal_record_hash,
+                journal_lineage_id=verified.journal_lineage_id,
+                external_reconciliation_required=verified.external_reconciliation_required,
+            )
+            self._verify_records((*records, checkpoint))
+            self._append_record_unlocked(checkpoint)
+            self._maybe_rotate_unlocked()
+
+    migrate_v3 = append_v3_migration_checkpoint
+
+    def _append_transaction(
+        self, lifecycle: EventLifecycle, event: AgentEvent, **fields: object
+    ) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 3:
+                raise EventJournalIntegrityError(
+                    "transaction evidence requires schema 3"
+                )
+            validation_failure: EventJournalAppendError | None = None
+            try:
+                record = self._make_record(
+                    lifecycle,
+                    previous_hash=records[-1].record_hash,
+                    event=event,
+                    schema_version=3,
+                    processing_sequence=event.processing_sequence,
+                    **fields,
+                )
+                self._verify_records((*records, record))
+            except (ValidationError, ValueError, EventJournalIntegrityError):
+                validation_failure = EventJournalAppendError(
+                    EventJournalAppendStage.VALIDATE, published=False
+                )
+            if validation_failure is not None:
+                raise validation_failure
+            self._append_record_unlocked(record)
+            self._maybe_rotate_unlocked()
+
+    def append_transaction_prepared(
+        self,
+        event: AgentEvent,
+        transaction_id: str,
+        kind: TransactionKind,
+        required_participants: tuple[ParticipantRequirement, ...],
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_PREPARED,
+            event,
+            transaction_id=transaction_id,
+            transaction_kind=kind,
+            required_participants=required_participants,
+        )
+
+    def append_participant_finalized(
+        self,
+        event: AgentEvent,
+        transaction_id: str,
+        participant_id: str,
+        operation_digest: str,
+        outcome: ParticipantOutcome,
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.PARTICIPANT_FINALIZED,
+            event,
+            transaction_id=transaction_id,
+            participant_id=participant_id,
+            operation_digest=operation_digest,
+            participant_outcome=outcome,
+        )
+
+    def append_transaction_completed(
+        self, event: AgentEvent, transaction_id: str
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_COMPLETED, event, transaction_id=transaction_id
+        )
+
+    def append_transaction_reconciliation_required(
+        self,
+        event: AgentEvent,
+        transaction_id: str,
+        reason: ReconciliationReason,
+        unresolved_participants: tuple[str, ...],
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED,
+            event,
+            transaction_id=transaction_id,
+            reconciliation_reason=reason,
+            unresolved_participants=unresolved_participants,
+        )
+
+    def append_transaction_reconciled(
+        self, event: AgentEvent, transaction_id: str
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_RECONCILED, event, transaction_id=transaction_id
+        )
+
+    def append_participant_aborted(
+        self,
+        event: AgentEvent,
+        transaction_id: str,
+        participant_id: str,
+        operation_digest: str,
+        outcome: AbortOutcome,
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.PARTICIPANT_ABORTED,
+            event,
+            transaction_id=transaction_id,
+            participant_id=participant_id,
+            operation_digest=operation_digest,
+            abort_outcome=outcome,
+        )
+
+    def append_transaction_abort_required(
+        self,
+        event: AgentEvent,
+        transaction_id: str,
+        reason: ReconciliationReason,
+        unresolved_participants: tuple[str, ...],
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_ABORT_REQUIRED,
+            event,
+            transaction_id=transaction_id,
+            abort_reason=reason,
+            unresolved_participants=unresolved_participants,
+        )
+
+    def append_transaction_aborted(
+        self, event: AgentEvent, transaction_id: str
+    ) -> None:
+        self._append_transaction(
+            EventLifecycle.TRANSACTION_ABORTED, event, transaction_id=transaction_id
+        )
+
+    def _append_startup_reconciliation(
+        self, lifecycle: EventLifecycle, **fields: object
+    ) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 3:
+                raise EventJournalIntegrityError(
+                    "startup reconciliation evidence requires schema 3"
+                )
+            validation_failure: EventJournalAppendError | None = None
+            try:
+                if (
+                    lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED
+                    and not any(
+                        record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                        and record.recovery_id == fields.get("recovery_id")
+                        for record in records
+                    )
+                ):
+                    raise EventJournalIntegrityError(
+                        "startup reconciliation recovery evidence is unknown"
+                    )
+                record = self._make_record(
+                    lifecycle,
+                    previous_hash=records[-1].record_hash,
+                    schema_version=3,
+                    event=None,
+                    **fields,
+                )
+                self._verify_records((*records, record))
+            except (ValidationError, ValueError, EventJournalIntegrityError):
+                validation_failure = EventJournalAppendError(
+                    EventJournalAppendStage.VALIDATE, published=False
+                )
+            if validation_failure is not None:
+                raise validation_failure
+            self._append_record_unlocked(record)
+            self._maybe_rotate_unlocked()
+
+    def append_startup_reconciliation_prepared(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+        required_participants: tuple[ParticipantRequirement, ...],
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
+            required_participants=required_participants,
+        )
+
+    def append_startup_participant_reconciled(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+        participant_id: str,
+        operation_digest: str,
+        outcome: StartupParticipantOutcome,
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
+            participant_id=participant_id,
+            operation_digest=operation_digest,
+            startup_participant_outcome=outcome,
+        )
+
+    def append_startup_reconciliation_completed(
+        self,
+        reconciliation_id: str,
+        recovery_id: str,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        recovery_processing_high_water: int,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        journal_lineage_id: str,
+    ) -> None:
+        self._append_startup_reconciliation(
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            reconciliation_id=reconciliation_id,
+            recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=recovery_processing_high_water,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            journal_lineage_id=journal_lineage_id,
+        )
+
+    def _append_external_gate(
+        self, lifecycle: EventLifecycle, **fields: object
+    ) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 3:
+                raise EventJournalIntegrityError("external gate requires schema 3")
+            try:
+                record = self._make_record(
+                    lifecycle, previous_hash=records[-1].record_hash,
+                    schema_version=3, event=None, **fields
+                )
+                self._verify_records((*records, record))
+            except (ValidationError, ValueError, EventJournalIntegrityError):
+                raise EventJournalAppendError(
+                    EventJournalAppendStage.VALIDATE, published=False
+                ) from None
+            self._append_record_unlocked(record)
+            self._maybe_rotate_unlocked()
+
+    def append_participant_baseline(
+        self, baseline_id: str, snapshot_sequence: int, snapshot_hash: str,
+        processing_high_water: int, wal_generation_id: str, wal_record_id: str,
+        wal_record_hash: str, journal_lineage_id: str,
+        participant_registry: tuple[ParticipantBaseline, ...],
+    ) -> None:
+        if participant_registry != (
+            ParticipantBaseline(
+                participant_id="memory.episodic",
+                domain=ParticipantDomain.DURABLE_DOMAIN,
+            ),
+            ParticipantBaseline(
+                participant_id="session.turn",
+                domain=ParticipantDomain.EPHEMERAL_PROCESS,
+            ),
+        ):
+            raise ValueError("participant baseline registry is incomplete")
+        inspection = self.inspect()
+        if inspection.baselines:
+            raise EventJournalIntegrityError("participant baseline already exists")
+        if (
+            inspection.open_events
+            or inspection.open_transactions
+            or inspection.open_recoveries
+            or inspection.open_startup_reconciliations
+            or inspection.open_gate_clear is not None
+            or inspection.external_reconciliation_required
+            or snapshot_sequence != inspection.snapshot_sequence
+            or snapshot_hash != inspection.snapshot_hash
+            or processing_high_water != inspection.processing_high_water
+            or wal_generation_id != inspection.wal_generation_id
+            or wal_record_id != inspection.wal_record_id
+            or wal_record_hash != inspection.wal_record_hash
+            or journal_lineage_id != inspection.journal_lineage_id
+        ):
+            raise EventJournalIntegrityError(
+                "participant baseline requires clean current authority"
+            )
+        self._append_external_gate(
+            EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
+            baseline_id=baseline_id, snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=processing_high_water,
+            wal_generation_id=wal_generation_id, wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash, journal_lineage_id=journal_lineage_id,
+            participant_registry=participant_registry,
+        )
+
+    def append_clear_prepared(
+        self, baseline_id: str, reconciliation_id: str, recovery_id: str,
+        snapshot_sequence: int, snapshot_hash: str, processing_high_water: int,
+        wal_generation_id: str, wal_record_id: str, wal_record_hash: str,
+        journal_lineage_id: str,
+    ) -> None:
+        self._append_external_gate(
+            EventLifecycle.CLEAR_PREPARED, baseline_id=baseline_id,
+            reconciliation_id=reconciliation_id, recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence, snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=processing_high_water,
+            wal_generation_id=wal_generation_id, wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash, journal_lineage_id=journal_lineage_id,
+        )
+
+    def append_cleared(
+        self, baseline_id: str, reconciliation_id: str, recovery_id: str,
+        snapshot_sequence: int, snapshot_hash: str, processing_high_water: int,
+        wal_generation_id: str, wal_record_id: str, wal_record_hash: str,
+        journal_lineage_id: str,
+    ) -> None:
+        self._append_external_gate(
+            EventLifecycle.CLEARED, baseline_id=baseline_id,
+            reconciliation_id=reconciliation_id, recovery_id=recovery_id,
+            snapshot_sequence=snapshot_sequence, snapshot_hash=snapshot_hash,
+            recovery_processing_high_water=processing_high_water,
+            wal_generation_id=wal_generation_id, wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash, journal_lineage_id=journal_lineage_id,
+        )
+
+    append_external_reconciliation_clear_prepared = append_clear_prepared
+    append_external_reconciliation_cleared = append_cleared
+
     def append_v2_bootstrap_checkpoint(
         self,
         snapshot_sequence: int,
@@ -926,7 +1957,7 @@ class EventJournal:
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
-            if not records or records[-1].schema_version != 2:
+            if not records or records[-1].schema_version < 2:
                 raise EventJournalIntegrityError(
                     "current checkpoint requires v2 history"
                 )
@@ -938,17 +1969,35 @@ class EventJournal:
                 or verified.journal_lineage_id is None
             ):
                 raise EventJournalIntegrityError("current checkpoint is inconsistent")
+            schema_version = records[-1].schema_version
+            v3_migration_anchor_hash = (
+                next(
+                    (
+                        record.v3_migration_anchor_hash
+                        for record in reversed(records)
+                        if record.schema_version == 3
+                        and record.lifecycle is EventLifecycle.CHECKPOINT
+                        and record.v3_migration_anchor_hash is not None
+                    ),
+                    None,
+                )
+                if schema_version == 3
+                else None
+            )
+            if schema_version == 3 and v3_migration_anchor_hash is None:
+                raise EventJournalIntegrityError("v3 Journal lacks migration authority")
             checkpoint = self._make_record(
                 EventLifecycle.CHECKPOINT,
                 previous_hash=records[-1].record_hash,
                 processing_sequence=verified.processing_high_water,
                 snapshot_sequence=snapshot_sequence,
                 snapshot_hash=snapshot_hash,
-                schema_version=2,
+                schema_version=schema_version,
                 wal_generation_id=wal_generation_id,
                 wal_record_id=wal_record_id,
                 wal_record_hash=wal_record_hash,
                 journal_lineage_id=verified.journal_lineage_id,
+                v3_migration_anchor_hash=v3_migration_anchor_hash,
                 external_reconciliation_required=(
                     verified.external_reconciliation_required
                 ),
@@ -1204,7 +2253,7 @@ class EventJournal:
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
-            if not records or self._active_schema(records) != 2:
+            if not records or self._active_schema(records) < 2:
                 raise EventJournalIntegrityError("v2 recovery requires migration")
             verified = self._verify_records(records)
             if processing_high_water is None:
@@ -1236,7 +2285,7 @@ class EventJournal:
             ):
                 raise EventJournalIntegrityError("recovery WAL identity is incomplete")
             kwargs: dict[str, Any] = {
-                "schema_version": 2,
+                "schema_version": self._active_schema(records),
                 "recovery_id": recovery_id,
                 "snapshot_sequence": snapshot_sequence,
                 "snapshot_hash": snapshot_hash,
@@ -1336,8 +2385,43 @@ class EventJournal:
                 "recovery_category",
                 "recovery_processing_high_water",
                 "external_reconciliation_required",
+                "migration_previous_v2_hash",
+                "v3_migration_anchor_hash",
+                "transaction_id",
+                "transaction_kind",
+                "required_participants",
+                "participant_id",
+                "operation_digest",
+                "participant_outcome",
+                "abort_outcome",
+                "abort_reason",
+                "reconciliation_reason",
+                "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
+                "baseline_id",
+                "participant_registry",
             }
             if record.schema_version == 1
+            else {
+                "migration_previous_v2_hash",
+                "v3_migration_anchor_hash",
+                "transaction_id",
+                "transaction_kind",
+                "required_participants",
+                "participant_id",
+                "operation_digest",
+                "participant_outcome",
+                "abort_outcome",
+                "abort_reason",
+                "reconciliation_reason",
+                "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
+                "baseline_id",
+                "participant_registry",
+            }
+            if record.schema_version in {1, 2}
             else set()
         )
         canonical = json.dumps(
@@ -1347,7 +2431,13 @@ class EventJournal:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        domain = _HASH_DOMAIN_V1 if record.schema_version == 1 else _HASH_DOMAIN_V2
+        domain = (
+            _HASH_DOMAIN_V1
+            if record.schema_version == 1
+            else _HASH_DOMAIN_V2
+            if record.schema_version == 2
+            else _HASH_DOMAIN_V3
+        )
         return hashlib.sha256(domain + canonical).hexdigest()
 
     @staticmethod
@@ -1363,8 +2453,43 @@ class EventJournal:
                 "recovery_category",
                 "recovery_processing_high_water",
                 "external_reconciliation_required",
+                "migration_previous_v2_hash",
+                "v3_migration_anchor_hash",
+                "transaction_id",
+                "transaction_kind",
+                "required_participants",
+                "participant_id",
+                "operation_digest",
+                "participant_outcome",
+                "abort_outcome",
+                "abort_reason",
+                "reconciliation_reason",
+                "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
+                "baseline_id",
+                "participant_registry",
             }
             if record.schema_version == 1
+            else {
+                "migration_previous_v2_hash",
+                "v3_migration_anchor_hash",
+                "transaction_id",
+                "transaction_kind",
+                "required_participants",
+                "participant_id",
+                "operation_digest",
+                "participant_outcome",
+                "abort_outcome",
+                "abort_reason",
+                "reconciliation_reason",
+                "unresolved_participants",
+                "reconciliation_id",
+                "startup_participant_outcome",
+                "baseline_id",
+                "participant_registry",
+            }
+            if record.schema_version in {1, 2}
             else set()
         )
         return (
@@ -1430,26 +2555,87 @@ class EventJournal:
             raise failure
         if size <= self.max_bytes:
             return
-        verified = self._verify_records(self._read_records_unlocked())
-        if verified.open_events or verified.open_recoveries:
+        safe_rotation, _lifecycle_blocked, _proof_blocked = (
+            self._rotation_decision_unlocked()
+        )
+        if not safe_rotation:
             return
-        if verified.records[-1].schema_version == 2 and not any(
+        verified = self._verify_records(self._read_records_unlocked())
+        self._rotate_unlocked(verified)
+
+    def _admission_status_unlocked(self) -> EventJournalAdmissionStatus:
+        try:
+            active_bytes = self.path.stat().st_size
+        except OSError as error:
+            raise EventJournalLoadError(
+                "EventJournal size cannot be inspected"
+            ) from error
+        rotated_count = len(self._rotated_paths_unlocked())
+        if active_bytes <= self.max_bytes:
+            return EventJournalAdmissionStatus(
+                True,
+                None,
+                active_bytes,
+                self.max_bytes,
+                rotated_count,
+                self.retained_files,
+                False,
+                False,
+                False,
+            )
+        safe_rotation, lifecycle_blocked, proof_blocked = (
+            self._rotation_decision_unlocked()
+        )
+        return EventJournalAdmissionStatus(
+            safe_rotation,
+            None if safe_rotation else "event_journal_retention_exhausted",
+            active_bytes,
+            self.max_bytes,
+            rotated_count,
+            self.retained_files,
+            safe_rotation,
+            lifecycle_blocked,
+            proof_blocked,
+        )
+
+    def _rotation_decision_unlocked(self) -> tuple[bool, bool, bool]:
+        """Use one authority-preserving policy for status and ordinary rotation."""
+        records = self._read_records_unlocked()
+        if not records:
+            raise EventJournalLoadError("EventJournal cannot rotate without records")
+        verified = self._verify_records(records)
+        lifecycle_blocked = bool(
+            verified.open_events
+            or verified.open_recoveries
+            or any(t.terminal_lifecycle is None for t in verified.transactions)
+            or any(not item.completed for item in verified.startup_reconciliations)
+            or verified.external_reconciliation_required
+            or verified.open_gate_clear is not None
+        )
+        proof_blocked = bool(
+            (verified.transactions or verified.baselines)
+            and len(self._rotated_paths_unlocked()) + 1 >= self.retained_files
+        )
+        anchor_blocked = verified.records[-1].schema_version >= 2 and not any(
             record.lifecycle
             in {
                 EventLifecycle.CHECKPOINT,
                 EventLifecycle.COMPLETED,
                 EventLifecycle.RECOVERY_COMPLETED,
             }
-            and record.schema_version == 2
+            and record.schema_version >= 2
             and record.snapshot_sequence == verified.snapshot_sequence
             and record.snapshot_hash == verified.snapshot_hash
             and record.wal_generation_id is not None
             and record.wal_record_id is not None
             and record.wal_record_hash is not None
             for record in reversed(verified.records)
-        ):
-            return
-        self._rotate_unlocked(verified)
+        )
+        return (
+            not (lifecycle_blocked or proof_blocked or anchor_blocked),
+            lifecycle_blocked,
+            proof_blocked,
+        )
 
     def _rotate_unlocked(self, verified: _VerifiedJournal) -> None:
         failure: EventJournalAppendError | None = None
@@ -1461,7 +2647,8 @@ class EventJournal:
             wal_record_id: str | None = None
             wal_record_hash: str | None = None
             journal_lineage_id: str | None = None
-            if verified.records[-1].schema_version == 2:
+            v3_migration_anchor_hash: str | None = None
+            if verified.records[-1].schema_version >= 2:
                 anchor = next(
                     (
                         record
@@ -1472,7 +2659,7 @@ class EventJournal:
                             EventLifecycle.COMPLETED,
                             EventLifecycle.RECOVERY_COMPLETED,
                         }
-                        and record.schema_version == 2
+                        and record.schema_version >= 2
                         and record.wal_generation_id is not None
                         and record.wal_record_id is not None
                         and record.wal_record_hash is not None
@@ -1490,6 +2677,21 @@ class EventJournal:
                 wal_record_id = anchor.wal_record_id
                 wal_record_hash = anchor.wal_record_hash
                 journal_lineage_id = verified.journal_lineage_id
+                if verified.records[-1].schema_version == 3:
+                    v3_migration_anchor_hash = next(
+                        (
+                            record.v3_migration_anchor_hash
+                            for record in verified.records
+                            if record.schema_version == 3
+                            and record.lifecycle is EventLifecycle.CHECKPOINT
+                            and record.v3_migration_anchor_hash is not None
+                        ),
+                        None,
+                    )
+                    if v3_migration_anchor_hash is None:
+                        raise EventJournalIntegrityError(
+                            "v3 Journal lacks migration authority"
+                        )
             checkpoint = self._make_record(
                 EventLifecycle.CHECKPOINT,
                 previous_hash=verified.records[-1].record_hash,
@@ -1501,9 +2703,10 @@ class EventJournal:
                 wal_record_id=wal_record_id,
                 wal_record_hash=wal_record_hash,
                 journal_lineage_id=journal_lineage_id,
+                v3_migration_anchor_hash=v3_migration_anchor_hash,
                 external_reconciliation_required=(
                     verified.external_reconciliation_required
-                    if verified.records[-1].schema_version == 2
+                    if verified.records[-1].schema_version >= 2
                     else None
                 ),
             )
@@ -1621,7 +2824,7 @@ class EventJournal:
                 if (
                     isinstance(version, int)
                     and not isinstance(version, bool)
-                    and version not in {1, 2}
+                    and version not in {1, 2, 3}
                 ):
                     raise UnsupportedEventJournalVersion(
                         "EventJournal schema version is unsupported"
@@ -1729,7 +2932,7 @@ class EventJournal:
         if (
             not records
             or records[0].lifecycle is not EventLifecycle.CHECKPOINT
-            or records[0].schema_version not in {1, 2}
+            or records[0].schema_version not in {1, 2, 3}
         ):
             raise EventJournalIntegrityError("EventJournal lacks checkpoint authority")
         checkpoint = records[0]
@@ -1748,14 +2951,15 @@ class EventJournal:
         external_reconciliation_required = bool(
             checkpoint.external_reconciliation_required
         )
-        if checkpoint.schema_version == 2 and (
+        if checkpoint.schema_version >= 2 and (
             checkpoint.wal_generation_id is None
             or checkpoint.wal_record_id is None
             or checkpoint.wal_record_hash is None
             or checkpoint.journal_lineage_id is None
             or checkpoint.migration_previous_v1_hash is not None
+            or checkpoint.migration_previous_v2_hash is not None
         ):
-            raise EventJournalIntegrityError("v2 bootstrap anchor is invalid")
+            raise EventJournalIntegrityError("WAL-bound checkpoint anchor is invalid")
         if snapshot_sequence > high_water:
             raise EventJournalIntegrityError("Checkpoint sequence is impossible")
         open_events: dict[str, _EventState] = {}
@@ -1765,7 +2969,15 @@ class EventJournal:
         seen_record_ids: set[str] = set()
         recovery_open: dict[str, EventJournalRecord] = {}
         seen_recovery_ids: set[str] = set()
+        completed_recoveries: dict[str, EventJournalRecord] = {}
+        startup_open: dict[str, dict[str, Any]] = {}
+        startup_seen_ids: set[str] = set()
+        startup_seen_recovery_ids: set[str] = set()
+        startup_completed: list[dict[str, Any]] = []
         v2_seen = checkpoint.schema_version == 2
+        v3_seen = checkpoint.schema_version == 3
+        v3_migration_anchor_hash = checkpoint.v3_migration_anchor_hash
+        transactions: dict[str, dict[str, Any]] = {}
 
         for record in records:
             if record.record_id in seen_record_ids:
@@ -1773,7 +2985,22 @@ class EventJournal:
             seen_record_ids.add(record.record_id)
 
         for index, record in enumerate(records[1:], start=1):
-            if record.schema_version == 2:
+            if record.schema_version == 3:
+                if not v3_seen and (
+                    record.lifecycle is not EventLifecycle.CHECKPOINT
+                    or record.migration_previous_v2_hash
+                    != records[index - 1].record_hash
+                    or records[index - 1].schema_version != 2
+                    or record.v3_migration_anchor_hash
+                    != record.migration_previous_v2_hash
+                ):
+                    raise EventJournalIntegrityError("v3 migration boundary is invalid")
+                if v3_seen and record.migration_previous_v2_hash is not None:
+                    raise EventJournalIntegrityError("v3 migration is duplicated")
+                v3_seen = True
+            elif record.schema_version == 2:
+                if v3_seen:
+                    raise EventJournalIntegrityError("schema downgrade is invalid")
                 if not v2_seen and (
                     record.lifecycle is not EventLifecycle.CHECKPOINT
                     or record.migration_previous_v1_hash
@@ -1784,7 +3011,7 @@ class EventJournal:
                 if v2_seen and record.migration_previous_v1_hash is not None:
                     raise EventJournalIntegrityError("v2 migration is duplicated")
                 v2_seen = True
-            elif v2_seen:
+            elif v2_seen or v3_seen:
                 raise EventJournalIntegrityError("v1 record follows v2 migration")
             if record.lifecycle is EventLifecycle.CHECKPOINT:
                 if open_events:
@@ -1795,6 +3022,14 @@ class EventJournal:
                     raise EventJournalIntegrityError(
                         "Checkpoint cannot hide open recovery lifecycle"
                     )
+                if any(t["terminal"] is None for t in transactions.values()):
+                    raise EventJournalIntegrityError(
+                        "Checkpoint cannot hide open transaction lifecycle"
+                    )
+                if startup_open:
+                    raise EventJournalIntegrityError(
+                        "Checkpoint cannot hide open startup reconciliation"
+                    )
                 if (
                     record.processing_sequence != high_water
                     or record.snapshot_sequence != snapshot_sequence
@@ -1802,7 +3037,24 @@ class EventJournal:
                 ):
                     raise EventJournalIntegrityError("Checkpoint continuity is invalid")
                 if (
-                    record.schema_version == 2
+                    record.schema_version == 3
+                    and record.migration_previous_v2_hash is not None
+                    and (
+                        records[index - 1].schema_version != 2
+                        or record.migration_previous_v2_hash
+                        != records[index - 1].record_hash
+                    )
+                ):
+                    raise EventJournalIntegrityError("v3 migration anchor is invalid")
+                if record.schema_version == 3:
+                    if v3_migration_anchor_hash is None:
+                        v3_migration_anchor_hash = record.v3_migration_anchor_hash
+                    elif record.v3_migration_anchor_hash != v3_migration_anchor_hash:
+                        raise EventJournalIntegrityError(
+                            "v3 migration authority changed"
+                        )
+                if (
+                    record.schema_version in {2, 3}
                     and record.migration_previous_v1_hash is None
                     and record.snapshot_sequence == wal_snapshot_sequence
                     and record.snapshot_hash == wal_snapshot_hash
@@ -1810,13 +3062,40 @@ class EventJournal:
                         record.wal_generation_id != wal_generation_id
                         or record.wal_record_id != wal_record_id
                         or record.wal_record_hash != wal_record_hash
-                        or record.external_reconciliation_required
-                        is not external_reconciliation_required
+                        or (
+                            record.external_reconciliation_required
+                            is not external_reconciliation_required
+                            and not (
+                                record.external_reconciliation_required is False
+                                and max(
+                                    (
+                                        position
+                                        for position, previous in enumerate(
+                                            records[:index]
+                                        )
+                                        if previous.lifecycle
+                                        is EventLifecycle.CLEARED
+                                    ),
+                                    default=-1,
+                                )
+                                > max(
+                                    (
+                                        position
+                                        for position, previous in enumerate(
+                                            records[:index]
+                                        )
+                                        if previous.lifecycle
+                                        is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+                                    ),
+                                    default=-1,
+                                )
+                            )
+                        )
                     )
                 ):
                     raise EventJournalIntegrityError("v2 checkpoint anchor changed")
                 if (
-                    record.schema_version == 2
+                    record.schema_version in {2, 3}
                     and record.migration_previous_v1_hash is not None
                 ):
                     if (
@@ -1830,7 +3109,7 @@ class EventJournal:
                         raise EventJournalIntegrityError(
                             "v2 migration anchor is invalid"
                         )
-                if record.schema_version == 2:
+                if record.schema_version in {2, 3}:
                     if journal_lineage_id is None:
                         journal_lineage_id = record.journal_lineage_id
                     elif record.journal_lineage_id != journal_lineage_id:
@@ -1845,7 +3124,7 @@ class EventJournal:
                 EventLifecycle.RECOVERY_PREPARED,
                 EventLifecycle.RECOVERY_COMPLETED,
             }:
-                if record.schema_version != 2 or record.recovery_id is None:
+                if record.schema_version < 2 or record.recovery_id is None:
                     raise EventJournalIntegrityError("v2 recovery identity is invalid")
                 if record.recovery_processing_high_water != high_water:
                     raise EventJournalIntegrityError("recovery high-water is invalid")
@@ -1925,7 +3204,436 @@ class EventJournal:
                     wal_record_hash = record.wal_record_hash
                     wal_snapshot_sequence = record.snapshot_sequence
                     wal_snapshot_hash = record.snapshot_hash
+                    completed_recoveries[record.recovery_id] = record
                     del recovery_open[record.recovery_id]
+                continue
+            if record.lifecycle in {
+                EventLifecycle.STARTUP_RECONCILIATION_PREPARED,
+                EventLifecycle.STARTUP_PARTICIPANT_RECONCILED,
+                EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            }:
+                rid = record.reconciliation_id
+                assert rid is not None
+                if record.lifecycle is EventLifecycle.STARTUP_RECONCILIATION_PREPARED:
+                    recovery = completed_recoveries.get(record.recovery_id or "")
+                    recovery_binding = (
+                        (
+                            recovery.external_reconciliation_required,
+                            recovery.snapshot_sequence,
+                            recovery.snapshot_hash,
+                            recovery.recovery_processing_high_water,
+                            recovery.wal_generation_id,
+                            recovery.wal_record_id,
+                            recovery.wal_record_hash,
+                        )
+                        if recovery is not None
+                        else (
+                            external_reconciliation_required,
+                            snapshot_sequence,
+                            snapshot_hash,
+                            high_water,
+                            wal_generation_id,
+                            wal_record_id,
+                            wal_record_hash,
+                        )
+                    )
+                    if (
+                        recovery_binding
+                        != (
+                            True,
+                            record.snapshot_sequence,
+                            record.snapshot_hash,
+                            record.recovery_processing_high_water,
+                            record.wal_generation_id,
+                            record.wal_record_id,
+                            record.wal_record_hash,
+                        )
+                        or record.journal_lineage_id != journal_lineage_id
+                    ):
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation binding is invalid"
+                        )
+                    if (
+                        rid in startup_seen_ids
+                        or rid in startup_open
+                        or record.recovery_id in startup_seen_recovery_ids
+                    ):
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation is duplicated"
+                        )
+                    assert record.required_participants is not None
+                    startup_open[rid] = {
+                        "record": record,
+                        "required": record.required_participants,
+                        "outcomes": {},
+                        "completed": False,
+                    }
+                    startup_seen_ids.add(rid)
+                    assert record.recovery_id is not None
+                    startup_seen_recovery_ids.add(record.recovery_id)
+                else:
+                    state = startup_open.get(rid)
+                    if state is None:
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation is not open"
+                        )
+                    prior = state["record"]
+                    common = (
+                        record.recovery_id,
+                        record.snapshot_sequence,
+                        record.snapshot_hash,
+                        record.recovery_processing_high_water,
+                        record.wal_generation_id,
+                        record.wal_record_id,
+                        record.wal_record_hash,
+                        record.journal_lineage_id,
+                    )
+                    expected = (
+                        prior.recovery_id,
+                        prior.snapshot_sequence,
+                        prior.snapshot_hash,
+                        prior.recovery_processing_high_water,
+                        prior.wal_generation_id,
+                        prior.wal_record_id,
+                        prior.wal_record_hash,
+                        prior.journal_lineage_id,
+                    )
+                    if common != expected:
+                        raise EventJournalIntegrityError(
+                            "startup reconciliation binding changed"
+                        )
+                    if (
+                        record.lifecycle
+                        is EventLifecycle.STARTUP_PARTICIPANT_RECONCILED
+                    ):
+                        assert record.participant_id is not None
+                        assert record.operation_digest is not None
+                        required = {
+                            item.participant_id: item.operation_digest
+                            for item in state["required"]
+                        }
+                        if (
+                            record.participant_id not in required
+                            or record.operation_digest
+                            != required[record.participant_id]
+                            or record.participant_id in state["outcomes"]
+                        ):
+                            raise EventJournalIntegrityError(
+                                "startup participant evidence is invalid"
+                            )
+                        assert record.startup_participant_outcome is not None
+                        state["outcomes"][record.participant_id] = (
+                            record.operation_digest,
+                            record.startup_participant_outcome,
+                        )
+                    else:
+                        required_ids = {
+                            item.participant_id for item in state["required"]
+                        }
+                        if set(state["outcomes"]) != required_ids:
+                            raise EventJournalIntegrityError(
+                                "startup reconciliation completion is premature"
+                            )
+                        state["completed"] = True
+                        startup_completed.append(state)
+                        del startup_open[rid]
+                continue
+            if record.lifecycle in {
+                EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
+                EventLifecycle.CLEAR_PREPARED,
+                EventLifecycle.CLEARED,
+            }:
+                if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
+                    prior_records = records[:index]
+                    if (
+                        record.schema_version != 3
+                        or external_reconciliation_required
+                        or open_events
+                        or recovery_open
+                        or any(
+                            transaction["terminal"] is None
+                            for transaction in transactions.values()
+                        )
+                        or startup_open
+                        or startup_seen_ids
+                        or any(
+                            prior.lifecycle
+                            in {
+                                EventLifecycle.CLEAR_PREPARED,
+                                EventLifecycle.CLEARED,
+                            }
+                            or (
+                                prior.lifecycle
+                                in {
+                                    EventLifecycle.RECOVERY_PREPARED,
+                                    EventLifecycle.RECOVERY_COMPLETED,
+                                }
+                                and prior.recovery_category
+                                is EventRecoveryCategory.TRUE_ROLLBACK
+                            )
+                            for prior in prior_records
+                        )
+                        or record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                        or record.recovery_processing_high_water != high_water
+                        or record.wal_generation_id != wal_generation_id
+                        or record.wal_record_id != wal_record_id
+                        or record.wal_record_hash != wal_record_hash
+                        or record.journal_lineage_id != journal_lineage_id
+                    ):
+                        raise EventJournalIntegrityError(
+                            "participant baseline authority is invalid"
+                        )
+                continue
+            if record.lifecycle in {
+                EventLifecycle.TRANSACTION_PREPARED,
+                EventLifecycle.PARTICIPANT_FINALIZED,
+                EventLifecycle.TRANSACTION_COMPLETED,
+                EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED,
+                EventLifecycle.TRANSACTION_RECONCILED,
+                EventLifecycle.PARTICIPANT_ABORTED,
+                EventLifecycle.TRANSACTION_ABORT_REQUIRED,
+                EventLifecycle.TRANSACTION_ABORTED,
+            }:
+                if (
+                    record.schema_version != 3
+                    or record.event_id is None
+                    or record.event_type is None
+                    or record.source is None
+                    or record.transaction_id is None
+                ):
+                    raise EventJournalIntegrityError("transaction identity is invalid")
+                current = open_events.get(record.event_id)
+                if (
+                    current is None
+                    or record.processing_sequence != current.processing_sequence
+                ):
+                    raise EventJournalIntegrityError(
+                        "transaction event anchor is invalid"
+                    )
+                tx = transactions.get(record.transaction_id)
+                if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED:
+                    if (
+                        tx is not None
+                        or current.lifecycle is not EventLifecycle.STARTED
+                        or record.transaction_kind is None
+                        or record.required_participants is None
+                    ):
+                        raise EventJournalIntegrityError(
+                            "transaction preparation is invalid"
+                        )
+                    transactions[record.transaction_id] = {
+                        "event_id": record.event_id,
+                        "event_type": record.event_type,
+                        "source": record.source,
+                        "sequence": record.processing_sequence,
+                        "kind": record.transaction_kind,
+                        "required": record.required_participants,
+                        "outcomes": {},
+                        "reason": None,
+                        "unresolved": (),
+                        "abort_outcomes": {},
+                        "abort_reason": None,
+                        "branch": None,
+                        "terminal": None,
+                    }
+                else:
+                    if (
+                        tx is None
+                        or current.lifecycle
+                        not in {EventLifecycle.PREPARED, EventLifecycle.STARTED}
+                        or (
+                            tx["event_id"],
+                            tx["event_type"],
+                            tx["source"],
+                            tx["sequence"],
+                        )
+                        != (
+                            record.event_id,
+                            record.event_type,
+                            record.source,
+                            record.processing_sequence,
+                        )
+                    ):
+                        raise EventJournalIntegrityError("transaction identity changed")
+                    required = {
+                        item.participant_id: item.operation_digest
+                        for item in tx["required"]
+                    }
+                    if (
+                        record.lifecycle
+                        in {
+                            EventLifecycle.PARTICIPANT_FINALIZED,
+                            EventLifecycle.TRANSACTION_COMPLETED,
+                            EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED,
+                            EventLifecycle.TRANSACTION_RECONCILED,
+                        }
+                        and current.lifecycle is not EventLifecycle.PREPARED
+                    ):
+                        raise EventJournalIntegrityError(
+                            "finalization evidence is before internal prepare"
+                        )
+                    if (
+                        record.lifecycle
+                        in {
+                            EventLifecycle.PARTICIPANT_ABORTED,
+                            EventLifecycle.TRANSACTION_ABORT_REQUIRED,
+                            EventLifecycle.TRANSACTION_ABORTED,
+                        }
+                        and current.lifecycle
+                        not in {EventLifecycle.STARTED, EventLifecycle.PREPARED}
+                    ):
+                        raise EventJournalIntegrityError(
+                            "abort evidence has no startup-eligible event state"
+                        )
+                    if record.lifecycle is EventLifecycle.PARTICIPANT_FINALIZED:
+                        if tx["branch"] == "abort":
+                            raise EventJournalIntegrityError(
+                                "transaction branches are mixed"
+                            )
+                        tx["branch"] = "finalize"
+                        if (
+                            record.participant_id is None
+                            or record.operation_digest
+                            != required.get(record.participant_id)
+                            or record.participant_id in tx["outcomes"]
+                            or tx["terminal"] is not None
+                        ):
+                            raise EventJournalIntegrityError(
+                                "participant finalization is invalid"
+                            )
+                        assert record.participant_outcome is not None
+                        tx["outcomes"][record.participant_id] = (
+                            record.participant_outcome
+                        )
+                        if tx["reason"] is not None:
+                            tx["unresolved"] = tuple(
+                                sorted(set(required) - set(tx["outcomes"]))
+                            )
+                    elif (
+                        record.lifecycle
+                        is EventLifecycle.TRANSACTION_RECONCILIATION_REQUIRED
+                    ):
+                        if tx["branch"] == "abort":
+                            raise EventJournalIntegrityError(
+                                "transaction branches are mixed"
+                            )
+                        tx["branch"] = "finalize"
+                        missing = tuple(sorted(set(required) - set(tx["outcomes"])))
+                        if (
+                            tx["reason"] is not None
+                            or tuple(record.unresolved_participants or ()) != missing
+                            or not missing
+                        ):
+                            raise EventJournalIntegrityError(
+                                "transaction reconciliation is invalid"
+                            )
+                        tx["reason"] = record.reconciliation_reason
+                        tx["unresolved"] = missing
+                    elif record.lifecycle is EventLifecycle.TRANSACTION_COMPLETED:
+                        if (
+                            tx["branch"] == "abort"
+                            or tx["terminal"] is not None
+                            or tx["reason"] is not None
+                            or set(tx["outcomes"]) != set(required)
+                        ):
+                            raise EventJournalIntegrityError(
+                                "transaction completion is premature"
+                            )
+                        tx["terminal"] = EventLifecycle.TRANSACTION_COMPLETED
+                    elif record.lifecycle is EventLifecycle.PARTICIPANT_ABORTED:
+                        if tx["branch"] == "finalize":
+                            raise EventJournalIntegrityError(
+                                "transaction branches are mixed"
+                            )
+                        tx["branch"] = "abort"
+                        requirements = {
+                            item.participant_id: item for item in tx["required"]
+                        }
+                        requirement = requirements.get(record.participant_id or "")
+                        if (
+                            requirement is None
+                            or ParticipantCapability.ABORT
+                            not in requirement.capabilities
+                            or record.operation_digest != requirement.operation_digest
+                            or record.participant_id in tx["abort_outcomes"]
+                            or tx["terminal"] is not None
+                        ):
+                            raise EventJournalIntegrityError(
+                                "participant abort is invalid"
+                            )
+                        assert record.abort_outcome is not None
+                        tx["abort_outcomes"][record.participant_id] = (
+                            record.abort_outcome
+                        )
+                        if tx["abort_reason"] is not None:
+                            tx["unresolved"] = tuple(
+                                sorted(
+                                    participant
+                                    for participant, item in requirements.items()
+                                    if ParticipantCapability.ABORT in item.capabilities
+                                    and participant not in tx["abort_outcomes"]
+                                )
+                            )
+                    elif record.lifecycle is EventLifecycle.TRANSACTION_ABORT_REQUIRED:
+                        if tx["branch"] == "finalize":
+                            raise EventJournalIntegrityError(
+                                "transaction branches are mixed"
+                            )
+                        tx["branch"] = "abort"
+                        requirements = {
+                            item.participant_id: item for item in tx["required"]
+                        }
+                        missing = tuple(
+                            sorted(
+                                participant
+                                for participant, item in requirements.items()
+                                if ParticipantCapability.ABORT in item.capabilities
+                                and participant not in tx["abort_outcomes"]
+                            )
+                        )
+                        if (
+                            tx["abort_reason"] is not None
+                            or tuple(record.unresolved_participants or ()) != missing
+                            or not missing
+                        ):
+                            raise EventJournalIntegrityError(
+                                "transaction abort is invalid"
+                            )
+                        tx["abort_reason"] = record.abort_reason
+                        tx["unresolved"] = missing
+                    elif record.lifecycle is EventLifecycle.TRANSACTION_ABORTED:
+                        abort_ids = {
+                            item.participant_id
+                            for item in tx["required"]
+                            if ParticipantCapability.ABORT in item.capabilities
+                        }
+                        if (
+                            tx["terminal"] is not None
+                            or set(tx["abort_outcomes"]) != abort_ids
+                            or (abort_ids and tx["branch"] != "abort")
+                            or (not abort_ids and tx["branch"] is not None)
+                        ):
+                            raise EventJournalIntegrityError(
+                                "transaction abort is incomplete"
+                            )
+                        tx["unresolved"] = ()
+                        tx["terminal"] = EventLifecycle.TRANSACTION_ABORTED
+                    elif (
+                        tx["reason"] is None
+                        or set(tx["outcomes"]) != set(required)
+                        or tx["terminal"] is not None
+                        or tx["branch"] == "abort"
+                    ):
+                        raise EventJournalIntegrityError(
+                            "transaction reconciliation is incomplete"
+                        )
+                    elif tx["branch"] != "abort":
+                        tx["terminal"] = EventLifecycle.TRANSACTION_RECONCILED
+                    else:
+                        raise EventJournalIntegrityError(
+                            "transaction branch is invalid"
+                        )
                 continue
             assert record.event_id is not None
             assert record.event_type is not None
@@ -1983,6 +3691,14 @@ class EventJournal:
                     or record.state_hash_before != snapshot_hash
                 ):
                     raise EventJournalIntegrityError("Prepared lifecycle is impossible")
+                if any(
+                    transaction["event_id"] == record.event_id
+                    and transaction["terminal"] is EventLifecycle.TRANSACTION_ABORTED
+                    for transaction in transactions.values()
+                ):
+                    raise EventJournalIntegrityError(
+                        "aborted transaction cannot cross internal prepare"
+                    )
                 open_events[record.event_id] = _EventState(
                     current.event_id,
                     current.event_type,
@@ -2004,12 +3720,19 @@ class EventJournal:
                     or record.snapshot_sequence != current.processing_sequence
                     or record.snapshot_hash != current.state_hash_after
                     or (
-                        record.schema_version == 2
+                        record.schema_version >= 2
                         and record.wal_generation_id != current.wal_generation_id
                     )
                 ):
                     raise EventJournalIntegrityError(
                         "Completed lifecycle is impossible"
+                    )
+                if any(
+                    t["event_id"] == record.event_id and t["terminal"] is None
+                    for t in transactions.values()
+                ):
+                    raise EventJournalIntegrityError(
+                        "event completed with open transaction evidence"
                     )
                 assert record.snapshot_sequence is not None
                 assert record.snapshot_hash is not None
@@ -2034,12 +3757,27 @@ class EventJournal:
                     or record.snapshot_hash != snapshot_hash
                 ):
                     raise EventJournalIntegrityError("Failed lifecycle is impossible")
+                if any(
+                    t["event_id"] == record.event_id and t["terminal"] is None
+                    for t in transactions.values()
+                ):
+                    raise EventJournalIntegrityError(
+                        "event failed with open transaction evidence"
+                    )
                 del open_events[record.event_id]
                 accepted_queue.pop(0)
                 processing_event_id = None
             elif record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED:
                 if record.snapshot_sequence is None or record.snapshot_hash is None:
                     raise EventJournalIntegrityError("Recovery snapshot is missing")
+                if any(
+                    transaction["event_id"] == record.event_id
+                    and transaction["terminal"] is None
+                    for transaction in transactions.values()
+                ):
+                    raise EventJournalIntegrityError(
+                        "recovery cannot hide open transaction evidence"
+                    )
                 if record.failure_category is EventFailureCategory.ACCEPTED_NOT_STARTED:
                     if (
                         current.lifecycle is not EventLifecycle.ACCEPTED
@@ -2098,6 +3836,146 @@ class EventJournal:
             else:
                 raise EventJournalIntegrityError("Lifecycle is impossible")
 
+        transaction_views = tuple(
+            EventJournalTransaction(
+                transaction_id=transaction_id,
+                event_id=value["event_id"],
+                event_type=value["event_type"],
+                source=value["source"],
+                processing_sequence=value["sequence"],
+                kind=value["kind"],
+                required_participants=value["required"],
+                participant_outcomes=tuple(sorted(value["outcomes"].items())),
+                abort_outcomes=tuple(sorted(value["abort_outcomes"].items())),
+                reconciliation_reason=value["reason"],
+                abort_reason=value["abort_reason"],
+                unresolved_participants=value["unresolved"],
+                terminal_lifecycle=value["terminal"],
+            )
+            for transaction_id, value in transactions.items()
+        )
+        startup_views = tuple(
+            EventJournalStartupReconciliation(
+                reconciliation_id=rid,
+                recovery_id=state["record"].recovery_id or "",
+                snapshot_sequence=state["record"].snapshot_sequence or 0,
+                snapshot_hash=state["record"].snapshot_hash or "0" * 64,
+                recovery_processing_high_water=(
+                    state["record"].recovery_processing_high_water or 0
+                ),
+                wal_generation_id=state["record"].wal_generation_id or "",
+                wal_record_id=state["record"].wal_record_id or "",
+                wal_record_hash=state["record"].wal_record_hash or "0" * 64,
+                journal_lineage_id=state["record"].journal_lineage_id or "",
+                required_participants=state["required"],
+                participant_outcomes=tuple(
+                    (participant, digest, outcome)
+                    for participant, (digest, outcome) in sorted(
+                        state["outcomes"].items()
+                    )
+                ),
+                completed=state["completed"],
+            )
+            for rid, state in [
+                *startup_open.items(),
+                *[
+                    (item["record"].reconciliation_id, item)
+                    for item in startup_completed
+                ],
+            ]
+        )
+        baseline_views: list[EventJournalParticipantBaseline] = []
+        baseline_records: dict[str, EventJournalRecord] = {}
+        for record in records:
+            if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
+                assert record.baseline_id is not None
+                if baseline_records:
+                    raise EventJournalIntegrityError("participant baseline is duplicated")
+                baseline_records[record.baseline_id] = record
+                assert record.participant_registry is not None
+                baseline_views.append(EventJournalParticipantBaseline(
+                    record.baseline_id, record.snapshot_sequence or 0,
+                    record.snapshot_hash or "0" * 64,
+                    record.recovery_processing_high_water or 0,
+                    record.wal_generation_id or "", record.wal_record_id or "",
+                    record.wal_record_hash or "0" * 64,
+                    record.journal_lineage_id or "", record.participant_registry,
+                ))
+        open_gate: EventJournalGateClear | None = None
+        terminal_gate: EventJournalGateClear | None = None
+        for record in records:
+            if record.lifecycle not in {
+                EventLifecycle.CLEAR_PREPARED, EventLifecycle.CLEARED
+            }:
+                continue
+            assert record.baseline_id is not None
+            baseline = baseline_records.get(record.baseline_id)
+            if baseline is None:
+                raise EventJournalIntegrityError("gate clear baseline is unknown")
+            if (
+                record.snapshot_sequence is None
+                or baseline.snapshot_sequence is None
+                or record.snapshot_sequence < baseline.snapshot_sequence
+                or record.recovery_processing_high_water is None
+                or baseline.recovery_processing_high_water is None
+                or record.recovery_processing_high_water
+                < baseline.recovery_processing_high_water
+                or record.journal_lineage_id != baseline.journal_lineage_id
+            ):
+                raise EventJournalIntegrityError("gate clear baseline coverage is invalid")
+            startup = next(
+                (item for item in startup_views
+                 if item.reconciliation_id == (record.reconciliation_id or "")
+                 and item.recovery_id == (record.recovery_id or "")
+                 and item.completed),
+                None,
+            )
+            if startup is None or (
+                startup.snapshot_sequence != record.snapshot_sequence
+                or startup.snapshot_hash != record.snapshot_hash
+                or startup.recovery_processing_high_water
+                != record.recovery_processing_high_water
+                or startup.wal_generation_id != record.wal_generation_id
+                or startup.wal_record_id != record.wal_record_id
+                or startup.wal_record_hash != record.wal_record_hash
+                or startup.journal_lineage_id != record.journal_lineage_id
+            ):
+                raise EventJournalIntegrityError("gate clear reconciliation binding is invalid")
+            view = EventJournalGateClear(
+                record.baseline_id, record.reconciliation_id or "",
+                record.recovery_id or "", record.snapshot_sequence or 0,
+                record.snapshot_hash or "0" * 64,
+                record.recovery_processing_high_water or 0,
+                record.wal_generation_id or "", record.wal_record_id or "",
+                record.wal_record_hash or "0" * 64,
+                record.journal_lineage_id or "",
+                record.lifecycle is EventLifecycle.CLEARED,
+            )
+            if record.lifecycle is EventLifecycle.CLEAR_PREPARED:
+                if open_gate is not None:
+                    raise EventJournalIntegrityError("gate clear is duplicated")
+                if (
+                    terminal_gate is not None
+                    and terminal_gate.reconciliation_id == view.reconciliation_id
+                ):
+                    raise EventJournalIntegrityError("gate clear is duplicated")
+                open_gate = view
+                terminal_gate = None
+            else:
+                if open_gate is None or terminal_gate is not None:
+                    raise EventJournalIntegrityError("gate clear completion is impossible")
+                if view != EventJournalGateClear(
+                    open_gate.baseline_id, open_gate.reconciliation_id,
+                    open_gate.recovery_id, open_gate.snapshot_sequence,
+                    open_gate.snapshot_hash, open_gate.processing_high_water,
+                    open_gate.wal_generation_id, open_gate.wal_record_id,
+                    open_gate.wal_record_hash, open_gate.journal_lineage_id, True
+                ):
+                    raise EventJournalIntegrityError("gate clear completion binding changed")
+                terminal_gate = view
+                open_gate = None
+        if terminal_gate is not None:
+            external_reconciliation_required = False
         return _VerifiedJournal(
             records,
             high_water,
@@ -2112,6 +3990,11 @@ class EventJournal:
             wal_generation_id,
             wal_record_id,
             wal_record_hash,
+            transaction_views,
+            startup_views,
+            tuple(baseline_views),
+            open_gate,
+            terminal_gate,
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:

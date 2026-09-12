@@ -15,14 +15,21 @@ from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
     AgentRuntime,
+    AgentRuntimeStatus,
     AgentStateSnapshot,
     AgentStateStore,
     EventJournal,
+    EventJournalError,
     EventJournalLease,
+    InternalCommitEvidence,
     KagyaMainLoop,
     StateRecoveryCoordinator,
+    StateRecoveryError,
+    StateRecoveryResult,
     StateWAL,
+    TransactionCoordinator,
 )
+from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -64,19 +71,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.event_journal,
                 app.state.state_wal,
             )
-            recovery = app.state.state_recovery.prepare_startup()
-            app.state.external_reconciliation_required = (
-                recovery.external_reconciliation_required
+            journal_schema = app.state.event_journal.inspect().schema_version
+            app.state.memory_system = getattr(
+                app.state, "memory_system", None
+            ) or DualMemorySystem(app_settings)
+            app.state.startup_reconciliation = StartupReconciliationCoordinator(
+                app.state.event_journal,
+                app.state.state_recovery,
+                app.state.memory_system,
             )
-            snapshot = recovery.snapshot
-            snapshot_hash = recovery.snapshot_hash
+            app.state.startup_reconciliation.resume_prepared_gate_clear()
+            participants_consistent = True
+            degraded_reason = None
+            if journal_schema == 3:
+                participants_consistent, degraded_reason = (
+                    app.state.startup_reconciliation.reconcile_open_transactions()
+                )
+            recovery: StateRecoveryResult | None = None
+            if participants_consistent:
+                recovery = app.state.state_recovery.prepare_startup()
+                journal_schema = app.state.event_journal.inspect().schema_version
+                if journal_schema == 2:
+                    app.state.event_journal.append_v3_migration_checkpoint()
+                    journal_schema = app.state.event_journal.inspect().schema_version
+                if journal_schema != 3:
+                    raise StateRecoveryError("Runtime requires EventJournal schema 3")
+                if recovery.external_reconciliation_required:
+                    reconciliation = (
+                        app.state.startup_reconciliation.reconcile_recovery_gate(
+                            recovery
+                        )
+                    )
+                    recovery = reconciliation.recovery
+                    participants_consistent = reconciliation.participants_consistent
+                    degraded_reason = reconciliation.degraded_reason
+                else:
+                    app.state.startup_reconciliation.ensure_adoption_baseline(
+                        recovery
+                    )
+                startup_state = recovery
+            else:
+                if journal_schema != 3:
+                    raise StateRecoveryError("Degraded startup requires schema 3")
+                startup_state = app.state.state_recovery.inspect_degraded_startup()
+            app.state.external_reconciliation_required = (
+                (recovery.external_reconciliation_required if recovery else False)
+                or not participants_consistent
+            )
+            app.state.reconciliation_degraded_reason = degraded_reason
+            retention_status = app.state.event_journal.admission_status()
+            app.state.startup_retention_admission_available = retention_status.available
+            app.state.startup_retention_reason = retention_status.reason
+            snapshot = startup_state.snapshot
+            snapshot_hash = startup_state.snapshot_hash
 
             app.state.model_provider = getattr(
                 app.state, "model_provider", None
             ) or load_model_provider(app_settings)
-            app.state.memory_system = getattr(
-                app.state, "memory_system", None
-            ) or DualMemorySystem(app_settings)
             app.state.adapter_registry = getattr(
                 app.state, "adapter_registry", None
             ) or AdapterRegistry(app_settings)
@@ -103,14 +154,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         committed_snapshot: AgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
+        app.state.transaction_coordinator = TransactionCoordinator(
+            app.state.event_journal,
+            app.state.state_recovery.verify_internal_commit,
+        )
 
         def admission_checkpoint(event: AgentEvent) -> None:
-            app.state.event_journal.append_accepted(event)
+            del event
+
+        def pre_admission_guard(event: AgentEvent) -> bool:
+            return app.state.event_journal.append_accepted_if_admission_available(
+                event
+            )
 
         def started_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_started(event)
 
-        def completion_checkpoint(event: AgentEvent) -> None:
+        def preparation_checkpoint(event: AgentEvent, value: object) -> object:
+            return app.state.transaction_coordinator.prepare_result(event, value)
+
+        def internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
             sequence = event.processing_sequence
             assert sequence is not None
@@ -118,11 +181,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.main_loop, sequence
             )
             candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
-            app.state.state_recovery.commit_candidate(
+            evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
+            return evidence
+
+        def finalization_checkpoint(event: AgentEvent, evidence: object) -> None:
+            if not isinstance(evidence, InternalCommitEvidence):
+                raise StateRecoveryError("Internal commit evidence is unavailable")
+            app.state.transaction_coordinator.finalize_event(event, evidence)
+
+        def terminal_completion_checkpoint(event: AgentEvent, evidence: object) -> None:
+            if not isinstance(evidence, InternalCommitEvidence):
+                raise StateRecoveryError("Internal commit evidence is unavailable")
+            app.state.state_recovery.complete_committed_event(event, evidence)
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
@@ -138,25 +212,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if getattr(app.state, "agent_runtime", None) is None:
                 app.state.agent_runtime = AgentRuntime(
                     app_settings.runtime.queue_capacity,
-                    initial_sequence=recovery.processing_high_water,
+                    initial_sequence=startup_state.processing_high_water,
+                    pre_admission_guard=pre_admission_guard,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
-                    completion_checkpoint=completion_checkpoint,
+                    preparation_checkpoint=preparation_checkpoint,
+                    internal_commit_checkpoint=internal_commit_checkpoint,
+                    finalization_checkpoint=finalization_checkpoint,
+                    terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
             else:
                 app.state.agent_runtime.configure_durability(
-                    initial_sequence=recovery.processing_high_water,
+                    initial_sequence=startup_state.processing_high_water,
+                    pre_admission_guard=pre_admission_guard,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
-                    completion_checkpoint=completion_checkpoint,
+                    preparation_checkpoint=preparation_checkpoint,
+                    internal_commit_checkpoint=internal_commit_checkpoint,
+                    finalization_checkpoint=finalization_checkpoint,
+                    terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
         except BaseException:
             app.state.event_journal.close()
             raise
-        if not recovery.external_reconciliation_required:
+        if (
+            not app.state.external_reconciliation_required
+            and app.state.startup_retention_admission_available
+        ):
             try:
+                assert recovery is not None
                 app.state.agent_runtime.start()
                 app.state.state_recovery.publish_boot_anchor(recovery)
             except BaseException:
@@ -185,7 +271,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
-                "reason": "external_reconciliation_required",
+                "reason": app.state.reconciliation_degraded_reason
+                or "external_reconciliation_required",
+            }
+        try:
+            retention_available = app.state.event_journal.admission_status().available
+        except EventJournalError:
+            retention_available = False
+        if (
+            not retention_available
+            or not app.state.startup_retention_admission_available
+        ):
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "event_journal_retention_exhausted",
+            }
+        if app.state.agent_runtime.status is not AgentRuntimeStatus.ACCEPTING:
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "agent_runtime_unavailable",
             }
         return {"status": "ok", "project": app_settings.project.name}
 

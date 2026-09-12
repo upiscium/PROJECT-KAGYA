@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError, asdict
 from threading import Barrier, Event, Lock, Thread, current_thread
 import traceback
@@ -10,6 +11,7 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime as DurableAgentRuntime,
+    AgentRuntimeAdmissionBlocked,
     AgentRuntimeDurabilityError,
     AgentRuntimeDurabilityPhase,
     AgentRuntimeExecutionError,
@@ -41,7 +43,10 @@ def test_authoritative_runtime_requires_complete_durability_lifecycle() -> None:
         initial_sequence=4,
         admission_checkpoint=callback,
         started_checkpoint=callback,
-        completion_checkpoint=callback,
+        preparation_checkpoint=lambda _event, value: value,
+        internal_commit_checkpoint=callback,
+        finalization_checkpoint=lambda _event, _evidence: None,
+        terminal_completion_checkpoint=lambda _event, _evidence: None,
         failure_checkpoint=callback,
     )
     runtime.start()
@@ -80,14 +85,85 @@ def test_initial_sequence_is_used_for_first_event() -> None:
     assert outcome.event.processing_sequence == 8
 
 
+def test_pre_admission_guard_rejects_without_acceptance_or_sequence() -> None:
+    accepted: list[str] = []
+    available = [False]
+    handler_called = False
+    runtime = AgentRuntime(
+        1,
+        initial_sequence=7,
+        pre_admission_guard=lambda _event: available[0],
+        admission_checkpoint=lambda event: accepted.append(event.event_id),
+    )
+    runtime.start()
+
+    def handler() -> None:
+        nonlocal handler_called
+        handler_called = True
+
+    with pytest.raises(AgentRuntimeAdmissionBlocked):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, handler)
+
+    available[0] = True
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "accepted"
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert accepted == [outcome.event.event_id]
+    assert outcome.event.processing_sequence == 8
+    assert not handler_called
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_admission_block_does_not_strand_already_accepted_work() -> None:
+    available = True
+    entered = Event()
+    release = Event()
+    terminal: list[int] = []
+
+    def handler() -> str:
+        entered.set()
+        assert release.wait(timeout=2)
+        return "done"
+
+    runtime = AgentRuntime(
+        2,
+        pre_admission_guard=lambda _event: available,
+        terminal_completion_checkpoint=lambda event, _evidence: terminal.append(
+            event.processing_sequence or 0
+        ),
+    )
+    runtime.start()
+    accepted = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, handler
+    )
+    assert entered.wait(timeout=2)
+    available = False
+
+    with pytest.raises(AgentRuntimeAdmissionBlocked):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "blocked")
+
+    release.set()
+    assert accepted.result(timeout=2).value == "done"
+    available = True
+    resumed = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "resumed"
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert terminal == [1, 2]
+    assert resumed.event.processing_sequence == 2
+
+
 def test_checkpoint_runs_before_future_success_is_observable() -> None:
     observations: list[str] = []
 
-    def checkpoint(event: object) -> None:
+    def checkpoint(event: object, _evidence: object) -> None:
         assert event is not None
         observations.append("checkpoint")
 
-    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    runtime = AgentRuntime(1, terminal_completion_checkpoint=checkpoint)
     runtime.start()
     future = runtime.submit(
         AgentEventType.CHAT,
@@ -105,11 +181,11 @@ def test_checkpoint_runs_before_future_success_is_observable() -> None:
 def test_handler_failure_skips_checkpoint() -> None:
     checkpoint_called = False
 
-    def checkpoint(_: object) -> None:
+    def checkpoint(_: object, _evidence: object) -> None:
         nonlocal checkpoint_called
         checkpoint_called = True
 
-    runtime = AgentRuntime(1, completion_checkpoint=checkpoint)
+    runtime = AgentRuntime(1, terminal_completion_checkpoint=checkpoint)
     runtime.start()
 
     def fail() -> None:
@@ -137,7 +213,7 @@ def test_checkpoint_failure_fail_stops_runtime() -> None:
             )
 
     handler_ran = Event()
-    runtime = AgentRuntime(2, completion_checkpoint=checkpoint)
+    runtime = AgentRuntime(2, internal_commit_checkpoint=checkpoint)
     runtime.start()
     failed = runtime.submit(
         AgentEventType.CHAT,
@@ -155,7 +231,7 @@ def test_checkpoint_failure_fail_stops_runtime() -> None:
     runtime.shutdown()
 
     assert handler_ran.is_set()
-    assert error.value.phase is AgentRuntimeDurabilityPhase.COMPLETION
+    assert error.value.phase is AgentRuntimeDurabilityPhase.INTERNAL_COMMIT
     assert error.value.failure_type == "AgentStateSaveError"
     assert error.value.published is False
     assert error.value.__cause__ is None
@@ -168,12 +244,22 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
     release_blocker = Event()
     cancelled_handler_ran = Event()
     checkpoint_sequences: list[int] = []
+    internal_commit_sequences: list[int] = []
+    finalization_sequences: list[int] = []
     accepted_ids: list[str] = []
     started_sequences: list[int] = []
 
     def checkpoint(event) -> None:
         assert event.processing_sequence is not None
         checkpoint_sequences.append(event.processing_sequence)
+
+    def internal_commit(event) -> None:
+        assert event.processing_sequence is not None
+        internal_commit_sequences.append(event.processing_sequence)
+
+    def finalization(event, _evidence) -> None:
+        assert event.processing_sequence is not None
+        finalization_sequences.append(event.processing_sequence)
 
     def started_checkpoint(event) -> None:
         assert event.processing_sequence is not None
@@ -183,7 +269,9 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
         1,
         admission_checkpoint=lambda event: accepted_ids.append(event.event_id),
         started_checkpoint=started_checkpoint,
-        completion_checkpoint=checkpoint,
+        internal_commit_checkpoint=internal_commit,
+        finalization_checkpoint=finalization,
+        terminal_completion_checkpoint=lambda event, _evidence: checkpoint(event),
     )
     runtime.start()
     blocker = runtime.submit(
@@ -206,6 +294,8 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
     assert cancelled_handler_ran.is_set()
     assert len(accepted_ids) == 2
     assert started_sequences == [1, 2]
+    assert internal_commit_sequences == [1, 2]
+    assert finalization_sequences == [1, 2]
     assert checkpoint_sequences == [1, 2]
 
 
@@ -566,14 +656,14 @@ def test_later_admission_failure_does_not_abandon_started_event() -> None:
         if admissions == 2:
             raise OSError("journal unavailable")
 
-    def completion(event) -> None:
+    def completion(event, _evidence) -> None:
         assert event.processing_sequence is not None
         completed.append(event.processing_sequence)
 
     runtime = AgentRuntime(
         1,
         admission_checkpoint=admission,
-        completion_checkpoint=completion,
+        terminal_completion_checkpoint=completion,
     )
     runtime.start()
     active = runtime.submit(
@@ -634,7 +724,15 @@ def test_full_success_protocol_precedes_future_success() -> None:
         1,
         admission_checkpoint=lambda _event: order.append("accepted"),
         started_checkpoint=lambda _event: order.append("started"),
-        completion_checkpoint=lambda _event: order.append("completed"),
+        preparation_checkpoint=lambda _event, value: (
+            order.append("transaction_preparation"),
+            value,
+        )[1],
+        internal_commit_checkpoint=lambda _event: order.append("internal_commit"),
+        finalization_checkpoint=lambda _event, _evidence: order.append("finalization"),
+        terminal_completion_checkpoint=lambda _event, _evidence: order.append(
+            "terminal_completion"
+        ),
     )
     runtime.start()
     future = runtime.submit(
@@ -645,7 +743,189 @@ def test_full_success_protocol_precedes_future_success() -> None:
     future.add_done_callback(lambda _future: order.append("future"))
     future.result(timeout=2)
     runtime.shutdown()
-    assert order == ["accepted", "started", "handler", "completed", "future"]
+    assert order == [
+        "accepted",
+        "started",
+        "handler",
+        "transaction_preparation",
+        "internal_commit",
+        "finalization",
+        "terminal_completion",
+        "future",
+    ]
+
+
+def test_preparation_separates_handler_result_and_hands_internal_proof_forward() -> (
+    None
+):
+    private_result = object()
+    proof = object()
+    observed_proofs: list[object] = []
+
+    def prepare(_event: object, value: object) -> str:
+        assert value is private_result
+        return "public"
+
+    runtime = AgentRuntime(
+        1,
+        preparation_checkpoint=prepare,
+        internal_commit_checkpoint=lambda _event: proof,
+        finalization_checkpoint=lambda _event, evidence: observed_proofs.append(
+            evidence
+        ),
+        terminal_completion_checkpoint=lambda _event, evidence: observed_proofs.append(
+            evidence
+        ),
+    )
+    runtime.start()
+
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: private_result
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.value == "public"
+    assert observed_proofs == [proof, proof]
+
+
+def test_success_phases_have_exact_future_observable_order() -> None:
+    order: list[str] = []
+    runtime = AgentRuntime(
+        1,
+        internal_commit_checkpoint=lambda _event: order.append("internal_commit"),
+        finalization_checkpoint=lambda _event, _evidence: order.append("finalization"),
+        terminal_completion_checkpoint=lambda _event, _evidence: order.append(
+            "terminal_completion"
+        ),
+    )
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: order.append("handler"),
+    )
+    future.add_done_callback(lambda _future: order.append("future"))
+
+    assert future.result(timeout=2).value is None
+    runtime.shutdown()
+
+    assert order == [
+        "handler",
+        "internal_commit",
+        "finalization",
+        "terminal_completion",
+        "future",
+    ]
+
+
+def test_future_is_not_done_while_terminal_completion_is_blocked() -> None:
+    terminal_started = Event()
+    release_terminal = Event()
+
+    def terminal_completion(_event: object, _evidence: object) -> None:
+        terminal_started.set()
+        assert release_terminal.wait(timeout=2)
+
+    runtime = AgentRuntime(1, terminal_completion_checkpoint=terminal_completion)
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "complete"
+    )
+
+    assert terminal_started.wait(timeout=2)
+    assert not future.done()
+    release_terminal.set()
+    assert future.result(timeout=2).value == "complete"
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("failed_phase", "callback_name"),
+    [
+        (
+            AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION,
+            "transaction_preparation",
+        ),
+        (AgentRuntimeDurabilityPhase.INTERNAL_COMMIT, "internal_commit"),
+        (AgentRuntimeDurabilityPhase.FINALIZATION, "finalization"),
+        (AgentRuntimeDurabilityPhase.TERMINAL_COMPLETION, "terminal_completion"),
+    ],
+)
+def test_each_success_phase_failure_fail_stops_and_skips_later_phases(
+    failed_phase: AgentRuntimeDurabilityPhase, callback_name: str
+) -> None:
+    calls: list[str] = []
+    failure_checkpoint_called = False
+
+    def phase_callback(name: str) -> Callable[..., None]:
+        def callback(*_args: object) -> None:
+            calls.append(name)
+            if name == callback_name:
+                raise OSError(f"{name} failed")
+
+        return callback
+
+    def failure_checkpoint(_event: object) -> None:
+        nonlocal failure_checkpoint_called
+        failure_checkpoint_called = True
+
+    runtime = AgentRuntime(
+        2,
+        preparation_checkpoint=phase_callback("transaction_preparation"),
+        internal_commit_checkpoint=phase_callback("internal_commit"),
+        finalization_checkpoint=phase_callback("finalization"),
+        terminal_completion_checkpoint=phase_callback("terminal_completion"),
+        failure_checkpoint=failure_checkpoint,
+    )
+    runtime.start()
+    handler_started = Event()
+    release_handler = Event()
+    failed = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: (handler_started.set(), release_handler.wait())[1],
+    )
+    assert handler_started.wait(timeout=2)
+    later = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+    release_handler.set()
+
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        failed.result(timeout=2)
+    with pytest.raises(AgentRuntimeDurabilityError):
+        later.result(timeout=2)
+    runtime.shutdown()
+
+    assert error.value.phase is failed_phase
+    phase_order = [
+        "transaction_preparation",
+        "internal_commit",
+        "finalization",
+        "terminal_completion",
+    ]
+    assert calls == phase_order[: phase_order.index(callback_name) + 1]
+    assert not failure_checkpoint_called
+    assert runtime.status is AgentRuntimeStatus.FAILED
+
+
+def test_processing_sequences_are_unchanged_by_success_phases() -> None:
+    def callback(_event, _evidence) -> None:
+        pass
+
+    runtime = AgentRuntime(
+        2,
+        internal_commit_checkpoint=lambda _event: None,
+        finalization_checkpoint=callback,
+        terminal_completion_checkpoint=callback,
+    )
+    runtime.start()
+    futures = [
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None)
+        for _ in range(2)
+    ]
+    outcomes = [future.result(timeout=2) for future in futures]
+    runtime.shutdown()
+
+    assert [outcome.event.processing_sequence for outcome in outcomes] == [1, 2]
 
 
 def test_handler_failure_checkpoint_consumes_sequence_and_runtime_continues() -> None:

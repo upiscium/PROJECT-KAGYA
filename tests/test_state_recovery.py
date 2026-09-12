@@ -1,5 +1,6 @@
 """Deterministic startup and mutation tests for StateRecoveryCoordinator."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -17,13 +18,18 @@ from kagya.runtime.agent_state import (
 )
 from kagya.runtime.event_journal import (
     EventFailureCategory,
+    EventJournalInspection,
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
     EventJournalLoadError,
     EventLifecycle,
+    ParticipantCapability,
+    ParticipantRequirement,
+    TransactionKind,
 )
 from kagya.runtime.state_recovery import (
+    InternalCommitClassification,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
@@ -78,6 +84,38 @@ def coordinator(
 def start_event(journal: EventJournal, item: AgentEvent) -> None:
     journal.append_accepted(item)
     journal.append_started(item)
+
+
+def start_transaction(journal: EventJournal, item: AgentEvent) -> None:
+    if journal.inspect().schema_version == 2:
+        journal.append_v3_migration_checkpoint()
+    start_event(journal, item)
+    journal.append_transaction_prepared(
+        item,
+        str(uuid5(NAMESPACE_URL, f"transaction:{item.event_id}")),
+        TransactionKind.EVENT_MUTATION,
+        (
+            ParticipantRequirement(
+                participant_id="memory.episodic",
+                operation_digest="1" * 64,
+                capabilities=(
+                    ParticipantCapability.ABORT,
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+    )
+
+
+def commit_event(
+    recovery: StateRecoveryCoordinator,
+    item: AgentEvent,
+    prior: AgentStateSnapshot,
+    candidate: AgentStateSnapshot,
+) -> None:
+    evidence = recovery.commit_internal_candidate(item, prior, candidate)
+    recovery.complete_committed_event(item, evidence)
 
 
 def append_uncommitted_candidate(
@@ -162,6 +200,55 @@ def test_fresh_r06_bootstrap_creates_consistent_artifacts(tmp_path: Path) -> Non
     assert wal.inspect_boot_anchor_optional() is not None
 
 
+def test_clean_v3_journal_preserves_r06_startup_recovery(tmp_path: Path) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup()
+    journal.append_v3_migration_checkpoint()
+
+    restarted = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert restarted.snapshot == initial.snapshot
+    assert restarted.processing_high_water == initial.processing_high_water
+    assert journal.inspect().schema_version == 3
+
+
+def test_v3_committed_crash_recovery_publishes_current_checkpoint(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    journal.append_v3_migration_checkpoint()
+    migration_anchor = journal.records[-1].v3_migration_anchor_hash
+    item = event("v3-committed-crash", 1)
+    candidate = snapshot(1, 0.4)
+    start_event(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=uuid5(NAMESPACE_URL, "v3-committed-crash"),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+
+    reconciled = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    checkpoint = journal.records[-1]
+    assert reconciled.snapshot == candidate
+    assert checkpoint.schema_version == 3
+    assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
+    assert checkpoint.v3_migration_anchor_hash == migration_anchor
+
+
 def test_r05_migration_preserves_high_water_above_snapshot_sequence(
     tmp_path: Path,
 ) -> None:
@@ -185,7 +272,7 @@ def test_r05_migration_preserves_high_water_above_snapshot_sequence(
     next_event = event("post-r06-success", 2)
     candidate = snapshot(2, 0.4)
     start_event(journal, next_event)
-    recovery.commit_candidate(next_event, initial, candidate)
+    commit_event(recovery, next_event, initial, candidate)
     assert wal.inspect().latest_snapshot_sequence == 2
 
 
@@ -322,7 +409,8 @@ def test_normal_commit_order_and_artifacts_are_durable(
     monkeypatch.setattr(store, "save", publish)
     monkeypatch.setattr(journal, "append_completed", completed)
 
-    transition = recovery.commit_candidate(item, initial, candidate)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    recovery.complete_committed_event(item, evidence)
 
     assert order == ["prepared", "wal", "snapshot", "completed"]
     lifecycles = [record.lifecycle for record in journal.inspect().records]
@@ -332,9 +420,273 @@ def test_normal_commit_order_and_artifacts_are_durable(
     ]  # WAL and snapshot lie between these journal boundaries.
     assert store.load() == candidate
     assert wal.reconstruct(sequence=1) == candidate
-    assert transition.processing_sequence == 1
+    assert evidence.processing_sequence == 1
     assert journal.inspect().records[-2].lifecycle is EventLifecycle.PREPARED
     assert journal.inspect().records[-1].lifecycle is EventLifecycle.COMPLETED
+
+
+def test_internal_commit_publishes_state_but_leaves_event_prepared(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("internal-only-commit", 1)
+    start_event(journal, item)
+
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+
+    assert journal.inspect().records[-1].lifecycle is EventLifecycle.PREPARED
+    assert store.load() == candidate
+    assert wal.reconstruct(sequence=1) == candidate
+    assert evidence.snapshot_hash == store.snapshot_hash(candidate)
+
+
+def test_internal_commit_verification_is_read_only(tmp_path: Path) -> None:
+    recovery, _store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("verified-internal-commit", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    before = journal.path.read_bytes()
+
+    recovery.verify_internal_commit(item, evidence)
+
+    assert journal.path.read_bytes() == before
+    assert journal.inspect().records[-1].lifecycle is EventLifecycle.PREPARED
+
+
+def test_transaction_classification_is_pre_internal_before_publication(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    recovery.prepare_startup()
+    item = event("classify-pre-internal", 1)
+    start_transaction(journal, item)
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.PRE_INTERNAL
+    assert proof.event_id == item.event_id
+    assert proof.processing_sequence == 1
+    assert proof.snapshot_sequence == 0
+    assert proof.snapshot_hash == store.snapshot_hash(store.load())
+    assert proof.wal_record_id is None
+    assert proof.wal_record_hash is None
+    assert wal.inspect().latest_snapshot_sequence == 0
+
+
+def test_transaction_classification_is_internally_committed(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-internally-committed", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.INTERNALLY_COMMITTED
+    assert proof.snapshot_sequence == 1
+    assert proof.snapshot_hash == store.snapshot_hash(candidate)
+    assert proof.wal_generation_id is not None
+    assert proof.wal_record_id is not None
+    assert proof.wal_record_hash is not None
+    assert wal.inspect().latest_snapshot_sequence == 1
+
+
+def test_transaction_classification_treats_exact_wal_only_tail_as_pre_internal(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-wal-only-tail", 1)
+    start_transaction(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    transition = wal.append_transition(
+        event_id=UUID(item.event_id),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    transaction = journal.inspect().open_transactions[0]
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.PRE_INTERNAL
+    assert proof.snapshot_sequence == 0
+    assert proof.snapshot_hash == store.snapshot_hash(initial)
+    assert proof.wal_record_id == str(transition.record_id)
+    assert store.load() == initial
+
+
+def test_transaction_classification_is_ambiguous_for_cross_authority_evidence(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-cross-authority-tamper", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+    store.save(snapshot(1, 0.9))
+
+    proof = recovery.classify_transaction_commit(transaction)
+
+    assert proof.classification is InternalCommitClassification.AMBIGUOUS
+
+
+def test_transaction_classification_is_read_only(tmp_path: Path) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("classify-read-only", 1)
+    start_transaction(journal, item)
+    recovery.commit_internal_candidate(item, initial, candidate)
+    transaction = journal.inspect().open_transactions[0]
+    snapshot_before = store.path.read_bytes()
+    journal_before = journal.path.read_bytes()
+    manifest_before = (wal.root / "manifest.json").read_bytes()
+
+    recovery.classify_transaction_commit(transaction)
+
+    assert store.path.read_bytes() == snapshot_before
+    assert journal.path.read_bytes() == journal_before
+    assert (wal.root / "manifest.json").read_bytes() == manifest_before
+
+
+def test_terminal_completion_only_appends_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("terminal-completion-only", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    before = journal.path.read_bytes()
+
+    monkeypatch.setattr(store, "save", lambda _snapshot: pytest.fail("recaptured"))
+    monkeypatch.setattr(
+        wal,
+        "append_transition",
+        lambda **_kwargs: pytest.fail("appended WAL transition"),
+    )
+
+    recovery.complete_committed_event(item, evidence)
+
+    assert journal.path.read_bytes() != before
+    assert [record.lifecycle for record in journal.inspect().records][-2:] == [
+        EventLifecycle.PREPARED,
+        EventLifecycle.COMPLETED,
+    ]
+    assert store.load() == candidate
+    assert wal.reconstruct(sequence=1) == candidate
+
+
+def test_completion_rejects_mismatched_event_proof(tmp_path: Path) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("mismatched-proof", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+
+    with pytest.raises(StateRecoveryError):
+        recovery.complete_committed_event(event("different-event", 1), evidence)
+
+
+def test_completion_rejects_stale_canonical_snapshot(tmp_path: Path) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("stale-canonical-proof", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    store.save(snapshot(1, 0.9))
+
+    with pytest.raises(StateRecoveryError):
+        recovery.complete_committed_event(item, evidence)
+
+
+def test_completion_rejects_stale_journal_prepared_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("stale-journal-proof", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    original_inspect = journal.inspect
+
+    def tampered_inspect(*args: object, **kwargs: object) -> EventJournalInspection:
+        inspection = original_inspect(*args, **kwargs)
+        records = list(inspection.records)
+        prepared_index = next(
+            index
+            for index, record in enumerate(records)
+            if record.lifecycle is EventLifecycle.PREPARED
+        )
+        records[prepared_index] = records[prepared_index].model_copy(
+            update={"state_hash_after": "0" * 64}
+        )
+        return replace(inspection, records=tuple(records))
+
+    monkeypatch.setattr(journal, "inspect", tampered_inspect)
+    with pytest.raises(StateRecoveryError):
+        recovery.complete_committed_event(item, evidence)
+
+
+def test_completion_rejects_stale_wal_identity(tmp_path: Path) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("stale-wal-proof", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+
+    with pytest.raises(StateRecoveryError):
+        recovery.complete_committed_event(
+            item, replace(evidence, wal_record_hash="0" * 64)
+        )
+
+
+def test_completion_rejects_later_wal_tail(tmp_path: Path) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("stale-wal-tail", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    later = snapshot(2, 0.5)
+    wal.append_transition(
+        event_id=UUID(event("later-wal-tail", 2).event_id),
+        event_type=AgentEventType.CHAT.value,
+        event_source=AgentEventSource.API_CHAT.value,
+        processing_sequence=2,
+        prior_snapshot=candidate,
+        candidate_snapshot=later,
+    )
+
+    with pytest.raises(StateRecoveryError):
+        recovery.complete_committed_event(item, evidence)
 
 
 def test_exact_current_reconstructs_missing_canonical_snapshot(tmp_path: Path) -> None:
@@ -343,7 +695,7 @@ def test_exact_current_reconstructs_missing_canonical_snapshot(tmp_path: Path) -
     candidate = snapshot(1, 0.4)
     item = event("exact-current", 1)
     start_event(journal, item)
-    recovery.commit_candidate(item, initial, candidate)
+    commit_event(recovery, item, initial, candidate)
     store.path.unlink()
 
     result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
@@ -725,7 +1077,7 @@ def test_retained_checkpoint_replaces_old_lifecycle_cross_validation(
     committed_event = event("retained-committed-2", 2)
     committed = snapshot(2, 0.4)
     start_event(journal, committed_event)
-    recovery.commit_candidate(committed_event, initial, committed)
+    commit_event(recovery, committed_event, initial, committed)
     for sequence in range(3, 31):
         item = event(f"retained-later-{sequence}", sequence)
         start_event(journal, item)
@@ -847,7 +1199,7 @@ def test_missing_current_uses_journal_bound_wal_prefix_before_boot_anchor(
     item = event("newer-current", 1)
     candidate = snapshot(1, 0.4)
     start_event(journal, item)
-    recovery.commit_candidate(item, bootable.snapshot, candidate)
+    commit_event(recovery, item, bootable.snapshot, candidate)
     current_manifest = wal.inspect().active_manifest
     assert current_manifest is not None
     corrupt_generation = (
@@ -885,7 +1237,7 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
     item = event("tampered-current-prefix", 1)
     candidate = snapshot(1, 0.4)
     start_event(journal, item)
-    recovery.commit_candidate(item, bootable.snapshot, candidate)
+    commit_event(recovery, item, bootable.snapshot, candidate)
     corrupt_manifest = wal.inspect().active_manifest
     assert corrupt_manifest is not None
     generation = (
@@ -921,7 +1273,7 @@ def test_corrupt_before_journal_bound_record_fails_closed_when_anchor_is_invalid
     recovery.publish_boot_anchor(bootable)
     item = event("tampered-before-current-prefix", 1)
     start_event(journal, item)
-    recovery.commit_candidate(item, bootable.snapshot, snapshot(1, 0.4))
+    commit_event(recovery, item, bootable.snapshot, snapshot(1, 0.4))
     manifest = wal.inspect().active_manifest
     assert manifest is not None
     generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
@@ -996,7 +1348,7 @@ def test_journal_bound_prefix_resumes_existing_current_recovery_id(
     committed_event = event("prefix-recovery-committed", 1)
     current = snapshot(1, 0.4)
     start_event(journal, committed_event)
-    recovery.commit_candidate(committed_event, bootable.snapshot, current)
+    commit_event(recovery, committed_event, bootable.snapshot, current)
     tail_event = event("prefix-recovery-tail", 2)
     candidate = snapshot(2, 0.5)
     manifest = wal.inspect().active_manifest
@@ -1232,7 +1584,7 @@ def test_stale_recovery_result_is_rejected_when_publishing_boot_anchor(
     initial = stale.snapshot
     item = event("stale-anchor", 1)
     start_event(journal, item)
-    recovery.commit_candidate(item, initial, snapshot(1, 0.4))
+    commit_event(recovery, item, initial, snapshot(1, 0.4))
 
     with pytest.raises(StateRecoveryError, match="stale"):
         recovery.publish_boot_anchor(stale)

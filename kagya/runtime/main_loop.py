@@ -1,14 +1,30 @@
 """Integrated runtime main loop."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
-from kagya.memory import DualMemorySystem, MemoryContext
+from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.runtime.session_participant import (
+    SessionTurnOperation,
+    SessionTurnParticipant,
+)
 from kagya.runtime.session_state import SessionState
+from kagya.runtime.transaction_coordinator import (
+    CoordinatedResult,
+    TransactionBoundValue,
+    TransactionParticipant,
+)
+
+if TYPE_CHECKING:
+    from kagya.memory.episodic_participant import MemoryEpisodicParticipant
 
 
 @dataclass(frozen=True)
@@ -32,6 +48,18 @@ class DebugChatTrace:
     hidden_thought: str
     prompt: str
     memory_context: MemoryContext
+
+
+@dataclass(frozen=True)
+class _ComputedChat:
+    response: str
+    loss: float
+    valence: float
+    arousal: float
+    optimal_loss: float
+    trace: DebugChatTrace | None
+    memory_participant: MemoryEpisodicParticipant
+    session_participant: SessionTurnParticipant
 
 
 class KagyaMainLoop:
@@ -64,23 +92,44 @@ class KagyaMainLoop:
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
 
-    def chat(self, user_input: str) -> ChatResult:
-        """Run an ordinary chat turn without returning private diagnostic data."""
+    def chat(self, user_input: str) -> CoordinatedResult[ChatResult]:
+        """Compute an ordinary turn and return its process-local mutation plan."""
 
-        result, _trace = self._run_chat(user_input, capture_debug=False)
-        return result
+        computed = self._run_chat(user_input, capture_debug=False)
+        return CoordinatedResult(
+            TransactionBoundValue(
+                lambda transaction_id: self._chat_result(computed, transaction_id)
+            ),
+            self._participants(computed),
+        )
 
-    def chat_debug(self, user_input: str) -> tuple[ChatResult, DebugChatTrace]:
-        """Run a turn and return explicitly ephemeral admin/debug diagnostics."""
+    def chat_debug(
+        self, user_input: str
+    ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
+        """Compute a turn with ephemeral diagnostics and the same mutation plan."""
 
-        result, trace = self._run_chat(user_input, capture_debug=True)
-        if trace is None:  # pragma: no cover - internal invariant
+        computed = self._run_chat(user_input, capture_debug=True)
+        if computed.trace is None:  # pragma: no cover - internal invariant
             raise RuntimeError("Debug trace was not captured")
-        return result, trace
+        trace = computed.trace
+        return CoordinatedResult(
+            TransactionBoundValue(
+                lambda transaction_id: (
+                    self._chat_result(computed, transaction_id),
+                    trace,
+                )
+            ),
+            self._participants(computed),
+        )
 
     def _run_chat(
         self, user_input: str, *, capture_debug: bool
-    ) -> tuple[ChatResult, DebugChatTrace | None]:
+    ) -> _ComputedChat:
+        from kagya.memory.episodic_participant import (
+            EpisodicWrite,
+            MemoryEpisodicParticipant,
+        )
+
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
@@ -88,23 +137,24 @@ class KagyaMainLoop:
         prompt = self.prompt_builder.build(user_input, emotion_state, memory_context)
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
-        episode_id = self.memory_system.save_episodic(
-            user_input,
-            processed_response.visible_response,
-            loss=loss,
-            emotion_valence=emotion_state.valence,
-            emotion_arousal=emotion_state.arousal,
+        memory_participant = MemoryEpisodicParticipant(
+            self.memory_system,
+            EpisodicWrite(
+                user_input=user_input,
+                response=processed_response.visible_response,
+                loss=loss,
+                emotion_valence=emotion_state.valence,
+                emotion_arousal=emotion_state.arousal,
+                record_type=MemoryRecordType.EPISODIC_LOG,
+                created_at=datetime.now(UTC).isoformat(),
+            ),
         )
-        self.session_state.add_turn(user_input, processed_response.visible_response)
-        result = ChatResult(
-            episode_id=episode_id,
-            response=processed_response.visible_response,
-            loss=loss,
-            valence=emotion_state.valence,
-            arousal=emotion_state.arousal,
-            optimal_loss=emotion_state.optimal_loss,
-            model_id=self.settings.model.primary_id,
-            adapter_id=self.adapter_id,
+        session_participant = SessionTurnParticipant(
+            self.session_state,
+            SessionTurnOperation(
+                user_input=user_input,
+                response=processed_response.visible_response,
+            ),
         )
         trace = None
         if capture_debug:
@@ -113,4 +163,31 @@ class KagyaMainLoop:
                 prompt=prompt,
                 memory_context=memory_context,
             )
-        return result, trace
+        return _ComputedChat(
+            response=processed_response.visible_response,
+            loss=loss,
+            valence=emotion_state.valence,
+            arousal=emotion_state.arousal,
+            optimal_loss=emotion_state.optimal_loss,
+            trace=trace,
+            memory_participant=memory_participant,
+            session_participant=session_participant,
+        )
+
+    def _chat_result(
+        self, computed: _ComputedChat, transaction_id: str
+    ) -> ChatResult:
+        return ChatResult(
+            episode_id=computed.memory_participant.episode_id(transaction_id),
+            response=computed.response,
+            loss=computed.loss,
+            valence=computed.valence,
+            arousal=computed.arousal,
+            optimal_loss=computed.optimal_loss,
+            model_id=self.settings.model.primary_id,
+            adapter_id=self.adapter_id,
+        )
+
+    @staticmethod
+    def _participants(computed: _ComputedChat) -> tuple[TransactionParticipant, ...]:
+        return (computed.memory_participant, computed.session_participant)
