@@ -11,6 +11,7 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime as DurableAgentRuntime,
+    AgentRuntimeAdmissionBlocked,
     AgentRuntimeDurabilityError,
     AgentRuntimeDurabilityPhase,
     AgentRuntimeExecutionError,
@@ -82,6 +83,77 @@ def test_initial_sequence_is_used_for_first_event() -> None:
     runtime.shutdown()
 
     assert outcome.event.processing_sequence == 8
+
+
+def test_pre_admission_guard_rejects_without_acceptance_or_sequence() -> None:
+    accepted: list[str] = []
+    available = [False]
+    handler_called = False
+    runtime = AgentRuntime(
+        1,
+        initial_sequence=7,
+        pre_admission_guard=lambda _event: available[0],
+        admission_checkpoint=lambda event: accepted.append(event.event_id),
+    )
+    runtime.start()
+
+    def handler() -> None:
+        nonlocal handler_called
+        handler_called = True
+
+    with pytest.raises(AgentRuntimeAdmissionBlocked):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, handler)
+
+    available[0] = True
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "accepted"
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert accepted == [outcome.event.event_id]
+    assert outcome.event.processing_sequence == 8
+    assert not handler_called
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_admission_block_does_not_strand_already_accepted_work() -> None:
+    available = True
+    entered = Event()
+    release = Event()
+    terminal: list[int] = []
+
+    def handler() -> str:
+        entered.set()
+        assert release.wait(timeout=2)
+        return "done"
+
+    runtime = AgentRuntime(
+        2,
+        pre_admission_guard=lambda _event: available,
+        terminal_completion_checkpoint=lambda event, _evidence: terminal.append(
+            event.processing_sequence or 0
+        ),
+    )
+    runtime.start()
+    accepted = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, handler
+    )
+    assert entered.wait(timeout=2)
+    available = False
+
+    with pytest.raises(AgentRuntimeAdmissionBlocked):
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "blocked")
+
+    release.set()
+    assert accepted.result(timeout=2).value == "done"
+    available = True
+    resumed = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "resumed"
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert terminal == [1, 2]
+    assert resumed.event.processing_sequence == 2
 
 
 def test_checkpoint_runs_before_future_success_is_observable() -> None:

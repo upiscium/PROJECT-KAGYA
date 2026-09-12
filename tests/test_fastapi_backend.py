@@ -119,6 +119,96 @@ def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
         }
 
 
+def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    max_bytes: int
+    with _client(tmp_path, settings=settings) as client:
+        journal: EventJournal = client.app.state.event_journal
+        max_bytes = journal.path.stat().st_size + 1
+        journal.max_bytes = max_bytes
+        journal.retained_files = 2
+        for message in ("fill-one", "fill-two"):
+            response = client.post(
+                "/api/chat", json={"message": message, "attachments": []}
+            )
+            assert response.status_code == 200
+        saturated = journal.admission_status()
+        assert not saturated.available
+        assert saturated.proof_retention_blocks_safe_pruning
+        before_records = journal.records
+        before_high_water = journal.inspect().processing_high_water
+        before_snapshot = settings.agent_state.path.read_bytes()
+        before_wal = {
+            path.relative_to(settings.state_wal.directory): path.read_bytes()
+            for path in settings.state_wal.directory.rglob("*")
+            if path.is_file()
+        }
+        before_memory = client.app.state.memory_system.db1.get()
+        before_turns = list(client.app.state.main_loop.session_state.turns)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": PRIVATE_SENTINEL, "attachments": []},
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Agent runtime is temporarily unavailable"
+        }
+        assert PRIVATE_SENTINEL not in response.text
+        assert str(settings.event_journal.path) not in response.text
+        assert journal.records == before_records
+        assert journal.inspect().processing_high_water == before_high_water
+        assert settings.agent_state.path.read_bytes() == before_snapshot
+        assert {
+            path.relative_to(settings.state_wal.directory): path.read_bytes()
+            for path in settings.state_wal.directory.rglob("*")
+            if path.is_file()
+        } == before_wal
+        assert client.app.state.memory_system.db1.get() == before_memory
+        assert client.app.state.main_loop.session_state.turns == before_turns
+        assert not client.app.state.external_reconciliation_required
+        assert not journal.inspect().completed_startup_reconciliations
+        health = client.get("/health")
+        assert health.json() == {
+            "status": "degraded",
+            "project": settings.project.name,
+            "reason": "event_journal_retention_exhausted",
+        }
+        assert PRIVATE_SENTINEL not in health.text
+        assert str(settings.event_journal.path) not in health.text
+        read_only = client.get(
+            "/api/memory/search",
+            headers=admin_headers(),
+            params={"query": "fill"},
+        )
+        assert read_only.status_code == 200
+
+    constrained = settings.model_copy(
+        update={
+            "event_journal": settings.event_journal.model_copy(
+                update={"max_bytes": max_bytes, "retained_files": 2}
+            )
+        }
+    )
+    with _client(tmp_path, settings=constrained) as restarted:
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.CREATED
+        assert not restarted.app.state.external_reconciliation_required
+        assert restarted.get("/health").json()["reason"] == (
+            "event_journal_retention_exhausted"
+        )
+        assert restarted.get(
+            "/api/memory/search",
+            headers=admin_headers(),
+            params={"query": "fill"},
+        ).status_code == 200
+        assert restarted.post(
+            "/api/chat", json={"message": "blocked", "attachments": []}
+        ).status_code == 503
+
+
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:

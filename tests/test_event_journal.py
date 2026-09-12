@@ -2431,3 +2431,76 @@ def test_u5_rotation_preserves_baseline_and_clear_evidence(
     assert inspection.baselines[0].baseline_id == U5_BASELINE_ID
     assert inspection.terminal_gate_clear is not None
     assert inspection.open_gate_clear is None
+
+
+def test_retention_admission_temporarily_blocks_then_recovers_after_rotation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "retention-temporary.jsonl"
+    value = bootstrap(path)
+    value.max_bytes = path.stat().st_size + 1
+    item = event("retention-temporary", 1)
+
+    value.append_accepted(item)
+    saturated = value.admission_status()
+
+    assert not saturated.available
+    assert saturated.reason == "event_journal_retention_exhausted"
+    assert saturated.active_file_bytes > saturated.max_bytes
+    assert saturated.lifecycle_blocks_rotation
+    assert not saturated.proof_retention_blocks_safe_pruning
+    assert not saturated.safe_rotation_possible
+
+    value.append_started(item)
+    value.append_failed(item, 0, HASH_0)
+
+    recovered = value.admission_status()
+    assert recovered.available
+    assert recovered.reason is None
+    assert recovered.rotated_segment_count == 1
+    assert recovered.safe_rotation_possible
+    value.append_accepted(event("retention-after-rotation", 2))
+
+
+def test_retained_u5_proof_saturates_admission_without_pruning(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "retention-proof.jsonl"
+    value = EventJournal(path, 100_000, 2, clock=lambda: NOW)
+    generation = str(uuid5(NAMESPACE_URL, "retention-proof-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "retention-proof-wal"))
+    value.append_v2_bootstrap_checkpoint(0, HASH_0, generation, wal_id, HASH_2)
+    value.append_v3_migration_checkpoint()
+    value.max_bytes = path.stat().st_size + 1
+    append_u5_baseline(value)
+    assert len(list(tmp_path.glob("retention-proof.jsonl.[0-9]*"))) == 1
+    current = value.inspect()
+    item = event("retention-proof-event", 1)
+    value.append_accepted(item)
+    value.append_started(item)
+    value.append_prepared(item, HASH_0, HASH_1, generation)
+    value.append_completed(
+        item,
+        1,
+        HASH_1,
+        generation,
+        current.wal_record_id or wal_id,
+        current.wal_record_hash or HASH_2,
+    )
+
+    saturated = value.admission_status()
+    rotated = tuple(tmp_path.glob("retention-proof.jsonl.[0-9]*"))
+
+    assert not saturated.available
+    assert saturated.proof_retention_blocks_safe_pruning
+    assert not saturated.lifecycle_blocks_rotation
+    assert saturated.rotated_segment_count == 1
+    assert len(rotated) == 1
+    baseline = value.inspect().baselines[0]
+    max_bytes = value.max_bytes
+    value.close()
+
+    reopened = EventJournal(path, max_bytes, 2, clock=lambda: NOW)
+    assert not reopened.admission_status().available
+    assert reopened.inspect().baselines == (baseline,)
+    assert tuple(tmp_path.glob("retention-proof.jsonl.[0-9]*")) == rotated

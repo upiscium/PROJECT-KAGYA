@@ -15,9 +15,11 @@ from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
     AgentRuntime,
+    AgentRuntimeStatus,
     AgentStateSnapshot,
     AgentStateStore,
     EventJournal,
+    EventJournalError,
     EventJournalLease,
     InternalCommitEvidence,
     KagyaMainLoop,
@@ -117,6 +119,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 or not participants_consistent
             )
             app.state.reconciliation_degraded_reason = degraded_reason
+            retention_status = app.state.event_journal.admission_status()
+            app.state.startup_retention_admission_available = retention_status.available
+            app.state.startup_retention_reason = retention_status.reason
             snapshot = startup_state.snapshot
             snapshot_hash = startup_state.snapshot_hash
 
@@ -155,7 +160,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         def admission_checkpoint(event: AgentEvent) -> None:
-            app.state.event_journal.append_accepted(event)
+            del event
+
+        def pre_admission_guard(event: AgentEvent) -> bool:
+            return app.state.event_journal.append_accepted_if_admission_available(
+                event
+            )
 
         def started_checkpoint(event: AgentEvent) -> None:
             app.state.event_journal.append_started(event)
@@ -203,6 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.agent_runtime = AgentRuntime(
                     app_settings.runtime.queue_capacity,
                     initial_sequence=startup_state.processing_high_water,
+                    pre_admission_guard=pre_admission_guard,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
                     preparation_checkpoint=preparation_checkpoint,
@@ -214,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 app.state.agent_runtime.configure_durability(
                     initial_sequence=startup_state.processing_high_water,
+                    pre_admission_guard=pre_admission_guard,
                     admission_checkpoint=admission_checkpoint,
                     started_checkpoint=started_checkpoint,
                     preparation_checkpoint=preparation_checkpoint,
@@ -225,7 +237,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException:
             app.state.event_journal.close()
             raise
-        if not app.state.external_reconciliation_required:
+        if (
+            not app.state.external_reconciliation_required
+            and app.state.startup_retention_admission_available
+        ):
             try:
                 assert recovery is not None
                 app.state.agent_runtime.start()
@@ -258,6 +273,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "project": app_settings.project.name,
                 "reason": app.state.reconciliation_degraded_reason
                 or "external_reconciliation_required",
+            }
+        try:
+            retention_available = app.state.event_journal.admission_status().available
+        except EventJournalError:
+            retention_available = False
+        if (
+            not retention_available
+            or not app.state.startup_retention_admission_available
+        ):
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "event_journal_retention_exhausted",
+            }
+        if app.state.agent_runtime.status is not AgentRuntimeStatus.ACCEPTING:
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "agent_runtime_unavailable",
             }
         return {"status": "ok", "project": app_settings.project.name}
 

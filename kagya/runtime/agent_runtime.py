@@ -81,6 +81,10 @@ class AgentRuntimeQueueFull(_AgentRuntimeEventError):
     """The bounded pending queue has no admission capacity."""
 
 
+class AgentRuntimeAdmissionBlocked(_AgentRuntimeEventError):
+    """A bounded pre-admission policy intentionally refused the event."""
+
+
 class AgentRuntimeStopped(_AgentRuntimeEventError):
     """The runtime is not accepting new events."""
 
@@ -127,6 +131,7 @@ class AgentRuntime:
         queue_capacity: int,
         *,
         initial_sequence: int = 0,
+        pre_admission_guard: Callable[[AgentEvent], bool | None] | None = None,
         admission_checkpoint: Callable[[AgentEvent], None] | None = None,
         started_checkpoint: Callable[[AgentEvent], None] | None = None,
         preparation_checkpoint: Callable[[AgentEvent, object], object] | None = None,
@@ -151,6 +156,7 @@ class AgentRuntime:
         ):
             raise ValueError("initial_sequence must be a non-negative integer")
         self._queue_capacity = queue_capacity
+        self._pre_admission_guard = pre_admission_guard
         self._admission_checkpoint = admission_checkpoint
         self._started_checkpoint = started_checkpoint
         self._preparation_checkpoint = preparation_checkpoint
@@ -210,6 +216,7 @@ class AgentRuntime:
         self,
         *,
         initial_sequence: int,
+        pre_admission_guard: Callable[[AgentEvent], bool | None] | None = None,
         admission_checkpoint: Callable[[AgentEvent], None],
         started_checkpoint: Callable[[AgentEvent], None],
         preparation_checkpoint: Callable[[AgentEvent, object], object],
@@ -232,6 +239,7 @@ class AgentRuntime:
                     "AgentRuntime durability must be configured before start"
                 )
             self._sequence = initial_sequence
+            self._pre_admission_guard = pre_admission_guard
             self._admission_checkpoint = admission_checkpoint
             self._started_checkpoint = started_checkpoint
             self._preparation_checkpoint = preparation_checkpoint
@@ -268,6 +276,17 @@ class AgentRuntime:
                 raise AgentRuntimeStopped(event)
             if len(self._pending) >= self._queue_capacity:
                 raise AgentRuntimeQueueFull(event)
+            if self._pre_admission_guard is not None:
+                try:
+                    admitted = self._pre_admission_guard(event)
+                except Exception as error:
+                    guard_error = self._durability_error(
+                        event, AgentRuntimeDurabilityPhase.ADMISSION, error, False
+                    )
+                    self._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.ADMISSION)
+                    raise guard_error
+                if admitted is False:
+                    raise AgentRuntimeAdmissionBlocked(event)
             if self._admission_checkpoint is not None:
                 durability_error: AgentRuntimeDurabilityError | None = None
                 try:

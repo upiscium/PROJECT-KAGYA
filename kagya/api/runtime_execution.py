@@ -9,6 +9,7 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeAdmissionBlocked,
     AgentRuntimeDurabilityError,
     AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
@@ -48,7 +49,11 @@ def execute(
 
     try:
         return runtime.submit(event_type, source, handler).result().value
-    except (AgentRuntimeQueueFull, AgentRuntimeStopped) as exc:
+    except (
+        AgentRuntimeAdmissionBlocked,
+        AgentRuntimeQueueFull,
+        AgentRuntimeStopped,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Agent runtime is temporarily unavailable",

@@ -863,6 +863,21 @@ class EventJournalAppendError(EventJournalError):
 
 
 @dataclass(frozen=True, slots=True)
+class EventJournalAdmissionStatus:
+    """Bounded, read-only evidence for mutation admission."""
+
+    available: bool
+    reason: str | None
+    active_file_bytes: int
+    max_bytes: int
+    rotated_segment_count: int
+    retained_files: int
+    safe_rotation_possible: bool
+    lifecycle_blocks_rotation: bool
+    proof_retention_blocks_safe_pruning: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _EventState:
     event_id: str
     event_type: AgentEventType
@@ -1238,6 +1253,22 @@ class EventJournal:
         with self._lock:
             self._require_authority()
             return bool(self._read_records_unlocked())
+
+    def admission_status(self) -> EventJournalAdmissionStatus:
+        """Inspect bounded retention admission without mutating the Journal."""
+        with self._lock:
+            self._require_authority()
+            return self._admission_status_unlocked()
+
+    def append_accepted_if_admission_available(self, event: AgentEvent) -> bool:
+        """Atomically guard new admission and durably append ``ACCEPTED``."""
+
+        with self._lock:
+            self._require_authority()
+            if not self._admission_status_unlocked().available:
+                return False
+            self.append_accepted(event)
+            return True
 
     def inspect(
         self,
@@ -2524,25 +2555,68 @@ class EventJournal:
             raise failure
         if size <= self.max_bytes:
             return
+        safe_rotation, _lifecycle_blocked, _proof_blocked = (
+            self._rotation_decision_unlocked()
+        )
+        if not safe_rotation:
+            return
         verified = self._verify_records(self._read_records_unlocked())
-        if (
+        self._rotate_unlocked(verified)
+
+    def _admission_status_unlocked(self) -> EventJournalAdmissionStatus:
+        try:
+            active_bytes = self.path.stat().st_size
+        except OSError as error:
+            raise EventJournalLoadError(
+                "EventJournal size cannot be inspected"
+            ) from error
+        rotated_count = len(self._rotated_paths_unlocked())
+        if active_bytes <= self.max_bytes:
+            return EventJournalAdmissionStatus(
+                True,
+                None,
+                active_bytes,
+                self.max_bytes,
+                rotated_count,
+                self.retained_files,
+                False,
+                False,
+                False,
+            )
+        safe_rotation, lifecycle_blocked, proof_blocked = (
+            self._rotation_decision_unlocked()
+        )
+        return EventJournalAdmissionStatus(
+            safe_rotation,
+            None if safe_rotation else "event_journal_retention_exhausted",
+            active_bytes,
+            self.max_bytes,
+            rotated_count,
+            self.retained_files,
+            safe_rotation,
+            lifecycle_blocked,
+            proof_blocked,
+        )
+
+    def _rotation_decision_unlocked(self) -> tuple[bool, bool, bool]:
+        """Use one authority-preserving policy for status and ordinary rotation."""
+        records = self._read_records_unlocked()
+        if not records:
+            raise EventJournalLoadError("EventJournal cannot rotate without records")
+        verified = self._verify_records(records)
+        lifecycle_blocked = bool(
             verified.open_events
             or verified.open_recoveries
             or any(t.terminal_lifecycle is None for t in verified.transactions)
             or any(not item.completed for item in verified.startup_reconciliations)
             or verified.external_reconciliation_required
             or verified.open_gate_clear is not None
-        ):
-            return
-        # Participant coverage cannot yet be summarized in an ordinary state
-        # checkpoint. Preserve every segment containing transaction authority,
-        # including history before the first explicit participant baseline.
-        if (
+        )
+        proof_blocked = bool(
             (verified.transactions or verified.baselines)
             and len(self._rotated_paths_unlocked()) + 1 >= self.retained_files
-        ):
-            return
-        if verified.records[-1].schema_version >= 2 and not any(
+        )
+        anchor_blocked = verified.records[-1].schema_version >= 2 and not any(
             record.lifecycle
             in {
                 EventLifecycle.CHECKPOINT,
@@ -2556,9 +2630,12 @@ class EventJournal:
             and record.wal_record_id is not None
             and record.wal_record_hash is not None
             for record in reversed(verified.records)
-        ):
-            return
-        self._rotate_unlocked(verified)
+        )
+        return (
+            not (lifecycle_blocked or proof_blocked or anchor_blocked),
+            lifecycle_blocked,
+            proof_blocked,
+        )
 
     def _rotate_unlocked(self, verified: _VerifiedJournal) -> None:
         failure: EventJournalAppendError | None = None
