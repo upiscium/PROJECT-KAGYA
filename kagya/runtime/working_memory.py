@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
@@ -162,6 +162,51 @@ class WorkingMemory:
 
         with self._lock:
             return tuple(self._items[item_id] for item_id in sorted(self._items))
+
+    def restore_exact(
+        self, revision: int, items: Iterable[WorkingMemoryItem]
+    ) -> None:
+        """Restore canonical membership exactly without replaying mutations."""
+
+        with self._lock:
+            self._require_mutation_available()
+            # Validate and publish under one lock: a concurrent admission must
+            # not be able to slip between validation and exact replacement.
+            revision_value = _nonnegative_revision(revision, "revision")
+            restored: dict[str, WorkingMemoryItem] = {}
+            source_references: set[tuple[WorkingMemorySourceKind, str]] = set()
+            for item in items:
+                if not isinstance(item, WorkingMemoryItem):
+                    raise ValueError("Working Memory item is invalid")
+                _validate_source(item.source_kind, item.source_id)
+                if item.item_id != working_memory_item_id(
+                    item.source_kind, item.source_id
+                ):
+                    raise ValueError("Working Memory item identity is invalid")
+                _strict_unit_float(item.activation, "activation")
+                _strict_unit_float(item.salience, "salience")
+                if type(item.retention_reason) is not WorkingMemoryRetentionReason:
+                    raise ValueError("Working Memory retention reason is invalid")
+                created_revision = _nonnegative_revision(
+                    item.created_revision, "created_revision"
+                )
+                last_activated_revision = _nonnegative_revision(
+                    item.last_activated_revision, "last_activated_revision"
+                )
+                if (
+                    created_revision > revision_value
+                    or last_activated_revision > revision_value
+                ):
+                    raise ValueError("Working Memory item revision is invalid")
+                source_reference = (item.source_kind, item.source_id)
+                if item.item_id in restored or source_reference in source_references:
+                    raise ValueError("Working Memory item is duplicated")
+                restored[item.item_id] = item
+                source_references.add(source_reference)
+            if len(restored) > self._item_capacity:
+                raise ValueError("Working Memory state exceeds configured capacity")
+            self._items = restored
+            self._revision = revision_value
 
     @staticmethod
     def score(item: WorkingMemoryItem) -> float:
@@ -388,6 +433,24 @@ def _unit_float(value: float, name: str) -> float:
     if not math.isfinite(result) or not 0.0 <= result <= 1.0:
         raise ValueError(f"{name} must be finite and in [0, 1]")
     return result
+
+
+def _strict_unit_float(value: object, name: str) -> float:
+    """Validate the already-decoded float representation of durable state."""
+
+    if (
+        type(value) is not float
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValueError(f"{name} must be a finite float in [0, 1]")
+    return value
+
+
+def _nonnegative_revision(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
 
 
 def _validate_source(

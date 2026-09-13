@@ -1,6 +1,6 @@
 """R08 U1 bounded Working Memory state-machine contract tests."""
 
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 from threading import Thread
 
@@ -141,6 +141,91 @@ def test_select_is_exactly_pure_and_repeatable() -> None:
         first.projected_bytes = 0  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         first.decisions[0].selected = False  # type: ignore[misc]
+
+
+def test_projection_budget_is_ephemeral_and_never_changes_canonical_state() -> None:
+    memory = WorkingMemory(item_capacity=1, projection_max_bytes=3)
+    item = admit(memory, "episode-budget", activation=1.0, salience=1.0)
+    before = (memory.revision, memory.items)
+
+    view = memory.select(lambda _item: "too large")
+
+    assert view.selected == ()
+    assert view.projected_bytes == 0
+    assert view.decisions[0].reason is WorkingMemoryDecisionReason.PROJECTION_BUDGET
+    assert (memory.revision, memory.items) == before
+    assert memory.items == (item,)
+
+
+def test_restore_exact_preserves_revision_and_membership_without_replay() -> None:
+    source = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    item = admit(source, "episode-exact", activation=0.7, salience=0.8)
+    source.advance(decay=0.0, forget_below=0.0)
+    target = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+
+    target.restore_exact(source.revision, source.items)
+
+    assert target.revision == source.revision == 1
+    assert target.items == (item,)
+
+
+def test_restore_exact_rejects_capacity_decrease_but_accepts_larger_capacity() -> None:
+    source = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    admit(source, "episode-one")
+    admit(source, "episode-two")
+    smaller = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    larger = WorkingMemory(item_capacity=3, projection_max_bytes=10)
+
+    with pytest.raises(ValueError):
+        smaller.restore_exact(source.revision, source.items)
+    larger.restore_exact(source.revision, source.items)
+
+    assert larger.revision == source.revision == 2
+    assert larger.items == source.items
+
+
+@pytest.mark.parametrize(
+    "revision,item_change",
+    [
+        (1, {"item_id": "wm-invalid"}),
+        (1, {"source_kind": "invalid"}),
+        (1, {"source_id": "../invalid"}),
+        (1, {"activation": float("nan")}),
+        (1, {"activation": 1}),
+        (1, {"salience": 2.0}),
+        (1, {"retention_reason": "invalid"}),
+        (1, {"created_revision": 2}),
+        (1, {"last_activated_revision": 2}),
+        (-1, {}),
+        (True, {}),
+    ],
+)
+def test_restore_exact_rejects_malformed_canonical_state_without_mutation(
+    revision: int, item_change: dict[str, object]
+) -> None:
+    source = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    item = admit(source, "episode-valid")
+    target = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    retained = admit(target, "episode-retained")
+    before = (target.revision, target.items)
+    malformed = replace(item, **item_change)
+
+    with pytest.raises((TypeError, ValueError)):
+        target.restore_exact(revision, (malformed,))
+
+    assert (target.revision, target.items) == before == (1, (retained,))
+
+
+def test_restore_exact_rejects_duplicate_identity_and_source_reference() -> None:
+    source = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    item = admit(source, "episode-duplicate-restore")
+    target = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+
+    with pytest.raises(ValueError, match="duplicated"):
+        target.restore_exact(source.revision, (item, item))
+
+    assert target.revision == 0
+    assert target.items == ()
 
 
 def test_capacity_revision_and_budget_are_read_only() -> None:

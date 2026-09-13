@@ -18,6 +18,7 @@ from kagya.runtime.agent_state import (
     AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
+    WorkingMemorySnapshot,
 )
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -77,6 +78,7 @@ def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
         emotion_state=EmotionStateSnapshot(
             valence=valence, arousal=0.2, optimal_loss=1.0
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
     )
 
 

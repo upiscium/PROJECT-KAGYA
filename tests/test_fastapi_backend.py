@@ -33,6 +33,7 @@ from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
+    WorkingMemorySnapshot,
     EventFailureCategory,
     EventJournal,
     EventJournalAppendError,
@@ -567,6 +568,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
                 arousal=0.5,
                 optimal_loss=0.6,
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     )
     app = create_app(settings)
@@ -651,6 +653,7 @@ def test_restored_sequence_continues_and_success_checkpoints_chat(
                 arousal=0.2,
                 optimal_loss=0.9,
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     )
 
@@ -1066,7 +1069,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 1
+        == 2
     )
 
 
@@ -1085,6 +1088,7 @@ def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
             arousal=0.3,
             optimal_loss=0.8,
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
     )
     store.save(snapshot)
     snapshot_bytes = settings.agent_state.path.read_bytes()

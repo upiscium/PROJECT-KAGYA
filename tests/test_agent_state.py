@@ -16,9 +16,17 @@ from kagya.runtime import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshot,
+    AgentStateSnapshotV1,
     AgentStateStore,
     EmotionStateSnapshot,
     UnsupportedAgentStateVersion,
+    WorkingMemory,
+    WorkingMemoryItem,
+    WorkingMemoryItemSnapshot,
+    WorkingMemorySnapshot,
+    WorkingMemoryRetentionReason,
+    WorkingMemorySourceKind,
+    working_memory_item_id,
 )
 import kagya.runtime.agent_state as agent_state_module
 
@@ -29,8 +37,18 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 class LoopStub:
-    def __init__(self, emotion: EmotionState) -> None:
+    def __init__(
+        self,
+        emotion: EmotionState,
+        *,
+        item_capacity: int = 32,
+        projection_max_bytes: int = 2048,
+    ) -> None:
         self.emotion_engine = EmotionEngineAllostasis(emotion)
+        self.working_memory = WorkingMemory(
+            item_capacity=item_capacity,
+            projection_max_bytes=projection_max_bytes,
+        )
 
 
 def assert_bounded_exception(error: Exception, sentinel: str) -> None:
@@ -49,6 +67,40 @@ def make_snapshot(sequence: int = 4) -> AgentStateSnapshot:
             arousal=0.3,
             optimal_loss=1.2,
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+    )
+
+
+def make_v1_snapshot(sequence: int = 4) -> AgentStateSnapshotV1:
+    return AgentStateSnapshotV1(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2, arousal=0.3, optimal_loss=1.2
+        ),
+    )
+
+
+def make_wm_snapshot() -> AgentStateSnapshot:
+    item = WorkingMemoryItemSnapshot(
+        item_id=working_memory_item_id(
+            WorkingMemorySourceKind.EPISODIC, "episode-wm"
+        ),
+        source_kind="episodic",
+        source_id="episode-wm",
+        activation=0.7,
+        salience=0.8,
+        retention_reason="reactivated",
+        created_revision=2,
+        last_activated_revision=5,
+    )
+    return AgentStateSnapshot(
+        saved_at=NOW,
+        last_processed_event_sequence=9,
+        emotion_state=EmotionStateSnapshot(
+            valence=-0.4, arousal=0.6, optimal_loss=0.8
+        ),
+        working_memory=WorkingMemorySnapshot(revision=5, items=(item,)),
     )
 
 
@@ -76,9 +128,200 @@ def test_minimal_capture_save_load_restore_round_trip(tmp_path: Path) -> None:
     snapshot = new_store.load()
     new_store.restore_into(restored, snapshot)
 
-    assert snapshot.schema_version == 1
+    assert snapshot.schema_version == 2
     assert snapshot.last_processed_event_sequence == 7
     assert restored.emotion_engine.state == original.emotion_engine.state
+    assert restored.working_memory.revision == 0
+    assert restored.working_memory.items == ()
+
+
+def test_current_v2_round_trip_preserves_exact_nonempty_working_memory(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    original = LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+    original.working_memory.restore_exact(
+        5,
+        (
+            WorkingMemoryItem(
+                item_id=working_memory_item_id(
+                    WorkingMemorySourceKind.EPISODIC, "episode-wm"
+                ),
+                source_kind=WorkingMemorySourceKind.EPISODIC,
+                source_id="episode-wm",
+                activation=0.7,
+                salience=0.8,
+                retention_reason=WorkingMemoryRetentionReason.REACTIVATED,
+                created_revision=2, last_activated_revision=5,
+            ),
+        ),
+    )
+    snapshot = store.capture(original, sequence=9)
+    store.save(snapshot)
+    restored = LoopStub(
+        EmotionState(valence=1.0, arousal=1.0, optimal_loss=2.0)
+    )
+    loaded = make_store(path).load()
+    make_store(path).restore_into(restored, loaded)
+
+    assert loaded == snapshot
+    assert restored.working_memory.revision == 5
+    assert restored.working_memory.items == original.working_memory.items
+
+
+def test_capacity_decrease_restore_fails_without_trimming_or_rewriting(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    source = LoopStub(
+        EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0),
+        item_capacity=2,
+    )
+    source.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "episode-one", 0.5, 0.5
+    )
+    source.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "episode-two", 0.5, 0.5
+    )
+    snapshot = store.capture(source, sequence=2)
+    store.save(snapshot)
+    canonical = path.read_bytes()
+    target = LoopStub(
+        EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0),
+        item_capacity=1,
+    )
+
+    with pytest.raises(AgentStateLoadError, match="restore failed"):
+        store.restore_into(target, store.load())
+
+    assert target.working_memory.items == ()
+    assert target.working_memory.revision == 0
+    assert path.read_bytes() == canonical
+
+
+def test_projection_budget_change_does_not_change_agent_state_hash(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    emotion = EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0)
+    smaller = LoopStub(emotion, projection_max_bytes=8)
+    larger = LoopStub(emotion, projection_max_bytes=4096)
+    for loop in (smaller, larger):
+        loop.working_memory.admit(
+            WorkingMemorySourceKind.EPISODIC, "episode-shared", 0.5, 0.5
+        )
+
+    smaller_snapshot = store.capture(smaller, sequence=1)
+    larger_snapshot = store.capture(larger, sequence=1)
+
+    assert smaller_snapshot == larger_snapshot
+    assert store.snapshot_hash(smaller_snapshot) == store.snapshot_hash(
+        larger_snapshot
+    )
+
+
+def test_legacy_v1_fixture_bytes_and_hash_remain_unchanged(tmp_path: Path) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    snapshot = make_v1_snapshot()
+    fixture = (
+        b'{"emotion_state":{"arousal":0.3,"optimal_loss":1.2,"valence":0.2},'
+        b'"last_processed_event_sequence":4,"saved_at":"2026-01-02T03:04:05Z",'
+        b'"schema_version":1}'
+    )
+
+    assert store.canonical_bytes(snapshot) == fixture
+    assert hashlib.sha256(fixture).hexdigest() == (
+        "d117f3f036ac792121b30ae02bb17b2653806608e2abb9d0a4dd7de0a26d7391"
+    )
+    assert store.snapshot_hash(snapshot) == (
+        "d117f3f036ac792121b30ae02bb17b2653806608e2abb9d0a4dd7de0a26d7391"
+    )
+
+
+def test_legacy_v1_restore_preserves_emotion_sequence_and_file(tmp_path: Path) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    legacy = make_v1_snapshot(sequence=17)
+    original = store.canonical_bytes(legacy)
+    path.write_bytes(original)
+    loop = LoopStub(EmotionState(valence=0.9, arousal=0.9, optimal_loss=2.0))
+    loop.working_memory.admit(WorkingMemorySourceKind.EPISODIC, "episode-old", 0.5, 0.5)
+
+    loaded = store.load()
+    store.restore_into(loop, loaded)
+
+    assert isinstance(loaded, AgentStateSnapshotV1)
+    assert loaded.last_processed_event_sequence == 17
+    assert loop.emotion_engine.state == EmotionState(
+        valence=0.2, arousal=0.3, optimal_loss=1.2
+    )
+    assert loop.working_memory.revision == 0
+    assert loop.working_memory.items == ()
+    assert path.read_bytes() == original
+
+
+def test_ensure_published_preserves_valid_noncanonical_v1_bytes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    legacy = make_v1_snapshot(sequence=17)
+    noncanonical = json.dumps(
+        legacy.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    path.write_bytes(noncanonical)
+
+    loaded = store.load()
+    store.ensure_published(loaded)
+
+    assert loaded == legacy
+    assert path.read_bytes() == noncanonical
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw.pop("working_memory"),
+        lambda raw: raw["working_memory"].pop("items"),
+        lambda raw: raw["working_memory"]["items"].append(
+            raw["working_memory"]["items"][0].copy()
+        ),
+        lambda raw: raw["working_memory"]["items"].__setitem__(
+            0, {**raw["working_memory"]["items"][0], "source_id": "episode-other"}
+        ),
+        lambda raw: raw["working_memory"]["items"][0].__setitem__(
+            "source_kind", "EPISODIC"
+        ),
+        lambda raw: raw["working_memory"]["items"][0].__setitem__(
+            "retention_reason", "RECENT"
+        ),
+        lambda raw: raw["working_memory"].__setitem__("revision", -1),
+        lambda raw: raw["working_memory"]["items"][0].__setitem__(
+            "created_revision", 6
+        ),
+        lambda raw: raw["working_memory"]["items"][0].__setitem__(
+            "activation", float("inf")
+        ),
+        lambda raw: raw["working_memory"].__setitem__(
+            "private_reasoning", PRIVATE_SENTINEL
+        ),
+        lambda raw: raw["working_memory"].__setitem__("unknown", PRIVATE_SENTINEL),
+    ],
+)
+def test_malformed_working_memory_is_rejected_without_rewriting(
+    tmp_path: Path, mutate
+) -> None:
+    path = tmp_path / "agent_state.json"
+    raw = make_wm_snapshot().model_dump(mode="json")
+    mutate(raw)
+    original = json.dumps(raw, allow_nan=True).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(AgentStateLoadError):
+        make_store(path).load()
+    assert path.read_bytes() == original
 
 
 def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> None:
@@ -95,6 +338,9 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         arousal=0.0,
         optimal_loss=2.5,
     )
+    assert isinstance(snapshot, AgentStateSnapshot)
+    assert snapshot.schema_version == 2
+    assert snapshot.working_memory == WorkingMemorySnapshot(revision=0, items=())
 
 
 def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> None:
@@ -107,7 +353,7 @@ def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> Non
     assert compatible.agent_state.path == Path(".kagya/agent_state.json")
 
 
-def test_v0_migrates_strictly_to_v1(tmp_path: Path) -> None:
+def test_v0_migrates_strictly_to_v2(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
     path.write_text(
         json.dumps(
@@ -134,6 +380,7 @@ def test_v0_migrates_strictly_to_v1(tmp_path: Path) -> None:
             arousal=0.2,
             optimal_loss=0.9,
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
     )
 
 
@@ -284,7 +531,22 @@ def test_unknown_field_value_is_absent_from_full_exception(tmp_path: Path) -> No
 
 @pytest.mark.parametrize(
     "private_key",
-    ["hiddenThought", "Hidden-Thought", "private_reasoning", "eventPayload", "turns"],
+    [
+        "content",
+        "user_input",
+        "response",
+        "turn",
+        "turns",
+        "transcript",
+        "prompt",
+        "raw_prompt",
+        "hidden_thought",
+        "private_reasoning",
+        "attachment",
+        "attachments",
+        "event_payload",
+        "debug_trace",
+    ],
 )
 def test_normalized_private_aliases_fail_closed(
     tmp_path: Path, private_key: str
@@ -312,7 +574,7 @@ def test_canonical_snapshot_contains_no_private_or_independent_store_data(
     assert raw == (
         '{"emotion_state":{"arousal":0.3,"optimal_loss":1.2,"valence":0.2},'
         '"last_processed_event_sequence":4,"saved_at":"2026-01-02T03:04:05Z",'
-        '"schema_version":1}'
+        '"schema_version":2,"working_memory":{"items":[],"revision":0}}'
     )
     assert PRIVATE_SENTINEL not in raw
     for forbidden in (
@@ -424,6 +686,7 @@ def test_model_constraints_are_strict_finite_and_timezone_aware() -> None:
             emotion_state=EmotionStateSnapshot(
                 valence=0.0, arousal=0.0, optimal_loss=1.0
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     with pytest.raises(ValidationError):
         AgentStateSnapshot(
@@ -432,6 +695,7 @@ def test_model_constraints_are_strict_finite_and_timezone_aware() -> None:
             emotion_state=EmotionStateSnapshot(
                 valence=0.0, arousal=0.0, optimal_loss=1.0
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
 
 
@@ -528,7 +792,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(
