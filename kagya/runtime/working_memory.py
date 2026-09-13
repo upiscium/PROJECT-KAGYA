@@ -39,6 +39,9 @@ class WorkingMemoryDecisionReason(str, Enum):
     SELECTED = "selected"
     UNRESOLVED_REFERENCE = "unresolved_reference"
     RESOLVER_FAILURE = "resolver_failure"
+    SOURCE_ARCHIVED = "source_archived"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    SOURCE_MALFORMED = "source_malformed"
     PROJECTION_BUDGET = "projection_budget"
 
 
@@ -110,7 +113,35 @@ class WorkingMemoryView:
     revision: int
 
 
-WorkingMemoryResolver = Callable[[WorkingMemoryItem], str | None]
+class WorkingMemoryResolutionStatus(str, Enum):
+    """Bounded outcomes from resolving an authoritative source reference."""
+
+    RESOLVED = "resolved"
+    MISSING = "missing"
+    ARCHIVED = "archived"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingMemoryResolution:
+    """Immutable typed resolution; only resolved sources may carry content."""
+
+    status: WorkingMemoryResolutionStatus
+    rendered_content: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not WorkingMemoryResolutionStatus:
+            raise TypeError("status must be WorkingMemoryResolutionStatus")
+        if self.status is WorkingMemoryResolutionStatus.RESOLVED:
+            if type(self.rendered_content) is not str:
+                raise ValueError("resolved Working Memory content must be a string")
+        elif self.rendered_content is not None:
+            raise ValueError("non-resolved Working Memory content must be None")
+
+
+WorkingMemoryResolverResult = str | WorkingMemoryResolution | None
+WorkingMemoryResolver = Callable[[WorkingMemoryItem], WorkingMemoryResolverResult]
 
 
 def working_memory_item_id(
@@ -349,18 +380,39 @@ class WorkingMemory:
                     resolved = resolver(item)
                     if resolved is None:
                         reason = WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
-                    elif not isinstance(resolved, str):
+                    elif isinstance(resolved, str):
+                        rendered = resolved
+                    elif not isinstance(resolved, WorkingMemoryResolution):
                         reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE
                     else:
-                        resolved_bytes = resolved.encode("utf-8")
+                        resolution_reasons = {
+                            WorkingMemoryResolutionStatus.MISSING: (
+                                WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
+                            ),
+                            WorkingMemoryResolutionStatus.ARCHIVED: (
+                                WorkingMemoryDecisionReason.SOURCE_ARCHIVED
+                            ),
+                            WorkingMemoryResolutionStatus.UNAVAILABLE: (
+                                WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE
+                            ),
+                            WorkingMemoryResolutionStatus.MALFORMED: (
+                                WorkingMemoryDecisionReason.SOURCE_MALFORMED
+                            ),
+                        }
                         if (
-                            projected_bytes + len(resolved_bytes)
-                            > projection_max_bytes
+                            resolved.status
+                            is not WorkingMemoryResolutionStatus.RESOLVED
                         ):
+                            reason = resolution_reasons[resolved.status]
+                        else:
+                            rendered = resolved.rendered_content
+                    if rendered is not None:
+                        resolved_bytes = rendered.encode("utf-8")
+                        if projected_bytes + len(resolved_bytes) > projection_max_bytes:
                             reason = WorkingMemoryDecisionReason.PROJECTION_BUDGET
+                            rendered = None
                         else:
                             reason = WorkingMemoryDecisionReason.SELECTED
-                            rendered = resolved
                             projected_bytes += len(resolved_bytes)
                 except Exception:
                     reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE

@@ -2,18 +2,33 @@
 
 from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
+from types import SimpleNamespace
 from threading import Thread
 
 import pytest
 import yaml
 
-from kagya.config import load_settings
+from kagya.config import Settings, load_settings
+from kagya.memory import DualMemorySystem
+from kagya.memory.dual_memory_system import (
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+    SemanticMemoryFormatError,
+    SemanticMemoryReadError,
+)
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from kagya.models import DummyProvider
 from kagya.runtime import (
+    AgentStateStore,
+    KagyaMainLoop,
+    StateWAL,
     WorkingMemory,
     WorkingMemoryAdmissionReason,
     WorkingMemoryDecisionReason,
     WorkingMemoryItem,
     WorkingMemoryRetentionReason,
+    WorkingMemoryResolution,
+    WorkingMemoryResolutionStatus,
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
@@ -442,3 +457,431 @@ def test_working_memory_config_defaults_and_legacy_compatibility(
     loaded = load_settings(legacy_path)
     assert loaded.working_memory.item_capacity == 32
     assert loaded.working_memory.projection_max_bytes == 2048
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkingMemoryResolutionStatus.MISSING,
+        WorkingMemoryResolutionStatus.ARCHIVED,
+        WorkingMemoryResolutionStatus.UNAVAILABLE,
+        WorkingMemoryResolutionStatus.MALFORMED,
+    ],
+)
+def test_nonresolved_resolution_cannot_expose_content(
+    status: WorkingMemoryResolutionStatus,
+) -> None:
+    with pytest.raises(ValueError):
+        WorkingMemoryResolution(status, "private body")
+    assert WorkingMemoryResolution(status).rendered_content is None
+
+
+def test_typed_resolution_selects_and_maps_source_statuses() -> None:
+    memory = WorkingMemory(item_capacity=5, projection_max_bytes=100)
+    for index, status in enumerate(
+        (
+            WorkingMemoryResolutionStatus.RESOLVED,
+            WorkingMemoryResolutionStatus.MISSING,
+            WorkingMemoryResolutionStatus.ARCHIVED,
+            WorkingMemoryResolutionStatus.UNAVAILABLE,
+            WorkingMemoryResolutionStatus.MALFORMED,
+        )
+    ):
+        admit(memory, f"episode-typed-{index}")
+
+    results = {
+        f"episode-typed-{index}": WorkingMemoryResolution(
+            status,
+            "authoritative body"
+            if status is WorkingMemoryResolutionStatus.RESOLVED
+            else None,
+        )
+        for index, status in enumerate(
+            (
+                WorkingMemoryResolutionStatus.RESOLVED,
+                WorkingMemoryResolutionStatus.MISSING,
+                WorkingMemoryResolutionStatus.ARCHIVED,
+                WorkingMemoryResolutionStatus.UNAVAILABLE,
+                WorkingMemoryResolutionStatus.MALFORMED,
+            )
+        )
+    }
+    view = memory.select(lambda item: results[item.source_id])
+
+    assert [selection.rendered_content for selection in view.selected] == [
+        "authoritative body"
+    ]
+    reasons = {decision.source_id: decision.reason for decision in view.decisions}
+    assert reasons == {
+        f"episode-typed-{index}": expected
+        for index, expected in enumerate(
+            (
+                WorkingMemoryDecisionReason.SELECTED,
+                WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE,
+                WorkingMemoryDecisionReason.SOURCE_ARCHIVED,
+                WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE,
+                WorkingMemoryDecisionReason.SOURCE_MALFORMED,
+            )
+        )
+    }
+
+
+def test_invalid_typed_result_is_resolver_failure() -> None:
+    memory = WorkingMemory(item_capacity=1, projection_max_bytes=20)
+    admit(memory, "episode-invalid-typed")
+
+    view = memory.select(
+        lambda _item: SimpleNamespace(status="resolved", rendered_content=3)
+    )
+
+    assert view.decisions[0].reason is WorkingMemoryDecisionReason.RESOLVER_FAILURE
+
+
+def test_memory_resolver_dispatches_committed_reads_and_maps_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kagya.memory.dual_memory_system as dual_memory_system
+
+    class EpisodicReadError(Exception):
+        pass
+
+    class EpisodicFormatError(Exception):
+        pass
+
+    class SemanticReadError(Exception):
+        pass
+
+    class SemanticFormatError(Exception):
+        pass
+
+    monkeypatch.setattr(
+        dual_memory_system, "EpisodicMemoryReadError", EpisodicReadError
+    )
+    monkeypatch.setattr(
+        dual_memory_system, "EpisodicMemoryFormatError", EpisodicFormatError
+    )
+    monkeypatch.setattr(
+        dual_memory_system, "SemanticMemoryReadError", SemanticReadError, raising=False
+    )
+    monkeypatch.setattr(
+        dual_memory_system,
+        "SemanticMemoryFormatError",
+        SemanticFormatError,
+        raising=False,
+    )
+
+    episodic = WorkingMemoryItem(
+        working_memory_item_id(WorkingMemorySourceKind.EPISODIC, "episode-real"),
+        WorkingMemorySourceKind.EPISODIC,
+        "episode-real",
+        0.5,
+        0.5,
+        WorkingMemoryRetentionReason.RECENT,
+        0,
+        0,
+    )
+    semantic = replace(
+        episodic,
+        source_kind=WorkingMemorySourceKind.SEMANTIC,
+        source_id="semantic-real",
+        item_id=working_memory_item_id(
+            WorkingMemorySourceKind.SEMANTIC, "semantic-real"
+        ),
+    )
+
+    class Memory:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def get_committed_episodic(self, source_id: str) -> object:
+            self.calls.append(("episodic", source_id))
+            return SimpleNamespace(
+                document="episode body", record=SimpleNamespace(archived=False)
+            )
+
+        def get_committed_semantic(self, source_id: str) -> object:
+            self.calls.append(("semantic", source_id))
+            return SimpleNamespace(document="semantic body")
+
+    memory = Memory()
+    resolver = MemoryWorkingMemoryResolver(memory)
+
+    assert resolver(episodic) == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.RESOLVED, "episode body"
+    )
+    assert resolver(semantic) == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.RESOLVED, "semantic body"
+    )
+    assert memory.calls == [
+        ("episodic", "episode-real"),
+        ("semantic", "semantic-real"),
+    ]
+
+
+def test_real_episodic_resolution_is_exact_pure_and_archived_is_ineligible(
+    tmp_path: Path,
+) -> None:
+    source = _dual_memory(tmp_path)
+    episode_id = source.save_episodic("remember me", "I remember")
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = admit(working, episode_id)
+    resolver = MemoryWorkingMemoryResolver(source)
+    before_working = (working.revision, working.items)
+    before_db1 = source.db1.get(include=["documents", "metadatas"])
+
+    resolution = resolver.resolve(item)
+    view = working.select(resolver)
+
+    assert resolution == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.RESOLVED,
+        "User: remember me\nAssistant: I remember",
+    )
+    assert view.selected[0].rendered_content == resolution.rendered_content
+    assert (working.revision, working.items) == before_working
+    assert source.db1.get(include=["documents", "metadatas"]) == before_db1
+
+    source._archive_episodic(episode_id)
+    archived_db1 = source.db1.get(include=["documents", "metadatas"])
+    archived = resolver.resolve(item)
+    archived_view = working.select(resolver)
+
+    assert archived == WorkingMemoryResolution(WorkingMemoryResolutionStatus.ARCHIVED)
+    assert archived.rendered_content is None
+    assert archived_view.decisions[0].reason is (
+        WorkingMemoryDecisionReason.SOURCE_ARCHIVED
+    )
+    assert (working.revision, working.items) == before_working
+    assert source.db1.get(include=["documents", "metadatas"]) == archived_db1
+
+
+@pytest.mark.parametrize(
+    ("kind", "status", "decision"),
+    [
+        (
+            WorkingMemorySourceKind.EPISODIC,
+            WorkingMemoryResolutionStatus.MISSING,
+            WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE,
+        ),
+        (
+            WorkingMemorySourceKind.SEMANTIC,
+            WorkingMemoryResolutionStatus.MISSING,
+            WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE,
+        ),
+    ],
+)
+def test_real_missing_source_remains_authoritative(
+    tmp_path: Path,
+    kind: WorkingMemorySourceKind,
+    status: WorkingMemoryResolutionStatus,
+    decision: WorkingMemoryDecisionReason,
+) -> None:
+    source = _dual_memory(tmp_path)
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = admit(working, f"{kind.value}-missing", kind=kind)
+    before = (working.revision, working.items)
+    resolver = MemoryWorkingMemoryResolver(source)
+
+    resolution = resolver.resolve(item)
+    view = working.select(resolver)
+
+    assert resolution == WorkingMemoryResolution(status)
+    assert resolution.rendered_content is None
+    assert view.decisions[0].reason is decision
+    assert (working.revision, working.items) == before
+
+
+@pytest.mark.parametrize(
+    ("kind", "error_type"),
+    [
+        (WorkingMemorySourceKind.EPISODIC, EpisodicMemoryReadError),
+        (WorkingMemorySourceKind.SEMANTIC, SemanticMemoryReadError),
+    ],
+)
+def test_known_backend_unavailability_is_not_resolver_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: WorkingMemorySourceKind,
+    error_type: type[Exception],
+) -> None:
+    source = _dual_memory(tmp_path)
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = admit(working, f"{kind.value}-unavailable", kind=kind)
+    method_name = f"get_committed_{kind.value}"
+
+    def unavailable(_source_id: str) -> None:
+        raise error_type("PRIVATE backend exception")
+
+    monkeypatch.setattr(source, method_name, unavailable)
+    before = (working.revision, working.items)
+
+    resolution = MemoryWorkingMemoryResolver(source).resolve(item)
+    view = working.select(MemoryWorkingMemoryResolver(source))
+
+    assert resolution == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.UNAVAILABLE
+    )
+    assert view.decisions[0].reason is (WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE)
+    assert "PRIVATE" not in repr(resolution)
+    assert "PRIVATE" not in repr(view)
+    assert (working.revision, working.items) == before
+
+
+@pytest.mark.parametrize(
+    ("kind", "error_type"),
+    [
+        (WorkingMemorySourceKind.EPISODIC, EpisodicMemoryFormatError),
+        (WorkingMemorySourceKind.SEMANTIC, SemanticMemoryFormatError),
+    ],
+)
+def test_malformed_source_is_distinct_and_body_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: WorkingMemorySourceKind,
+    error_type: type[Exception],
+) -> None:
+    source = _dual_memory(tmp_path)
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = admit(working, f"{kind.value}-malformed", kind=kind)
+
+    def malformed(_source_id: str) -> None:
+        raise error_type("PRIVATE malformed source body")
+
+    monkeypatch.setattr(source, f"get_committed_{kind.value}", malformed)
+    before = (working.revision, working.items)
+
+    resolution = MemoryWorkingMemoryResolver(source).resolve(item)
+    view = working.select(MemoryWorkingMemoryResolver(source))
+
+    assert resolution == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.MALFORMED
+    )
+    assert resolution.rendered_content is None
+    assert view.decisions[0].reason is WorkingMemoryDecisionReason.SOURCE_MALFORMED
+    assert "PRIVATE" not in repr(resolution)
+    assert "PRIVATE" not in repr(view)
+    assert (working.revision, working.items) == before
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [WorkingMemorySourceKind.EPISODIC, WorkingMemorySourceKind.SEMANTIC],
+)
+def test_real_conflicting_source_resolves_malformed_without_repair(
+    tmp_path: Path, kind: WorkingMemorySourceKind
+) -> None:
+    source = _dual_memory(tmp_path)
+    if kind is WorkingMemorySourceKind.EPISODIC:
+        source_id = source.save_episodic("visible", "answer")
+        source.db1.update(ids=[source_id], documents=["conflicting document"])
+        collection = source.db1
+    else:
+        source_id = source.save_semantic("visible semantic")
+        stored = source.db2.get(ids=[source_id], include=["metadatas"])
+        metadata = dict(stored["metadatas"][0])
+        metadata["text"] = "conflicting metadata"
+        source.db2.update(ids=[source_id], metadatas=[metadata])
+        collection = source.db2
+    before_source = collection.get(ids=[source_id], include=["documents", "metadatas"])
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = admit(working, source_id, kind=kind)
+    before_working = (working.revision, working.items)
+    resolver = MemoryWorkingMemoryResolver(source)
+
+    resolution = resolver.resolve(item)
+    view = working.select(resolver)
+
+    assert resolution == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.MALFORMED
+    )
+    assert resolution.rendered_content is None
+    assert view.decisions[0].reason is WorkingMemoryDecisionReason.SOURCE_MALFORMED
+    assert (working.revision, working.items) == before_working
+    assert (
+        collection.get(ids=[source_id], include=["documents", "metadatas"])
+        == before_source
+    )
+
+
+def test_real_semantic_resolution_and_utf8_budget_use_authoritative_documents(
+    tmp_path: Path,
+) -> None:
+    source = _dual_memory(tmp_path)
+    large_id = source.save_semantic("é" * 20)
+    small_id = source.save_semantic("fits")
+    working = WorkingMemory(item_capacity=2, projection_max_bytes=5)
+    admit(
+        working,
+        large_id,
+        activation=1.0,
+        salience=1.0,
+        kind=WorkingMemorySourceKind.SEMANTIC,
+    )
+    admit(
+        working,
+        small_id,
+        activation=0.2,
+        salience=0.2,
+        kind=WorkingMemorySourceKind.SEMANTIC,
+    )
+    resolver = MemoryWorkingMemoryResolver(source)
+    small_item = next(item for item in working.items if item.source_id == small_id)
+
+    resolution = resolver.resolve(small_item)
+    view = working.select(resolver)
+
+    assert resolution == WorkingMemoryResolution(
+        WorkingMemoryResolutionStatus.RESOLVED, "fits"
+    )
+    assert [decision.reason for decision in view.decisions] == [
+        WorkingMemoryDecisionReason.PROJECTION_BUDGET,
+        WorkingMemoryDecisionReason.SELECTED,
+    ]
+    assert [selection.rendered_content for selection in view.selected] == ["fits"]
+    assert view.projected_bytes == len("fits".encode("utf-8"))
+    assert view.projected_bytes <= view.projection_max_bytes
+
+
+def test_resolved_body_never_enters_agent_state_or_wal(tmp_path: Path) -> None:
+    sentinel = "U3-EPHEMERAL-BODY-SENTINEL"
+    settings = _settings_for_tmp_memory(tmp_path)
+    source = DualMemorySystem(settings)
+    semantic_id = source.save_semantic(sentinel)
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    admit(working, semantic_id, kind=WorkingMemorySourceKind.SEMANTIC)
+    loop = KagyaMainLoop(settings, DummyProvider(), source, working_memory=working)
+    state_store = AgentStateStore(
+        tmp_path / "agent-state.json", settings.emotion.baseline_surprisal
+    )
+
+    view = working.select(MemoryWorkingMemoryResolver(source))
+    snapshot = state_store.capture(loop, sequence=0)
+    canonical = state_store.canonical_bytes(snapshot)
+    wal = StateWAL(tmp_path / "wal")
+    wal.bootstrap(snapshot, 0)
+    durable_wal = b"".join(
+        path.read_bytes() for path in (tmp_path / "wal").rglob("*") if path.is_file()
+    )
+
+    assert view.selected[0].rendered_content == sentinel
+    assert sentinel not in repr(working.items)
+    assert sentinel.encode() not in canonical
+    assert sentinel.encode() not in durable_wal
+
+
+def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={
+            "memory": settings.memory.model_copy(
+                update={
+                    "persist_directory": tmp_path / "chroma",
+                    "db1_collection": "hippocampus_working_memory_test",
+                    "db2_collection": "cortex_working_memory_test",
+                }
+            )
+        }
+    )
+
+
+def _dual_memory(tmp_path: Path) -> DualMemorySystem:
+    return DualMemorySystem(_settings_for_tmp_memory(tmp_path))

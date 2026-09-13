@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import math
 from typing import Any
 from uuid import uuid4
 
@@ -60,6 +61,14 @@ class EpisodicMemoryFormatError(Exception):
     """Committed episodic Memory has malformed domain content."""
 
 
+class SemanticMemoryReadError(Exception):
+    """A bounded failure to read committed semantic Memory."""
+
+
+class SemanticMemoryFormatError(Exception):
+    """Committed semantic Memory has malformed domain content."""
+
+
 @dataclass(frozen=True, slots=True)
 class CommittedEpisodicMemory:
     """One committed DB1 document and its parsed metadata projection."""
@@ -67,6 +76,15 @@ class CommittedEpisodicMemory:
     document: str
     metadata: dict[str, Any]
     record: EpisodicMemoryRecord
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedSemanticMemory:
+    """One committed DB2 document and its parsed metadata projection."""
+
+    document: str
+    metadata: dict[str, Any]
+    record: SemanticMemoryRecord
 
 
 class DualMemorySystem:
@@ -138,33 +156,47 @@ class DualMemorySystem:
             raise EpisodicMemoryReadError(
                 "Committed episodic Memory is unavailable"
             ) from None
-        ids = result.get("ids") or []
-        documents = result.get("documents") or []
-        metadatas = result.get("metadatas") or []
-        if not ids:
-            if documents or metadatas:
-                raise EpisodicMemoryFormatError(
-                    "Committed episodic Memory is invalid"
-                )
-            return None
         try:
-            if (
-                len(ids) != 1
-                or len(documents) != 1
-                or len(metadatas) != 1
-                or str(ids[0]) != episode_id
-                or not isinstance(documents[0], str)
-            ):
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != episode_id:
                 raise ValueError
-            record = _episodic_record_from_metadata(
-                str(ids[0]), dict(metadatas[0] or {})
-            )
+            metadata = _strict_metadata(metadatas[0])
+            record = _committed_episodic_record(episode_id, documents[0], metadata)
         except Exception:
             raise EpisodicMemoryFormatError(
                 "Committed episodic Memory is invalid"
             ) from None
         return CommittedEpisodicMemory(
-            document=documents[0], metadata=dict(metadatas[0] or {}), record=record
+            document=documents[0], metadata=metadata, record=record
+        )
+
+    def get_committed_semantic(
+        self, semantic_id: str
+    ) -> CommittedSemanticMemory | None:
+        """Read exactly one DB2 document and metadata without repairing it."""
+
+        try:
+            result = self.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+        except Exception:
+            raise SemanticMemoryReadError(
+                "Committed semantic Memory is unavailable"
+            ) from None
+        try:
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != semantic_id:
+                raise ValueError
+            metadata = _strict_metadata(metadatas[0])
+            record = _committed_semantic_record(semantic_id, documents[0], metadata)
+        except Exception:
+            raise SemanticMemoryFormatError(
+                "Committed semantic Memory is invalid"
+            ) from None
+        return CommittedSemanticMemory(
+            document=documents[0], metadata=metadata, record=record
         )
 
     def publish_coordinated_episodic(
@@ -436,6 +468,125 @@ def _semantic_records_from_query(
             ids, documents, metadatas, strict=False
         )
     ]
+
+
+def _strict_get_parts(
+    result: Mapping[str, Any],
+) -> tuple[list[Any], list[Any], list[Any]]:
+    ids = result.get("ids")
+    documents = result.get("documents")
+    metadatas = result.get("metadatas")
+    if (
+        not isinstance(ids, list)
+        or not isinstance(documents, list)
+        or not isinstance(metadatas, list)
+    ):
+        raise ValueError
+    if not ids and not documents and not metadatas:
+        return [], [], []
+    if not (len(ids) == len(documents) == len(metadatas) == 1):
+        raise ValueError
+    return ids, documents, metadatas
+
+
+def _strict_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError
+    return dict(value)
+
+
+def _committed_episodic_record(
+    record_id: str, document: Any, metadata: dict[str, Any]
+) -> EpisodicMemoryRecord:
+    if not isinstance(document, str):
+        raise ValueError
+    required = (
+        "user_input",
+        "response",
+        "loss",
+        "emotion_valence",
+        "emotion_arousal",
+        "record_type",
+        "archived",
+        "created_at",
+        "extra",
+    )
+    if any(key not in metadata for key in required):
+        raise ValueError
+    if not all(
+        isinstance(metadata[key], str)
+        for key in ("user_input", "response", "record_type", "created_at", "extra")
+    ):
+        raise ValueError
+    if not all(
+        type(metadata[key]) in (int, float)
+        for key in ("loss", "emotion_valence", "emotion_arousal")
+    ):
+        raise ValueError
+    if not all(
+        math.isfinite(float(metadata[key]))
+        for key in ("loss", "emotion_valence", "emotion_arousal")
+    ):
+        raise ValueError
+    if type(metadata["archived"]) is not bool:
+        raise ValueError
+    if metadata["record_type"] not in (
+        MemoryRecordType.EPISODIC_LOG.value,
+        MemoryRecordType.THOUGHT_LOG.value,
+        MemoryRecordType.EXTRACTED_FACT.value,
+        MemoryRecordType.EVALUATION_LOG.value,
+    ):
+        raise ValueError
+    if (
+        canonical_episodic_document(metadata["user_input"], metadata["response"])
+        != document
+    ):
+        raise ValueError
+    extra = json.loads(metadata["extra"])
+    if not isinstance(extra, dict):
+        raise ValueError
+    return EpisodicMemoryRecord(
+        id=record_id,
+        user_input=metadata["user_input"],
+        response=metadata["response"],
+        loss=float(metadata["loss"]),
+        emotion_valence=float(metadata["emotion_valence"]),
+        emotion_arousal=float(metadata["emotion_arousal"]),
+        record_type=MemoryRecordType(metadata["record_type"]),
+        archived=metadata["archived"],
+        created_at=metadata["created_at"],
+        metadata=extra,
+    )
+
+
+def _committed_semantic_record(
+    record_id: str, document: Any, metadata: dict[str, Any]
+) -> SemanticMemoryRecord:
+    required = ("text", "source_episode_ids", "record_type", "created_at", "extra")
+    if any(key not in metadata for key in required) or not isinstance(document, str):
+        raise ValueError
+    if not all(isinstance(metadata[key], str) for key in required):
+        raise ValueError
+    if metadata["record_type"] != MemoryRecordType.SEMANTIC_MEMORY.value:
+        raise ValueError
+    if metadata["text"] != document:
+        raise ValueError
+    source_episode_ids = json.loads(metadata["source_episode_ids"])
+    extra = json.loads(metadata["extra"])
+    if (
+        not isinstance(source_episode_ids, list)
+        or not all(isinstance(item, str) for item in source_episode_ids)
+        or not isinstance(extra, dict)
+    ):
+        raise ValueError
+    return SemanticMemoryRecord(
+        id=record_id,
+        text=metadata["text"],
+        source_episode_ids=source_episode_ids,
+        record_type=MemoryRecordType.SEMANTIC_MEMORY,
+        created_at=metadata["created_at"],
+        metadata=extra,
+    )
 
 
 def _episodic_records_from_get(
