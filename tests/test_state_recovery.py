@@ -13,8 +13,15 @@ from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshot,
+    AgentStateSnapshotV1,
     AgentStateStore,
     EmotionStateSnapshot,
+    WorkingMemoryItemSnapshot,
+    WorkingMemorySnapshot,
+)
+from kagya.runtime.working_memory import (
+    WorkingMemorySourceKind,
+    working_memory_item_id,
 )
 from kagya.runtime.event_journal import (
     EventFailureCategory,
@@ -51,6 +58,47 @@ def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshot:
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
             valence=value, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+    )
+
+
+def v1_snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV1:
+    return AgentStateSnapshotV1(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=value, arousal=0.2, optimal_loss=1.0
+        ),
+    )
+
+
+def snapshot_with_working_memory(
+    sequence: int, value: float = 0.1
+) -> AgentStateSnapshot:
+    source_id = f"episode-state-{sequence}"
+    return AgentStateSnapshot(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=value, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(
+            revision=7,
+            items=(
+                WorkingMemoryItemSnapshot(
+                    item_id=working_memory_item_id(
+                        WorkingMemorySourceKind.EPISODIC, source_id
+                    ),
+                    source_kind="episodic",
+                    source_id=source_id,
+                    activation=0.7,
+                    salience=0.8,
+                    retention_reason="reactivated",
+                    created_revision=2,
+                    last_activated_revision=7,
+                ),
+            ),
         ),
     )
 
@@ -706,6 +754,104 @@ def test_exact_current_reconstructs_missing_canonical_snapshot(tmp_path: Path) -
     assert store.load() == candidate
 
 
+def test_v2_wal_candidate_is_exactly_reconstructible_at_save_crash_boundary(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot_with_working_memory(1, 0.6)
+    item = event("v2-save-crash-reconstruction", 1)
+    start_event(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=UUID(item.event_id),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+
+    assert wal.reconstruct(sequence=1) == candidate
+    restarted = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert restarted.snapshot == candidate
+    assert restarted.processing_high_water == 1
+    assert wal.reconstruct(sequence=1) == candidate
+
+
+def test_first_normal_internal_commit_bridges_v1_to_v2_without_migration(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    prior = v1_snapshot(0, 0.2)
+    candidate = snapshot(1, 0.8)
+    store.save(prior)
+    prior_bytes = store.path.read_bytes()
+    prior_hash = store.snapshot_hash(prior)
+    journal.verify_and_reconcile(0, prior_hash)
+    wal.bootstrap(prior, 0)
+    started = recovery.prepare_startup()
+    assert started.snapshot == prior
+    assert store.path.read_bytes() == prior_bytes
+    item = event("first-v2-internal-commit", 1)
+    start_event(journal, item)
+
+    evidence = recovery.commit_internal_candidate(item, prior, candidate)
+    recovery.complete_committed_event(item, evidence)
+
+    records = wal.inspect().records
+    assert len(records) == 2
+    assert isinstance(records[0].baseline_snapshot, AgentStateSnapshotV1)
+    assert records[1].prior_snapshot_hash == prior_hash
+    assert records[1].candidate_snapshot == candidate
+    assert evidence.processing_sequence == 1
+    assert wal.reconstruct(sequence=1) == candidate
+    assert store.load() == candidate
+    assert journal.inspect().snapshot_hash == store.snapshot_hash(candidate)
+
+
+def test_startup_preserves_valid_noncanonical_v1_snapshot_bytes(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    prior = v1_snapshot(0, 0.2)
+    prior_hash = store.snapshot_hash(prior)
+    noncanonical = json.dumps(
+        prior.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    store.path.write_bytes(noncanonical)
+    journal.verify_and_reconcile(0, prior_hash)
+    wal.bootstrap(prior, 0)
+
+    started = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert started.snapshot == prior
+    assert started.snapshot_hash == prior_hash
+    assert store.path.read_bytes() == noncanonical
+
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    with generation.open("ab") as output:
+        output.write(b"corrupt-tail\n")
+
+    repaired = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert repaired.snapshot == prior
+    assert repaired.exact_current_reconstructed
+    assert store.path.read_bytes() == noncanonical
+
+
 def test_uncommitted_wal_tail_is_recovered_into_new_generation(tmp_path: Path) -> None:
     recovery, store, journal, wal = coordinator(tmp_path)
     initial = recovery.prepare_startup().snapshot
@@ -1231,8 +1377,14 @@ def test_missing_current_uses_journal_bound_wal_prefix_before_boot_anchor(
 def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
     tmp_path: Path,
 ) -> None:
-    recovery, store, journal, wal = coordinator(tmp_path)
+    store, journal, wal = graph(tmp_path)
+    target = snapshot_with_working_memory(0, 0.25)
+    store.save(target)
+    journal.verify_and_reconcile(0, store.snapshot_hash(target))
+    wal.bootstrap(target, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
     bootable = recovery.prepare_startup()
+    assert bootable.snapshot == target
     recovery.publish_boot_anchor(bootable)
     item = event("tampered-current-prefix", 1)
     candidate = snapshot(1, 0.4)
@@ -1255,6 +1407,9 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
     rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert rolled_back.snapshot == bootable.snapshot
+    assert rolled_back.snapshot == target
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshot)
+    assert rolled_back.snapshot.working_memory == target.working_memory
     assert rolled_back.processing_high_water == 1
     assert rolled_back.true_rollback_performed
     assert rolled_back.external_reconciliation_required
@@ -1263,6 +1418,45 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
         != corrupt_manifest.active_generation_id
     )
     assert generation.read_bytes() == corrupt_bytes
+
+
+def test_true_rollback_to_retained_v1_preserves_high_water_and_legacy_state(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    target = v1_snapshot(0, 0.25)
+    target_bytes = store.canonical_bytes(target)
+    store.save(target)
+    journal.verify_and_reconcile(0, store.snapshot_hash(target))
+    wal.bootstrap(target, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    assert bootable.snapshot == target
+    assert store.path.read_bytes() == target_bytes
+    recovery.publish_boot_anchor(bootable)
+    item = event("v1-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, target, snapshot(1, 0.4))
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == target
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV1)
+    assert rolled_back.processing_high_water == 1
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.external_reconciliation_required
 
 
 def test_corrupt_before_journal_bound_record_fails_closed_when_anchor_is_invalid(

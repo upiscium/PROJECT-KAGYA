@@ -16,8 +16,8 @@ from kagya.runtime import (
     AgentEvent,
     AgentRuntime,
     AgentRuntimeStatus,
-    AgentStateSnapshot,
     AgentStateStore,
+    CompatibleAgentStateSnapshot,
     EventJournal,
     EventJournalError,
     EventJournalLease,
@@ -28,6 +28,7 @@ from kagya.runtime import (
     StateRecoveryResult,
     StateWAL,
     TransactionCoordinator,
+    WorkingMemory,
 )
 from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
@@ -131,11 +132,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.adapter_registry = getattr(
                 app.state, "adapter_registry", None
             ) or AdapterRegistry(app_settings)
+            injected_working_memory = getattr(app.state, "working_memory", None)
+            app.state.working_memory = (
+                injected_working_memory
+                if injected_working_memory is not None
+                else WorkingMemory(
+                    item_capacity=app_settings.working_memory.item_capacity,
+                    projection_max_bytes=app_settings.working_memory.projection_max_bytes,
+                )
+            )
             app.state.main_loop = getattr(
                 app.state, "main_loop", None
             ) or KagyaMainLoop(
-                app_settings, app.state.model_provider, app.state.memory_system
+                app_settings,
+                app.state.model_provider,
+                app.state.memory_system,
+                working_memory=app.state.working_memory,
             )
+            app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
             app.state.sleep_cycle_manager = getattr(
                 app.state, "sleep_cycle_manager", None
@@ -152,7 +166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if journal is not None:
                 journal.close()
             raise
-        committed_snapshot: AgentStateSnapshot = snapshot
+        committed_snapshot: CompatibleAgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
         app.state.transaction_coordinator = TransactionCoordinator(
             app.state.event_journal,

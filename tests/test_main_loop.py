@@ -7,6 +7,8 @@ from kagya.runtime import (
     CoordinatedResult,
     KagyaMainLoop,
     TransactionBoundValue,
+    WorkingMemory,
+    WorkingMemorySourceKind,
 )
 
 
@@ -45,6 +47,55 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     assert not hasattr(result, "hidden_thought")
     assert not hasattr(result, "prompt")
     assert not hasattr(result, "memory_context")
+
+
+def test_main_loop_passively_owns_configured_or_injected_working_memory(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkingDummyProvider()
+    configured = KagyaMainLoop(settings, provider, DualMemorySystem(settings))
+    injected = WorkingMemory(item_capacity=1, projection_max_bytes=7)
+    explicit = KagyaMainLoop(
+        settings, provider, DualMemorySystem(settings), working_memory=injected
+    )
+
+    assert (
+        configured.working_memory.item_capacity
+        == settings.working_memory.item_capacity
+    )
+    assert (
+        configured.working_memory.projection_max_bytes
+        == settings.working_memory.projection_max_bytes
+    )
+    assert explicit.working_memory is injected
+
+
+def test_ordinary_and_debug_chat_leave_working_memory_untouched(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    working_memory = WorkingMemory(item_capacity=2, projection_max_bytes=20)
+    working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC,
+        "episode-passive",
+        0.8,
+        0.8,
+    )
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        working_memory=working_memory,
+    )
+    before = (working_memory.revision, working_memory.items)
+
+    ordinary = _materialize(loop.chat("ordinary"))
+    debug_result, trace = _materialize(loop.chat_debug("debug"))
+
+    assert ordinary.response == debug_result.response == "Visible runtime answer."
+    assert "User: debug\nAssistant:" in trace.prompt
+    assert (working_memory.revision, working_memory.items) == before
 
 
 def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) -> None:

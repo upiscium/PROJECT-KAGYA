@@ -22,6 +22,7 @@ from kagya.runtime.transaction_coordinator import (
     TransactionBoundValue,
     TransactionParticipant,
 )
+from kagya.runtime.working_memory import WorkingMemory
 
 if TYPE_CHECKING:
     from kagya.memory.episodic_participant import MemoryEpisodicParticipant
@@ -72,6 +73,7 @@ class KagyaMainLoop:
         memory_system: DualMemorySystem,
         *,
         session_state: SessionState | None = None,
+        working_memory: WorkingMemory | None = None,
         emotion_engine: EmotionEngineAllostasis | None = None,
         prompt_builder: PromptBuilder | None = None,
         agent: ConsciousAgent | None = None,
@@ -82,6 +84,14 @@ class KagyaMainLoop:
         self.provider = provider
         self.memory_system = memory_system
         self.session_state = session_state or SessionState()
+        self.working_memory = (
+            working_memory
+            if working_memory is not None
+            else WorkingMemory(
+                item_capacity=settings.working_memory.item_capacity,
+                projection_max_bytes=settings.working_memory.projection_max_bytes,
+            )
+        )
         self.surprisal_calculator = SurprisalCalculator(provider)
         self.emotion_engine = emotion_engine or EmotionEngineAllostasis(
             EmotionState(optimal_loss=settings.emotion.baseline_surprisal),
