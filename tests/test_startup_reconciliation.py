@@ -13,11 +13,16 @@ from kagya.memory.episodic_participant import (
     EpisodicWrite,
     MemoryEpisodicParticipant,
 )
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from kagya.models import ModelProvider
+from kagya.persona.prompt_builder import PromptBuilder
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
     AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
+    WorkingMemoryItemSnapshot,
+    WorkingMemorySnapshot,
 )
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -37,6 +42,11 @@ from kagya.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBinding,
     TransactionCoordinator,
+)
+from kagya.runtime.working_memory import (
+    WorkingMemory,
+    WorkingMemorySourceKind,
+    working_memory_item_id,
 )
 
 
@@ -77,6 +87,33 @@ def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
         emotion_state=EmotionStateSnapshot(
             valence=valence, arousal=0.2, optimal_loss=1.0
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+    )
+
+
+def _snapshot_with_working_memory(
+    sequence: int, references: tuple[tuple[str, str], ...], revision: int
+) -> AgentStateSnapshot:
+    items = tuple(
+        WorkingMemoryItemSnapshot(
+            item_id=working_memory_item_id(WorkingMemorySourceKind(kind), source_id),
+            source_kind=kind,
+            source_id=source_id,
+            activation=0.7 - index * 0.1,
+            salience=0.8 - index * 0.1,
+            retention_reason="recent",
+            created_revision=index + 1,
+            last_activated_revision=index + 1,
+        )
+        for index, (kind, source_id) in enumerate(references)
+    )
+    return AgentStateSnapshot(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.4, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=revision, items=items),
     )
 
 
@@ -535,6 +572,151 @@ def test_gate_reconciliation_is_idempotent_after_clear(tmp_path: Path) -> None:
 
     assert second.recovery == first.recovery
     assert journal.path.read_bytes() == before
+
+
+def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, store, journal, wal, recovery = _graph(tmp_path)
+    boot = recovery.prepare_startup()
+    recovery.publish_boot_anchor(boot)
+    semantic_ids = (
+        memory.save_semantic("semantic B"),
+        memory.save_semantic("semantic D"),
+    )
+
+    initial = store.load()
+    older = _snapshot_with_working_memory(
+        1, (("episodic", "memory-a"), ("semantic", semantic_ids[0])), 2
+    )
+    newer = _snapshot_with_working_memory(
+        2, (("episodic", "memory-c"), ("semantic", semantic_ids[1])), 4
+    )
+    first = _event("startup-u5-older-working-memory", 1)
+    first_participant = _participant(memory, "record C")
+    first_coordinator = _prepared_transaction(journal, first, first_participant)
+    first_transaction_id = next(
+        item.transaction_id
+        for item in journal.inspect().open_transactions
+        if item.event_id == first.event_id
+    )
+    first_evidence = recovery.commit_internal_candidate(first, initial, older)
+    first_coordinator.finalize_event(first, first_evidence)
+    recovery.complete_committed_event(first, first_evidence)
+    older_state_bytes = store.path.read_bytes()
+    anchored_older = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    recovery.publish_boot_anchor(anchored_older)
+
+    second = _event("startup-u5-newer-working-memory", 2)
+    second_participant = _participant(memory, "record D")
+    second_coordinator = _prepared_transaction(journal, second, second_participant)
+    second_transaction_id = next(
+        item.transaction_id
+        for item in journal.inspect().open_transactions
+        if item.event_id == second.event_id
+    )
+    second_evidence = recovery.commit_internal_candidate(second, older, newer)
+    second_coordinator.finalize_event(second, second_evidence)
+    recovery.complete_committed_event(second, second_evidence)
+    committed_ids = (
+        first_participant.episode_id(first_transaction_id),
+        second_participant.episode_id(second_transaction_id),
+    )
+    episodic_before = memory.db1.get(
+        ids=list(committed_ids), include=["documents", "metadatas"]
+    )
+    records_before = tuple(
+        memory.get_committed_episodic(episode_id) for episode_id in committed_ids
+    )
+    semantic_before = tuple(
+        memory.get_committed_semantic(semantic_id) for semantic_id in semantic_ids
+    )
+
+    replay_calls = {
+        "retrieve": 0,
+        "select": 0,
+        "resolve": 0,
+        "prompt": 0,
+        "model": 0,
+    }
+
+    def no_retrieve(*_args: object, **_kwargs: object) -> object:
+        replay_calls["retrieve"] += 1
+        pytest.fail("startup reconstruction retrieved memory")
+
+    def no_select(*_args: object, **_kwargs: object) -> object:
+        replay_calls["select"] += 1
+        pytest.fail("startup reconstruction selected Working Memory")
+
+    def no_resolve(*_args: object, **_kwargs: object) -> object:
+        replay_calls["resolve"] += 1
+        pytest.fail("startup reconstruction resolved Working Memory")
+
+    def no_prompt(*_args: object, **_kwargs: object) -> object:
+        replay_calls["prompt"] += 1
+        pytest.fail("startup reconstruction built a prompt")
+
+    def no_model(*_args: object, **_kwargs: object) -> object:
+        replay_calls["model"] += 1
+        pytest.fail("startup reconstruction called the model")
+
+    monkeypatch.setattr(memory, "retrieve_context", no_retrieve)
+    monkeypatch.setattr(WorkingMemory, "select", no_select)
+    monkeypatch.setattr(MemoryWorkingMemoryResolver, "resolve", no_resolve)
+    monkeypatch.setattr(PromptBuilder, "build", no_prompt)
+    monkeypatch.setattr(ModelProvider, "generate", no_model)
+
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[-1])
+    transition["record_hash"] = "0" * 64
+    lines[-1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.snapshot == older
+    assert rolled_back.processing_high_water == 2
+    assert rolled_back.external_reconciliation_required
+    assert store.path.read_bytes() == older_state_bytes
+
+    result = StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).reconcile_recovery_gate(rolled_back)
+    assert result.participants_consistent
+    assert not result.recovery.external_reconciliation_required
+    assert result.recovery.snapshot == older
+    assert result.recovery.processing_high_water == 2
+    assert journal.inspect().processing_high_water == 2
+    assert _event("startup-u5-next-sequence", 3).processing_sequence > 2
+
+    assert memory.db1.get(
+        ids=list(committed_ids), include=["documents", "metadatas"]
+    ) == episodic_before
+    assert tuple(
+        memory.get_committed_episodic(episode_id) for episode_id in committed_ids
+    ) == records_before
+    assert tuple(
+        memory.get_committed_semantic(semantic_id) for semantic_id in semantic_ids
+    ) == semantic_before
+    inspection = journal.inspect()
+    assert not inspection.open_startup_reconciliations
+    assert inspection.terminal_gate_clear is not None
+    assert not wal.inspect().active_manifest.external_reconciliation_required
+    assert {
+        item.participant_id for item in inspection.baselines[0].participant_registry
+    } == {"memory.episodic", "session.turn"}
+    assert "working_memory" not in journal.path.read_text()
+    assert replay_calls == {
+        "retrieve": 0,
+        "select": 0,
+        "resolve": 0,
+        "prompt": 0,
+        "model": 0,
+    }
 
 
 def test_gate_clear_resumes_after_wal_cas_before_journal_terminal(

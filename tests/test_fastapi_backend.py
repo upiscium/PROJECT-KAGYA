@@ -14,9 +14,11 @@ from kagya.api.server import create_app
 from kagya.body import EmotionState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem
+from kagya.memory import DualMemorySystem, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
+from kagya.persona import PromptBuilder
 from kagya.runtime import (
     AbortOutcome,
     AgentEvent,
@@ -33,6 +35,9 @@ from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
+    WorkingMemorySnapshot,
+    WorkingMemoryResolution,
+    WorkingMemoryResolutionStatus,
     EventFailureCategory,
     EventJournal,
     EventJournalAppendError,
@@ -44,6 +49,9 @@ from kagya.runtime import (
     StateWALError,
     SessionTurnParticipant,
     TransactionBinding,
+    WorkingMemoryDecisionReason,
+    WorkingMemory,
+    WorkingMemorySourceKind,
 )
 
 
@@ -567,6 +575,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
                 arousal=0.5,
                 optimal_loss=0.6,
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     )
     app = create_app(settings)
@@ -651,6 +660,7 @@ def test_restored_sequence_continues_and_success_checkpoints_chat(
                 arousal=0.2,
                 optimal_loss=0.9,
             ),
+            working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     )
 
@@ -767,10 +777,20 @@ def test_successful_chat_is_reconstructable_without_private_payloads(
 
 
 def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
+        client.app.state.memory_system.save_semantic("rollback WM seed")
+        assert (
+            client.post(
+                "/api/chat", json={"message": "rollback WM seed", "attachments": []}
+            ).status_code
+            == 200
+        )
+
+    with _client(tmp_path, settings=settings) as client:
+        assert client.app.state.main_loop.working_memory.items
         assert (
             client.post(
                 "/api/chat", json={"message": "advance", "attachments": []}
@@ -783,12 +803,21 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
         generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
 
     lines = generation.read_bytes().splitlines(keepends=True)
-    transition = json.loads(lines[1])
+    transition = json.loads(lines[-1])
     transition["record_hash"] = "0" * 64
-    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    lines[-1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
     generation.write_bytes(b"".join(lines))
     generation.chmod(0o600)
     settings.agent_state.path.unlink()
+
+    def no_startup_replay(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("true-rollback startup replayed Working Memory computation")
+
+    monkeypatch.setattr(DualMemorySystem, "retrieve_context", no_startup_replay)
+    monkeypatch.setattr(WorkingMemory, "select", no_startup_replay)
+    monkeypatch.setattr(MemoryWorkingMemoryResolver, "resolve", no_startup_replay)
+    monkeypatch.setattr(PromptBuilder, "build", no_startup_replay)
+    monkeypatch.setattr(ThinkingProvider, "generate", no_startup_replay)
 
     runtime = RecordingRuntime()
     with _client(tmp_path, settings=settings, runtime=runtime) as reconciled:
@@ -807,6 +836,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
             "status": "ok",
             "project": settings.project.name,
         }
+        monkeypatch.undo()
         response = reconciled.post(
             "/api/chat", json={"message": "accepted", "attachments": []}
         )
@@ -1066,7 +1096,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 1
+        == 2
     )
 
 
@@ -1085,6 +1115,7 @@ def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
             arousal=0.3,
             optimal_loss=0.8,
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
     )
     store.save(snapshot)
     snapshot_bytes = settings.agent_state.path.read_bytes()
@@ -1126,16 +1157,20 @@ def test_snapshot_does_not_shadow_memory_or_adapter_registry(tmp_path: Path) -> 
     assert settings.memory.persist_directory.exists()
 
 
+@pytest.mark.parametrize(
+    "save_stage",
+    [AgentStateSaveStage.TEMP_WRITE, AgentStateSaveStage.ATOMIC_REPLACE],
+)
 def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
-    tmp_path: Path,
+    tmp_path: Path, save_stage: AgentStateSaveStage
 ) -> None:
     settings = _settings(tmp_path)
 
     class FailingStore(AgentStateStore):
         def save(self, snapshot: AgentStateSnapshot) -> None:
-            if snapshot.last_processed_event_sequence > 0:
+            if snapshot.last_processed_event_sequence > 1:
                 raise AgentStateSaveError(
-                    AgentStateSaveStage.TEMP_WRITE,
+                    save_stage,
                     published=False,
                 )
             super().save(snapshot)
@@ -1150,6 +1185,17 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
     )
 
     with TestClient(app) as client:
+        client.app.state.memory_system.save_semantic("U5 durable WM seed")
+        assert client.post(
+            "/api/chat", json={"message": "U5 durable WM seed", "attachments": []}
+        ).status_code == 200
+        prior = client.app.state.agent_state_store.load()
+        prior_wm = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+        prior_bytes = settings.agent_state.path.read_bytes()
+        prior_hash = client.app.state.agent_state_store.snapshot_hash(prior)
         response = client.post(
             "/api/chat",
             json={"message": "visible request", "attachments": [], "debug": False},
@@ -1161,11 +1207,30 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
         assert PRIVATE_SENTINEL not in response.text
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
         assert (
-            client.app.state.agent_state_store.load().last_processed_event_sequence == 0
+            client.app.state.agent_state_store.load().last_processed_event_sequence == 1
         )
-        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
-        assert client.app.state.main_loop.session_state.turns == []
-        assert client.app.state.memory_system.db1.get()["ids"] == []
+        assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 2
+        assert len(client.app.state.main_loop.session_state.turns) == 1
+        assert len(client.app.state.memory_system.db1.get()["ids"]) == 1
+        candidate_wm = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+        assert candidate_wm != prior_wm
+        wal_candidate = client.app.state.state_wal.reconstruct(sequence=2)
+        assert wal_candidate.working_memory.revision == candidate_wm[0]
+        assert tuple(
+            (item.item_id, item.source_kind, item.source_id)
+            for item in wal_candidate.working_memory.items
+        ) == tuple(
+            (item.item_id, item.source_kind.value, item.source_id)
+            for item in candidate_wm[1]
+        )
+        assert client.app.state.agent_state_store.load() == prior
+        assert settings.agent_state.path.read_bytes() == prior_bytes
+        assert (
+            client.app.state.state_wal.inspect().latest_snapshot_hash != prior_hash
+        )
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         assert transaction.terminal_lifecycle is None
         pending_path = (
@@ -1189,9 +1254,16 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
         assert inspection.aborted_transactions
         assert not pending_path.exists()
         assert recovered.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
-        assert recovered.app.state.state_wal.inspect().latest_snapshot_sequence == 0
+        assert recovered.app.state.state_wal.inspect().latest_snapshot_sequence == 1
         assert recovered.app.state.main_loop.session_state.turns == []
-        assert recovered.app.state.memory_system.db1.get()["ids"] == []
+        assert len(recovered.app.state.memory_system.db1.get()["ids"]) == 1
+        assert (
+            recovered.app.state.main_loop.working_memory.revision,
+            recovered.app.state.main_loop.working_memory.items,
+        ) == prior_wm
+        assert recovered.app.state.agent_state_store.snapshot_hash(
+            recovered.app.state.agent_state_store.load()
+        ) == prior_hash
 
 
 def test_wal_failure_after_prepared_prevents_snapshot_publish_and_fail_stops(
@@ -1443,6 +1515,13 @@ def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit
         }
         assert client.app.state.agent_state_store.load().last_processed_event_sequence == 1
         assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
+        candidate = client.app.state.agent_state_store.load()
+        candidate_wm = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+        candidate_hash = client.app.state.agent_state_store.snapshot_hash(candidate)
+        episode_count = len(client.app.state.memory_system.db1.get()["ids"])
         assert client.app.state.main_loop.session_state.turns == []
         assert len(client.app.state.memory_system.db1.get()["ids"]) == 1
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
@@ -1455,6 +1534,20 @@ def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit
             record.lifecycle is EventLifecycle.COMPLETED
             for record in client.app.state.event_journal.records
         )
+
+    with _client(tmp_path, settings=settings) as reconciled:
+        restored = reconciled.app.state.agent_state_store.load()
+        assert restored == candidate
+        assert (
+            reconciled.app.state.agent_state_store.snapshot_hash(restored)
+            == candidate_hash
+        )
+        assert (
+            reconciled.app.state.main_loop.working_memory.revision,
+            reconciled.app.state.main_loop.working_memory.items,
+        ) == candidate_wm
+        assert len(reconciled.app.state.memory_system.db1.get()["ids"]) == episode_count
+        assert not reconciled.app.state.event_journal.inspect().open_transactions
 
 
 def test_finalization_failure_preserves_internal_commit_without_restore(
@@ -1541,8 +1634,14 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
         )
         assert response.status_code == 500
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        candidate = client.app.state.agent_state_store.load()
+        candidate_wm = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+        candidate_hash = client.app.state.agent_state_store.snapshot_hash(candidate)
         assert (
-            client.app.state.agent_state_store.load().last_processed_event_sequence == 1
+            candidate.last_processed_event_sequence == 1
         )
         assert client.app.state.state_wal.inspect().latest_snapshot_sequence == 1
         assert client.app.state.event_journal.records[-1].lifecycle is (
@@ -1554,6 +1653,16 @@ def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> 
             restarted.app.state.agent_state_store.load().last_processed_event_sequence
             == 1
         )
+        restored = restarted.app.state.agent_state_store.load()
+        assert (
+            restarted.app.state.main_loop.working_memory.revision,
+            restarted.app.state.main_loop.working_memory.items,
+        ) == candidate_wm
+        assert (
+            restarted.app.state.agent_state_store.snapshot_hash(restored)
+            == candidate_hash
+        )
+        assert restarted.app.state.event_journal.inspect().processing_high_water == 1
         assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
         records = restarted.app.state.event_journal.records
         assert records[-2].lifecycle is EventLifecycle.RECOVERY_CLASSIFIED
@@ -1598,6 +1707,254 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
 
         assert not load_called
         assert settings.agent_state.path.read_bytes() == original
+
+
+def test_chat_commits_post_chat_working_memory_in_agent_state_v2(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    resolved_body = "U4-RESOLVED-BODY-SENTINEL"
+
+    with _client(tmp_path, settings=settings) as client:
+        semantic_id = client.app.state.memory_system.save_semantic(resolved_body)
+        response = client.post(
+            "/api/chat",
+            json={"message": resolved_body, "attachments": [], "debug": False},
+        )
+
+        assert response.status_code == 200
+        assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
+        snapshot = client.app.state.agent_state_store.load()
+        authoritative_items = client.app.state.main_loop.working_memory.items
+        assert snapshot.schema_version == 2
+        assert snapshot.working_memory.revision == (
+            client.app.state.main_loop.working_memory.revision
+        )
+        assert len(snapshot.working_memory.items) == len(authoritative_items) == 1
+        assert snapshot.working_memory.items[0].source_kind == (
+            WorkingMemorySourceKind.SEMANTIC.value
+        )
+        assert snapshot.working_memory.items[0].source_id == semantic_id
+        assert snapshot.working_memory.items[0].item_id == authoritative_items[0].item_id
+        assert snapshot.working_memory.items[0].activation == authoritative_items[0].activation
+        assert snapshot.working_memory.items[0].salience == authoritative_items[0].salience
+        assert snapshot.working_memory.items[0].created_revision == (
+            authoritative_items[0].created_revision
+        )
+        assert snapshot.working_memory.items[0].last_activated_revision == (
+            authoritative_items[0].last_activated_revision
+        )
+        assert resolved_body not in response.text
+        assert "working_memory" not in response.text
+        assert "debug" not in response.text
+
+        durable = (
+            settings.agent_state.path.read_bytes()
+            + settings.event_journal.path.read_bytes()
+            + b"".join(
+                path.read_bytes()
+                for path in settings.state_wal.directory.rglob("*")
+                if path.is_file()
+            )
+        )
+        assert resolved_body.encode() not in durable
+
+
+def test_debug_projection_can_use_resolved_body_without_durable_leak(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    resolved_body = "U4-DEBUG-RESOLVED-BODY-SENTINEL"
+
+    with _client(tmp_path, settings=settings) as client:
+        client.app.state.memory_system.save_semantic(resolved_body)
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": resolved_body, "attachments": [], "debug": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert resolved_body in data["prompt"]
+        assert resolved_body in str(data["retrieved_memory"])
+        durable = (
+            settings.agent_state.path.read_bytes()
+            + settings.event_journal.path.read_bytes()
+            + b"".join(
+                path.read_bytes()
+                for path in settings.state_wal.directory.rglob("*")
+                if path.is_file()
+            )
+        )
+        assert resolved_body.encode() not in durable
+        assert resolved_body.encode() not in settings.agent_state.path.read_bytes()
+
+
+def test_handler_failure_restores_prior_canonical_working_memory(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.app.state.memory_system.save_semantic("U4 failure checkpoint marker")
+        first = client.post(
+            "/api/chat",
+            json={"message": "U4 failure checkpoint marker", "attachments": []},
+        )
+        assert first.status_code == 200
+        prior = client.app.state.agent_state_store.load()
+        prior_working_memory = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+        prior_canonical = client.app.state.agent_state_store.canonical_bytes(prior)
+        prior_hash = client.app.state.agent_state_store.snapshot_hash(prior)
+
+        failing = FailOnceAfterEmotionProvider()
+        client.app.state.main_loop.agent.provider = failing
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat",
+                json={"message": "U4 failure checkpoint marker", "attachments": []},
+            )
+
+        assert (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        ) == prior_working_memory
+        assert client.app.state.agent_state_store.load() == prior
+        assert client.app.state.agent_state_store.canonical_bytes(
+            client.app.state.agent_state_store.load()
+        ) == prior_canonical
+        assert client.app.state.agent_state_store.snapshot_hash(
+            client.app.state.agent_state_store.load()
+        ) == prior_hash
+        failed = client.app.state.event_journal.records[-1]
+        assert failed.lifecycle is EventLifecycle.FAILED
+        assert failed.failure_category is EventFailureCategory.HANDLER_FAILURE
+        assert failed.snapshot_hash == prior_hash
+        assert sum(
+            record.lifecycle is EventLifecycle.FAILED
+            for record in client.app.state.event_journal.records
+        ) == 1
+        durable = b"".join(
+            path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        )
+        assert PRIVATE_SENTINEL.encode() not in durable
+
+
+def test_finalized_episode_is_retrieved_and_admitted_on_later_turn(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post(
+            "/api/chat",
+            json={"message": "U4 later-turn retrieval marker", "attachments": []},
+        )
+        assert first.status_code == 200
+        episode_id = first.json()["episode_id"]
+        assert client.app.state.memory_system.get_episodic_record(episode_id) is not None
+
+        second = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={
+                "message": "U4 later-turn retrieval marker",
+                "attachments": [],
+                "debug": True,
+            },
+        )
+        assert second.status_code == 200
+        assert episode_id in str(second.json()["retrieved_memory"])
+        assert (
+            "User: U4 later-turn retrieval marker\nAssistant: "
+            "Visible API answer."
+        ) in second.json()["prompt"]
+        assert any(
+            item.source_kind is WorkingMemorySourceKind.EPISODIC
+            and item.source_id == episode_id
+            for item in client.app.state.main_loop.working_memory.items
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkingMemoryResolutionStatus.MISSING,
+        WorkingMemoryResolutionStatus.ARCHIVED,
+        WorkingMemoryResolutionStatus.UNAVAILABLE,
+    ],
+)
+def test_startup_does_not_resolve_noneligible_working_memory_refs(
+    tmp_path: Path,
+    status: WorkingMemoryResolutionStatus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    marker = f"U5-{status.value}-working-memory-ref"
+    with _client(tmp_path, settings=settings) as first:
+        source_id = first.app.state.memory_system.save_semantic(marker)
+        assert first.post(
+            "/api/chat", json={"message": marker, "attachments": []}
+        ).status_code == 200
+        assert any(
+            item.source_id == source_id
+            for item in first.app.state.main_loop.working_memory.items
+        )
+
+    original_resolve = MemoryWorkingMemoryResolver.resolve
+    startup_calls = 0
+
+    def fail_if_startup_resolves(
+        resolver: MemoryWorkingMemoryResolver, item: object
+    ) -> NoReturn:
+        nonlocal startup_calls
+        startup_calls += 1
+        raise AssertionError("startup resolved a Working Memory reference")
+
+    monkeypatch.setattr(
+        MemoryWorkingMemoryResolver, "resolve", fail_if_startup_resolves
+    )
+    with _client(tmp_path, settings=settings) as restarted:
+        assert startup_calls == 0
+        resolver = restarted.app.state.main_loop.working_memory_resolver
+        resolver.resolve = (  # type: ignore[method-assign]
+            lambda _item: WorkingMemoryResolution(status)
+        )
+        monkeypatch.setattr(
+            restarted.app.state.memory_system,
+            "retrieve_context",
+            lambda _query: MemoryContext(),
+        )
+        expected_reason = {
+            WorkingMemoryResolutionStatus.MISSING: (
+                WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
+            ),
+            WorkingMemoryResolutionStatus.ARCHIVED: (
+                WorkingMemoryDecisionReason.SOURCE_ARCHIVED
+            ),
+            WorkingMemoryResolutionStatus.UNAVAILABLE: (
+                WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE
+            ),
+        }[status]
+        view = restarted.app.state.main_loop.working_memory.select(resolver)
+        assert view.decisions[0].reason is expected_reason
+        response = restarted.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "later decision", "attachments": [], "debug": True},
+        )
+        assert response.status_code == 200
+        assert marker not in response.json()["prompt"]
+        assert marker not in str(response.json()["retrieved_memory"])
+        assert all(
+            item.source_id == source_id
+            for item in restarted.app.state.main_loop.working_memory.items
+        )
+        resolver.resolve = original_resolve.__get__(resolver, type(resolver))
 
 
 def _client(

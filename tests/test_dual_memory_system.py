@@ -6,7 +6,12 @@ import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.dual_memory_system import EpisodicMemoryFormatError
+from kagya.memory.dual_memory_system import (
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+    SemanticMemoryFormatError,
+    SemanticMemoryReadError,
+)
 from kagya.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     EpisodicWrite,
@@ -100,9 +105,7 @@ def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> N
     )
 
     reopened = DualMemorySystem(settings)
-    stored = reopened.db1.get(
-        ids=[legacy_id], include=["documents", "metadatas"]
-    )
+    stored = reopened.db1.get(ids=[legacy_id], include=["documents", "metadatas"])
 
     assert stored["documents"] == ["User: legacy user\nAssistant: visible answer"]
     assert "hidden_thought" not in stored["metadatas"][0]
@@ -118,6 +121,190 @@ def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
 
     assert [record.id for record in context.db2_results] == [semantic_id]
     assert context.db2_results[0].record_type == MemoryRecordType.SEMANTIC_MEMORY
+
+
+def test_committed_episodic_read_returns_exact_consistent_projection(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic(
+        "visible user", "visible answer", metadata={"safe": "yes"}
+    )
+
+    committed = memory.get_committed_episodic(episode_id)
+
+    assert committed is not None
+    assert committed.document == "User: visible user\nAssistant: visible answer"
+    assert committed.record.id == episode_id
+    assert committed.record.user_input == "visible user"
+    assert committed.record.response == "visible answer"
+    assert committed.record.metadata == {"safe": "yes"}
+
+
+def test_committed_episodic_read_bounds_backend_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    monkeypatch.setattr(
+        memory.db1,
+        "get",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("PRIVATE backend detail")),
+    )
+
+    with pytest.raises(EpisodicMemoryReadError) as error:
+        memory.get_committed_episodic("episode-unavailable")
+
+    assert str(error.value) == "Committed episodic Memory is unavailable"
+    assert "PRIVATE" not in str(error.value)
+
+
+def test_committed_episodic_read_returns_none_when_missing(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+
+    assert memory.get_committed_episodic("episode-missing") is None
+
+
+def test_committed_episodic_read_rejects_document_conflict_without_repair(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    episode_id = memory.save_episodic("visible user", "visible answer")
+    memory.db1.update(ids=[episode_id], documents=["conflicting body"])
+    before = memory.db1.get(ids=[episode_id], include=["documents", "metadatas"])
+
+    with pytest.raises(EpisodicMemoryFormatError) as error:
+        memory.get_committed_episodic(episode_id)
+
+    assert str(error.value) == "Committed episodic Memory is invalid"
+    assert (
+        memory.db1.get(ids=[episode_id], include=["documents", "metadatas"]) == before
+    )
+
+
+def test_committed_episodic_read_rejects_conflicting_backend_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    monkeypatch.setattr(
+        memory.db1,
+        "get",
+        lambda **_: {
+            "ids": ["episode-requested", "episode-conflict"],
+            "documents": ["one", "two"],
+            "metadatas": [{}, {}],
+        },
+    )
+
+    with pytest.raises(EpisodicMemoryFormatError):
+        memory.get_committed_episodic("episode-requested")
+
+
+def test_committed_semantic_read_returns_exact_projection(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic(
+        "The user likes lunar gardens.",
+        source_episode_ids=["episode-1"],
+        metadata={"safe": "yes"},
+    )
+
+    committed = memory.get_committed_semantic(semantic_id)
+
+    assert committed is not None
+    assert committed.document == "The user likes lunar gardens."
+    assert committed.metadata["text"] == committed.document
+    assert committed.record.id == semantic_id
+    assert committed.record.source_episode_ids == ["episode-1"]
+    assert committed.record.metadata == {"safe": "yes"}
+
+
+def test_committed_semantic_read_returns_none_when_missing(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+
+    assert memory.get_committed_semantic("semantic-missing") is None
+
+
+def test_committed_semantic_read_bounds_backend_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    monkeypatch.setattr(
+        memory.db2,
+        "get",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("backend detail")),
+    )
+
+    with pytest.raises(SemanticMemoryReadError, match="unavailable") as error:
+        memory.get_committed_semantic("semantic-1")
+    assert str(error.value) == "Committed semantic Memory is unavailable"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda metadata: metadata.update({"record_type": "episodic_log"}),
+        lambda metadata: metadata.update({"text": "conflicting text"}),
+        lambda metadata: metadata.update({"source_episode_ids": "not-json"}),
+        lambda metadata: metadata.update({"extra": "[]"}),
+    ],
+)
+def test_committed_semantic_read_rejects_malformed_conflicts_without_repair(
+    tmp_path: Path, mutate
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    semantic_id = memory.save_semantic("visible text")
+    stored = memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+    metadata = dict(stored["metadatas"][0])
+    mutate(metadata)
+    memory.db2.update(ids=[semantic_id], metadatas=[metadata])
+    before = memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+
+    with pytest.raises(SemanticMemoryFormatError) as error:
+        memory.get_committed_semantic(semantic_id)
+
+    assert str(error.value) == "Committed semantic Memory is invalid"
+    assert (
+        memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"]) == before
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "ids": ["semantic-requested", "semantic-conflict"],
+            "documents": ["one", "two"],
+            "metadatas": [{}, {}],
+        },
+        {
+            "ids": ["semantic-other"],
+            "documents": ["text"],
+            "metadatas": [
+                {
+                    "text": "text",
+                    "source_episode_ids": "[]",
+                    "record_type": "semantic_memory",
+                    "created_at": "now",
+                    "extra": "{}",
+                }
+            ],
+        },
+        {
+            "ids": ["semantic-requested"],
+            "documents": ["text"],
+            "metadatas": ["not-a-metadata-map"],
+        },
+    ],
+)
+def test_committed_semantic_read_rejects_conflicting_backend_shapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    result: dict[str, object],
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    monkeypatch.setattr(memory.db2, "get", lambda **_: result)
+
+    with pytest.raises(SemanticMemoryFormatError):
+        memory.get_committed_semantic("semantic-requested")
 
 
 def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) -> None:
@@ -166,9 +353,10 @@ def test_coordinated_episode_id_is_deterministic_and_pending_survives_reopen(
     assert reopened.pending_path(binding).exists()
     assert reopened.pending_path(binding).stat().st_mode & 0o777 == 0o600
     assert reopened.reconcile(binding) is StartupParticipantOutcome.ROLLED_FORWARD
-    assert reopened.memory.get_episodic_record(
-        reopened.episode_id(TRANSACTION_ID)
-    ) is not None
+    assert (
+        reopened.memory.get_episodic_record(reopened.episode_id(TRANSACTION_ID))
+        is not None
+    )
 
 
 def test_pending_episodic_is_invisible_to_retrieval_and_consolidation(
@@ -349,6 +537,7 @@ def test_all_committed_verification_paths_reject_raw_metadata_conflict(
 
     assert participant.pending_path(binding).exists()
 
+
 def test_abort_removes_only_pending_and_never_committed_memory(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
     pending = _participant(memory)
@@ -410,9 +599,7 @@ def test_memory_staging_rejects_symlink_ancestor(tmp_path: Path) -> None:
             )
         }
     )
-    participant = _participant(
-        DualMemorySystem(settings), user_input=PRIVATE_SENTINEL
-    )
+    participant = _participant(DualMemorySystem(settings), user_input=PRIVATE_SENTINEL)
 
     with pytest.raises(ParticipantUnavailableError):
         participant.prepare(_binding(participant))

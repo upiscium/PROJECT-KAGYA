@@ -10,7 +10,12 @@ import pytest
 from pydantic import ValidationError
 
 from kagya.config import Settings, load_settings
-from kagya.runtime.agent_state import AgentStateSnapshot, EmotionStateSnapshot
+from kagya.runtime.agent_state import (
+    AgentStateSnapshot,
+    AgentStateSnapshotV1,
+    EmotionStateSnapshot,
+    WorkingMemorySnapshot,
+)
 from kagya.runtime.state_wal import (
     RecoveryReason,
     Manifest,
@@ -28,6 +33,17 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 def make_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshot:
     return AgentStateSnapshot(
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=value, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+    )
+
+
+def make_v1_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshotV1:
+    return AgentStateSnapshotV1(
         saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -259,6 +275,155 @@ def test_reconstruct_by_sequence_hash_and_record(tmp_path: Path) -> None:
     )
 
 
+def test_retained_v1_records_preserve_exact_snapshot_and_record_hashes(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v1_snapshot(10, value=0.3)
+    candidate = make_v1_snapshot(12, value=0.4)
+    manifest = wal.bootstrap(initial, 10)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=12,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    inspection = wal.inspect()
+    assert inspection.records[0].baseline_snapshot == initial
+    assert inspection.records[0].baseline_snapshot_hash == wal._snapshot_hash_value(
+        initial
+    )
+    assert inspection.records[1].candidate_snapshot == candidate
+    assert inspection.records[1].candidate_snapshot_hash == wal._snapshot_hash_value(
+        candidate
+    )
+    assert inspection.record_hashes == (
+        manifest.active_baseline_record_hash,
+        transition.record_hash,
+    )
+    assert wal.reconstruct(sequence=10) == initial
+    assert wal.reconstruct(sequence=12) == candidate
+
+
+def test_mixed_v1_then_v2_wal_reconstructs_exact_snapshots(tmp_path: Path) -> None:
+    wal = make_wal(tmp_path)
+    v1_initial = make_v1_snapshot(0)
+    v1_candidate = make_v1_snapshot(1, value=0.2)
+    v2_candidate = make_snapshot(2, value=0.3)
+    wal.bootstrap(v1_initial, 0)
+    first = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=1,
+        prior_snapshot=v1_initial,
+        candidate_snapshot=v1_candidate,
+    )
+    second = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=2,
+        prior_snapshot=v1_candidate,
+        candidate_snapshot=v2_candidate,
+    )
+
+    inspection = wal.inspect()
+    assert len(inspection.records) == 3
+    assert inspection.records[0].baseline_snapshot == v1_initial
+    assert inspection.records[1].candidate_snapshot == v1_candidate
+    assert inspection.records[2].candidate_snapshot == v2_candidate
+    assert second.previous_record_hash == first.record_hash
+    assert wal.reconstruct(sequence=0) == v1_initial
+    assert wal.reconstruct(sequence=1) == v1_candidate
+    assert wal.reconstruct(sequence=2) == v2_candidate
+
+
+def test_first_internal_commit_uses_v1_prior_and_emits_v2_without_migration(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v1_snapshot(0)
+    candidate = make_snapshot(1, value=0.8)
+    wal.bootstrap(initial, 0)
+    before = wal.inspect()
+    prior_hash = before.latest_snapshot_hash
+    assert prior_hash is not None
+
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    assert len(wal.inspect().records) == 2
+    assert transition.processing_sequence == 1
+    assert transition.prior_snapshot_hash == prior_hash
+    assert transition.candidate_snapshot == candidate
+    assert wal.reconstruct(sequence=1) == candidate
+
+
+def test_true_rollback_selects_retained_v1_snapshot_without_changing_high_water(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    target = make_v1_snapshot(0, value=0.2)
+    wal.bootstrap(target, 7)
+    wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=8,
+        prior_snapshot=target,
+        candidate_snapshot=make_v1_snapshot(8, value=0.9),
+    )
+
+    manifest = wal.begin_generation(
+        target,
+        8,
+        reason=RecoveryReason.TRUE_ROLLBACK,
+        external_reconciliation_required=True,
+    )
+
+    inspection = wal.inspect()
+    assert inspection.latest_snapshot_sequence == 0
+    assert wal.reconstruct(sequence=0) == target
+    assert manifest.external_reconciliation_required
+    assert inspection.records[0].journal_processing_high_water == 8
+
+
+def test_true_rollback_selects_exact_retained_v2_snapshot(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    target = make_snapshot(0, value=0.2)
+    wal.bootstrap(target, 4)
+    wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=5,
+        prior_snapshot=target,
+        candidate_snapshot=make_snapshot(5, value=0.9),
+    )
+
+    wal.begin_generation(
+        target,
+        5,
+        reason=RecoveryReason.TRUE_ROLLBACK,
+        external_reconciliation_required=True,
+    )
+
+    assert wal.reconstruct(sequence=0) == target
+    assert wal.inspect().records[0].baseline_snapshot == target
+
+
 def test_dry_run_has_typed_deterministic_changes_and_no_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -356,10 +521,31 @@ def test_external_reconciliation_gate_is_durable(tmp_path: Path) -> None:
     assert manifest.external_reconciliation_required
 
 
-def test_private_sentinel_and_bounded_errors(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "private_key",
+    [
+        "content",
+        "user_input",
+        "response",
+        "turn",
+        "turns",
+        "transcript",
+        "prompt",
+        "raw_prompt",
+        "hidden_thought",
+        "private_reasoning",
+        "attachment",
+        "attachments",
+        "event_payload",
+        "debug_trace",
+    ],
+)
+def test_private_sentinel_and_bounded_errors(
+    tmp_path: Path, private_key: str
+) -> None:
     wal = make_wal(tmp_path)
     with pytest.raises(StateWALError) as error:
-        wal.bootstrap({"hiddenthought": "sentinel"}, 0)  # type: ignore[arg-type]
+        wal.bootstrap({private_key: "sentinel"}, 0)  # type: ignore[arg-type]
     assert "Traceback" not in str(error.value)
     assert "sentinel" not in str(error.value)
 

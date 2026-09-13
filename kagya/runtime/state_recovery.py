@@ -12,8 +12,9 @@ from uuid import UUID, uuid4, uuid5
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.agent_state import (
     AgentStateLoadError,
-    AgentStateSnapshot,
+    AgentStateSnapshotV1,
     AgentStateStore,
+    CompatibleAgentStateSnapshot,
 )
 from kagya.runtime.event_journal import (
     EventJournalGateClear,
@@ -51,7 +52,7 @@ class InternalCommitClassification(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class StateRecoveryResult:
-    snapshot: AgentStateSnapshot
+    snapshot: CompatibleAgentStateSnapshot
     snapshot_hash: str
     processing_high_water: int
     manifest: Manifest
@@ -99,7 +100,7 @@ class RecoveryGateClearProof:
 class DegradedStartupInspection:
     """Read-only startup state for a non-accepting degraded application."""
 
-    snapshot: AgentStateSnapshot
+    snapshot: CompatibleAgentStateSnapshot
     snapshot_hash: str
     processing_high_water: int
     manifest: Manifest
@@ -859,7 +860,7 @@ class StateRecoveryCoordinator:
     def _inspect_journal_bound_current(
         self,
         journal: EventJournalInspection,
-    ) -> AgentStateSnapshot | None:
+    ) -> CompatibleAgentStateSnapshot | None:
         if (
             (journal.schema_version or 0) < 2
             or journal.wal_generation_id is None
@@ -883,7 +884,7 @@ class StateRecoveryCoordinator:
 
     def _repair_v2_invalid_current(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
     ) -> StateRecoveryResult:
         snapshot_hash = self.state_store.snapshot_hash(snapshot)
         self.journal.inspect(snapshot.last_processed_event_sequence, snapshot_hash)
@@ -911,7 +912,7 @@ class StateRecoveryCoordinator:
     def _replace_unanchored_provisional(
         self,
         journal: EventJournalInspection,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
     ) -> StateRecoveryResult:
         """Finish bootstrap/migration when no v2 evidence anchors provisional WAL."""
 
@@ -968,8 +969,8 @@ class StateRecoveryCoordinator:
     def commit_internal_candidate(
         self,
         event: AgentEvent,
-        prior_snapshot: AgentStateSnapshot,
-        candidate_snapshot: AgentStateSnapshot,
+        prior_snapshot: CompatibleAgentStateSnapshot,
+        candidate_snapshot: CompatibleAgentStateSnapshot,
     ) -> InternalCommitEvidence:
         """Publish internal state without claiming overall event completion."""
 
@@ -981,8 +982,8 @@ class StateRecoveryCoordinator:
     def _commit_internal_candidate(
         self,
         event: AgentEvent,
-        prior_snapshot: AgentStateSnapshot,
-        candidate_snapshot: AgentStateSnapshot,
+        prior_snapshot: CompatibleAgentStateSnapshot,
+        candidate_snapshot: CompatibleAgentStateSnapshot,
     ) -> InternalCommitEvidence:
 
         sequence = event.processing_sequence
@@ -1169,7 +1170,7 @@ class StateRecoveryCoordinator:
     def _bootstrap_r06(
         self,
         journal: EventJournalInspection,
-        snapshot: AgentStateSnapshot | None,
+        snapshot: CompatibleAgentStateSnapshot | None,
         snapshot_error: AgentStateLoadError | None,
     ) -> StateRecoveryResult:
         if snapshot is None:
@@ -1221,7 +1222,7 @@ class StateRecoveryCoordinator:
         self,
         journal: EventJournalInspection,
         wal: StateWALInspection,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         *,
         reconstructed: bool = False,
     ) -> StateRecoveryResult:
@@ -1270,7 +1271,7 @@ class StateRecoveryCoordinator:
         self,
         journal: EventJournalInspection,
         wal: StateWALInspection | None,
-        target: AgentStateSnapshot,
+        target: CompatibleAgentStateSnapshot,
         category: EventRecoveryCategory,
         reason: RecoveryReason,
         *,
@@ -1330,7 +1331,20 @@ class StateRecoveryCoordinator:
         wal_record, wal_record_hash = self._record_for_snapshot(
             post_wal, target, target_hash
         )
-        self.state_store.save(target)
+        if isinstance(target, AgentStateSnapshotV1):
+            try:
+                published = self.state_store.load()
+            except AgentStateLoadError:
+                published = None
+            if isinstance(published, AgentStateSnapshotV1) and published == target:
+                # A valid retained v1 file is historical evidence.  Preserve its
+                # original bytes during startup instead of canonicalizing it.
+                self.state_store.ensure_published(target)
+            else:
+                # A true rollback from v2 to v1 must publish the selected state.
+                self.state_store.save(target)
+        else:
+            self.state_store.save(target)
         self.journal.append_recovery_completed(
             recovery_id,
             target.last_processed_event_sequence,
@@ -1353,7 +1367,7 @@ class StateRecoveryCoordinator:
         self,
         journal: EventJournalInspection,
         wal: StateWALInspection,
-        snapshot: AgentStateSnapshot | None,
+        snapshot: CompatibleAgentStateSnapshot | None,
     ) -> StateRecoveryResult:
         if len(journal.open_recoveries) != 1:
             raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
@@ -1424,8 +1438,8 @@ class StateRecoveryCoordinator:
     def _resume_invalid_current_recovery(
         self,
         journal: EventJournalInspection,
-        target: AgentStateSnapshot,
-        current_snapshot: AgentStateSnapshot | None,
+        target: CompatibleAgentStateSnapshot,
+        current_snapshot: CompatibleAgentStateSnapshot | None,
     ) -> StateRecoveryResult:
         if len(journal.open_recoveries) != 1:
             raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
@@ -1485,7 +1499,7 @@ class StateRecoveryCoordinator:
     def _recover_from_anchor(
         self,
         journal: EventJournalInspection,
-        snapshot: AgentStateSnapshot | None,
+        snapshot: CompatibleAgentStateSnapshot | None,
         *,
         anchor_expected: bool,
         wal_error: StateWALError | None,
@@ -1557,7 +1571,7 @@ class StateRecoveryCoordinator:
     def _ensure_participant_baseline_covers_recovery(
         self,
         journal: EventJournalInspection,
-        target: AgentStateSnapshot,
+        target: CompatibleAgentStateSnapshot,
         category: EventRecoveryCategory,
     ) -> None:
         if category is not EventRecoveryCategory.TRUE_ROLLBACK or not journal.baselines:
@@ -1592,7 +1606,7 @@ class StateRecoveryCoordinator:
 
     def _result(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         high_water: int,
         *,
         exact: bool = False,
@@ -1616,7 +1630,7 @@ class StateRecoveryCoordinator:
 
     def _inspect_snapshot(
         self,
-    ) -> tuple[AgentStateSnapshot | None, AgentStateLoadError | None]:
+    ) -> tuple[CompatibleAgentStateSnapshot | None, AgentStateLoadError | None]:
         if not self.state_store.snapshot_exists():
             return None, None
         try:
@@ -1789,7 +1803,7 @@ class StateRecoveryCoordinator:
         return None
 
     def _wal_latest_matches(
-        self, wal: StateWALInspection, snapshot: AgentStateSnapshot
+        self, wal: StateWALInspection, snapshot: CompatibleAgentStateSnapshot
     ) -> bool:
         return (
             wal.latest_snapshot_sequence == snapshot.last_processed_event_sequence
@@ -1799,7 +1813,7 @@ class StateRecoveryCoordinator:
     def _record_for_snapshot(
         self,
         wal: StateWALInspection,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         snapshot_hash: str,
     ) -> tuple[BaselineRecord | TransitionRecord, str]:
         for record, record_hash in reversed(tuple(zip(wal.records, wal.record_hashes))):

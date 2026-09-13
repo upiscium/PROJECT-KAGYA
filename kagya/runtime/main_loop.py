@@ -22,6 +22,11 @@ from kagya.runtime.transaction_coordinator import (
     TransactionBoundValue,
     TransactionParticipant,
 )
+from kagya.runtime.working_memory import (
+    WorkingMemory,
+    WorkingMemorySourceKind,
+    WorkingMemoryView,
+)
 
 if TYPE_CHECKING:
     from kagya.memory.episodic_participant import MemoryEpisodicParticipant
@@ -48,6 +53,7 @@ class DebugChatTrace:
     hidden_thought: str
     prompt: str
     memory_context: MemoryContext
+    working_memory_view: WorkingMemoryView
 
 
 @dataclass(frozen=True)
@@ -72,16 +78,28 @@ class KagyaMainLoop:
         memory_system: DualMemorySystem,
         *,
         session_state: SessionState | None = None,
+        working_memory: WorkingMemory | None = None,
         emotion_engine: EmotionEngineAllostasis | None = None,
         prompt_builder: PromptBuilder | None = None,
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
     ) -> None:
+        from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system
+        self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
+        self.working_memory = (
+            working_memory
+            if working_memory is not None
+            else WorkingMemory(
+                item_capacity=settings.working_memory.item_capacity,
+                projection_max_bytes=settings.working_memory.projection_max_bytes,
+            )
+        )
         self.surprisal_calculator = SurprisalCalculator(provider)
         self.emotion_engine = emotion_engine or EmotionEngineAllostasis(
             EmotionState(optimal_loss=settings.emotion.baseline_surprisal),
@@ -134,7 +152,30 @@ class KagyaMainLoop:
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
         memory_context = self.memory_system.retrieve_context(user_input)
-        prompt = self.prompt_builder.build(user_input, emotion_state, memory_context)
+        self.working_memory.advance()
+        candidates = [
+            (WorkingMemorySourceKind.EPISODIC, record.id, rank)
+            for rank, record in enumerate(memory_context.db1_results)
+        ] + [
+            (WorkingMemorySourceKind.SEMANTIC, record.id, rank)
+            for rank, record in enumerate(memory_context.db2_results)
+        ]
+        # Admit larger rank numbers first (lower retrieval priority). Equal-rank
+        # references use ascending source kind and source ID as the total tie-break.
+        for source_kind, source_id, rank in sorted(
+            candidates,
+            key=lambda candidate: (-candidate[2], candidate[0].value, candidate[1]),
+        ):
+            self.working_memory.admit(
+                source_kind,
+                source_id,
+                activation=1.0,
+                salience=1.0 / (rank + 1),
+            )
+        working_memory_view = self.working_memory.select(self.working_memory_resolver)
+        prompt = self.prompt_builder.build(
+            user_input, emotion_state, working_memory_view
+        )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
         memory_participant = MemoryEpisodicParticipant(
@@ -162,6 +203,7 @@ class KagyaMainLoop:
                 hidden_thought=processed_response.hidden_thought,
                 prompt=prompt,
                 memory_context=memory_context,
+                working_memory_view=working_memory_view,
             )
         return _ComputedChat(
             response=processed_response.visible_response,

@@ -1,13 +1,29 @@
+from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
 from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem
+from kagya.memory import (
+    DualMemorySystem,
+    EpisodicMemoryRecord,
+    MemoryContext,
+    SemanticMemoryFormatError,
+    SemanticMemoryReadError,
+    SemanticMemoryRecord,
+)
 from kagya.models import DummyProvider
+from kagya.persona import PromptBuilder
 from kagya.runtime import (
     CoordinatedResult,
     KagyaMainLoop,
     TransactionBoundValue,
+    WorkingMemory,
+    WorkingMemoryDecisionReason,
+    WorkingMemoryRetentionReason,
+    WorkingMemorySourceKind,
 )
+from kagya.runtime.main_loop import DebugChatTrace
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -47,6 +63,56 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     assert not hasattr(result, "memory_context")
 
 
+def test_main_loop_passively_owns_configured_or_injected_working_memory(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    provider = ThinkingDummyProvider()
+    configured = KagyaMainLoop(settings, provider, DualMemorySystem(settings))
+    injected = WorkingMemory(item_capacity=1, projection_max_bytes=7)
+    explicit = KagyaMainLoop(
+        settings, provider, DualMemorySystem(settings), working_memory=injected
+    )
+
+    assert (
+        configured.working_memory.item_capacity
+        == settings.working_memory.item_capacity
+    )
+    assert (
+        configured.working_memory.projection_max_bytes
+        == settings.working_memory.projection_max_bytes
+    )
+    assert explicit.working_memory is injected
+
+
+def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    working_memory = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    memory = DualMemorySystem(settings)
+    passive_id = memory.save_episodic("passive", "memory")
+    working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC,
+        passive_id,
+        0.8,
+        0.8,
+    )
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        memory,
+        working_memory=working_memory,
+    )
+    ordinary = _materialize(loop.chat("ordinary"))
+    debug_result, trace = _materialize(loop.chat_debug("debug"))
+
+    assert ordinary.response == debug_result.response == "Visible runtime answer."
+    assert "User: debug\nAssistant:" in trace.prompt
+    assert trace.working_memory_view.revision == working_memory.revision
+    assert trace.working_memory_view.selected[0].source_id == passive_id
+
+
 def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     loop = KagyaMainLoop(
@@ -61,6 +127,412 @@ def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) ->
     assert trace.hidden_thought == PRIVATE_SENTINEL
     assert PRIVATE_SENTINEL not in str(result)
     assert "Assistant:" in trace.prompt
+
+
+def test_main_loop_resolves_committed_body_and_passes_view_to_prompt_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    semantic_id = memory.save_semantic("committed body")
+    captured: list[object] = []
+
+    class CapturingPromptBuilder:
+        def build(self, user_input, emotion_state, working_memory_view):
+            captured.append(working_memory_view)
+            return PromptBuilder().build(user_input, emotion_state, working_memory_view)
+
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db2_results=[SemanticMemoryRecord(semantic_id, "stale retrieval body")]
+        ),
+    )
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        memory,
+        prompt_builder=CapturingPromptBuilder(),
+    )
+
+    _result, trace = _materialize(loop.chat_debug("query"))
+
+    assert len(captured) == 1
+    assert captured[0] is trace.working_memory_view
+    assert [selection.rendered_content for selection in trace.working_memory_view.selected] == [
+        "committed body"
+    ]
+    assert "committed body" in trace.prompt
+    assert "stale retrieval body" not in trace.prompt
+
+
+def test_retrieval_failure_does_not_age_working_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    working_memory = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    working_memory.admit(WorkingMemorySourceKind.SEMANTIC, "existing", 1.0, 1.0)
+    memory = DualMemorySystem(settings)
+
+    def fail(_query: str) -> MemoryContext:
+        raise RuntimeError("retrieval failed")
+
+    monkeypatch.setattr(memory, "retrieve_context", fail)
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), memory, working_memory=working_memory
+    )
+    before = (working_memory.revision, working_memory.items)
+
+    with pytest.raises(RuntimeError, match="retrieval failed"):
+        loop.chat("query")
+
+    assert (working_memory.revision, working_memory.items) == before
+
+
+def test_retrieval_candidates_are_admitted_in_exact_cross_kind_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    context = MemoryContext(
+        db1_results=[
+            EpisodicMemoryRecord("episode-rank-0", "ignored", "ignored"),
+            EpisodicMemoryRecord("episode-rank-1", "ignored", "ignored"),
+        ],
+        db2_results=[
+            SemanticMemoryRecord("semantic-rank-0", "ignored"),
+            SemanticMemoryRecord("semantic-rank-1", "ignored"),
+        ],
+    )
+    monkeypatch.setattr(memory, "retrieve_context", lambda _query: context)
+    working = WorkingMemory(item_capacity=4, projection_max_bytes=100)
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), memory, working_memory=working
+    )
+
+    loop.chat("rank candidates")
+
+    by_source = {item.source_id: item for item in working.items}
+    assert working.revision == 4
+    assert len(working.items) == working.item_capacity == 4
+    assert {
+        source_id: (
+            item.activation,
+            item.salience,
+            item.created_revision,
+            item.last_activated_revision,
+        )
+        for source_id, item in by_source.items()
+    } == {
+        "episode-rank-1": (1.0, 0.5, 1, 1),
+        "semantic-rank-1": (1.0, 0.5, 2, 2),
+        "episode-rank-0": (1.0, 1.0, 3, 3),
+        "semantic-rank-0": (1.0, 1.0, 4, 4),
+    }
+
+
+def test_prior_working_memory_decays_and_retrieved_reference_reactivates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    retrieved_id = memory.save_semantic("retrieved exact body")
+    working = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    working.admit(WorkingMemorySourceKind.SEMANTIC, retrieved_id, 0.5, 0.4)
+    working.admit(WorkingMemorySourceKind.SEMANTIC, "semantic-not-retrieved", 0.5, 0.4)
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db2_results=[SemanticMemoryRecord(retrieved_id, "ignored stale body")]
+        ),
+    )
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), memory, working_memory=working
+    )
+
+    loop.chat("reactivate")
+
+    by_source = {item.source_id: item for item in working.items}
+    assert working.revision == 4
+    assert by_source[retrieved_id].activation == 1.0
+    assert by_source[retrieved_id].salience == 1.0
+    assert by_source[retrieved_id].retention_reason is (
+        WorkingMemoryRetentionReason.REACTIVATED
+    )
+    assert by_source["semantic-not-retrieved"].activation == pytest.approx(0.35)
+    assert by_source["semantic-not-retrieved"].retention_reason is (
+        WorkingMemoryRetentionReason.RECENT
+    )
+
+
+def test_oversized_exact_source_is_excluded_and_smaller_source_is_prompted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    large_id = memory.save_semantic("X" * 20)
+    small_id = memory.save_semantic("fits")
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db2_results=[
+                SemanticMemoryRecord(large_id, "untrusted large"),
+                SemanticMemoryRecord(small_id, "untrusted small"),
+            ]
+        ),
+    )
+    working = WorkingMemory(item_capacity=2, projection_max_bytes=5)
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), memory, working_memory=working
+    )
+
+    _result, trace = _materialize(loop.chat_debug("budget query"))
+
+    assert [decision.reason for decision in trace.working_memory_view.decisions] == [
+        WorkingMemoryDecisionReason.PROJECTION_BUDGET,
+        WorkingMemoryDecisionReason.SELECTED,
+    ]
+    assert "X" * 20 not in trace.prompt
+    assert "fits" in trace.prompt
+    assert trace.working_memory_view.projected_bytes == 4
+
+
+def test_missing_and_archived_references_remain_but_do_not_enter_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    archived_id = memory.save_episodic("archived user", "archived answer")
+    memory._archive_episodic(archived_id)
+    missing_id = "semantic-disappeared"
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db1_results=[
+                EpisodicMemoryRecord(
+                    archived_id, "untrusted archived", "untrusted archived"
+                )
+            ],
+            db2_results=[SemanticMemoryRecord(missing_id, "untrusted missing")],
+        ),
+    )
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+
+    result, trace = _materialize(loop.chat_debug("status query"))
+
+    assert result.response == "Visible runtime answer."
+    assert {item.source_id for item in loop.working_memory.items} == {
+        archived_id,
+        missing_id,
+    }
+    assert {decision.source_id: decision.reason for decision in trace.working_memory_view.decisions} == {
+        archived_id: WorkingMemoryDecisionReason.SOURCE_ARCHIVED,
+        missing_id: WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE,
+    }
+    assert "archived user" not in trace.prompt
+    assert "untrusted archived" not in trace.prompt
+    assert "untrusted missing" not in trace.prompt
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_reason"),
+    [
+        (SemanticMemoryReadError, WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE),
+        (SemanticMemoryFormatError, WorkingMemoryDecisionReason.SOURCE_MALFORMED),
+    ],
+)
+def test_exact_source_failure_is_bounded_and_chat_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+    expected_reason: WorkingMemoryDecisionReason,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    source_id = memory.save_semantic("source body must stay absent")
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db2_results=[SemanticMemoryRecord(source_id, "untrusted retrieval body")]
+        ),
+    )
+
+    def fail_exact(_source_id: str) -> None:
+        raise error_type("PRIVATE RAW SOURCE DETAIL")
+
+    monkeypatch.setattr(memory, "get_committed_semantic", fail_exact)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+
+    result, trace = _materialize(loop.chat_debug("failure query"))
+
+    assert result.response == "Visible runtime answer."
+    assert trace.working_memory_view.decisions[0].reason is expected_reason
+    assert trace.working_memory_view.selected == ()
+    assert source_id in {item.source_id for item in loop.working_memory.items}
+    assert "source body must stay absent" not in trace.prompt
+    assert "untrusted retrieval body" not in trace.prompt
+    assert "PRIVATE RAW SOURCE DETAIL" not in trace.prompt
+    assert "PRIVATE RAW SOURCE DETAIL" not in repr(result)
+
+
+def test_malformed_exact_source_is_not_prompted_or_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    source_id = memory.save_semantic("authoritative document")
+    stored = memory.db2.get(ids=[source_id], include=["metadatas"])
+    metadata = dict(stored["metadatas"][0])
+    metadata["text"] = "conflicting metadata body"
+    memory.db2.update(ids=[source_id], metadatas=[metadata])
+    before = memory.db2.get(
+        ids=[source_id], include=["documents", "metadatas"]
+    )
+    monkeypatch.setattr(
+        memory,
+        "retrieve_context",
+        lambda _query: MemoryContext(
+            db2_results=[SemanticMemoryRecord(source_id, "untrusted retrieval body")]
+        ),
+    )
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+
+    result, trace = _materialize(loop.chat_debug("malformed query"))
+
+    assert result.response == "Visible runtime answer."
+    assert trace.working_memory_view.decisions[0].reason is (
+        WorkingMemoryDecisionReason.SOURCE_MALFORMED
+    )
+    assert trace.working_memory_view.selected == ()
+    assert "authoritative document" not in trace.prompt
+    assert "conflicting metadata body" not in trace.prompt
+    assert "untrusted retrieval body" not in trace.prompt
+    assert memory.db2.get(
+        ids=[source_id], include=["documents", "metadatas"]
+    ) == before
+
+
+def test_select_and_prompt_build_are_pure_after_explicit_chat_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    semantic_id = memory.save_semantic("pure source")
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), memory, working_memory=working
+    )
+    original_select = working.select
+    selection_states: list[tuple[object, object]] = []
+
+    def checked_select(resolver):
+        before = (working.revision, working.items)
+        view = original_select(resolver)
+        selection_states.append((before, (working.revision, working.items)))
+        return view
+
+    monkeypatch.setattr(working, "select", checked_select)
+
+    class PurePromptBuilder:
+        def build(self, user_input, emotion_state, working_memory_view):
+            before = (working.revision, working.items)
+            prompt = PromptBuilder().build(
+                user_input, emotion_state, working_memory_view
+            )
+            assert (working.revision, working.items) == before
+            return prompt
+
+    loop.prompt_builder = PurePromptBuilder()  # type: ignore[assignment]
+
+    loop.chat("pure source")
+
+    assert selection_states == [(selection_states[0][0], selection_states[0][0])]
+    assert {item.source_id for item in working.items} == {semantic_id}
+
+
+def test_current_future_episode_is_absent_from_its_own_working_memory_view(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(
+        settings, ThinkingDummyProvider(), DualMemorySystem(settings)
+    )
+
+    result, trace = _materialize(loop.chat_debug("current turn only"))
+
+    assert result.episode_id not in {
+        selection.source_id for selection in trace.working_memory_view.selected
+    }
+    assert result.episode_id not in {item.source_id for item in loop.working_memory.items}
+    assert result.response not in trace.prompt
+
+
+def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    ordinary_working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    debug_working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    for working in (ordinary_working, debug_working):
+        working.admit(
+            WorkingMemorySourceKind.SEMANTIC,
+            "semantic-shared-missing",
+            0.6,
+            0.4,
+        )
+    ordinary_loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        working_memory=ordinary_working,
+    )
+    debug_settings = _settings_for_tmp_memory(tmp_path / "debug")
+    debug_loop = KagyaMainLoop(
+        debug_settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(debug_settings),
+        working_memory=debug_working,
+    )
+
+    ordinary_plan = ordinary_loop.chat("same input")
+    debug_plan = debug_loop.chat_debug("same input")
+    ordinary = _materialize(ordinary_plan)
+    debug_result, trace = _materialize(debug_plan)
+
+    assert (
+        ordinary.response,
+        ordinary.loss,
+        ordinary.valence,
+        ordinary.arousal,
+        ordinary.optimal_loss,
+        ordinary.model_id,
+        ordinary.adapter_id,
+    ) == (
+        debug_result.response,
+        debug_result.loss,
+        debug_result.valence,
+        debug_result.arousal,
+        debug_result.optimal_loss,
+        debug_result.model_id,
+        debug_result.adapter_id,
+    )
+    assert ordinary_working.items == debug_working.items
+    assert ordinary_working.revision == debug_working.revision
+    assert [participant.participant_id for participant in ordinary_plan.participants] == [
+        participant.participant_id for participant in debug_plan.participants
+    ] == ["memory.episodic", "session.turn"]
+    assert trace.working_memory_view.revision == debug_working.revision
+    assert tuple(field.name for field in fields(DebugChatTrace)) == (
+        "hidden_thought",
+        "prompt",
+        "memory_context",
+        "working_memory_view",
+    )
 
 
 def test_computation_does_not_write_memory_or_session(tmp_path: Path) -> None:

@@ -18,7 +18,11 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from kagya.privacy import normalize_private_key
-from kagya.runtime.agent_state import AgentStateSnapshot, AgentStateStore
+from kagya.runtime.agent_state import (
+    AgentStateStore,
+    CompatibleAgentStateSnapshot,
+    validate_compatible_agent_state_snapshot,
+)
 
 
 class StateWALError(Exception):
@@ -69,7 +73,7 @@ class BaselineRecord(_StrictModel):
     created_at: datetime
     baseline_snapshot_sequence: int = Field(ge=0)
     baseline_snapshot_hash: str = Field(min_length=64, max_length=64)
-    baseline_snapshot: AgentStateSnapshot
+    baseline_snapshot: CompatibleAgentStateSnapshot
     journal_processing_high_water: int = Field(ge=0)
     predecessor_generation_id: UUID | None = None
     predecessor_generation_hash: str | None = None
@@ -93,7 +97,7 @@ class TransitionRecord(_StrictModel):
     prior_snapshot_hash: str = Field(min_length=64, max_length=64)
     candidate_snapshot_sequence: int = Field(ge=0)
     candidate_snapshot_hash: str = Field(min_length=64, max_length=64)
-    candidate_snapshot: AgentStateSnapshot
+    candidate_snapshot: CompatibleAgentStateSnapshot
     previous_record_hash: str = Field(min_length=64, max_length=64)
     record_hash: str = Field(min_length=64, max_length=64)
 
@@ -158,14 +162,18 @@ _FORBIDDEN = frozenset(
         "privatereasoning",
         "reasoning",
         "chainofthought",
+        "content",
         "prompt",
         "rawprompt",
         "systemprompt",
         "userprompt",
+        "userinput",
         "assistantprompt",
+        "response",
         "retrievedmemory",
         "privatestate",
         "turns",
+        "turn",
         "attachments",
         "eventpayload",
         "requestpayload",
@@ -217,8 +225,8 @@ class StateWAL:
         self,
         directory: str | Path,
         *,
-        canonical_bytes: Callable[[AgentStateSnapshot], bytes] | None = None,
-        snapshot_hash: Callable[[AgentStateSnapshot], str] | None = None,
+        canonical_bytes: Callable[[CompatibleAgentStateSnapshot], bytes] | None = None,
+        snapshot_hash: Callable[[CompatibleAgentStateSnapshot], str] | None = None,
         failure_hook: Callable[[str], None] | None = None,
     ) -> None:
         self.root = Path(directory)
@@ -421,11 +429,18 @@ class StateWAL:
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
 
-    def _snapshot_hash_value(self, snapshot: AgentStateSnapshot) -> str:
+    def _snapshot_hash_value(self, snapshot: CompatibleAgentStateSnapshot) -> str:
         try:
-            validated = AgentStateSnapshot.model_validate(
-                snapshot.model_dump(mode="python")
-            )
+            # Validate the union directly.  Round-tripping through a generic
+            # dump is needlessly lossy for retained v1 records (and makes it
+            # easier for a future v2 adapter to normalize the legacy shape).
+            # Keeping the discriminated model intact is what preserves both
+            # the legacy snapshot bytes and its hash in mixed generations.
+            validated = validate_compatible_agent_state_snapshot(snapshot)
+            # The v1 representation is part of the retained WAL contract.  Do
+            # not route it through a v2-producing canonicalizer: doing so
+            # changes the identity of old snapshots and, consequently, every
+            # record hash that embeds that identity.
             payload = self._canonical_bytes(validated)
             return (
                 self._snapshot_hash(validated)
@@ -440,7 +455,7 @@ class StateWAL:
 
     def _begin_generation(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         journal_processing_high_water: int,
         *,
         reason: RecoveryReason = RecoveryReason.BOOTSTRAP,
@@ -659,7 +674,7 @@ class StateWAL:
 
     def begin_generation(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         journal_processing_high_water: int,
         *,
         reason: RecoveryReason = RecoveryReason.BOOTSTRAP,
@@ -681,7 +696,7 @@ class StateWAL:
 
     def resume_prepared_generation(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         journal_processing_high_water: int,
         *,
         recovery_id: UUID,
@@ -707,7 +722,7 @@ class StateWAL:
 
     def rebaseline_prepared_current(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         journal_processing_high_water: int,
         *,
         recovery_id: UUID,
@@ -731,7 +746,7 @@ class StateWAL:
 
     def replace_unanchored_provisional(
         self,
-        snapshot: AgentStateSnapshot,
+        snapshot: CompatibleAgentStateSnapshot,
         journal_processing_high_water: int,
     ) -> Manifest:
         """Replace WAL bytes proven not to be anchored by a v2 Journal."""
@@ -995,8 +1010,8 @@ class StateWAL:
         event_type: str,
         event_source: str,
         processing_sequence: int,
-        prior_snapshot: AgentStateSnapshot,
-        candidate_snapshot: AgentStateSnapshot,
+        prior_snapshot: CompatibleAgentStateSnapshot,
+        candidate_snapshot: CompatibleAgentStateSnapshot,
     ) -> TransitionRecord:
         inspection = self.inspect()
         assert inspection.active_manifest is not None
@@ -1155,7 +1170,9 @@ class StateWAL:
             raise StateWALIntegrityError("boot anchor cannot be inspected") from None
         return self.inspect_boot_anchor()
 
-    def inspect_anchored_prefix(self) -> tuple[BootAnchor, AgentStateSnapshot]:
+    def inspect_anchored_prefix(
+        self,
+    ) -> tuple[BootAnchor, CompatibleAgentStateSnapshot]:
         anchor = self.inspect_boot_anchor()
         snapshot = self.inspect_bound_prefix(
             generation_id=anchor.generation_id,
@@ -1174,7 +1191,7 @@ class StateWAL:
         record_hash: str,
         snapshot_sequence: int,
         snapshot_hash: str,
-    ) -> AgentStateSnapshot:
+    ) -> CompatibleAgentStateSnapshot:
         """Verify through an exact externally bound record, ignoring later bytes."""
 
         if not _HASH_RE.fullmatch(record_hash) or not _HASH_RE.fullmatch(snapshot_hash):
@@ -1289,9 +1306,9 @@ class StateWAL:
         sequence: int | None = None,
         snapshot_hash: str | None = None,
         record_id: UUID | None = None,
-    ) -> AgentStateSnapshot:
+    ) -> CompatibleAgentStateSnapshot:
         inspection = self.inspect()
-        found: AgentStateSnapshot | None = None
+        found: CompatibleAgentStateSnapshot | None = None
         for record in inspection.records:
             snapshot = (
                 record.baseline_snapshot

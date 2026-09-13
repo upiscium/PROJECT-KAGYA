@@ -1,7 +1,13 @@
 """Prompt construction for the conscious runtime loop."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from kagya.body import EmotionState
-from kagya.memory import MemoryContext
+
+if TYPE_CHECKING:
+    from kagya.runtime.working_memory import WorkingMemoryView
 
 
 class PromptBuilder:
@@ -11,13 +17,18 @@ class PromptBuilder:
         self,
         user_input: str,
         emotion_state: EmotionState,
-        memory_context: MemoryContext,
+        working_memory_view: WorkingMemoryView,
     ) -> str:
-        db1_lines = [
-            f"- User: {record.user_input} | Assistant: {record.response}"
-            for record in memory_context.db1_results
+        episodic_lines = [
+            f"- {selection.rendered_content}"
+            for selection in working_memory_view.selected
+            if selection.source_kind.value == "episodic"
         ]
-        db2_lines = [f"- {record.text}" for record in memory_context.db2_results]
+        semantic_lines = [
+            f"- {selection.rendered_content}"
+            for selection in working_memory_view.selected
+            if selection.source_kind.value == "semantic"
+        ]
         return "\n".join(
             [
                 "Context: PROJECT-KAGYA is a private local AI assistant for subjective conversation.",
@@ -29,10 +40,10 @@ class PromptBuilder:
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
                 "",
                 "Episodic memories:",
-                *(db1_lines or ["- none"]),
+                *(episodic_lines or ["- none"]),
                 "",
                 "Semantic memories:",
-                *(db2_lines or ["- none"]),
+                *(semantic_lines or ["- none"]),
                 "",
                 f"User: {user_input}",
                 "Assistant:",

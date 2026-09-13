@@ -12,18 +12,32 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from kagya.body import EmotionState
 from kagya.privacy import normalize_private_key
+from kagya.runtime.working_memory import (
+    WorkingMemoryItem,
+    WorkingMemoryRetentionReason,
+    WorkingMemorySourceKind,
+    working_memory_item_id,
+)
 
 if TYPE_CHECKING:
     from kagya.runtime.main_loop import KagyaMainLoop
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[1] = 1
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[2] = 2
 
 
 class _StateModel(BaseModel):
@@ -43,8 +57,7 @@ class EmotionStateSnapshot(_StateModel):
         return value
 
 
-class AgentStateSnapshot(_StateModel):
-    schema_version: Literal[1] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+class _AgentStateSnapshotBase(_StateModel):
     saved_at: datetime
     last_processed_event_sequence: int = Field(ge=0)
     emotion_state: EmotionStateSnapshot
@@ -72,6 +85,112 @@ class AgentStateSnapshot(_StateModel):
         if isinstance(value, bool):
             raise ValueError("sequence must be an integer")
         return value
+
+
+class AgentStateSnapshotV1(_AgentStateSnapshotBase):
+    """Exact retained R04-R07 canonical AgentState schema."""
+
+    schema_version: Literal[1] = 1
+
+
+class WorkingMemoryItemSnapshot(_StateModel):
+    """Strict durable form of one U1 authoritative reference item."""
+
+    item_id: str
+    source_kind: Literal["episodic", "semantic"]
+    source_id: str
+    activation: float = Field(ge=0.0, le=1.0)
+    salience: float = Field(ge=0.0, le=1.0)
+    retention_reason: Literal["recent", "reactivated"]
+    created_revision: int = Field(ge=0)
+    last_activated_revision: int = Field(ge=0)
+
+    @field_validator("activation", "salience")
+    @classmethod
+    def require_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Working Memory value must be finite")
+        return value
+
+    @field_validator("created_revision", "last_activated_revision", mode="before")
+    @classmethod
+    def reject_boolean_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Working Memory revision must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def require_canonical_reference(self) -> WorkingMemoryItemSnapshot:
+        try:
+            source_kind = WorkingMemorySourceKind(self.source_kind)
+            expected = working_memory_item_id(source_kind, self.source_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Working Memory source reference is invalid") from error
+        if self.item_id != expected:
+            raise ValueError("Working Memory item identity is invalid")
+        return self
+
+
+class WorkingMemorySnapshot(_StateModel):
+    """Canonical Working Memory authority embedded in AgentState v2."""
+
+    revision: int = Field(ge=0)
+    items: tuple[WorkingMemoryItemSnapshot, ...]
+
+    @field_validator("items", mode="before")
+    @classmethod
+    def parse_json_items(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("revision", mode="before")
+    @classmethod
+    def reject_boolean_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Working Memory revision must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def require_consistent_membership(self) -> WorkingMemorySnapshot:
+        item_ids: set[str] = set()
+        source_references: set[tuple[str, str]] = set()
+        for item in self.items:
+            if (
+                item.created_revision > self.revision
+                or item.last_activated_revision > self.revision
+            ):
+                raise ValueError("Working Memory item revision is invalid")
+            source_reference = (item.source_kind, item.source_id)
+            if item.item_id in item_ids or source_reference in source_references:
+                raise ValueError("Working Memory item is duplicated")
+            item_ids.add(item.item_id)
+            source_references.add(source_reference)
+        return self
+
+
+class AgentStateSnapshot(_AgentStateSnapshotBase):
+    """Current AgentState v2 canonical snapshot."""
+
+    schema_version: Literal[2] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+
+
+CompatibleAgentStateSnapshot = Annotated[
+    AgentStateSnapshotV1 | AgentStateSnapshot,
+    Field(discriminator="schema_version"),
+]
+_COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
+    TypeAdapter(CompatibleAgentStateSnapshot)
+)
+
+
+def validate_compatible_agent_state_snapshot(
+    value: object,
+) -> CompatibleAgentStateSnapshot:
+    """Validate retained v1 or current v2 without changing its version."""
+
+    return _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(value)
 
 
 class _LegacyEmotionState(_StateModel):
@@ -139,14 +258,18 @@ _PRIVATE_STATE_KEYS = frozenset(
         "reasoning",
         "chainofthought",
         "thought",
+        "content",
         "prompt",
         "rawprompt",
         "systemprompt",
         "userprompt",
+        "userinput",
         "assistantprompt",
+        "response",
         "retrievedmemory",
         "privatestate",
         "turns",
+        "turn",
         "sessionturns",
         "attachments",
         "attachment",
@@ -186,6 +309,7 @@ def default_agent_state_snapshot(
             arousal=0.0,
             optimal_loss=baseline_surprisal,
         ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
     )
 
 
@@ -218,7 +342,7 @@ class AgentStateStore:
             ) from None
         return True
 
-    def load(self) -> AgentStateSnapshot:
+    def load(self) -> CompatibleAgentStateSnapshot:
         inspection_failure: AgentStateLoadError | None = None
         try:
             path_status = self.path.lstat()
@@ -276,8 +400,17 @@ class AgentStateStore:
             raise privacy_failure
 
         version = raw.get("schema_version")
-        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+        if version == 1:
             schema_failure: AgentStateLoadError | None = None
+            try:
+                return AgentStateSnapshotV1.model_validate(raw)
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            raise schema_failure
+        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+            schema_failure = None
             try:
                 return AgentStateSnapshot.model_validate(raw)
             except ValidationError:
@@ -293,7 +426,7 @@ class AgentStateStore:
             )
         raise AgentStateLoadError("AgentState schema version is invalid")
 
-    def save(self, snapshot: AgentStateSnapshot) -> None:
+    def save(self, snapshot: CompatibleAgentStateSnapshot) -> None:
         stage = AgentStateSaveStage.TEMP_WRITE
         published = False
         temporary_path: Path | None = None
@@ -347,18 +480,14 @@ class AgentStateStore:
         if save_failure is not None:
             raise save_failure
 
-    def canonical_bytes(self, snapshot: AgentStateSnapshot) -> bytes:
+    def canonical_bytes(self, snapshot: CompatibleAgentStateSnapshot) -> bytes:
         """Return the one canonical representation used for save and hashing."""
 
         canonical_failure: AgentStateSaveError | None = None
         try:
-            raw: object = (
-                snapshot.model_dump(mode="python")
-                if isinstance(snapshot, AgentStateSnapshot)
-                else snapshot
-            )
+            raw: object = snapshot.model_dump(mode="python")
             _reject_private_keys(raw)
-            validated = AgentStateSnapshot.model_validate(raw)
+            validated = validate_compatible_agent_state_snapshot(raw)
             return self._canonical_bytes(validated)
         except Exception:
             canonical_failure = AgentStateSaveError(
@@ -366,14 +495,28 @@ class AgentStateStore:
             )
         raise canonical_failure
 
-    def snapshot_hash(self, snapshot: AgentStateSnapshot) -> str:
+    def snapshot_hash(self, snapshot: CompatibleAgentStateSnapshot) -> str:
         """Hash the exact canonical bytes published by this store."""
 
         return hashlib.sha256(self.canonical_bytes(snapshot)).hexdigest()
 
-    def ensure_published(self, snapshot: AgentStateSnapshot) -> None:
+    def ensure_published(self, snapshot: CompatibleAgentStateSnapshot) -> None:
         """Publish bootstrap/migrated state while avoiding an identical rewrite."""
 
+        try:
+            preserve_legacy = (
+                isinstance(snapshot, AgentStateSnapshotV1) and self.snapshot_exists()
+            )
+        except AgentStateLoadError:
+            preserve_legacy = False
+        if preserve_legacy:
+            try:
+                published_snapshot = self.load()
+            except AgentStateLoadError:
+                pass
+            else:
+                if published_snapshot == snapshot:
+                    return
         payload = self.canonical_bytes(snapshot)
         inspection_failure: AgentStateSaveError | None = None
         descriptor: int | None = None
@@ -427,6 +570,22 @@ class AgentStateStore:
                     arousal=emotion.arousal,
                     optimal_loss=emotion.optimal_loss,
                 ),
+                working_memory=WorkingMemorySnapshot(
+                    revision=main_loop.working_memory.revision,
+                    items=tuple(
+                        WorkingMemoryItemSnapshot(
+                            item_id=item.item_id,
+                            source_kind=item.source_kind.value,
+                            source_id=item.source_id,
+                            activation=item.activation,
+                            salience=item.salience,
+                            retention_reason=item.retention_reason.value,
+                            created_revision=item.created_revision,
+                            last_activated_revision=item.last_activated_revision,
+                        )
+                        for item in main_loop.working_memory.items
+                    ),
+                ),
             )
         except Exception:
             capture_failure = AgentStateSaveError(
@@ -435,14 +594,37 @@ class AgentStateStore:
         raise capture_failure
 
     def restore_into(
-        self, main_loop: KagyaMainLoop, snapshot: AgentStateSnapshot
+        self, main_loop: KagyaMainLoop, snapshot: CompatibleAgentStateSnapshot
     ) -> None:
         restore_failure: AgentStateLoadError | None = None
         try:
-            validated = AgentStateSnapshot.model_validate(
+            validated = validate_compatible_agent_state_snapshot(
                 snapshot.model_dump(mode="python")
             )
             emotion = validated.emotion_state
+            working_memory = (
+                validated.working_memory
+                if isinstance(validated, AgentStateSnapshot)
+                else WorkingMemorySnapshot(revision=0, items=())
+            )
+            main_loop.working_memory.restore_exact(
+                working_memory.revision,
+                tuple(
+                    WorkingMemoryItem(
+                        item_id=item.item_id,
+                        source_kind=WorkingMemorySourceKind(item.source_kind),
+                        source_id=item.source_id,
+                        activation=item.activation,
+                        salience=item.salience,
+                        retention_reason=WorkingMemoryRetentionReason(
+                            item.retention_reason
+                        ),
+                        created_revision=item.created_revision,
+                        last_activated_revision=item.last_activated_revision,
+                    )
+                    for item in working_memory.items
+                ),
+            )
             main_loop.emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
@@ -465,6 +647,7 @@ class AgentStateStore:
                     arousal=legacy.emotion.arousal,
                     optimal_loss=legacy.emotion.optimal_loss,
                 ),
+                working_memory=WorkingMemorySnapshot(revision=0, items=()),
             )
         except Exception:
             migration_failure = AgentStateLoadError("AgentState v0 migration failed")
@@ -481,7 +664,7 @@ class AgentStateStore:
             self._save_stage_hook(stage)
 
     @staticmethod
-    def _canonical_bytes(snapshot: AgentStateSnapshot) -> bytes:
+    def _canonical_bytes(snapshot: CompatibleAgentStateSnapshot) -> bytes:
         return json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,
