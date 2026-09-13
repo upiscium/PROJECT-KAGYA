@@ -48,6 +48,11 @@ class MemorySettings(StrictBaseModel):
     default_record_type: str = Field(min_length=1)
 
 
+class WorkingMemorySettings(StrictBaseModel):
+    item_capacity: int = Field(default=32, gt=0, le=4096)
+    projection_max_bytes: int = Field(default=2048, gt=0, le=16 * 1024 * 1024)
+
+
 class SleepSettings(StrictBaseModel):
     enabled: bool
     dream_dataset_path: Path
@@ -120,6 +125,7 @@ class Settings(StrictBaseModel):
     api: ApiSettings
     frontend: FrontendSettings
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
