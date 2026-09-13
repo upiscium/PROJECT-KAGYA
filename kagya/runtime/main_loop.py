@@ -10,6 +10,7 @@ from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import ModelProvider
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_participant import (
@@ -22,7 +23,11 @@ from kagya.runtime.transaction_coordinator import (
     TransactionBoundValue,
     TransactionParticipant,
 )
-from kagya.runtime.working_memory import WorkingMemory
+from kagya.runtime.working_memory import (
+    WorkingMemory,
+    WorkingMemorySourceKind,
+    WorkingMemoryView,
+)
 
 if TYPE_CHECKING:
     from kagya.memory.episodic_participant import MemoryEpisodicParticipant
@@ -49,6 +54,7 @@ class DebugChatTrace:
     hidden_thought: str
     prompt: str
     memory_context: MemoryContext
+    working_memory_view: WorkingMemoryView
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,7 @@ class KagyaMainLoop:
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system
+        self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
             working_memory
@@ -144,7 +151,30 @@ class KagyaMainLoop:
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
         memory_context = self.memory_system.retrieve_context(user_input)
-        prompt = self.prompt_builder.build(user_input, emotion_state, memory_context)
+        self.working_memory.advance()
+        candidates = [
+            (WorkingMemorySourceKind.EPISODIC, record.id, rank)
+            for rank, record in enumerate(memory_context.db1_results)
+        ] + [
+            (WorkingMemorySourceKind.SEMANTIC, record.id, rank)
+            for rank, record in enumerate(memory_context.db2_results)
+        ]
+        # Admit larger rank numbers first (lower retrieval priority). Equal-rank
+        # references use ascending source kind and source ID as the total tie-break.
+        for source_kind, source_id, rank in sorted(
+            candidates,
+            key=lambda candidate: (-candidate[2], candidate[0].value, candidate[1]),
+        ):
+            self.working_memory.admit(
+                source_kind,
+                source_id,
+                activation=1.0,
+                salience=1.0 / (rank + 1),
+            )
+        working_memory_view = self.working_memory.select(self.working_memory_resolver)
+        prompt = self.prompt_builder.build(
+            user_input, emotion_state, working_memory_view
+        )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
         memory_participant = MemoryEpisodicParticipant(
@@ -172,6 +202,7 @@ class KagyaMainLoop:
                 hidden_thought=processed_response.hidden_thought,
                 prompt=prompt,
                 memory_context=memory_context,
+                working_memory_view=working_memory_view,
             )
         return _ComputedChat(
             response=processed_response.visible_response,

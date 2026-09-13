@@ -45,6 +45,7 @@ from kagya.runtime import (
     StateWALError,
     SessionTurnParticipant,
     TransactionBinding,
+    WorkingMemorySourceKind,
 )
 
 
@@ -1602,6 +1603,158 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
 
         assert not load_called
         assert settings.agent_state.path.read_bytes() == original
+
+
+def test_chat_commits_post_chat_working_memory_in_agent_state_v2(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    resolved_body = "U4-RESOLVED-BODY-SENTINEL"
+
+    with _client(tmp_path, settings=settings) as client:
+        semantic_id = client.app.state.memory_system.save_semantic(resolved_body)
+        response = client.post(
+            "/api/chat",
+            json={"message": resolved_body, "attachments": [], "debug": False},
+        )
+
+        assert response.status_code == 200
+        assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
+        snapshot = client.app.state.agent_state_store.load()
+        authoritative_items = client.app.state.main_loop.working_memory.items
+        assert snapshot.schema_version == 2
+        assert snapshot.working_memory.revision == (
+            client.app.state.main_loop.working_memory.revision
+        )
+        assert len(snapshot.working_memory.items) == len(authoritative_items) == 1
+        assert snapshot.working_memory.items[0].source_kind == (
+            WorkingMemorySourceKind.SEMANTIC.value
+        )
+        assert snapshot.working_memory.items[0].source_id == semantic_id
+        assert snapshot.working_memory.items[0].item_id == authoritative_items[0].item_id
+        assert snapshot.working_memory.items[0].activation == authoritative_items[0].activation
+        assert snapshot.working_memory.items[0].salience == authoritative_items[0].salience
+        assert snapshot.working_memory.items[0].created_revision == (
+            authoritative_items[0].created_revision
+        )
+        assert snapshot.working_memory.items[0].last_activated_revision == (
+            authoritative_items[0].last_activated_revision
+        )
+        assert resolved_body not in response.text
+        assert "working_memory" not in response.text
+        assert "debug" not in response.text
+
+        durable = (
+            settings.agent_state.path.read_bytes()
+            + settings.event_journal.path.read_bytes()
+            + b"".join(
+                path.read_bytes()
+                for path in settings.state_wal.directory.rglob("*")
+                if path.is_file()
+            )
+        )
+        assert resolved_body.encode() not in durable
+
+
+def test_debug_projection_can_use_resolved_body_without_durable_leak(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    resolved_body = "U4-DEBUG-RESOLVED-BODY-SENTINEL"
+
+    with _client(tmp_path, settings=settings) as client:
+        client.app.state.memory_system.save_semantic(resolved_body)
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": resolved_body, "attachments": [], "debug": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert resolved_body in data["prompt"]
+        assert resolved_body in str(data["retrieved_memory"])
+        durable = (
+            settings.agent_state.path.read_bytes()
+            + settings.event_journal.path.read_bytes()
+            + b"".join(
+                path.read_bytes()
+                for path in settings.state_wal.directory.rglob("*")
+                if path.is_file()
+            )
+        )
+        assert resolved_body.encode() not in durable
+        assert resolved_body.encode() not in settings.agent_state.path.read_bytes()
+
+
+def test_handler_failure_restores_prior_canonical_working_memory(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        client.app.state.memory_system.save_semantic("U4 failure checkpoint marker")
+        first = client.post(
+            "/api/chat",
+            json={"message": "U4 failure checkpoint marker", "attachments": []},
+        )
+        assert first.status_code == 200
+        prior = client.app.state.agent_state_store.load()
+        prior_working_memory = (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        )
+
+        failing = FailOnceAfterEmotionProvider()
+        client.app.state.main_loop.agent.provider = failing
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat",
+                json={"message": "U4 failure checkpoint marker", "attachments": []},
+            )
+
+        assert (
+            client.app.state.main_loop.working_memory.revision,
+            client.app.state.main_loop.working_memory.items,
+        ) == prior_working_memory
+        assert client.app.state.agent_state_store.load() == prior
+        failed = client.app.state.event_journal.records[-1]
+        assert failed.lifecycle is EventLifecycle.FAILED
+        assert failed.failure_category is EventFailureCategory.HANDLER_FAILURE
+
+
+def test_finalized_episode_is_retrieved_and_admitted_on_later_turn(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post(
+            "/api/chat",
+            json={"message": "U4 later-turn retrieval marker", "attachments": []},
+        )
+        assert first.status_code == 200
+        episode_id = first.json()["episode_id"]
+        assert client.app.state.memory_system.get_episodic_record(episode_id) is not None
+
+        second = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={
+                "message": "U4 later-turn retrieval marker",
+                "attachments": [],
+                "debug": True,
+            },
+        )
+        assert second.status_code == 200
+        assert episode_id in str(second.json()["retrieved_memory"])
+        assert (
+            "User: U4 later-turn retrieval marker\nAssistant: "
+            "Visible API answer."
+        ) in second.json()["prompt"]
+        assert any(
+            item.source_kind is WorkingMemorySourceKind.EPISODIC
+            and item.source_id == episode_id
+            for item in client.app.state.main_loop.working_memory.items
+        )
 
 
 def _client(
