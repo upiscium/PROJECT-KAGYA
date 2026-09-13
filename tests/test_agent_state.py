@@ -222,6 +222,45 @@ def test_projection_budget_change_does_not_change_agent_state_hash(
     )
 
 
+def test_restart_with_projection_config_change_preserves_state_but_repacks(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    source = LoopStub(
+        EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0),
+        item_capacity=2,
+        projection_max_bytes=100,
+    )
+    for source_id in ("episode-pack-a", "episode-pack-b"):
+        source.working_memory.admit(
+            WorkingMemorySourceKind.EPISODIC, source_id, 0.5, 0.5
+        )
+    snapshot = store.capture(source, sequence=3)
+    store.save(snapshot)
+
+    target = LoopStub(
+        EmotionState(valence=1.0, arousal=1.0, optimal_loss=2.0),
+        item_capacity=2,
+        projection_max_bytes=4,
+    )
+    loaded = make_store(path).load()
+    make_store(path).restore_into(target, loaded)
+    wide = source.working_memory.select(lambda _item: "long")
+    narrow = target.working_memory.select(lambda _item: "long")
+    recaptured = make_store(path).capture(target, sequence=3)
+
+    assert target.working_memory.items == source.working_memory.items
+    assert target.working_memory.revision == source.working_memory.revision
+    assert recaptured == snapshot
+    assert make_store(path).snapshot_hash(
+        recaptured
+    ) == make_store(path).snapshot_hash(snapshot)
+    assert len(wide.selected) == 2
+    assert len(narrow.selected) == 1
+    assert narrow.projected_bytes <= 4
+
+
 def test_legacy_v1_fixture_bytes_and_hash_remain_unchanged(tmp_path: Path) -> None:
     store = make_store(tmp_path / "agent_state.json")
     snapshot = make_v1_snapshot()
@@ -588,6 +627,23 @@ def test_canonical_snapshot_contains_no_private_or_independent_store_data(
     ):
         assert forbidden not in raw.casefold()
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_agent_state_has_no_working_memory_participant_or_journal_authority() -> None:
+    assert set(AgentStateSnapshot.model_fields) == {
+        "saved_at",
+        "last_processed_event_sequence",
+        "emotion_state",
+        "working_memory",
+        "schema_version",
+    }
+    assert set(WorkingMemorySnapshot.model_fields) == {"revision", "items"}
+    assert not {
+        "participant",
+        "store",
+        "journal",
+        "journaling",
+    }.intersection(AgentStateSnapshot.model_fields)
 
 
 @pytest.mark.parametrize(

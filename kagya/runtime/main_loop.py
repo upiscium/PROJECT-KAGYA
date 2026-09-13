@@ -10,7 +10,6 @@ from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import ModelProvider
 from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
 from kagya.runtime.session_participant import (
@@ -86,6 +85,8 @@ class KagyaMainLoop:
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
     ) -> None:
+        from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system

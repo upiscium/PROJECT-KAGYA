@@ -76,7 +76,8 @@ def v1_snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV1:
 def snapshot_with_working_memory(
     sequence: int, value: float = 0.1
 ) -> AgentStateSnapshot:
-    source_id = f"episode-state-{sequence}"
+    episodic_source_id = f"episode-state-{sequence}"
+    semantic_source_id = f"semantic-state-{sequence}"
     return AgentStateSnapshot(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
@@ -88,14 +89,26 @@ def snapshot_with_working_memory(
             items=(
                 WorkingMemoryItemSnapshot(
                     item_id=working_memory_item_id(
-                        WorkingMemorySourceKind.EPISODIC, source_id
+                        WorkingMemorySourceKind.EPISODIC, episodic_source_id
                     ),
                     source_kind="episodic",
-                    source_id=source_id,
+                    source_id=episodic_source_id,
                     activation=0.7,
                     salience=0.8,
                     retention_reason="reactivated",
                     created_revision=2,
+                    last_activated_revision=7,
+                ),
+                WorkingMemoryItemSnapshot(
+                    item_id=working_memory_item_id(
+                        WorkingMemorySourceKind.SEMANTIC, semantic_source_id
+                    ),
+                    source_kind="semantic",
+                    source_id=semantic_source_id,
+                    activation=0.55,
+                    salience=0.65,
+                    retention_reason="reactivated",
+                    created_revision=3,
                     last_activated_revision=7,
                 ),
             ),
@@ -174,7 +187,7 @@ def append_uncommitted_candidate(
     name: str,
 ) -> tuple[AgentStateSnapshot, AgentStateSnapshot]:
     initial = store.load()
-    candidate = snapshot(1, 0.4)
+    candidate = snapshot_with_working_memory(1, 0.4)
     item = event(name, 1)
     manifest = wal.inspect().active_manifest
     assert manifest is not None
@@ -737,21 +750,61 @@ def test_completion_rejects_later_wal_tail(tmp_path: Path) -> None:
         recovery.complete_committed_event(item, evidence)
 
 
-def test_exact_current_reconstructs_missing_canonical_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_exact_current_repair_restores_exact_working_memory_without_runtime_calls(
+    tmp_path: Path, corrupt: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     recovery, store, journal, wal = coordinator(tmp_path)
     initial = recovery.prepare_startup().snapshot
-    candidate = snapshot(1, 0.4)
+    candidate = snapshot_with_working_memory(1, 0.4)
     item = event("exact-current", 1)
     start_event(journal, item)
     commit_event(recovery, item, initial, candidate)
-    store.path.unlink()
+    if corrupt:
+        store.path.write_bytes(b"{corrupt")
+    else:
+        store.path.unlink()
 
-    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    forbidden_calls: list[str] = []
+
+    def forbidden(name: str):
+        def call(*_args: object, **_kwargs: object) -> object:
+            forbidden_calls.append(name)
+            pytest.fail(f"unexpected {name} call")
+
+        return call
+
+    # Recovery is deliberately exercised through its state authorities only;
+    # these guards make the evidence explicit that no runtime handler surface
+    # participates in exact-current repair.
+    restarted_recovery = StateRecoveryCoordinator(store, journal, wal)
+    monkeypatch.setattr(
+        restarted_recovery, "commit_internal_candidate", forbidden("handler")
+    )
+    monkeypatch.setattr(
+        restarted_recovery, "complete_committed_event", forbidden("handler")
+    )
+
+    result = restarted_recovery.prepare_startup()
 
     assert result.snapshot == candidate
+    assert result.snapshot_hash == store.snapshot_hash(candidate)
+    assert result.snapshot.last_processed_event_sequence == 1
+    assert result.snapshot.working_memory == candidate.working_memory
+    assert {item.source_kind for item in candidate.working_memory.items} == {
+        "episodic",
+        "semantic",
+    }
+    assert all(
+        item.retention_reason == "reactivated"
+        and item.created_revision != 0
+        and item.last_activated_revision == candidate.working_memory.revision
+        for item in candidate.working_memory.items
+    )
     assert result.exact_current_reconstructed
     assert not result.external_reconciliation_required
     assert store.load() == candidate
+    assert forbidden_calls == []
 
 
 def test_v2_wal_candidate_is_exactly_reconstructible_at_save_crash_boundary(
@@ -785,7 +838,42 @@ def test_v2_wal_candidate_is_exactly_reconstructible_at_save_crash_boundary(
 
     assert restarted.snapshot == candidate
     assert restarted.processing_high_water == 1
+    assert restarted.snapshot_hash == store.snapshot_hash(candidate)
+    assert restarted.snapshot.last_processed_event_sequence == 1
+    assert restarted.snapshot.working_memory == candidate.working_memory
     assert wal.reconstruct(sequence=1) == candidate
+
+
+def test_published_v2_candidate_before_terminal_completion_restores_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot_with_working_memory(1, 0.61)
+    item = event("published-v2-before-terminal", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    assert journal.inspect().records[-1].lifecycle is EventLifecycle.PREPARED
+
+    restarted_recovery = StateRecoveryCoordinator(store, journal, wal)
+    monkeypatch.setattr(
+        restarted_recovery,
+        "commit_internal_candidate",
+        lambda *_args, **_kwargs: pytest.fail("handler replayed"),
+    )
+    monkeypatch.setattr(
+        restarted_recovery,
+        "complete_committed_event",
+        lambda *_args, **_kwargs: pytest.fail("terminal handler replayed"),
+    )
+
+    restarted = restarted_recovery.prepare_startup()
+
+    assert restarted.snapshot == candidate
+    assert restarted.snapshot_hash == evidence.snapshot_hash
+    assert restarted.snapshot.last_processed_event_sequence == evidence.snapshot_sequence
+    assert restarted.snapshot.working_memory == candidate.working_memory
+    assert restarted.processing_high_water == evidence.processing_sequence
 
 
 def test_first_normal_internal_commit_bridges_v1_to_v2_without_migration(
@@ -1436,7 +1524,11 @@ def test_true_rollback_to_retained_v1_preserves_high_water_and_legacy_state(
     recovery.publish_boot_anchor(bootable)
     item = event("v1-rollback-target", 1)
     start_event(journal, item)
-    commit_event(recovery, item, target, snapshot(1, 0.4))
+    commit_event(recovery, item, target, snapshot_with_working_memory(1, 0.4))
+    for sequence in range(2, 6):
+        later = event(f"v1-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
     corrupt_manifest = wal.inspect().active_manifest
     assert corrupt_manifest is not None
     generation = (
@@ -1454,7 +1546,10 @@ def test_true_rollback_to_retained_v1_preserves_high_water_and_legacy_state(
 
     assert rolled_back.snapshot == target
     assert isinstance(rolled_back.snapshot, AgentStateSnapshotV1)
-    assert rolled_back.processing_high_water == 1
+    assert rolled_back.snapshot.last_processed_event_sequence == 0
+    assert rolled_back.snapshot.emotion_state == target.emotion_state
+    assert not hasattr(rolled_back.snapshot, "working_memory")
+    assert rolled_back.processing_high_water == 5
     assert rolled_back.true_rollback_performed
     assert rolled_back.external_reconciliation_required
 
@@ -1728,7 +1823,11 @@ def test_recovery_resumes_after_new_generation_before_snapshot_publication(
     resumed = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert resumed.snapshot == initial
+    assert resumed.snapshot_hash == store.snapshot_hash(initial)
+    assert resumed.snapshot.working_memory == initial.working_memory
+    assert resumed.snapshot.last_processed_event_sequence == 0
     assert resumed.processing_high_water == 1
+    assert wal.inspect().latest_snapshot_sequence == 0
     assert journal.inspect().open_recoveries == ()
     assert any(
         record.lifecycle is EventLifecycle.RECOVERY_COMPLETED

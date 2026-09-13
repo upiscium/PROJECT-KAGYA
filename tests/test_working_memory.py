@@ -1,13 +1,17 @@
 """R08 U1 bounded Working Memory state-machine contract tests."""
 
 from dataclasses import FrozenInstanceError, fields, replace
+from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from threading import Thread
 
 import pytest
 import yaml
 
+from kagya.body import EmotionState
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem
 from kagya.memory.dual_memory_system import (
@@ -18,6 +22,7 @@ from kagya.memory.dual_memory_system import (
 )
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
+from kagya.persona import PromptBuilder
 from kagya.runtime import (
     AgentStateStore,
     KagyaMainLoop,
@@ -32,9 +37,11 @@ from kagya.runtime import (
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
+from kagya.runtime.event_journal import EventJournal
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def admit(
@@ -156,6 +163,56 @@ def test_select_is_exactly_pure_and_repeatable() -> None:
         first.projected_bytes = 0  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         first.decisions[0].selected = False  # type: ignore[misc]
+
+
+def test_memory_resolver_imports_cleanly_before_runtime_package() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from kagya.memory.working_memory_resolver import "
+            "MemoryWorkingMemoryResolver",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_repeated_selection_and_prompt_builds_preserve_canonical_evidence(
+    tmp_path: Path,
+) -> None:
+    memory = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    admit(memory, "episode-repeat", activation=0.8, salience=0.6)
+    before = (memory.revision, memory.items)
+    loop = SimpleNamespace(
+        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+    )
+    store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
+
+    views = [
+        memory.select(lambda item: f"resolved:{item.source_id}") for _ in range(3)
+    ]
+    prompts = [
+        PromptBuilder().build("hello", loop.emotion_engine.state, view)
+        for view in views
+    ]
+    snapshots = [store.capture(loop, sequence=7) for _ in range(3)]
+
+    assert views[0] == views[1] == views[2]
+    assert prompts[0] == prompts[1] == prompts[2]
+    assert (memory.revision, memory.items) == before
+    assert all(
+        store.canonical_bytes(snapshot) == store.canonical_bytes(snapshots[0])
+        for snapshot in snapshots
+    )
+    assert all(
+        store.snapshot_hash(snapshot) == store.snapshot_hash(snapshots[0])
+        for snapshot in snapshots
+    )
 
 
 def test_projection_budget_is_ephemeral_and_never_changes_canonical_state() -> None:
@@ -474,6 +531,58 @@ def test_nonresolved_resolution_cannot_expose_content(
     with pytest.raises(ValueError):
         WorkingMemoryResolution(status, "private body")
     assert WorkingMemoryResolution(status).rendered_content is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkingMemoryResolutionStatus.RESOLVED,
+        WorkingMemoryResolutionStatus.MISSING,
+        WorkingMemoryResolutionStatus.ARCHIVED,
+        WorkingMemoryResolutionStatus.UNAVAILABLE,
+        WorkingMemoryResolutionStatus.MALFORMED,
+    ],
+)
+def test_resolution_outcomes_preserve_wm_wal_and_journal_evidence(
+    tmp_path: Path, status: WorkingMemoryResolutionStatus
+) -> None:
+    memory = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    admit(memory, "episode-evidence")
+    before = (memory.revision, memory.items)
+    loop = SimpleNamespace(
+        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+    )
+    store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
+    snapshot = store.capture(loop, sequence=0)
+    snapshot_hash = store.snapshot_hash(snapshot)
+    wal = StateWAL(tmp_path / "wal")
+    wal.bootstrap(snapshot, 0)
+    journal = EventJournal(
+        tmp_path / "journal.jsonl", 100_000, 4, clock=lambda: NOW
+    )
+    journal.verify_and_reconcile(0, snapshot_hash)
+    wal_before = tuple(
+        (path.relative_to(tmp_path / "wal"), path.read_bytes())
+        for path in sorted((tmp_path / "wal").rglob("*"))
+        if path.is_file()
+    )
+    journal_before = journal.path.read_bytes()
+
+    result = WorkingMemoryResolution(
+        status, "body" if status is WorkingMemoryResolutionStatus.RESOLVED else None
+    )
+    memory.select(lambda _item: result)
+
+    after = store.capture(loop, sequence=0)
+    assert (memory.revision, memory.items) == before
+    assert store.canonical_bytes(after) == store.canonical_bytes(snapshot)
+    assert store.snapshot_hash(after) == snapshot_hash
+    assert tuple(
+        (path.relative_to(tmp_path / "wal"), path.read_bytes())
+        for path in sorted((tmp_path / "wal").rglob("*"))
+        if path.is_file()
+    ) == wal_before
+    assert journal.path.read_bytes() == journal_before
 
 
 def test_typed_resolution_selects_and_maps_source_statuses() -> None:
