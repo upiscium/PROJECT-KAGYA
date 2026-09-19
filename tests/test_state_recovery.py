@@ -12,7 +12,7 @@ from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEvent
 from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
+    AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     AgentStateStore,
     EmotionStateSnapshot,
@@ -52,8 +52,8 @@ from kagya.runtime.state_wal import (
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -75,10 +75,10 @@ def v1_snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV1:
 
 def snapshot_with_working_memory(
     sequence: int, value: float = 0.1
-) -> AgentStateSnapshot:
+) -> AgentStateSnapshotV2:
     episodic_source_id = f"episode-state-{sequence}"
     semantic_source_id = f"semantic-state-{sequence}"
-    return AgentStateSnapshot(
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -172,8 +172,8 @@ def start_transaction(journal: EventJournal, item: AgentEvent) -> None:
 def commit_event(
     recovery: StateRecoveryCoordinator,
     item: AgentEvent,
-    prior: AgentStateSnapshot,
-    candidate: AgentStateSnapshot,
+    prior: AgentStateSnapshotV2,
+    candidate: AgentStateSnapshotV2,
 ) -> None:
     evidence = recovery.commit_internal_candidate(item, prior, candidate)
     recovery.complete_committed_event(item, evidence)
@@ -185,7 +185,7 @@ def append_uncommitted_candidate(
     wal: StateWAL,
     *,
     name: str,
-) -> tuple[AgentStateSnapshot, AgentStateSnapshot]:
+) -> tuple[AgentStateSnapshotV2, AgentStateSnapshotV2]:
     initial = store.load()
     candidate = snapshot_with_working_memory(1, 0.4)
     item = event(name, 1)
@@ -443,7 +443,7 @@ def test_normal_commit_order_and_artifacts_are_durable(
         order.append("wal")
         return append_transition(**kwargs)
 
-    def publish(value: AgentStateSnapshot) -> None:
+    def publish(value: AgentStateSnapshotV2) -> None:
         order.append("snapshot")
         save(value)
 
@@ -1496,7 +1496,7 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
 
     assert rolled_back.snapshot == bootable.snapshot
     assert rolled_back.snapshot == target
-    assert isinstance(rolled_back.snapshot, AgentStateSnapshot)
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV2)
     assert rolled_back.snapshot.working_memory == target.working_memory
     assert rolled_back.processing_high_water == 1
     assert rolled_back.true_rollback_performed

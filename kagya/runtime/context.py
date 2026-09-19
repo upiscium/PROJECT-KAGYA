@@ -477,7 +477,7 @@ class ContextRegistry:
     def restore_exact(self, state: ContextRegistryState) -> None:
         with self._mutation():
             try:
-                self._validate_state(state)
+                validate_context_registry_state(state)
             except ContextError:
                 raise
             except Exception:
@@ -490,7 +490,8 @@ class ContextRegistry:
                 for binding in state.interlocutor_bindings
             }
 
-    def _validate_state(self, state: ContextRegistryState) -> None:
+    @staticmethod
+    def _validate_state(state: ContextRegistryState) -> None:
         if type(state) is not ContextRegistryState:
             raise ContextStateInvalid("invalid registry state")
         revision = _revision(state.revision)
@@ -610,3 +611,14 @@ class ContextRegistry:
             or frames[state.current_context_id].status is not ContextStatus.ACTIVE
         ):
             raise ContextStateInvalid("invalid current context")
+
+
+def validate_context_registry_state(state: ContextRegistryState) -> None:
+    """Validate an exact registry projection without reading or mutating a registry."""
+
+    try:
+        ContextRegistry._validate_state(state)
+    except ContextError:
+        raise
+    except Exception:
+        raise ContextStateInvalid("invalid registry state") from None

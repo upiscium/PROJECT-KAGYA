@@ -16,6 +16,7 @@ from kagya.models import DummyProvider
 from kagya.persona import PromptBuilder
 from kagya.runtime import (
     CoordinatedResult,
+    ContextRegistry,
     KagyaMainLoop,
     TransactionBoundValue,
     WorkingMemory,
@@ -83,6 +84,23 @@ def test_main_loop_passively_owns_configured_or_injected_working_memory(
         == settings.working_memory.projection_max_bytes
     )
     assert explicit.working_memory is injected
+
+
+def test_main_loop_accepts_context_registry_without_creating_or_selecting_context(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    registry = ContextRegistry()
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        context_registry=registry,
+    )
+
+    assert loop.context_registry is registry
+    assert registry.state.revision == 0
+    assert registry.current_context_id is None
 
 
 def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(

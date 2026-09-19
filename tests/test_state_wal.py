@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from kagya.config import Settings, load_settings
 from kagya.runtime.agent_state import (
-    AgentStateSnapshot,
+    AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     EmotionStateSnapshot,
     WorkingMemorySnapshot,
@@ -31,8 +31,8 @@ from kagya.runtime.state_wal import (
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
-def make_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+def make_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(

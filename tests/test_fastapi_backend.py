@@ -32,7 +32,7 @@ from kagya.runtime import (
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
+    AgentStateSnapshotV2 as AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
     WorkingMemorySnapshot,
@@ -598,6 +598,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
             "load",
             "journal",
             "ensure",
+            "load",
             "v3",
             "load",
             "restore",
@@ -1096,7 +1097,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 2
+        == 3
     )
 
 
@@ -1709,7 +1710,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v2(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v3(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -1726,7 +1727,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v2(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 2
+        assert snapshot.schema_version == 3
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )
