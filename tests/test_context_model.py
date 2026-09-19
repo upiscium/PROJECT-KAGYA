@@ -758,6 +758,26 @@ def test_restore_rejects_noncanonical_order_and_references() -> None:
     assert target.state.revision == 0
 
 
+def test_restore_rejects_equivalent_non_utc_timestamps_without_mutating() -> None:
+    valid = nontrivial_registry().state
+    offset = timezone(timedelta(hours=9))
+    frame = valid.frames[0]
+    non_utc_frame = replace(
+        frame,
+        started_at=frame.started_at.astimezone(offset),
+        last_active_at=frame.last_active_at.astimezone(offset),
+    )
+    malformed = replace(valid, frames=(non_utc_frame, *valid.frames[1:]))
+    target = ContextRegistry(clock=DeterministicClock())
+    create_context(target, "existing")
+    before = target.state
+
+    with pytest.raises(ContextStateInvalid, match="timestamp"):
+        target.restore_exact(malformed)
+
+    assert target.state == before
+
+
 def test_context_models_are_immutable_and_have_exact_fields() -> None:
     assert issubclass(ContextNotFound, ContextError)
     assert issubclass(ContextConflict, ContextError)

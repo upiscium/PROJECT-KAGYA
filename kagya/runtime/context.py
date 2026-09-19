@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import math
 import re
@@ -153,16 +153,16 @@ def _revision(value: object) -> int:
     return value
 
 
-def _time(value: object) -> datetime:
+def _time(value: object, *, require_utc: bool = False) -> datetime:
     if type(value) is not datetime or value.tzinfo is None:
         raise ContextStateInvalid("invalid timestamp")
     try:
         offset = value.utcoffset()
-        result = value.astimezone(timezone.utc)
+        if offset is None or (require_utc and offset != timedelta(0)):
+            raise ValueError
+        result = value if require_utc else value.astimezone(timezone.utc)
     except (OverflowError, TypeError, ValueError):
         raise ContextStateInvalid("invalid timestamp") from None
-    if offset is None:
-        raise ContextStateInvalid("invalid timestamp")
     return result
 
 
@@ -541,8 +541,8 @@ class ContextRegistry:
             if frame.created_revision in creation_revisions:
                 raise ContextStateInvalid("duplicate creation revision")
             creation_revisions.add(frame.created_revision)
-            started = _time(frame.started_at)
-            active = _time(frame.last_active_at)
+            started = _time(frame.started_at, require_utc=True)
+            active = _time(frame.last_active_at, require_utc=True)
             if (
                 started > active
                 or started != frame.started_at
