@@ -12,6 +12,8 @@ import pytest
 from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.runtime import (
     AgentStateLoadError,
+    AgentStateSaveError,
+    AgentStateSaveStage,
     AgentStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateStore,
@@ -23,6 +25,7 @@ from kagya.runtime import (
     StateRecoveryCoordinator,
     AgentStateSnapshotV1,
     WorkingMemory,
+    WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
 
@@ -90,6 +93,67 @@ def test_v2_canonical_bytes_and_hash_remain_exact() -> None:
     assert hashlib.sha256(fixture).hexdigest() == (
         "ee9b71ed758520d00a62fb928e505047e915c585f604298bbee58a3912bcad60"
     )
+
+
+def test_v2_nonempty_working_memory_canonical_bytes_and_hash_remain_exact() -> None:
+    item = {
+        "activation": 0.7,
+        "created_revision": 2,
+        "item_id": "wm-6e5ff5f0ffb5e82bc7174a955ecf100d5801157f6eff3367ad7d11b62925de0e",
+        "last_activated_revision": 5,
+        "retention_reason": "reactivated",
+        "salience": 0.8,
+        "source_id": "episode-wm",
+        "source_kind": "episodic",
+    }
+    snapshot = AgentStateSnapshotV2(
+        saved_at=NOW,
+        last_processed_event_sequence=9,
+        emotion_state=EmotionStateSnapshot(
+            valence=-0.4, arousal=0.6, optimal_loss=0.8
+        ),
+        working_memory=WorkingMemorySnapshot(
+            revision=5,
+            items=(
+                WorkingMemoryItemSnapshot(**item),
+            ),
+        ),
+    )
+    fixture = (
+        b'{"emotion_state":{"arousal":0.6,"optimal_loss":0.8,"valence":-0.4},'
+        b'"last_processed_event_sequence":9,"saved_at":"2026-01-02T03:04:05Z",'
+        b'"schema_version":2,"working_memory":{"items":[{"activation":0.7,'
+        b'"created_revision":2,"item_id":"wm-6e5ff5f0ffb5e82bc7174a955ecf100d5801157f6eff3367ad7d11b62925de0e",'
+        b'"last_activated_revision":5,"retention_reason":"reactivated","salience":0.8,'
+        b'"source_id":"episode-wm","source_kind":"episodic"}],"revision":5}}'
+    )
+
+    assert AgentStateStore._canonical_bytes(snapshot) == fixture
+    assert hashlib.sha256(fixture).hexdigest() == (
+        "237b970ca3326b84cef9f12ea34efb9f26fbd7e1cc0b801f1aa271311f0340af"
+    )
+
+
+def test_capture_without_context_authority_is_a_bounded_capture_failure(
+    tmp_path: Path,
+) -> None:
+    class MissingContextAuthority:
+        def __init__(self) -> None:
+            self.emotion_engine = EmotionEngineAllostasis(
+                EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0)
+            )
+            self.working_memory = WorkingMemory(
+                item_capacity=32, projection_max_bytes=2048
+            )
+
+    store = make_store(tmp_path / "agent_state.json")
+
+    with pytest.raises(AgentStateSaveError) as error:
+        store.capture(MissingContextAuthority(), sequence=1)
+
+    assert error.value.stage is AgentStateSaveStage.CAPTURE
+    assert error.value.published is False
+    assert not (tmp_path / "agent_state.json").exists()
 
 
 def test_valid_noncanonical_v2_is_not_rewritten_and_restores_empty_context(

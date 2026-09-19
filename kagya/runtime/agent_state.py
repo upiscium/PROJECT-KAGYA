@@ -753,12 +753,10 @@ class AgentStateStore:
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion = main_loop.emotion_engine.state
-            context_registry = getattr(main_loop, "context_registry", None)
-            context_state = (
-                context_registry.state
-                if context_registry is not None
-                else ContextRegistryState(0, None, (), ())
-            )
+            context_registry = main_loop.context_registry
+            if context_registry is None:
+                raise ValueError("Context authority is unavailable")
+            context_state = context_registry.state
             validate_context_registry_state(context_state)
             return AgentStateSnapshot(
                 saved_at=self._now(),

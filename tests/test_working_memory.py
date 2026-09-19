@@ -37,6 +37,7 @@ from kagya.runtime import (
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
+from kagya.runtime.context import ContextRegistry
 from kagya.runtime.event_journal import EventJournal
 
 
@@ -189,7 +190,9 @@ def test_repeated_selection_and_prompt_builds_preserve_canonical_evidence(
     admit(memory, "episode-repeat", activation=0.8, salience=0.6)
     before = (memory.revision, memory.items)
     loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+        emotion_engine=SimpleNamespace(state=EmotionState()),
+        working_memory=memory,
+        context_registry=ContextRegistry(clock=lambda: NOW),
     )
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
 
@@ -550,7 +553,9 @@ def test_resolution_outcomes_preserve_wm_wal_and_journal_evidence(
     admit(memory, "episode-evidence")
     before = (memory.revision, memory.items)
     loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+        emotion_engine=SimpleNamespace(state=EmotionState()),
+        working_memory=memory,
+        context_registry=ContextRegistry(clock=lambda: NOW),
     )
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
     snapshot = store.capture(loop, sequence=0)
