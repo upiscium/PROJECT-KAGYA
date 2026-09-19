@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from kagya.identifiers import validate_identifier
 import kagya.runtime.context as context_module
 from kagya.runtime import (
     MAX_CONTEXTS,
@@ -267,6 +268,65 @@ def test_current_context_requires_active_and_clears_atomically() -> None:
     registry.set_current("context-b")
     registry.set_current(None)
     assert registry.current_context_id is None
+
+
+def test_current_context_returns_exact_active_immutable_frame_without_mutation() -> None:
+    registry = ContextRegistry(clock=DeterministicClock())
+    frame = create_context(registry, "context-a")
+    registry.set_current("context-a")
+    before = registry.state
+
+    current = registry.current_context
+
+    assert current is frame
+    assert current is registry.state.frames[0]
+    assert current.status is ContextStatus.ACTIVE
+    assert registry.state == before
+
+
+def test_current_context_returns_none_when_no_context_is_current() -> None:
+    clock = DeterministicClock()
+    registry = ContextRegistry(clock=clock)
+    before = registry.state
+
+    assert registry.current_context is None
+    assert registry.state == before
+    assert clock.calls == 0
+
+
+def test_shared_identifier_validator_and_context_validation_have_grammar_parity() -> None:
+    valid = ("a", "A0._:-", "x" * 100)
+    invalid = (
+        "",
+        "0" + "x" * 128,
+        "a..b",
+        "a/b",
+        "a\\b",
+        "a b",
+        "é",
+        "a\n",
+    )
+    for value in valid:
+        assert validate_identifier(value) == value
+        assert (
+            create_context(ContextRegistry(clock=DeterministicClock()), value).context_id
+            == value
+        )
+    for value in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            validate_identifier(value)
+        with pytest.raises(ContextStateInvalid, match="identifier"):
+            create_context(ContextRegistry(clock=DeterministicClock()), value)
+
+    for value in (True, 1, None):
+        if type(value) is str:
+            continue
+        with pytest.raises((TypeError, ValueError)):
+            validate_identifier(value)
+        with pytest.raises(ContextStateInvalid, match="identifier"):
+            create_context(
+                ContextRegistry(clock=DeterministicClock()), value  # type: ignore[arg-type]
+            )
 
 
 def test_parent_must_exist_and_is_not_an_implicit_relation() -> None:
@@ -869,6 +929,7 @@ def test_context_domain_has_no_later_authority_or_raw_local_text_fields() -> Non
         "dataclasses",
         "datetime",
         "enum",
+        "kagya",
         "math",
         "re",
         "threading",

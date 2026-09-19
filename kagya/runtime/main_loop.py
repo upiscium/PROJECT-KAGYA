@@ -153,6 +153,16 @@ class KagyaMainLoop:
             MemoryEpisodicParticipant,
         )
 
+        current_context = self.context_registry.current_context
+        provenance = (
+            (
+                current_context.context_id,
+                current_context.source_channel,
+                current_context.source_session_id,
+            )
+            if current_context is not None
+            else (None, None, None)
+        )
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
@@ -193,6 +203,10 @@ class KagyaMainLoop:
                 emotion_arousal=emotion_state.arousal,
                 record_type=MemoryRecordType.EPISODIC_LOG,
                 created_at=datetime.now(UTC).isoformat(),
+                context_id=provenance[0],
+                source_channel=provenance[1],
+                source_session_id=provenance[2],
+                schema_version=2,
             ),
         )
         session_participant = SessionTurnParticipant(

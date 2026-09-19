@@ -388,6 +388,10 @@ def test_pre_internal_committed_memory_with_pending_cannot_be_aborted(
         emotion_arousal=operation.emotion_arousal,
         record_type=operation.record_type,
         created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
     )
     pending = participant.pending_path(binding)
     assert pending.exists()
@@ -537,7 +541,7 @@ def test_true_rollback_reconciles_aggregate_and_clears_gate(tmp_path: Path) -> N
         participant.episode_id(transaction.transaction_id)
     )
     assert committed is not None
-    assert committed.metadata["coordination_schema"] == 1
+    assert committed.metadata["coordination_schema"] == 2
     assert committed.metadata["extra"] == "{}"
     assert "private" not in committed.metadata
     assert committed.document.startswith(f"User: {PRIVATE}")

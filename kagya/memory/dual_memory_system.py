@@ -12,6 +12,7 @@ import chromadb
 from chromadb.api.types import Metadata
 
 from kagya.config import Settings
+from kagya.identifiers import validate_identifier
 from kagya.memory.consolidation import build_consolidation_prompt
 from kagya.memory.memory_evaluator import MemoryEvaluator
 from kagya.memory.memory_schema import (
@@ -210,6 +211,10 @@ class DualMemorySystem:
         emotion_arousal: float,
         record_type: MemoryRecordType,
         created_at: str,
+        coordination_schema: int | None = None,
+        context_id: str | None = None,
+        source_channel: str | None = None,
+        source_session_id: str | None = None,
     ) -> None:
         """Publish one already-validated deterministic coordinated record to DB1."""
 
@@ -224,6 +229,10 @@ class DualMemorySystem:
             created_at=created_at,
             metadata={},
             coordinated=True,
+            coordination_schema=coordination_schema,
+            context_id=context_id,
+            source_channel=source_channel,
+            source_session_id=source_session_id,
         )
 
     def _add_episodic(
@@ -239,6 +248,10 @@ class DualMemorySystem:
         created_at: str,
         metadata: Mapping[str, Any],
         coordinated: bool = False,
+        coordination_schema: int | None = None,
+        context_id: str | None = None,
+        source_channel: str | None = None,
+        source_session_id: str | None = None,
     ) -> None:
         record_metadata = canonical_episodic_metadata(
             user_input,
@@ -250,6 +263,10 @@ class DualMemorySystem:
             created_at=created_at,
             metadata=metadata,
             coordinated=coordinated,
+            coordination_schema=coordination_schema,
+            context_id=context_id,
+            source_channel=source_channel,
+            source_session_id=source_session_id,
         )
         self.db1.add(
             ids=[episode_id],
@@ -338,6 +355,12 @@ class DualMemorySystem:
                 str(sanitized.get("response", "")),
             )
             if _is_coordinated_episodic_metadata(metadata):
+                try:
+                    _committed_episodic_record(str(record_id), document, metadata)
+                except ValueError:
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    ) from None
                 if sanitized != metadata or document != visible_document:
                     raise EpisodicMemoryFormatError(
                         "Committed episodic Memory is invalid"
@@ -393,6 +416,10 @@ def canonical_episodic_metadata(
     created_at: str,
     metadata: Mapping[str, Any],
     coordinated: bool = False,
+    coordination_schema: int | None = None,
+    context_id: str | None = None,
+    source_channel: str | None = None,
+    source_session_id: str | None = None,
 ) -> Metadata:
     """Build the authoritative DB1 metadata map for one episodic record."""
 
@@ -407,15 +434,44 @@ def canonical_episodic_metadata(
         "created_at": created_at,
         "extra": json.dumps(dict(metadata)),
     }
+    if not coordinated:
+        if any(
+            value is not None
+            for value in (context_id, source_channel, source_session_id)
+        ):
+            raise ValueError("Uncoordinated episodic records do not support provenance")
+        return result
+    if coordination_schema is None:
+        coordination_schema = (
+            2
+            if any(
+                value is not None
+                for value in (context_id, source_channel, source_session_id)
+            )
+            else 1
+        )
     if coordinated:
-        result["coordination_schema"] = 1
+        if type(coordination_schema) is not int or coordination_schema not in (1, 2):
+            raise ValueError("unsupported coordination schema")
+        if coordination_schema == 2:
+            _validate_provenance(context_id, source_channel, source_session_id)
+        elif any(value is not None for value in (context_id, source_channel, source_session_id)):
+            raise ValueError("schema 1 does not support provenance")
+        result["coordination_schema"] = coordination_schema
+        if coordination_schema == 2:
+            for key, value in (
+                ("context_id", context_id),
+                ("source_channel", source_channel),
+                ("source_session_id", source_session_id),
+            ):
+                if value is not None:
+                    result[key] = value
     return result
 
 
 def _is_coordinated_episodic_metadata(metadata: Mapping[str, Any]) -> bool:
-    return (
-        type(metadata.get("coordination_schema")) is int
-        and metadata["coordination_schema"] == 1
+    return "coordination_schema" in metadata or any(
+        key in metadata for key in ("context_id", "source_channel", "source_session_id")
     )
 
 
@@ -443,6 +499,47 @@ def _sanitize_extra_metadata(value: Any) -> str:
         return "{}"
     sanitized = scrub_private_fields(loaded)
     return json.dumps(sanitized)
+
+
+def _validate_opaque_id(value: Any) -> str:
+    """Validate one shared opaque identifier."""
+
+    return validate_identifier(value)
+
+
+def _validate_provenance(
+    context_id: Any, source_channel: Any, source_session_id: Any
+) -> None:
+    values = (context_id, source_channel, source_session_id)
+    if all(value is None for value in values):
+        return
+    if context_id is None or source_channel is None:
+        raise ValueError
+    for value in values:
+        if value is not None:
+            _validate_opaque_id(value)
+
+
+def _provenance_from_metadata(
+    metadata: Mapping[str, Any],
+) -> tuple[int | None, str | None, str | None, str | None]:
+    provenance_keys = ("context_id", "source_channel", "source_session_id")
+    if "coordination_schema" not in metadata:
+        if any(key in metadata for key in provenance_keys):
+            raise ValueError
+        return None, None, None, None
+    coordination_schema = metadata["coordination_schema"]
+    if type(coordination_schema) is not int or coordination_schema not in (1, 2):
+        raise ValueError
+    if coordination_schema == 1:
+        if any(key in metadata for key in provenance_keys):
+            raise ValueError
+        return 1, None, None, None
+    values = tuple(metadata.get(key) for key in provenance_keys)
+    if any(key in metadata and type(metadata[key]) is not str for key in provenance_keys):
+        raise ValueError
+    _validate_provenance(*values)
+    return (2, values[0], values[1], values[2])
 
 
 def _episodic_records_from_query(
@@ -513,6 +610,12 @@ def _committed_episodic_record(
     )
     if any(key not in metadata for key in required):
         raise ValueError
+    (
+        coordination_schema,
+        context_id,
+        source_channel,
+        source_session_id,
+    ) = _provenance_from_metadata(metadata)
     if not all(
         isinstance(metadata[key], str)
         for key in ("user_input", "response", "record_type", "created_at", "extra")
@@ -545,6 +648,7 @@ def _committed_episodic_record(
     extra = json.loads(metadata["extra"])
     if not isinstance(extra, dict):
         raise ValueError
+    reject_private_fields(extra, context="Committed episodic Memory metadata")
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=metadata["user_input"],
@@ -556,6 +660,10 @@ def _committed_episodic_record(
         archived=metadata["archived"],
         created_at=metadata["created_at"],
         metadata=extra,
+        context_id=context_id,
+        source_channel=source_channel,
+        source_session_id=source_session_id,
+        coordination_schema=coordination_schema,
     )
 
 
@@ -603,6 +711,17 @@ def _episodic_records_from_get(
 def _episodic_record_from_metadata(
     record_id: str, metadata: dict[str, Any]
 ) -> EpisodicMemoryRecord:
+    try:
+        (
+            coordination_schema,
+            context_id,
+            source_channel,
+            source_session_id,
+        ) = _provenance_from_metadata(metadata)
+    except ValueError:
+        raise EpisodicMemoryFormatError(
+            "Committed episodic Memory is invalid"
+        ) from None
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
@@ -616,6 +735,10 @@ def _episodic_record_from_metadata(
         archived=bool(metadata.get("archived", False)),
         created_at=str(metadata.get("created_at", "")),
         metadata=_loads_json_dict(metadata.get("extra")),
+        context_id=context_id,
+        source_channel=source_channel,
+        source_session_id=source_session_id,
+        coordination_schema=coordination_schema,
     )
 
 

@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import math
-import re
 from threading import RLock
 from typing import cast
+
+from kagya.identifiers import validate_identifier
 
 
 MAX_CONTEXTS = 1024
@@ -16,9 +17,6 @@ MAX_PARTICIPANTS_PER_CONTEXT = 32
 MAX_RELATIONS_PER_CONTEXT = 64
 MAX_INTERLOCUTOR_BINDINGS = 1024
 MAX_EVIDENCE_REFERENCES = 32
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-
-
 class ContextError(ValueError):
     """Base class for context domain failures."""
 
@@ -118,9 +116,10 @@ class ContextRegistryState:
 def _id(value: object, optional: bool = False) -> str | None:
     if optional and value is None:
         return None
-    if type(value) is not str or _ID.fullmatch(value) is None or ".." in value:
-        raise ContextStateInvalid("invalid identifier")
-    return value
+    try:
+        return validate_identifier(value)
+    except Exception:
+        raise ContextStateInvalid("invalid identifier") from None
 
 
 def _refs(values: Iterable[object], limit: int) -> tuple[str, ...]:
@@ -217,6 +216,18 @@ class ContextRegistry:
     def current_context_id(self) -> str | None:
         with self._lock:
             return self._current
+
+    @property
+    def current_context(self) -> ContextFrame | None:
+        """Return the exact active current frame without changing registry state."""
+
+        with self._lock:
+            if self._current is None:
+                return None
+            frame = self._frames.get(self._current)
+            if frame is None or frame.status is not ContextStatus.ACTIVE:
+                raise ContextStateInvalid("current context is invalid")
+            return frame
 
     def _frame(self, context_id: str) -> ContextFrame:
         frame = self._frames.get(context_id)
