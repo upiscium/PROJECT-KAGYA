@@ -18,7 +18,7 @@ from kagya.models import ModelProvider
 from kagya.persona.prompt_builder import PromptBuilder
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
-    AgentStateSnapshot,
+    AgentStateSnapshotV2,
     AgentStateStore,
     EmotionStateSnapshot,
     WorkingMemoryItemSnapshot,
@@ -80,8 +80,8 @@ def _event(name: str, sequence: int = 1) -> AgentEvent:
     )
 
 
-def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -93,7 +93,7 @@ def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
 
 def _snapshot_with_working_memory(
     sequence: int, references: tuple[tuple[str, str], ...], revision: int
-) -> AgentStateSnapshot:
+) -> AgentStateSnapshotV2:
     items = tuple(
         WorkingMemoryItemSnapshot(
             item_id=working_memory_item_id(WorkingMemorySourceKind(kind), source_id),
@@ -107,7 +107,7 @@ def _snapshot_with_working_memory(
         )
         for index, (kind, source_id) in enumerate(references)
     )
-    return AgentStateSnapshot(
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(

@@ -8,18 +8,24 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
+from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshot,
+    AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     AgentStateStore,
+    ContextFrameSnapshot,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
+from kagya.runtime.context import ContextRegistry, ContextType
 from kagya.runtime.working_memory import (
+    WorkingMemory,
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
@@ -52,8 +58,19 @@ from kagya.runtime.state_wal import (
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+class RestoreTarget:
+    def __init__(self) -> None:
+        self.emotion_engine = EmotionEngineAllostasis(
+            EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0)
+        )
+        self.working_memory = WorkingMemory(
+            item_capacity=32, projection_max_bytes=2048
+        )
+        self.context_registry = ContextRegistry(clock=lambda: NOW)
+
+
+def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -75,10 +92,10 @@ def v1_snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV1:
 
 def snapshot_with_working_memory(
     sequence: int, value: float = 0.1
-) -> AgentStateSnapshot:
+) -> AgentStateSnapshotV2:
     episodic_source_id = f"episode-state-{sequence}"
     semantic_source_id = f"semantic-state-{sequence}"
-    return AgentStateSnapshot(
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -172,8 +189,8 @@ def start_transaction(journal: EventJournal, item: AgentEvent) -> None:
 def commit_event(
     recovery: StateRecoveryCoordinator,
     item: AgentEvent,
-    prior: AgentStateSnapshot,
-    candidate: AgentStateSnapshot,
+    prior: AgentStateSnapshotV2,
+    candidate: AgentStateSnapshotV2,
 ) -> None:
     evidence = recovery.commit_internal_candidate(item, prior, candidate)
     recovery.complete_committed_event(item, evidence)
@@ -185,7 +202,7 @@ def append_uncommitted_candidate(
     wal: StateWAL,
     *,
     name: str,
-) -> tuple[AgentStateSnapshot, AgentStateSnapshot]:
+) -> tuple[AgentStateSnapshotV2, AgentStateSnapshotV2]:
     initial = store.load()
     candidate = snapshot_with_working_memory(1, 0.4)
     item = event(name, 1)
@@ -443,7 +460,7 @@ def test_normal_commit_order_and_artifacts_are_durable(
         order.append("wal")
         return append_transition(**kwargs)
 
-    def publish(value: AgentStateSnapshot) -> None:
+    def publish(value: AgentStateSnapshotV2) -> None:
         order.append("snapshot")
         save(value)
 
@@ -1496,7 +1513,7 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
 
     assert rolled_back.snapshot == bootable.snapshot
     assert rolled_back.snapshot == target
-    assert isinstance(rolled_back.snapshot, AgentStateSnapshot)
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV2)
     assert rolled_back.snapshot.working_memory == target.working_memory
     assert rolled_back.processing_high_water == 1
     assert rolled_back.true_rollback_performed
@@ -1506,6 +1523,95 @@ def test_corrupt_journal_bound_record_falls_back_to_older_boot_anchor(
         != corrupt_manifest.active_generation_id
     )
     assert generation.read_bytes() == corrupt_bytes
+
+
+def test_true_rollback_from_v3_to_retained_v2_clears_context(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    target = snapshot_with_working_memory(0, 0.25)
+    store.save(target)
+    journal.verify_and_reconcile(0, store.snapshot_hash(target))
+    wal.bootstrap(target, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+
+    context_frame = ContextFrameSnapshot(
+        context_id="current-context",
+        context_type="conversation",
+        source_channel="chat",
+        source_session_id="session-current",
+        participant_refs=(),
+        parent_context_id=None,
+        related_context_ids=(),
+        status="active",
+        created_revision=1,
+        last_modified_revision=1,
+        started_at=NOW,
+        last_active_at=NOW,
+    )
+    candidate = AgentStateSnapshot(
+        saved_at=NOW,
+        last_processed_event_sequence=1,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.4, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=1,
+            current_context_id="current-context",
+            frames=(context_frame,),
+            interlocutor_bindings=(),
+        ),
+    )
+    item = event("v3-context-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, target, candidate)
+    for sequence in range(2, 6):
+        later = event(f"v3-context-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
+
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == target
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV2)
+    assert rolled_back.snapshot.working_memory == target.working_memory
+    assert rolled_back.processing_high_water == 5
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.external_reconciliation_required
+
+    restored = RestoreTarget()
+    restored.context_registry.create(
+        "stale-context", ContextType.CONVERSATION, "chat"
+    )
+    restored.context_registry.set_current("stale-context")
+    store.restore_into(restored, rolled_back.snapshot)
+
+    assert restored.working_memory.revision == target.working_memory.revision
+    assert {
+        item.item_id for item in restored.working_memory.items
+    } == {
+        item.item_id for item in target.working_memory.items
+    }
+    assert restored.context_registry.state.revision == 0
+    assert restored.context_registry.state.current_context_id is None
+    assert restored.context_registry.state.frames == ()
+    assert restored.context_registry.state.interlocutor_bindings == ()
 
 
 def test_true_rollback_to_retained_v1_preserves_high_water_and_legacy_state(

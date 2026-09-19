@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import json
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -26,6 +26,14 @@ from pydantic import (
 
 from kagya.body import EmotionState
 from kagya.privacy import normalize_private_key
+from kagya.runtime.context import (
+    ContextFrame,
+    ContextRegistryState,
+    ContextStatus,
+    ContextType,
+    InterlocutorBinding,
+    validate_context_registry_state,
+)
 from kagya.runtime.working_memory import (
     WorkingMemoryItem,
     WorkingMemoryRetentionReason,
@@ -37,7 +45,7 @@ if TYPE_CHECKING:
     from kagya.runtime.main_loop import KagyaMainLoop
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[2] = 2
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[3] = 3
 
 
 class _StateModel(BaseModel):
@@ -169,15 +177,182 @@ class WorkingMemorySnapshot(_StateModel):
         return self
 
 
-class AgentStateSnapshot(_AgentStateSnapshotBase):
-    """Current AgentState v2 canonical snapshot."""
+class AgentStateSnapshotV2(_AgentStateSnapshotBase):
+    """Exact retained R08 canonical AgentState schema."""
 
-    schema_version: Literal[2] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[2] = 2
     working_memory: WorkingMemorySnapshot
 
 
+def _parse_context_timestamp(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("Context timestamp must be a valid datetime") from error
+    return value
+
+
+def _require_context_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("Context timestamp must be canonical UTC")
+    return value.astimezone(timezone.utc)
+
+
+def _tuple_value(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(value)
+    return value
+
+
+class ContextFrameSnapshot(_StateModel):
+    """Strict durable projection of one Context frame."""
+
+    context_id: str
+    context_type: Literal["conversation"]
+    source_channel: str
+    source_session_id: str | None
+    participant_refs: tuple[str, ...]
+    parent_context_id: str | None
+    related_context_ids: tuple[str, ...]
+    status: Literal["active", "suspended", "closed"]
+    created_revision: int = Field(ge=0)
+    last_modified_revision: int = Field(ge=0)
+    started_at: datetime
+    last_active_at: datetime
+
+    @field_validator(
+        "participant_refs", "related_context_ids", mode="before"
+    )
+    @classmethod
+    def parse_reference_lists(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("created_revision", "last_modified_revision", mode="before")
+    @classmethod
+    def reject_boolean_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Context revision must be an integer")
+        return value
+
+    @field_validator("started_at", "last_active_at", mode="before")
+    @classmethod
+    def parse_timestamps(cls, value: object) -> object:
+        return _parse_context_timestamp(value)
+
+    @field_validator("started_at", "last_active_at")
+    @classmethod
+    def require_utc_timestamps(cls, value: datetime) -> datetime:
+        return _require_context_utc(value)
+
+
+class InterlocutorBindingSnapshot(_StateModel):
+    """Strict durable projection of one evidence-bound interlocutor binding."""
+
+    reference_key: str
+    identity_key: str | None
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_references: tuple[str, ...]
+    created_revision: int = Field(ge=0)
+    last_modified_revision: int = Field(ge=0)
+
+    @field_validator("evidence_references", mode="before")
+    @classmethod
+    def parse_reference_list(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("confidence")
+    @classmethod
+    def require_finite_confidence(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Context confidence must be finite")
+        return value
+
+    @field_validator("created_revision", "last_modified_revision", mode="before")
+    @classmethod
+    def reject_boolean_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Context revision must be an integer")
+        return value
+
+
+class ContextStateSnapshot(_StateModel):
+    """Canonical Context authority embedded in AgentState v3."""
+
+    revision: int = Field(ge=0)
+    current_context_id: str | None
+    frames: tuple[ContextFrameSnapshot, ...]
+    interlocutor_bindings: tuple[InterlocutorBindingSnapshot, ...]
+
+    @field_validator("frames", "interlocutor_bindings", mode="before")
+    @classmethod
+    def parse_snapshot_lists(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("revision", mode="before")
+    @classmethod
+    def reject_boolean_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Context revision must be an integer")
+        return value
+
+    def to_registry_state(self) -> ContextRegistryState:
+        return ContextRegistryState(
+            revision=self.revision,
+            current_context_id=self.current_context_id,
+            frames=tuple(
+                ContextFrame(
+                    context_id=frame.context_id,
+                    context_type=ContextType(frame.context_type),
+                    source_channel=frame.source_channel,
+                    source_session_id=frame.source_session_id,
+                    participant_refs=frame.participant_refs,
+                    parent_context_id=frame.parent_context_id,
+                    related_context_ids=frame.related_context_ids,
+                    status=ContextStatus(frame.status),
+                    created_revision=frame.created_revision,
+                    last_modified_revision=frame.last_modified_revision,
+                    started_at=frame.started_at,
+                    last_active_at=frame.last_active_at,
+                )
+                for frame in self.frames
+            ),
+            interlocutor_bindings=tuple(
+                InterlocutorBinding(
+                    reference_key=binding.reference_key,
+                    identity_key=binding.identity_key,
+                    confidence=binding.confidence,
+                    evidence_references=binding.evidence_references,
+                    created_revision=binding.created_revision,
+                    last_modified_revision=binding.last_modified_revision,
+                )
+                for binding in self.interlocutor_bindings
+            ),
+        )
+
+    @model_validator(mode="after")
+    def require_valid_registry_state(self) -> ContextStateSnapshot:
+        validate_context_registry_state(self.to_registry_state())
+        return self
+
+
+class AgentStateSnapshot(_AgentStateSnapshotBase):
+    """Current AgentState v3 canonical snapshot."""
+
+    schema_version: Literal[3] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+
 CompatibleAgentStateSnapshot = Annotated[
-    AgentStateSnapshotV1 | AgentStateSnapshot,
+    AgentStateSnapshotV1 | AgentStateSnapshotV2 | AgentStateSnapshot,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -188,7 +363,7 @@ _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
 def validate_compatible_agent_state_snapshot(
     value: object,
 ) -> CompatibleAgentStateSnapshot:
-    """Validate retained v1 or current v2 without changing its version."""
+    """Validate a compatible snapshot without changing its schema version."""
 
     return _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(value)
 
@@ -310,6 +485,12 @@ def default_agent_state_snapshot(
             optimal_loss=baseline_surprisal,
         ),
         working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
     )
 
 
@@ -404,6 +585,15 @@ class AgentStateStore:
             schema_failure: AgentStateLoadError | None = None
             try:
                 return AgentStateSnapshotV1.model_validate(raw)
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            raise schema_failure
+        if version == 2:
+            schema_failure = None
+            try:
+                return AgentStateSnapshotV2.model_validate(raw)
             except ValidationError:
                 schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
@@ -505,7 +695,8 @@ class AgentStateStore:
 
         try:
             preserve_legacy = (
-                isinstance(snapshot, AgentStateSnapshotV1) and self.snapshot_exists()
+                isinstance(snapshot, (AgentStateSnapshotV1, AgentStateSnapshotV2))
+                and self.snapshot_exists()
             )
         except AgentStateLoadError:
             preserve_legacy = False
@@ -562,6 +753,11 @@ class AgentStateStore:
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion = main_loop.emotion_engine.state
+            context_registry = main_loop.context_registry
+            if context_registry is None:
+                raise ValueError("Context authority is unavailable")
+            context_state = context_registry.state
+            validate_context_registry_state(context_state)
             return AgentStateSnapshot(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -586,6 +782,43 @@ class AgentStateStore:
                         for item in main_loop.working_memory.items
                     ),
                 ),
+                context_state=ContextStateSnapshot(
+                    revision=context_state.revision,
+                    current_context_id=context_state.current_context_id,
+                    frames=tuple(
+                        ContextFrameSnapshot(
+                            context_id=frame.context_id,
+                            context_type=cast(
+                                Literal["conversation"], frame.context_type.value
+                            ),
+                            source_channel=frame.source_channel,
+                            source_session_id=frame.source_session_id,
+                            participant_refs=frame.participant_refs,
+                            parent_context_id=frame.parent_context_id,
+                            related_context_ids=frame.related_context_ids,
+                            status=cast(
+                                Literal["active", "suspended", "closed"],
+                                frame.status.value,
+                            ),
+                            created_revision=frame.created_revision,
+                            last_modified_revision=frame.last_modified_revision,
+                            started_at=frame.started_at,
+                            last_active_at=frame.last_active_at,
+                        )
+                        for frame in context_state.frames
+                    ),
+                    interlocutor_bindings=tuple(
+                        InterlocutorBindingSnapshot(
+                            reference_key=binding.reference_key,
+                            identity_key=binding.identity_key,
+                            confidence=binding.confidence,
+                            evidence_references=binding.evidence_references,
+                            created_revision=binding.created_revision,
+                            last_modified_revision=binding.last_modified_revision,
+                        )
+                        for binding in context_state.interlocutor_bindings
+                    ),
+                ),
             )
         except Exception:
             capture_failure = AgentStateSaveError(
@@ -604,33 +837,64 @@ class AgentStateStore:
             emotion = validated.emotion_state
             working_memory = (
                 validated.working_memory
-                if isinstance(validated, AgentStateSnapshot)
+                if isinstance(validated, (AgentStateSnapshotV2, AgentStateSnapshot))
                 else WorkingMemorySnapshot(revision=0, items=())
+            )
+            context_registry = getattr(main_loop, "context_registry", None)
+            context_state = (
+                validated.context_state.to_registry_state()
+                if isinstance(validated, AgentStateSnapshot)
+                else ContextRegistryState(0, None, (), ())
+            )
+            validate_context_registry_state(context_state)
+            restored_items = tuple(
+                WorkingMemoryItem(
+                    item_id=item.item_id,
+                    source_kind=WorkingMemorySourceKind(item.source_kind),
+                    source_id=item.source_id,
+                    activation=item.activation,
+                    salience=item.salience,
+                    retention_reason=WorkingMemoryRetentionReason(
+                        item.retention_reason
+                    ),
+                    created_revision=item.created_revision,
+                    last_activated_revision=item.last_activated_revision,
+                )
+                for item in working_memory.items
+            )
+            if isinstance(validated, AgentStateSnapshot) and context_registry is None:
+                raise AgentStateLoadError("AgentState restore requires ContextRegistry")
+
+            previous_emotion = main_loop.emotion_engine.state
+            previous_working_memory_revision = main_loop.working_memory.revision
+            previous_working_memory_items = main_loop.working_memory.items
+            previous_context = (
+                context_registry.state if context_registry is not None else None
             )
             main_loop.working_memory.restore_exact(
                 working_memory.revision,
-                tuple(
-                    WorkingMemoryItem(
-                        item_id=item.item_id,
-                        source_kind=WorkingMemorySourceKind(item.source_kind),
-                        source_id=item.source_id,
-                        activation=item.activation,
-                        salience=item.salience,
-                        retention_reason=WorkingMemoryRetentionReason(
-                            item.retention_reason
-                        ),
-                        created_revision=item.created_revision,
-                        last_activated_revision=item.last_activated_revision,
-                    )
-                    for item in working_memory.items
-                ),
+                restored_items,
             )
+            if context_registry is not None:
+                context_registry.restore_exact(context_state)
             main_loop.emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
                 optimal_loss=emotion.optimal_loss,
             )
         except Exception:
+            try:
+                if "previous_working_memory_revision" in locals():
+                    main_loop.working_memory.restore_exact(
+                        previous_working_memory_revision,
+                        previous_working_memory_items,
+                    )
+                if previous_context is not None and context_registry is not None:
+                    context_registry.restore_exact(previous_context)
+                if "previous_emotion" in locals():
+                    main_loop.emotion_engine.state = previous_emotion
+            except Exception:
+                pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
         if restore_failure is not None:
             raise restore_failure
@@ -648,6 +912,12 @@ class AgentStateStore:
                     optimal_loss=legacy.emotion.optimal_loss,
                 ),
                 working_memory=WorkingMemorySnapshot(revision=0, items=()),
+                context_state=ContextStateSnapshot(
+                    revision=0,
+                    current_context_id=None,
+                    frames=(),
+                    interlocutor_bindings=(),
+                ),
             )
         except Exception:
             migration_failure = AgentStateLoadError("AgentState v0 migration failed")

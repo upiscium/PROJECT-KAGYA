@@ -17,6 +17,7 @@ from kagya.runtime.session_participant import (
     SessionTurnParticipant,
 )
 from kagya.runtime.session_state import SessionState
+from kagya.runtime.context import ContextRegistry
 from kagya.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBoundValue,
@@ -84,6 +85,7 @@ class KagyaMainLoop:
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
+        context_registry: ContextRegistry | None = None,
     ) -> None:
         from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
@@ -109,6 +111,9 @@ class KagyaMainLoop:
         self.agent = agent or ConsciousAgent(provider)
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
+        self.context_registry = (
+            context_registry if context_registry is not None else ContextRegistry()
+        )
 
     def chat(self, user_input: str) -> CoordinatedResult[ChatResult]:
         """Compute an ordinary turn and return its process-local mutation plan."""
