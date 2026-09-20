@@ -26,6 +26,7 @@ from kagya.runtime import (
     EventJournal,
     EventJournalError,
     EventJournalLease,
+    EmotionTimer,
     InternalCommitEvidence,
     KagyaMainLoop,
     StateRecoveryCoordinator,
@@ -256,6 +257,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException:
             app.state.event_journal.close()
             raise
+        try:
+            app.state.emotion_timer = getattr(
+                app.state, "emotion_timer", None
+            ) or EmotionTimer(
+                app.state.agent_runtime,
+                app_settings.emotion.timer_interval_seconds,
+                app.state.main_loop.emotion_tick,
+            )
+        except BaseException:
+            app.state.agent_runtime.shutdown()
+            app.state.event_journal.close()
+            raise
         if (
             not app.state.external_reconciliation_required
             and app.state.startup_retention_admission_available
@@ -264,13 +277,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 assert recovery is not None
                 app.state.agent_runtime.start()
                 app.state.state_recovery.publish_boot_anchor(recovery)
+                if app_settings.emotion.timer_enabled:
+                    app.state.emotion_timer.start()
             except BaseException:
+                app.state.emotion_timer.stop()
                 app.state.agent_runtime.shutdown()
                 app.state.event_journal.close()
                 raise
         try:
             yield
         finally:
+            app.state.emotion_timer.stop()
             app.state.agent_runtime.shutdown()
             app.state.event_journal.close()
 

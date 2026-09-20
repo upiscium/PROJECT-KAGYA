@@ -222,6 +222,12 @@ class KagyaMainLoop:
             selectors=selectors,
         )
 
+    def emotion_tick(self) -> None:
+        """Advance idle emotion state inside the serialized runtime handler."""
+
+        self.emotion_engine.advance_to()
+        return None
+
     def _debug_chat_plan(
         self,
         user_input: str,

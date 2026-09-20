@@ -19,6 +19,7 @@ class AgentEventType(str, Enum):
     ADAPTER_EVALUATE = "adapter_evaluate"
     ADAPTER_UPDATE = "adapter_update"
     CONTEXT_UPDATE = "context_update"
+    EMOTION_TICK = "emotion_tick"
 
 
 class AgentEventSource(str, Enum):
@@ -36,6 +37,7 @@ class AgentEventSource(str, Enum):
     API_ADAPTER_APPROVE = "api.adapters.approve"
     API_ADAPTER_ACTIVATE = "api.adapters.activate"
     API_ADAPTER_REJECT = "api.adapters.reject"
+    RUNTIME_EMOTION_TIMER = "runtime.emotion_timer"
 
 
 class AgentRuntimeStatus(str, Enum):
@@ -215,7 +217,13 @@ class AgentRuntime:
                 name="kagya-agent-runtime",
                 daemon=True,
             )
-            self._worker.start()
+            worker = self._worker
+            try:
+                worker.start()
+            except BaseException:
+                self._worker = None
+                self._status = AgentRuntimeStatus.CREATED
+                raise
 
     def configure_durability(
         self,

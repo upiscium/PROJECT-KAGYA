@@ -160,6 +160,7 @@ from kagya.runtime.session_participant import (
     session_turn_operation_digest,
 )
 from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
+from kagya.runtime.emotion_timer import EmotionTimer
 
 __all__ = [
     "AbortOutcome",
@@ -218,6 +219,7 @@ __all__ = [
     "CURRENT_AGENT_STATE_SCHEMA_VERSION",
     "CURRENT_EVENT_JOURNAL_SCHEMA_VERSION",
     "ChatResult",
+    "EmotionTimer",
     "ChatContextSelectors",
     "CHAT_SOURCE_CHANNEL",
     "CoordinatedResult",

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock, current_thread
 from typing import Any, NoReturn
 
 import pytest
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from kagya.api.server import create_app
-from kagya.body import EmotionState, EmotionTemporalState
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
@@ -27,6 +28,9 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeDurabilityError,
+    AgentRuntimeDurabilityPhase,
+    AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     AgentRuntimeStatus,
@@ -46,6 +50,7 @@ from kagya.runtime import (
     WorkingMemoryResolutionStatus,
     EventFailureCategory,
     EventJournal,
+    EventJournalAdmissionStatus,
     EventJournalAppendError,
     EventJournalAppendStage,
     EventJournalLoadError,
@@ -134,6 +139,28 @@ class AdmissionRuntime:
     ) -> NoReturn:
         event = AgentEvent("test-event", event_type, source, datetime.now(timezone.utc))
         raise self.error_type(event)
+
+
+class RecordingTimer:
+    def __init__(
+        self,
+        on_start: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
+    ) -> None:
+        self.on_start = on_start
+        self.on_stop = on_stop
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+        if self.on_start is not None:
+            self.on_start()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if self.on_stop is not None:
+            self.on_stop()
 
 
 def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
@@ -321,6 +348,172 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
             main_loop.emotion_engine.state.arousal,
             main_loop.emotion_engine.state.optimal_loss,
         )
+
+
+def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        clock_values = iter((t0, t1))
+        main_loop.emotion_engine._clock = lambda: next(clock_values)  # type: ignore[method-assign]
+        original_advance_to = main_loop.emotion_engine.advance_to
+        active = 0
+        max_active = 0
+        lock = Lock()
+        threads: list[str] = []
+        chat_state: list[tuple[EmotionState, EmotionTemporalState]] = []
+
+        def tracked_advance_to(now=None):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                threads.append(current_thread().name)
+            try:
+                return original_advance_to(now)
+            finally:
+                with lock:
+                    active -= 1
+
+        main_loop.emotion_engine.advance_to = tracked_advance_to  # type: ignore[method-assign]
+
+        def chat_handler():
+            result = main_loop.chat("FIFO chat")
+            chat_state.append(
+                (main_loop.emotion_engine.state, main_loop.emotion_engine.temporal_state)
+            )
+            return result
+
+        chat_future = runtime.submit(
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            chat_handler,
+        )
+        tick_future = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        )
+        chat = chat_future.result(timeout=10)
+        tick = tick_future.result(timeout=10)
+
+        assert chat.event.processing_sequence == 1
+        assert tick.event.processing_sequence == 2
+        assert tick.value is None
+        assert max_active == 1
+        assert threads == ["kagya-agent-runtime", "kagya-agent-runtime"]
+        assert len(chat_state) == 1
+        assert main_loop.emotion_engine.temporal_state.last_update_at == t1
+
+        chat_emotion, chat_temporal = chat_state[0]
+        expected = EmotionEngineAllostasis(
+            chat_emotion,
+            adaptation_rate=main_loop.emotion_engine.adaptation_rate,
+            appraisal_response_rate=main_loop.emotion_engine.appraisal_response_rate,
+            resting_valence=main_loop.emotion_engine.resting_valence,
+            resting_arousal=main_loop.emotion_engine.resting_arousal,
+            valence_recovery_rate=main_loop.emotion_engine.valence_recovery_rate,
+            arousal_recovery_rate=main_loop.emotion_engine.arousal_recovery_rate,
+            temporal_state=chat_temporal,
+            clock=lambda: t1,
+        )
+        expected.advance_to()
+        assert main_loop.emotion_engine.state == expected.state
+
+        snapshot = client.app.state.agent_state_store.load()
+        assert snapshot.last_processed_event_sequence == 2
+        assert snapshot.appraisal_state.last_emotion_update_at == t1
+        tick_records = [
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_id == tick.event.event_id
+        ]
+        assert [record.lifecycle for record in tick_records] == [
+            EventLifecycle.ACCEPTED,
+            EventLifecycle.STARTED,
+            EventLifecycle.PREPARED,
+            EventLifecycle.COMPLETED,
+        ]
+        assert all(record.transaction_id is None for record in tick_records)
+
+
+def test_emotion_tick_clock_regression_restores_and_later_tick_recovers(
+    tmp_path: Path,
+) -> None:
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        current_time = [t0]
+        main_loop.emotion_engine._clock = lambda: current_time[0]  # type: ignore[method-assign]
+
+        first = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        ).result(timeout=10)
+        committed = client.app.state.agent_state_store.load()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
+        before_context = main_loop.context_registry.state
+        before_calibration = main_loop.loss_calibration.export()
+        before_turns = main_loop.session_state.turns
+        before_memory = client.app.state.memory_system.db1.get()
+
+        current_time[0] = t0 - timedelta(seconds=1)
+        failing = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        )
+        with pytest.raises(AgentRuntimeExecutionError) as error:
+            failing.result(timeout=10)
+
+        assert first.event.processing_sequence == 1
+        assert error.value.event.processing_sequence == 2
+        assert isinstance(error.value.__cause__, ValueError)
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert client.app.state.agent_state_store.load() == committed
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state == before_context
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert main_loop.session_state.turns == before_turns
+        assert client.app.state.memory_system.db1.get() == before_memory
+        failed_records = [
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_id == error.value.event.event_id
+        ]
+        assert [record.lifecycle for record in failed_records] == [
+            EventLifecycle.ACCEPTED,
+            EventLifecycle.STARTED,
+            EventLifecycle.FAILED,
+        ]
+
+        current_time[0] = t1
+        recovered = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        ).result(timeout=10)
+
+        assert recovered.event.processing_sequence == 3
+        assert main_loop.emotion_engine.temporal_state.last_update_at == t1
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence
+            == 3
+        )
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
 
 
 def test_chat_selector_validation_happens_before_event_admission(
@@ -961,6 +1154,150 @@ def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
         assert runtime is client.app.state.agent_runtime
         assert runtime.status is AgentRuntimeStatus.ACCEPTING
     assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_enabled_emotion_timer_starts_after_boot_anchor_and_stops_first(
+    tmp_path: Path,
+) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+
+    def assert_start_order() -> None:
+        assert app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert app.state.state_wal.inspect_boot_anchor_optional() is not None
+
+    def assert_stop_order() -> None:
+        assert app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert app.state.event_journal.path.exists()
+
+    timer = RecordingTimer(assert_start_order, assert_stop_order)
+    app.state.emotion_timer = timer
+
+    with TestClient(app) as client:
+        assert client.app.state.emotion_timer is timer
+        assert timer.start_calls == 1
+        assert timer.stop_calls == 0
+
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_timer_is_not_started_when_retention_admission_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class ExhaustedJournal(EventJournal):
+        def admission_status(self) -> EventJournalAdmissionStatus:
+            return EventJournalAdmissionStatus(
+                available=False,
+                reason="test retention gate",
+                active_file_bytes=0,
+                max_bytes=self.max_bytes,
+                rotated_segment_count=0,
+                retained_files=self.retained_files,
+                safe_rotation_possible=False,
+                lifecycle_blocks_rotation=False,
+                proof_retention_blocks_safe_pruning=True,
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.event_journal = ExhaustedJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
+
+    with TestClient(app) as client:
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.CREATED
+        assert timer.start_calls == 0
+        assert client.get("/health").json()["status"] == "degraded"
+
+    assert timer.stop_calls == 1
+
+
+def test_boot_anchor_failure_prevents_timer_start(tmp_path: Path) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class FailingBootAnchorWAL(StateWAL):
+        def publish_boot_anchor(self, **_kwargs: Any) -> NoReturn:
+            raise OSError("private boot anchor failure")
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.state_wal = FailingBootAnchorWAL(settings.state_wal.directory)
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
+
+    with pytest.raises(OSError, match="private boot anchor failure"):
+        with TestClient(app):
+            pass
+
+    assert timer.start_calls == 0
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_timer_start_failure_stops_runtime_before_startup_raises(tmp_path: Path) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class FailingTimer(RecordingTimer):
+        def start(self) -> None:
+            super().start()
+            raise OSError("private timer start failure")
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    timer = FailingTimer()
+    app.state.emotion_timer = timer
+
+    with pytest.raises(OSError, match="private timer start failure"):
+        with TestClient(app):
+            pass
+
+    assert timer.start_calls == 1
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
 
 
 def test_mutating_routes_submit_events_without_private_metadata(tmp_path: Path) -> None:
@@ -2241,6 +2578,65 @@ def test_finalization_failure_preserves_internal_commit_without_restore(
         assert records[-1].lifecycle is EventLifecycle.PREPARED
         assert not any(
             record.lifecycle is EventLifecycle.COMPLETED for record in records
+        )
+
+
+def test_emotion_tick_committed_before_crash_recovers_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+
+    class FinalizationFailingRuntime(RecordingRuntime):
+        def configure_durability(self, **kwargs: Any) -> None:
+            def fail_finalization(
+                _event: AgentEvent, _evidence: object
+            ) -> NoReturn:
+                raise OSError("private emotion tick finalization failure")
+
+            kwargs["finalization_checkpoint"] = fail_finalization
+            super().configure_durability(**kwargs)
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    runtime = FinalizationFailingRuntime()
+    app.state.agent_runtime = runtime
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        client.app.state.main_loop.emotion_engine._clock = (  # type: ignore[method-assign]
+            lambda: t0
+        )
+        future = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            client.app.state.main_loop.emotion_tick,
+        )
+        with pytest.raises(AgentRuntimeDurabilityError) as error:
+            future.result(timeout=10)
+
+        assert error.value.phase is AgentRuntimeDurabilityPhase.FINALIZATION
+        committed = client.app.state.agent_state_store.load()
+        assert committed.last_processed_event_sequence == 1
+        assert committed.appraisal_state.last_emotion_update_at == t0
+        assert runtime.status is AgentRuntimeStatus.FAILED
+        assert client.app.state.event_journal.records[-1].lifecycle is (
+            EventLifecycle.PREPARED
+        )
+
+    def fail_if_replayed(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("committed emotion tick was replayed during startup")
+
+    monkeypatch.setattr(EmotionEngineAllostasis, "advance_to", fail_if_replayed)
+    with _client(tmp_path, settings=settings) as restarted:
+        assert restarted.app.state.agent_state_store.load() == committed
+        assert restarted.app.state.main_loop.emotion_engine.temporal_state.last_update_at == t0
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert restarted.app.state.event_journal.inspect().processing_high_water == 1
+        assert any(
+            record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+            for record in restarted.app.state.event_journal.records
         )
 
 

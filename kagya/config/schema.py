@@ -37,6 +37,8 @@ class EmotionSettings(StrictBaseModel):
     baseline_surprisal: float = Field(ge=0.0)
     high_emotion_threshold: float = Field(ge=0.0, le=1.0)
     decay_rate: float = Field(ge=0.0)
+    timer_enabled: bool = False
+    timer_interval_seconds: float = Field(default=60.0, gt=0.0)
     appraisal_response_rate: float = Field(default=0.4, ge=0.0, le=1.0)
     resting_valence: float = Field(default=0.0, ge=-1.0, le=1.0)
     resting_arousal: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -47,6 +49,7 @@ class EmotionSettings(StrictBaseModel):
         "baseline_surprisal",
         "high_emotion_threshold",
         "decay_rate",
+        "timer_interval_seconds",
         "appraisal_response_rate",
         "resting_valence",
         "resting_arousal",

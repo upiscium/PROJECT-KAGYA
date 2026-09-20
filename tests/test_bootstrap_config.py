@@ -42,8 +42,8 @@ def test_existing_config_uses_emotion_recovery_defaults() -> None:
     assert settings.emotion.arousal_recovery_rate == 0.02
 
 
-def _emotion_settings_payload(**overrides: float) -> dict[str, float]:
-    payload = {
+def _emotion_settings_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
         "baseline_surprisal": 1.0,
         "high_emotion_threshold": 0.8,
         "decay_rate": 0.05,
@@ -76,6 +76,7 @@ def test_emotion_recovery_fields_enforce_bounds(field: str, value: float) -> Non
         "baseline_surprisal",
         "high_emotion_threshold",
         "decay_rate",
+        "timer_interval_seconds",
         "appraisal_response_rate",
         "resting_valence",
         "resting_arousal",
@@ -89,10 +90,18 @@ def test_all_emotion_fields_must_be_finite(field: str, value: float) -> None:
         EmotionSettings.model_validate(_emotion_settings_payload(**{field: value}))
 
 
-def test_emotion_rejects_timer_configuration_before_u5() -> None:
+def test_emotion_timer_defaults_are_disabled_and_minute_long() -> None:
+    settings = EmotionSettings.model_validate(_emotion_settings_payload())
+
+    assert settings.timer_enabled is False
+    assert settings.timer_interval_seconds == 60.0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf, -math.inf])
+def test_emotion_timer_interval_must_be_finite_and_positive(value: float) -> None:
     with pytest.raises(ValidationError):
         EmotionSettings.model_validate(
-            _emotion_settings_payload(timer_enabled=True)  # type: ignore[arg-type]
+            _emotion_settings_payload(timer_interval_seconds=value)
         )
 
 

@@ -1,9 +1,11 @@
 from dataclasses import fields
+from datetime import datetime, timezone
 import math
 from pathlib import Path
 
 import pytest
 
+from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import LossCalibration, LossInvalidReason, model_key
 from kagya.config import Settings, load_settings
 from kagya.memory import (
@@ -103,6 +105,40 @@ def test_main_loop_passively_owns_configured_or_injected_working_memory(
         == settings.working_memory.projection_max_bytes
     )
     assert explicit.working_memory is injected
+
+
+def test_emotion_tick_only_advances_emotion_temporal_state(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    engine = EmotionEngineAllostasis(
+        EmotionState(valence=0.4, arousal=0.6, optimal_loss=0.8),
+        temporal_state=None,
+        clock=lambda: timestamp,
+    )
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        emotion_engine=engine,
+    )
+    before_working_memory = (loop.working_memory.revision, loop.working_memory.items)
+    before_context = loop.context_registry.state
+    before_calibration = loop.loss_calibration.export()
+    before_memory = loop.memory_system.db1.get()
+    before_turns = loop.session_state.turns
+    before_state = engine.state
+
+    assert loop.emotion_tick() is None
+
+    assert engine.state == before_state
+    assert engine.temporal_state.last_update_at == timestamp
+    assert (loop.working_memory.revision, loop.working_memory.items) == (
+        before_working_memory
+    )
+    assert loop.context_registry.state == before_context
+    assert loop.loss_calibration.export() == before_calibration
+    assert loop.memory_system.db1.get() == before_memory
+    assert loop.session_state.turns == before_turns
 
 
 def test_main_loop_accepts_context_registry_without_creating_or_selecting_context(

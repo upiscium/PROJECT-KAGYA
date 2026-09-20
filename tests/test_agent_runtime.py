@@ -57,6 +57,21 @@ def test_authoritative_runtime_requires_complete_durability_lifecycle() -> None:
     assert outcome.event.processing_sequence == 5
 
 
+def test_runtime_start_failure_rolls_back_before_shutdown(monkeypatch) -> None:
+    runtime = AgentRuntime(1)
+
+    def fail_start(_thread) -> None:
+        raise RuntimeError("private thread start failure")
+
+    monkeypatch.setattr(Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="private thread start failure"):
+        runtime.start()
+
+    assert runtime.status is AgentRuntimeStatus.CREATED
+    runtime.shutdown()
+    assert runtime.status is AgentRuntimeStatus.STOPPED
+
+
 def test_fifo_order_and_consumer_sequences() -> None:
     runtime = AgentRuntime(4)
     runtime.start()
@@ -551,6 +566,30 @@ def test_context_event_types_and_sources_are_bounded_allowlist() -> None:
 
     assert outcome.event.event_type is AgentEventType.CONTEXT_UPDATE
     assert outcome.event.source is AgentEventSource.API_CONTEXT_RELATE
+
+
+def test_emotion_tick_identity_is_bounded_and_has_no_payload() -> None:
+    assert AgentEventType.EMOTION_TICK.value == "emotion_tick"
+    assert AgentEventSource.RUNTIME_EMOTION_TIMER.value == "runtime.emotion_timer"
+
+    runtime = AgentRuntime(1)
+    runtime.start()
+    outcome = runtime.submit(
+        AgentEventType.EMOTION_TICK,
+        AgentEventSource.RUNTIME_EMOTION_TIMER,
+        lambda: None,
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.event.event_type is AgentEventType.EMOTION_TICK
+    assert outcome.event.source is AgentEventSource.RUNTIME_EMOTION_TIMER
+    assert set(asdict(outcome.event)) == {
+        "event_id",
+        "event_type",
+        "source",
+        "requested_at",
+        "processing_sequence",
+    }
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True])
