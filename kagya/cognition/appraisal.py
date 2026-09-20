@@ -140,7 +140,7 @@ class CognitiveAppraiser:
                 reasons.append(AppraisalReasonCode.GOAL_PROGRESS)
             elif signals.goal_progress < 0.0:
                 reasons.append(AppraisalReasonCode.GOAL_SETBACK)
-        if signals.threat is not None:
+        if signals.threat is not None and signals.threat > 0.0:
             reasons.append(AppraisalReasonCode.THREAT)
 
         return AppraisalResult(

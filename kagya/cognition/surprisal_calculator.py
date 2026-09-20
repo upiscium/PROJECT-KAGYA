@@ -103,8 +103,10 @@ def _validate_calibration_values(
     m2_value = _finite_number(m2, "m2")
     if m2_value < 0.0:
         raise ValueError("m2 must be non-negative")
-    if count == 0 and (mean_value != 0.0 or m2_value != 0.0):
-        raise ValueError("an empty calibration entry must be zero")
+    if count < 2 and m2_value != 0.0:
+        raise ValueError("calibration m2 must be zero before two samples")
+    if count == 0 and mean_value != 0.0:
+        raise ValueError("an empty calibration entry must have a zero mean")
     return mean_value, m2_value
 
 

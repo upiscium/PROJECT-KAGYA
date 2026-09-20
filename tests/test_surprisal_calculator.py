@@ -230,6 +230,7 @@ def _forged_entry(model: str, count: object, mean: object, m2: object) -> Calibr
         lambda model, other: (_forged_entry(model, 1, 1.0, math.nan),),
         lambda model, other: (_forged_entry(model, 1, 1.0, math.inf),),
         lambda model, other: (_forged_entry(model, 1, 1.0, -1.0),),
+        lambda model, other: (_forged_entry(model, 1, 1.0, 1.0),),
         lambda model, other: (
             tuple(
                 sorted(
@@ -263,6 +264,11 @@ def test_calibration_entries_are_immutable() -> None:
     entry = CalibrationEntry(key(), 1, 1.0, 0.0)
     with pytest.raises(FrozenInstanceError):
         entry.count = 2  # type: ignore[misc]
+
+
+def test_single_sample_calibration_requires_zero_m2() -> None:
+    with pytest.raises(ValueError, match="m2 must be zero"):
+        CalibrationEntry(key(), 1, 1.0, 1.0)
 
 
 def test_unapproved_key_fails_before_provider_call() -> None:

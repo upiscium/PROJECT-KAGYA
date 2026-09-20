@@ -133,6 +133,20 @@ def test_appraisal_is_pure_deterministic_and_does_not_consume_private_text() -> 
     assert appraiser.appraise(measurement(), AppraisalSignals(goal_progress=-0.4)) != first
 
 
+@pytest.mark.parametrize(
+    ("threat", "has_threat_reason"),
+    [(None, False), (0.0, False), (0.0001, True)],
+)
+def test_threat_reason_requires_positive_threat_evidence(
+    threat: float | None, has_threat_reason: bool
+) -> None:
+    result = CognitiveAppraiser().appraise(
+        measurement(), AppraisalSignals(threat=threat)
+    )
+
+    assert (AppraisalReasonCode.THREAT in result.reasons) is has_threat_reason
+
+
 def test_same_novelty_with_explicit_goal_and_threat_evidence_differs() -> None:
     appraiser = CognitiveAppraiser()
     neutral = appraiser.appraise(measurement(0.75), AppraisalSignals())
