@@ -19,11 +19,15 @@ from kagya.persona.prompt_builder import PromptBuilder
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
     AgentStateSnapshot,
+    AgentStateSnapshotV2,
     AgentStateStore,
     EmotionStateSnapshot,
+    ContextFrameSnapshot,
+    ContextStateSnapshot,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
+from kagya.runtime.context import ContextRegistry
 from kagya.runtime.event_journal import (
     EventJournal,
     EventJournalAppendError,
@@ -80,8 +84,8 @@ def _event(name: str, sequence: int = 1) -> AgentEvent:
     )
 
 
-def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -92,8 +96,12 @@ def _snapshot(sequence: int, valence: float = 0.4) -> AgentStateSnapshot:
 
 
 def _snapshot_with_working_memory(
-    sequence: int, references: tuple[tuple[str, str], ...], revision: int
-) -> AgentStateSnapshot:
+    sequence: int,
+    references: tuple[tuple[str, str], ...],
+    revision: int,
+    *,
+    context_id: str | None = None,
+) -> AgentStateSnapshotV2 | AgentStateSnapshot:
     items = tuple(
         WorkingMemoryItemSnapshot(
             item_id=working_memory_item_id(WorkingMemorySourceKind(kind), source_id),
@@ -107,7 +115,7 @@ def _snapshot_with_working_memory(
         )
         for index, (kind, source_id) in enumerate(references)
     )
-    return AgentStateSnapshot(
+    base = AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -115,6 +123,31 @@ def _snapshot_with_working_memory(
         ),
         working_memory=WorkingMemorySnapshot(revision=revision, items=items),
     )
+    if context_id is None:
+        return base
+    frame = ContextFrameSnapshot(
+        context_id=context_id,
+        context_type="conversation",
+        source_channel="chat",
+        source_session_id=f"session-{context_id}",
+        participant_refs=(f"participant-{context_id}",),
+        parent_context_id=None,
+        related_context_ids=(),
+        status="active",
+        created_revision=1,
+        last_modified_revision=2,
+        started_at=NOW,
+        last_active_at=NOW,
+    )
+    payload = base.model_dump()
+    payload["schema_version"] = 3
+    payload["context_state"] = ContextStateSnapshot(
+        revision=2,
+        current_context_id=context_id,
+        frames=(frame,),
+        interlocutor_bindings=(),
+    )
+    return AgentStateSnapshot.model_validate(payload)
 
 
 def _graph(tmp_path: Path):
@@ -134,7 +167,12 @@ def _graph(tmp_path: Path):
     return memory, store, journal, wal, recovery
 
 
-def _participant(memory: DualMemorySystem, text: str = "visible input"):
+def _participant(
+    memory: DualMemorySystem,
+    text: str = "visible input",
+    *,
+    context_id: str | None = None,
+):
     return MemoryEpisodicParticipant(
         memory,
         EpisodicWrite(
@@ -145,6 +183,8 @@ def _participant(memory: DualMemorySystem, text: str = "visible input"):
             emotion_arousal=0.4,
             record_type=MemoryRecordType.EPISODIC_LOG,
             created_at=NOW.isoformat(),
+            context_id=context_id,
+            source_channel="chat" if context_id is not None else None,
         ),
     )
 
@@ -388,6 +428,10 @@ def test_pre_internal_committed_memory_with_pending_cannot_be_aborted(
         emotion_arousal=operation.emotion_arousal,
         record_type=operation.record_type,
         created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
     )
     pending = participant.pending_path(binding)
     assert pending.exists()
@@ -537,7 +581,7 @@ def test_true_rollback_reconciles_aggregate_and_clears_gate(tmp_path: Path) -> N
         participant.episode_id(transaction.transaction_id)
     )
     assert committed is not None
-    assert committed.metadata["coordination_schema"] == 1
+    assert committed.metadata["coordination_schema"] == 2
     assert committed.metadata["extra"] == "{}"
     assert "private" not in committed.metadata
     assert committed.document.startswith(f"User: {PRIVATE}")
@@ -587,13 +631,19 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
 
     initial = store.load()
     older = _snapshot_with_working_memory(
-        1, (("episodic", "memory-a"), ("semantic", semantic_ids[0])), 2
+        1,
+        (("episodic", "memory-a"), ("semantic", semantic_ids[0])),
+        2,
+        context_id="context-a",
     )
     newer = _snapshot_with_working_memory(
-        2, (("episodic", "memory-c"), ("semantic", semantic_ids[1])), 4
+        2,
+        (("episodic", "memory-c"), ("semantic", semantic_ids[1])),
+        4,
+        context_id="context-b",
     )
     first = _event("startup-u5-older-working-memory", 1)
-    first_participant = _participant(memory, "record C")
+    first_participant = _participant(memory, "record C", context_id="context-a")
     first_coordinator = _prepared_transaction(journal, first, first_participant)
     first_transaction_id = next(
         item.transaction_id
@@ -608,7 +658,7 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     recovery.publish_boot_anchor(anchored_older)
 
     second = _event("startup-u5-newer-working-memory", 2)
-    second_participant = _participant(memory, "record D")
+    second_participant = _participant(memory, "record D", context_id="context-b")
     second_coordinator = _prepared_transaction(journal, second, second_participant)
     second_transaction_id = next(
         item.transaction_id
@@ -622,15 +672,29 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
         first_participant.episode_id(first_transaction_id),
         second_participant.episode_id(second_transaction_id),
     )
+    derived_semantic_id = memory.save_semantic(
+        "semantic derived from context B", source_episode_ids=[committed_ids[1]]
+    )
     episodic_before = memory.db1.get(
         ids=list(committed_ids), include=["documents", "metadatas"]
     )
     records_before = tuple(
         memory.get_committed_episodic(episode_id) for episode_id in committed_ids
     )
-    semantic_before = tuple(
-        memory.get_committed_semantic(semantic_id) for semantic_id in semantic_ids
+    assert (
+        records_before[0] is not None
+        and records_before[0].record.context_id == "context-a"
     )
+    assert (
+        records_before[1] is not None
+        and records_before[1].record.context_id == "context-b"
+    )
+    semantic_before = tuple(
+        memory.get_committed_semantic(semantic_id)
+        for semantic_id in (*semantic_ids, derived_semantic_id)
+    )
+    assert semantic_before[-1] is not None
+    assert semantic_before[-1].record.context_id == "context-b"
 
     replay_calls = {
         "retrieve": 0,
@@ -679,9 +743,19 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
     assert rolled_back.true_rollback_performed
     assert rolled_back.snapshot == older
+    assert rolled_back.snapshot.context_state.current_context_id == "context-a"
+    assert tuple(
+        frame.context_id for frame in rolled_back.snapshot.context_state.frames
+    ) == ("context-a",)
     assert rolled_back.processing_high_water == 2
     assert rolled_back.external_reconciliation_required
     assert store.path.read_bytes() == older_state_bytes
+
+    recovered_registry = ContextRegistry(clock=lambda: NOW)
+    recovered_registry.restore_exact(rolled_back.snapshot.context_state.to_registry_state())
+    compatibility = recovered_registry.compatibility("context-b", "context-a")
+    assert compatibility.relation.value == "unknown_context"
+    assert compatibility.score == 0.35
 
     result = StartupReconciliationCoordinator(
         journal, recovery, memory
@@ -700,7 +774,8 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
         memory.get_committed_episodic(episode_id) for episode_id in committed_ids
     ) == records_before
     assert tuple(
-        memory.get_committed_semantic(semantic_id) for semantic_id in semantic_ids
+        memory.get_committed_semantic(semantic_id)
+        for semantic_id in (*semantic_ids, derived_semantic_id)
     ) == semantic_before
     inspection = journal.inspect()
     assert not inspection.open_startup_reconciliations

@@ -526,6 +526,33 @@ def test_arbitrary_event_type_cannot_be_used_as_private_metadata() -> None:
     runtime.shutdown()
 
 
+def test_context_event_types_and_sources_are_bounded_allowlist() -> None:
+    assert AgentEventType.CONTEXT_UPDATE.value == "context_update"
+    assert {
+        AgentEventSource.API_CONTEXT_SUSPEND.value,
+        AgentEventSource.API_CONTEXT_RESUME.value,
+        AgentEventSource.API_CONTEXT_CLOSE.value,
+        AgentEventSource.API_CONTEXT_RELATE.value,
+    } == {
+        "api.contexts.suspend",
+        "api.contexts.resume",
+        "api.contexts.close",
+        "api.contexts.relate",
+    }
+
+    runtime = AgentRuntime(1)
+    runtime.start()
+    outcome = runtime.submit(
+        AgentEventType.CONTEXT_UPDATE,
+        AgentEventSource.API_CONTEXT_RELATE,
+        lambda: None,
+    ).result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.event.event_type is AgentEventType.CONTEXT_UPDATE
+    assert outcome.event.source is AgentEventSource.API_CONTEXT_RELATE
+
+
 @pytest.mark.parametrize("capacity", [0, -1, True])
 def test_invalid_capacity(capacity: int) -> None:
     with pytest.raises(ValueError):
@@ -903,7 +930,9 @@ def test_each_success_phase_failure_fail_stops_and_skips_later_phases(
         "terminal_completion",
     ]
     assert calls == phase_order[: phase_order.index(callback_name) + 1]
-    assert not failure_checkpoint_called
+    assert failure_checkpoint_called is (
+        failed_phase is AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION
+    )
     assert runtime.status is AgentRuntimeStatus.FAILED
 
 

@@ -24,6 +24,7 @@ from kagya.memory.dual_memory_system import (
     canonical_episodic_metadata,
 )
 from kagya.memory.memory_schema import EpisodicMemoryRecord, MemoryRecordType
+from kagya.identifiers import validate_identifier
 from kagya.runtime.event_journal import (
     AbortOutcome,
     ParticipantCapability,
@@ -40,9 +41,12 @@ from kagya.runtime.transaction_coordinator import (
 
 
 MEMORY_EPISODIC_PARTICIPANT_ID = "memory.episodic"
-_OPERATION_SCHEMA_VERSION = 1
+_OPERATION_SCHEMA_VERSION = 2
 _PENDING_SCHEMA_VERSION = 1
-_OPERATION_HASH_DOMAIN = b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V1\x00"
+_OPERATION_HASH_DOMAINS = {
+    1: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V1\x00",
+    2: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V2\x00",
+}
 _EPISODE_ID_NAMESPACE = UUID("f0ced3ab-ad3f-5acb-b190-edea7fff6aff")
 _STAGING_DIRECTORY = ".r07-episodic-pending"
 _MAX_PENDING_BYTES = 4 * 1024 * 1024
@@ -57,6 +61,10 @@ class EpisodicWrite:
     emotion_arousal: float
     record_type: MemoryRecordType
     created_at: str
+    context_id: str | None = None
+    source_channel: str | None = None
+    source_session_id: str | None = None
+    schema_version: int = _OPERATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not isinstance(self.user_input, str) or not isinstance(self.response, str):
@@ -76,10 +84,21 @@ class EpisodicWrite:
             raise ValueError("Episodic timestamp is invalid") from None
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             raise ValueError("Episodic timestamp must be timezone-aware")
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
+            raise ValueError("Episodic schema version is unsupported")
+        if self.schema_version == 1 and any(
+            value is not None
+            for value in (self.context_id, self.source_channel, self.source_session_id)
+        ):
+            raise ValueError("Schema 1 does not support provenance")
+        if self.schema_version == 2:
+            _validate_provenance(
+                self.context_id, self.source_channel, self.source_session_id
+            )
 
     def canonical_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": _OPERATION_SCHEMA_VERSION,
+        result = {
+            "schema_version": self.schema_version,
             "user_input": self.user_input,
             "response": self.response,
             "loss": float(self.loss),
@@ -88,11 +107,18 @@ class EpisodicWrite:
             "record_type": self.record_type.value,
             "created_at": self.created_at,
         }
+        if self.schema_version == 2:
+            result.update(
+                context_id=self.context_id,
+                source_channel=self.source_channel,
+                source_session_id=self.source_session_id,
+            )
+        return result
 
 
 def episodic_operation_digest(operation: EpisodicWrite) -> str:
     canonical = _canonical_json_bytes(operation.canonical_dict())
-    return hashlib.sha256(_OPERATION_HASH_DOMAIN + canonical).hexdigest()
+    return hashlib.sha256(_OPERATION_HASH_DOMAINS[operation.schema_version] + canonical).hexdigest()
 
 
 class MemoryEpisodicParticipant:
@@ -230,6 +256,10 @@ class MemoryEpisodicParticipant:
                 emotion_arousal=self.operation.emotion_arousal,
                 record_type=self.operation.record_type,
                 created_at=self.operation.created_at,
+                coordination_schema=self.operation.schema_version,
+                context_id=self.operation.context_id,
+                source_channel=self.operation.source_channel,
+                source_session_id=self.operation.source_session_id,
             )
             committed = self._get_committed(
                 self.memory, str(expected["episode_id"])
@@ -387,6 +417,10 @@ class MemoryEpisodicParticipant:
                 created_at=self.operation.created_at,
                 metadata={},
                 coordinated=True,
+                coordination_schema=self.operation.schema_version,
+                context_id=self.operation.context_id,
+                source_channel=self.operation.source_channel,
+                source_session_id=self.operation.source_session_id,
             )
             and record.id == expected_episode_id
             and record.user_input == self.operation.user_input
@@ -398,6 +432,10 @@ class MemoryEpisodicParticipant:
             and not record.archived
             and record.created_at == self.operation.created_at
             and record.metadata == {}
+            and record.coordination_schema == self.operation.schema_version
+            and record.context_id == self.operation.context_id
+            and record.source_channel == self.operation.source_channel
+            and record.source_session_id == self.operation.source_session_id
         )
 
     def _staging_directory(self) -> Path:
@@ -595,21 +633,32 @@ def _episode_id(
 
 
 def _operation_from_record(record: EpisodicMemoryRecord) -> EpisodicWrite:
-    if record.metadata or record.archived:
+    if (
+        record.metadata
+        or record.archived
+        or record.coordination_schema not in (1, 2)
+    ):
         raise ParticipantDivergedError("Committed Memory record conflicts")
-    return EpisodicWrite(
-        user_input=record.user_input,
-        response=record.response,
-        loss=record.loss,
-        emotion_valence=record.emotion_valence,
-        emotion_arousal=record.emotion_arousal,
-        record_type=record.record_type,
-        created_at=record.created_at,
-    )
+    try:
+        return EpisodicWrite(
+            user_input=record.user_input,
+            response=record.response,
+            loss=record.loss,
+            emotion_valence=record.emotion_valence,
+            emotion_arousal=record.emotion_arousal,
+            record_type=record.record_type,
+            created_at=record.created_at,
+            context_id=record.context_id,
+            source_channel=record.source_channel,
+            source_session_id=record.source_session_id,
+            schema_version=record.coordination_schema,
+        )
+    except (TypeError, ValueError):
+        raise ParticipantDivergedError("Committed Memory record conflicts") from None
 
 
 def _operation_from_dict(value: object) -> EpisodicWrite:
-    expected_keys = {
+    base_keys = {
         "schema_version",
         "user_input",
         "response",
@@ -619,11 +668,19 @@ def _operation_from_dict(value: object) -> EpisodicWrite:
         "record_type",
         "created_at",
     }
-    if not isinstance(value, dict) or set(value) != expected_keys:
+    if not isinstance(value, dict) or not base_keys.issubset(value):
+        raise ParticipantDivergedError("Pending Memory operation is invalid")
+    schema = value["schema_version"]
+    expected_keys = base_keys | (
+        {"context_id", "source_channel", "source_session_id"}
+        if schema == 2
+        else set()
+    )
+    if set(value) != expected_keys:
         raise ParticipantDivergedError("Pending Memory operation is invalid")
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != _OPERATION_SCHEMA_VERSION
+        or schema not in (1, 2)
         or not isinstance(value["user_input"], str)
         or not isinstance(value["response"], str)
         or not isinstance(value["loss"], float)
@@ -642,6 +699,28 @@ def _operation_from_dict(value: object) -> EpisodicWrite:
             emotion_arousal=value["emotion_arousal"],
             record_type=MemoryRecordType(value["record_type"]),
             created_at=value["created_at"],
+            context_id=value.get("context_id"),
+            source_channel=value.get("source_channel"),
+            source_session_id=value.get("source_session_id"),
+            schema_version=schema,
         )
     except (TypeError, ValueError):
         raise ParticipantDivergedError("Pending Memory operation is invalid") from None
+
+
+def _validate_provenance(
+    context_id: str | None,
+    source_channel: str | None,
+    source_session_id: str | None,
+) -> None:
+    values = (context_id, source_channel, source_session_id)
+    if all(value is None for value in values):
+        return
+    if context_id is None or source_channel is None:
+        raise ValueError("Provenance must include context and channel")
+    for value in values:
+        if value is not None:
+            try:
+                validate_identifier(value)
+            except (TypeError, ValueError):
+                raise ValueError("Provenance identifier is invalid") from None

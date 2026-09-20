@@ -141,6 +141,88 @@ def test_committed_episodic_read_returns_exact_consistent_projection(
     assert committed.record.metadata == {"safe": "yes"}
 
 
+def test_coordinated_schema2_preserves_optional_provenance(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory.publish_coordinated_episodic(
+        "episode-schema2", "input", "response", loss=0.1,
+        emotion_valence=0.2, emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG, created_at="now",
+        coordination_schema=2, context_id="context-a", source_channel="chat",
+        source_session_id="session-a",
+    )
+
+    committed = memory.get_committed_episodic("episode-schema2")
+
+    assert committed is not None
+    assert committed.metadata["coordination_schema"] == 2
+    assert committed.record.context_id == "context-a"
+    assert committed.record.source_channel == "chat"
+    assert committed.record.source_session_id == "session-a"
+
+
+def test_coordinated_schema2_omits_absent_provenance(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory.publish_coordinated_episodic(
+        "episode-schema2", "input", "response", loss=0.1,
+        emotion_valence=0.2, emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG, created_at="now",
+        coordination_schema=2,
+    )
+
+    stored = memory.db1.get(ids=["episode-schema2"], include=["metadatas"])
+
+    assert stored["metadatas"] == [{
+        "user_input": "input", "response": "response", "loss": 0.1,
+        "emotion_valence": 0.2, "emotion_arousal": 0.3,
+        "record_type": "episodic_log", "archived": False, "created_at": "now",
+        "extra": "{}", "coordination_schema": 2,
+    }]
+
+
+def test_future_coordination_schema_fails_closed(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    memory.db1.add(
+        ids=["episode-future"],
+        documents=["User: input\nAssistant: response"],
+        metadatas=[{
+            "user_input": "input", "response": "response", "loss": 0.1,
+            "emotion_valence": 0.2, "emotion_arousal": 0.3,
+            "record_type": "episodic_log", "archived": False,
+            "created_at": "now", "extra": "{}", "coordination_schema": 99,
+        }],
+    )
+    before = memory.db1.get(
+        ids=["episode-future"], include=["documents", "metadatas"]
+    )
+
+    with pytest.raises(EpisodicMemoryFormatError):
+        DualMemorySystem(settings)
+    assert memory.db1.get(
+        ids=["episode-future"], include=["documents", "metadatas"]
+    ) == before
+
+
+def test_archive_preserves_schema2_provenance(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory.publish_coordinated_episodic(
+        "episode-schema2", "fact", "response", loss=0.1,
+        emotion_valence=0.2, emotion_arousal=1.0,
+        record_type=MemoryRecordType.EPISODIC_LOG, created_at="now",
+        coordination_schema=2, context_id="context-a", source_channel="chat",
+        source_session_id="session-a",
+    )
+
+    memory.consolidate_to_semantic(DummyProvider())
+
+    committed = memory.get_committed_episodic("episode-schema2")
+    assert committed is not None
+    assert committed.record.archived is True
+    assert committed.record.context_id == "context-a"
+    assert committed.record.source_channel == "chat"
+    assert committed.record.source_session_id == "session-a"
+
+
 def test_committed_episodic_read_bounds_backend_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -393,6 +475,10 @@ def test_finalize_is_idempotent_when_committed_record_and_pending_both_exist(
         emotion_arousal=operation.emotion_arousal,
         record_type=operation.record_type,
         created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
     )
 
     reopened = MemoryEpisodicParticipant.from_pending(
@@ -642,6 +728,10 @@ def _publish_participant(
         emotion_arousal=operation.emotion_arousal,
         record_type=operation.record_type,
         created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
     )
 
 

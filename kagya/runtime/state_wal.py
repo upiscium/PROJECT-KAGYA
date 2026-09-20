@@ -432,15 +432,14 @@ class StateWAL:
     def _snapshot_hash_value(self, snapshot: CompatibleAgentStateSnapshot) -> str:
         try:
             # Validate the union directly.  Round-tripping through a generic
-            # dump is needlessly lossy for retained v1 records (and makes it
-            # easier for a future v2 adapter to normalize the legacy shape).
+            # dump is needlessly lossy for retained v1/v2 records (and makes it
+            # easier for a newer adapter to normalize a retained shape).
             # Keeping the discriminated model intact is what preserves both
-            # the legacy snapshot bytes and its hash in mixed generations.
+            # legacy snapshot bytes and their hashes in mixed generations.
             validated = validate_compatible_agent_state_snapshot(snapshot)
-            # The v1 representation is part of the retained WAL contract.  Do
-            # not route it through a v2-producing canonicalizer: doing so
-            # changes the identity of old snapshots and, consequently, every
-            # record hash that embeds that identity.
+            # The v1/v2 representations are part of the retained WAL contract.
+            # Do not route them through a newer canonicalizer: doing so changes
+            # old snapshot identities and every record hash that embeds them.
             payload = self._canonical_bytes(validated)
             return (
                 self._snapshot_hash(validated)

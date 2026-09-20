@@ -25,6 +25,10 @@ class EpisodicMemoryRecord:
     archived: bool = False
     created_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    context_id: str | None = None
+    source_channel: str | None = None
+    source_session_id: str | None = None
+    coordination_schema: int | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,7 @@ class SemanticMemoryRecord:
     record_type: MemoryRecordType = MemoryRecordType.SEMANTIC_MEMORY
     created_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    context_id: str | None = None
 
 
 @dataclass(frozen=True)

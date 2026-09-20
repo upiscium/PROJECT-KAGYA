@@ -13,6 +13,7 @@ from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.agent_state import (
     AgentStateLoadError,
     AgentStateSnapshotV1,
+    AgentStateSnapshotV2,
     AgentStateStore,
     CompatibleAgentStateSnapshot,
 )
@@ -1331,17 +1332,18 @@ class StateRecoveryCoordinator:
         wal_record, wal_record_hash = self._record_for_snapshot(
             post_wal, target, target_hash
         )
-        if isinstance(target, AgentStateSnapshotV1):
+        if isinstance(target, (AgentStateSnapshotV1, AgentStateSnapshotV2)):
             try:
                 published = self.state_store.load()
             except AgentStateLoadError:
                 published = None
-            if isinstance(published, AgentStateSnapshotV1) and published == target:
-                # A valid retained v1 file is historical evidence.  Preserve its
-                # original bytes during startup instead of canonicalizing it.
+            if isinstance(published, type(target)) and published == target:
+                # A valid retained v1/v2 file is historical evidence.  Preserve
+                # its original bytes during startup instead of canonicalizing it.
                 self.state_store.ensure_published(target)
             else:
-                # A true rollback from v2 to v1 must publish the selected state.
+                # A true rollback from a newer snapshot must publish the
+                # selected retained state.
                 self.state_store.save(target)
         else:
             self.state_store.save(target)

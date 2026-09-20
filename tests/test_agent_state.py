@@ -17,7 +17,10 @@ from kagya.runtime import (
     AgentStateSaveStage,
     AgentStateSnapshot,
     AgentStateSnapshotV1,
+    AgentStateSnapshotV2,
     AgentStateStore,
+    ContextRegistry,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
     UnsupportedAgentStateVersion,
     WorkingMemory,
@@ -49,6 +52,7 @@ class LoopStub:
             item_capacity=item_capacity,
             projection_max_bytes=projection_max_bytes,
         )
+        self.context_registry = ContextRegistry(clock=lambda: NOW)
 
 
 def assert_bounded_exception(error: Exception, sentinel: str) -> None:
@@ -58,8 +62,8 @@ def assert_bounded_exception(error: Exception, sentinel: str) -> None:
     assert error.__context__ is None
 
 
-def make_snapshot(sequence: int = 4) -> AgentStateSnapshot:
-    return AgentStateSnapshot(
+def make_snapshot(sequence: int = 4) -> AgentStateSnapshotV2:
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -81,7 +85,7 @@ def make_v1_snapshot(sequence: int = 4) -> AgentStateSnapshotV1:
     )
 
 
-def make_wm_snapshot() -> AgentStateSnapshot:
+def make_wm_snapshot() -> AgentStateSnapshotV2:
     item = WorkingMemoryItemSnapshot(
         item_id=working_memory_item_id(
             WorkingMemorySourceKind.EPISODIC, "episode-wm"
@@ -94,7 +98,7 @@ def make_wm_snapshot() -> AgentStateSnapshot:
         created_revision=2,
         last_activated_revision=5,
     )
-    return AgentStateSnapshot(
+    return AgentStateSnapshotV2(
         saved_at=NOW,
         last_processed_event_sequence=9,
         emotion_state=EmotionStateSnapshot(
@@ -128,14 +132,15 @@ def test_minimal_capture_save_load_restore_round_trip(tmp_path: Path) -> None:
     snapshot = new_store.load()
     new_store.restore_into(restored, snapshot)
 
-    assert snapshot.schema_version == 2
+    assert snapshot.schema_version == 3
     assert snapshot.last_processed_event_sequence == 7
     assert restored.emotion_engine.state == original.emotion_engine.state
     assert restored.working_memory.revision == 0
     assert restored.working_memory.items == ()
+    assert restored.context_registry.state.revision == 0
 
 
-def test_current_v2_round_trip_preserves_exact_nonempty_working_memory(
+def test_current_v3_round_trip_preserves_exact_nonempty_working_memory(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "agent_state.json"
@@ -165,7 +170,8 @@ def test_current_v2_round_trip_preserves_exact_nonempty_working_memory(
     loaded = make_store(path).load()
     make_store(path).restore_into(restored, loaded)
 
-    assert loaded == snapshot
+    assert loaded.schema_version == 3
+    assert loaded.working_memory == snapshot.working_memory
     assert restored.working_memory.revision == 5
     assert restored.working_memory.items == original.working_memory.items
 
@@ -378,8 +384,14 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         optimal_loss=2.5,
     )
     assert isinstance(snapshot, AgentStateSnapshot)
-    assert snapshot.schema_version == 2
+    assert snapshot.schema_version == 3
     assert snapshot.working_memory == WorkingMemorySnapshot(revision=0, items=())
+    assert snapshot.context_state == ContextStateSnapshot(
+        revision=0,
+        current_context_id=None,
+        frames=(),
+        interlocutor_bindings=(),
+    )
 
 
 def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> None:
@@ -392,7 +404,7 @@ def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> Non
     assert compatible.agent_state.path == Path(".kagya/agent_state.json")
 
 
-def test_v0_migrates_strictly_to_v2(tmp_path: Path) -> None:
+def test_v0_migrates_strictly_to_v3(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
     path.write_text(
         json.dumps(
@@ -420,6 +432,12 @@ def test_v0_migrates_strictly_to_v2(tmp_path: Path) -> None:
             optimal_loss=0.9,
         ),
         working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
     )
 
 
@@ -635,6 +653,7 @@ def test_agent_state_has_no_working_memory_participant_or_journal_authority() ->
         "last_processed_event_sequence",
         "emotion_state",
         "working_memory",
+        "context_state",
         "schema_version",
     }
     assert set(WorkingMemorySnapshot.model_fields) == {"revision", "items"}
@@ -736,7 +755,7 @@ def test_model_constraints_are_strict_finite_and_timezone_aware() -> None:
     with pytest.raises(ValidationError):
         EmotionStateSnapshot(valence=0.0, arousal=float("inf"), optimal_loss=1.0)
     with pytest.raises(ValidationError):
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=datetime(2026, 1, 1),
             last_processed_event_sequence=0,
             emotion_state=EmotionStateSnapshot(
@@ -745,7 +764,7 @@ def test_model_constraints_are_strict_finite_and_timezone_aware() -> None:
             working_memory=WorkingMemorySnapshot(revision=0, items=()),
         )
     with pytest.raises(ValidationError):
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=NOW,
             last_processed_event_sequence=True,
             emotion_state=EmotionStateSnapshot(
@@ -848,7 +867,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 3
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(

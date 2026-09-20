@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import inspect
 from typing import TYPE_CHECKING
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
@@ -11,12 +12,19 @@ from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
-from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.persona import (
+    ConsciousAgent,
+    ContextPromptView,
+    PromptBuilder,
+    ResponsePostprocessor,
+)
+from kagya.runtime.chat_context import ChatContextSelectors, resolve_chat_context
 from kagya.runtime.session_participant import (
     SessionTurnOperation,
     SessionTurnParticipant,
 )
 from kagya.runtime.session_state import SessionState
+from kagya.runtime.context import ContextRegistry
 from kagya.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBoundValue,
@@ -84,6 +92,7 @@ class KagyaMainLoop:
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
+        context_registry: ContextRegistry | None = None,
     ) -> None:
         from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
@@ -109,11 +118,38 @@ class KagyaMainLoop:
         self.agent = agent or ConsciousAgent(provider)
         self.postprocessor = postprocessor or ResponsePostprocessor()
         self.adapter_id = adapter_id
+        self.context_registry = (
+            context_registry if context_registry is not None else ContextRegistry()
+        )
 
-    def chat(self, user_input: str) -> CoordinatedResult[ChatResult]:
-        """Compute an ordinary turn and return its process-local mutation plan."""
+    def chat(
+        self,
+        user_input: str,
+        selectors: ChatContextSelectors | None = None,
+    ) -> CoordinatedResult[ChatResult]:
+        """Compute one live turn inside the serialized AgentRuntime handler."""
 
-        computed = self._run_chat(user_input, capture_debug=False)
+        return self._chat_plan(
+            user_input,
+            capture_debug=False,
+            selectors=selectors,
+        )
+
+    def _chat_plan(
+        self,
+        user_input: str,
+        *,
+        capture_debug: bool,
+        selectors: ChatContextSelectors | None,
+    ) -> CoordinatedResult[ChatResult]:
+        computed = self._run_chat(
+            user_input,
+            capture_debug=capture_debug,
+            selectors=selectors,
+            context_registry=self.context_registry,
+            working_memory=self.working_memory,
+            emotion_engine=self.emotion_engine,
+        )
         return CoordinatedResult(
             TransactionBoundValue(
                 lambda transaction_id: self._chat_result(computed, transaction_id)
@@ -122,11 +158,31 @@ class KagyaMainLoop:
         )
 
     def chat_debug(
-        self, user_input: str
+        self,
+        user_input: str,
+        selectors: ChatContextSelectors | None = None,
     ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
-        """Compute a turn with ephemeral diagnostics and the same mutation plan."""
+        """Compute one live debug turn inside the serialized AgentRuntime handler."""
 
-        computed = self._run_chat(user_input, capture_debug=True)
+        return self._debug_chat_plan(
+            user_input,
+            selectors=selectors,
+        )
+
+    def _debug_chat_plan(
+        self,
+        user_input: str,
+        *,
+        selectors: ChatContextSelectors | None,
+    ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
+        computed = self._run_chat(
+            user_input,
+            capture_debug=True,
+            selectors=selectors,
+            context_registry=self.context_registry,
+            working_memory=self.working_memory,
+            emotion_engine=self.emotion_engine,
+        )
         if computed.trace is None:  # pragma: no cover - internal invariant
             raise RuntimeError("Debug trace was not captured")
         trace = computed.trace
@@ -141,18 +197,32 @@ class KagyaMainLoop:
         )
 
     def _run_chat(
-        self, user_input: str, *, capture_debug: bool
+        self,
+        user_input: str,
+        *,
+        capture_debug: bool,
+        selectors: ChatContextSelectors | None,
+        context_registry: ContextRegistry,
+        working_memory: WorkingMemory,
+        emotion_engine: EmotionEngineAllostasis,
     ) -> _ComputedChat:
         from kagya.memory.episodic_participant import (
             EpisodicWrite,
             MemoryEpisodicParticipant,
         )
 
+        current_context = resolve_chat_context(context_registry, selectors)
+        provenance = (
+            current_context.context_id,
+            current_context.source_channel,
+            current_context.source_session_id,
+        )
+        context_view = ContextPromptView.from_frame(current_context)
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
-        emotion_state = self.emotion_engine.update(loss)
+        emotion_state = emotion_engine.update(loss)
         memory_context = self.memory_system.retrieve_context(user_input)
-        self.working_memory.advance()
+        working_memory.advance()
         candidates = [
             (WorkingMemorySourceKind.EPISODIC, record.id, rank)
             for rank, record in enumerate(memory_context.db1_results)
@@ -166,15 +236,19 @@ class KagyaMainLoop:
             candidates,
             key=lambda candidate: (-candidate[2], candidate[0].value, candidate[1]),
         ):
-            self.working_memory.admit(
+            working_memory.admit(
                 source_kind,
                 source_id,
                 activation=1.0,
                 salience=1.0 / (rank + 1),
             )
-        working_memory_view = self.working_memory.select(self.working_memory_resolver)
-        prompt = self.prompt_builder.build(
-            user_input, emotion_state, working_memory_view
+        working_memory_view = working_memory.select_contextual(
+            self.working_memory_resolver,
+            context_registry,
+            current_context.context_id,
+        )
+        prompt = self._build_prompt(
+            user_input, emotion_state, working_memory_view, context_view
         )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
@@ -188,6 +262,10 @@ class KagyaMainLoop:
                 emotion_arousal=emotion_state.arousal,
                 record_type=MemoryRecordType.EPISODIC_LOG,
                 created_at=datetime.now(UTC).isoformat(),
+                context_id=provenance[0],
+                source_channel=provenance[1],
+                source_session_id=provenance[2],
+                schema_version=2,
             ),
         )
         session_participant = SessionTurnParticipant(
@@ -215,6 +293,31 @@ class KagyaMainLoop:
             memory_participant=memory_participant,
             session_participant=session_participant,
         )
+
+    def _build_prompt(
+        self,
+        user_input: str,
+        emotion_state: EmotionState,
+        working_memory_view: WorkingMemoryView,
+        context_view: ContextPromptView,
+    ) -> str:
+        """Pass Context projection while retaining older injected builders."""
+
+        build = self.prompt_builder.build
+        parameters = inspect.signature(build).parameters.values()
+        accepts_context = any(
+            parameter.name == "context_view"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_context:
+            return build(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                context_view=context_view,
+            )
+        return build(user_input, emotion_state, working_memory_view)
 
     def _chat_result(
         self, computed: _ComputedChat, transaction_id: str

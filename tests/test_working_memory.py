@@ -13,7 +13,7 @@ import yaml
 
 from kagya.body import EmotionState
 from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem
+from kagya.memory import DualMemorySystem, MemoryRecordType
 from kagya.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
@@ -37,6 +37,7 @@ from kagya.runtime import (
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
+from kagya.runtime.context import ContextRegistry
 from kagya.runtime.event_journal import EventJournal
 
 
@@ -189,7 +190,9 @@ def test_repeated_selection_and_prompt_builds_preserve_canonical_evidence(
     admit(memory, "episode-repeat", activation=0.8, salience=0.6)
     before = (memory.revision, memory.items)
     loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+        emotion_engine=SimpleNamespace(state=EmotionState()),
+        working_memory=memory,
+        context_registry=ContextRegistry(clock=lambda: NOW),
     )
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
 
@@ -530,6 +533,8 @@ def test_nonresolved_resolution_cannot_expose_content(
 ) -> None:
     with pytest.raises(ValueError):
         WorkingMemoryResolution(status, "private body")
+    with pytest.raises(ValueError):
+        WorkingMemoryResolution(status, source_context_id="context-private")
     assert WorkingMemoryResolution(status).rendered_content is None
 
 
@@ -550,7 +555,9 @@ def test_resolution_outcomes_preserve_wm_wal_and_journal_evidence(
     admit(memory, "episode-evidence")
     before = (memory.revision, memory.items)
     loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()), working_memory=memory
+        emotion_engine=SimpleNamespace(state=EmotionState()),
+        working_memory=memory,
+        context_registry=ContextRegistry(clock=lambda: NOW),
     )
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
     snapshot = store.capture(loop, sequence=0)
@@ -710,7 +717,9 @@ def test_memory_resolver_dispatches_committed_reads_and_maps_outcomes(
 
         def get_committed_semantic(self, source_id: str) -> object:
             self.calls.append(("semantic", source_id))
-            return SimpleNamespace(document="semantic body")
+            return SimpleNamespace(
+                document="semantic body", record=SimpleNamespace(context_id=None)
+            )
 
     memory = Memory()
     resolver = MemoryWorkingMemoryResolver(memory)
@@ -725,6 +734,127 @@ def test_memory_resolver_dispatches_committed_reads_and_maps_outcomes(
         ("episodic", "episode-real"),
         ("semantic", "semantic-real"),
     ]
+
+
+def test_resolver_passes_episodic_and_semantic_context_ephemerally(
+    tmp_path: Path,
+) -> None:
+    source = _dual_memory(tmp_path)
+    source.publish_coordinated_episodic(
+        "episode-context",
+        "context input",
+        "context response",
+        loss=0.1,
+        emotion_valence=0.2,
+        emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG,
+        created_at=NOW.isoformat(),
+        coordination_schema=2,
+        context_id="context-a",
+        source_channel="chat",
+    )
+    semantic_id = source.save_semantic(
+        "semantic context body", source_episode_ids=["episode-context"]
+    )
+    working = WorkingMemory(item_capacity=2, projection_max_bytes=1000)
+    episodic_item = admit(working, "episode-context")
+    semantic_item = admit(
+        working, semantic_id, kind=WorkingMemorySourceKind.SEMANTIC
+    )
+    resolver = MemoryWorkingMemoryResolver(source)
+
+    episodic_resolution = resolver.resolve(episodic_item)
+    semantic_resolution = resolver.resolve(semantic_item)
+    view = working.select(resolver)
+
+    assert episodic_resolution.source_context_id == "context-a"
+    assert semantic_resolution.source_context_id == "context-a"
+    assert {
+        selection.source_id: selection.source_context_id
+        for selection in view.selected
+    } == {
+        "episode-context": "context-a",
+        semantic_id: "context-a",
+    }
+    assert all(
+        not hasattr(item, "source_context_id") for item in working.items
+    )
+    prompt = PromptBuilder().build("hello", EmotionState(), view)
+    assert "context-a" not in prompt
+
+
+def test_semantic_resolver_does_not_reinfer_context_from_source_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _dual_memory(tmp_path)
+    source.publish_coordinated_episodic(
+        "episode-context",
+        "context input",
+        "context response",
+        loss=0.1,
+        emotion_valence=0.2,
+        emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG,
+        created_at=NOW.isoformat(),
+        coordination_schema=2,
+        context_id="context-a",
+        source_channel="chat",
+    )
+    semantic_id = source.save_semantic(
+        "semantic context body", source_episode_ids=["episode-context"]
+    )
+    item = WorkingMemoryItem(
+        working_memory_item_id(WorkingMemorySourceKind.SEMANTIC, semantic_id),
+        WorkingMemorySourceKind.SEMANTIC,
+        semantic_id,
+        0.5,
+        0.5,
+        WorkingMemoryRetentionReason.RECENT,
+        0,
+        0,
+    )
+
+    def no_source_lookup(_source_id: str) -> object:
+        raise AssertionError("Semantic resolution must use its committed record")
+
+    monkeypatch.setattr(source, "get_committed_episodic", no_source_lookup)
+    resolution = MemoryWorkingMemoryResolver(source).resolve(item)
+
+    assert resolution.source_context_id == "context-a"
+
+
+def test_context_resolution_metadata_does_not_change_selection_or_prompt() -> None:
+    context_memory = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    plain_memory = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    for memory in (context_memory, plain_memory):
+        admit(memory, "episode-context-one", activation=0.8, salience=0.6)
+        admit(memory, "episode-context-two", activation=0.4, salience=0.7)
+
+    context_view = context_memory.select(
+        lambda item: WorkingMemoryResolution(
+            WorkingMemoryResolutionStatus.RESOLVED,
+            f"body:{item.source_id}",
+            "context-a",
+        )
+    )
+    plain_view = plain_memory.select(lambda item: f"body:{item.source_id}")
+    context_prompt = PromptBuilder().build("hello", EmotionState(), context_view)
+    plain_prompt = PromptBuilder().build("hello", EmotionState(), plain_view)
+
+    assert [item.source_id for item in context_view.selected] == [
+        item.source_id for item in plain_view.selected
+    ]
+    assert [item.score for item in context_view.selected] == [
+        item.score for item in plain_view.selected
+    ]
+    assert [item.reason for item in context_view.selected] == [
+        item.reason for item in plain_view.selected
+    ]
+    assert context_view.projected_bytes == plain_view.projected_bytes
+    assert context_prompt == plain_prompt
+    assert all(
+        item.source_context_id == "context-a" for item in context_view.selected
+    )
 
 
 def test_real_episodic_resolution_is_exact_pure_and_archived_is_ineligible(

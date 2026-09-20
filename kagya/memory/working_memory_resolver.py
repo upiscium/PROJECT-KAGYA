@@ -51,7 +51,9 @@ class MemoryWorkingMemoryResolver:
             if committed.record.archived:
                 return WorkingMemoryResolution(WorkingMemoryResolutionStatus.ARCHIVED)
             return WorkingMemoryResolution(
-                WorkingMemoryResolutionStatus.RESOLVED, committed.document
+                WorkingMemoryResolutionStatus.RESOLVED,
+                committed.document,
+                getattr(committed.record, "context_id", None),
             )
 
         if item.source_kind is WorkingMemorySourceKind.SEMANTIC:
@@ -66,7 +68,9 @@ class MemoryWorkingMemoryResolver:
             if semantic is None:
                 return WorkingMemoryResolution(WorkingMemoryResolutionStatus.MISSING)
             return WorkingMemoryResolution(
-                WorkingMemoryResolutionStatus.RESOLVED, semantic.document
+                WorkingMemoryResolutionStatus.RESOLVED,
+                semantic.document,
+                getattr(semantic.record, "context_id", None),
             )
 
         raise TypeError("Working Memory source kind is unsupported")

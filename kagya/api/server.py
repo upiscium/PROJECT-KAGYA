@@ -4,10 +4,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as default_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from kagya.api.routes import adapters, chat, debug, memory, sleep
+from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep
 from kagya.config import Settings, get_settings
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
@@ -271,6 +276,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=app_settings.project.name, lifespan=lifespan)
     app.state.settings = app_settings
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        """Return bounded validation details without echoing request payloads."""
+
+        is_context_path = request.url.path == "/api/contexts" or (
+            request.url.path.startswith("/api/contexts/")
+        )
+        if (
+            request.url.path not in {"/api/chat", "/api/chat/debug"}
+            and not is_context_path
+        ):
+            return await default_validation_exception_handler(request, error)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "type": str(item.get("type", "validation_error")),
+                        "loc": list(item.get("loc", ())),
+                        "msg": "Invalid request",
+                    }
+                    for item in error.errors()
+                ]
+            },
+        )
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.api.cors_origins,
@@ -310,6 +344,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok", "project": app_settings.project.name}
 
     app.include_router(chat.router)
+    app.include_router(contexts.router)
     app.include_router(debug.router)
     app.include_router(memory.router)
     app.include_router(sleep.router)

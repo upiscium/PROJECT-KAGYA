@@ -18,6 +18,7 @@ class AgentEventType(str, Enum):
     SLEEP = "sleep"
     ADAPTER_EVALUATE = "adapter_evaluate"
     ADAPTER_UPDATE = "adapter_update"
+    CONTEXT_UPDATE = "context_update"
 
 
 class AgentEventSource(str, Enum):
@@ -26,6 +27,10 @@ class AgentEventSource(str, Enum):
     API_CHAT = "api.chat"
     API_CHAT_DEBUG = "api.chat.debug"
     API_SLEEP_RUN = "api.sleep.run"
+    API_CONTEXT_SUSPEND = "api.contexts.suspend"
+    API_CONTEXT_RESUME = "api.contexts.resume"
+    API_CONTEXT_CLOSE = "api.contexts.close"
+    API_CONTEXT_RELATE = "api.contexts.relate"
     API_ADAPTER_EVALUATE = "api.adapters.evaluate"
     API_ADAPTER_TRIAL = "api.adapters.trial"
     API_ADAPTER_APPROVE = "api.adapters.approve"
@@ -389,6 +394,16 @@ class AgentRuntime:
                         error,
                         True,
                     )
+                    if self._failure_checkpoint is not None:
+                        try:
+                            self._failure_checkpoint(event)
+                        except Exception as checkpoint_error:
+                            durability_error = self._durability_error(
+                                event,
+                                AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION,
+                                checkpoint_error,
+                                True,
+                            )
                     with self._condition:
                         self._fail_stop_locked(durability_error)
                     return
