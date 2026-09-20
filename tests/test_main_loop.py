@@ -1,9 +1,10 @@
 from dataclasses import fields
+import math
 from pathlib import Path
 
 import pytest
 
-from kagya.cognition import LossCalibration, model_key
+from kagya.cognition import LossCalibration, LossInvalidReason, model_key
 from kagya.config import Settings, load_settings
 from kagya.memory import (
     DualMemorySystem,
@@ -46,6 +47,19 @@ class ThinkingDummyProvider(DummyProvider):
     def generate(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.response_text
+
+
+class NonFiniteLossProvider(ThinkingDummyProvider):
+    loss_value = math.nan
+
+
+class InfiniteLossProvider(ThinkingDummyProvider):
+    loss_value = math.inf
+
+
+class RaisingLossProvider(ThinkingDummyProvider):
+    def calculate_loss(self, context_text: str, target_text: str) -> float:
+        raise ValueError(PRIVATE_SENTINEL)
 
 
 def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
@@ -601,6 +615,7 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
         "prompt",
         "memory_context",
         "working_memory_view",
+        "diagnostics",
     )
 
 
@@ -732,28 +747,116 @@ def test_main_loop_passes_u2_emotion_policy_to_default_engine(tmp_path: Path) ->
     )
 
 
-def test_main_loop_ordinary_chat_keeps_raw_calculate_update_path(
+def test_main_loop_ordinary_chat_uses_structured_appraisal_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     calls: list[tuple[str, object]] = []
-    original_update = loop.emotion_engine.update
 
-    def calculate(context: str, target: str) -> float:
-        calls.append(("calculate", (context, target)))
-        return 0.7
+    def fail_legacy(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("ordinary chat used the legacy raw-loss emotion path")
 
-    def update(loss: float):
-        calls.append(("update", loss))
-        return original_update(loss)
+    original_advance_to = loop.emotion_engine.advance_to
+    original_measure = loop.surprisal_calculator.measure
+    original_appraise = loop.appraiser.appraise
+    original_update = loop.emotion_engine.update_from_appraisal
 
-    monkeypatch.setattr(loop.surprisal_calculator, "calculate", calculate)
-    monkeypatch.setattr(loop.emotion_engine, "update", update)
-    loop.chat("raw path")
+    def advance_to():
+        calls.append(("advance_to", None))
+        return original_advance_to()
 
-    assert [name for name, _value in calls] == ["calculate", "update"]
-    assert calls[1] == ("update", 0.7)
+    def measure(context: str, target: str, *, model_key: str, calibration):
+        calls.append(("measure", (context, target, model_key)))
+        return original_measure(
+            context, target, model_key=model_key, calibration=calibration
+        )
+
+    def appraise(_appraiser, measurement, signals):
+        calls.append(("appraise", signals))
+        return original_appraise(measurement, signals)
+
+    def update(appraisal, *, primary_loss: float | None = None):
+        calls.append(("update_from_appraisal", primary_loss))
+        return original_update(appraisal, primary_loss=primary_loss)
+
+    monkeypatch.setattr(loop.surprisal_calculator, "calculate", fail_legacy)
+    monkeypatch.setattr(loop.emotion_engine, "update", fail_legacy)
+    monkeypatch.setattr(loop.emotion_engine, "advance_to", advance_to)
+    monkeypatch.setattr(loop.surprisal_calculator, "measure", measure)
+    monkeypatch.setattr(type(loop.appraiser), "appraise", appraise)
+    monkeypatch.setattr(
+        loop.emotion_engine, "update_from_appraisal", update
+    )
+    plan = loop.chat("structured path")
+
+    assert [name for name, _value in calls] == [
+        "advance_to",
+        "measure",
+        "appraise",
+        "update_from_appraisal",
+    ]
+    assert calls[1][1][2] == loop.primary_model_key
+    signals = calls[2][1]
+    assert all(getattr(signals, name) is None for name in (
+        "goal_progress",
+        "threat",
+        "controllability",
+        "certainty",
+        "social_relevance",
+        "effort_cost",
+    ))
+    assert calls[3] == ("update_from_appraisal", DummyProvider.loss_value)
+    assert len(loop.loss_calibration.export()) == 1
+    assert plan.participants[0].operation.schema_version == 3
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "invalid_reason"),
+    [
+        (NonFiniteLossProvider, LossInvalidReason.NON_FINITE_LOSS),
+        (InfiniteLossProvider, LossInvalidReason.NON_FINITE_LOSS),
+        (RaisingLossProvider, LossInvalidReason.PROVIDER_ERROR),
+    ],
+)
+def test_invalid_loss_generates_without_calibration_or_optimal_loss_mutation(
+    tmp_path: Path,
+    provider_type: type[ThinkingDummyProvider],
+    invalid_reason: LossInvalidReason,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    loop = KagyaMainLoop(settings, provider_type(), memory)
+    before_state = loop.emotion_engine.state
+    before_calibration = loop.loss_calibration.export()
+
+    plan = loop.chat_debug("invalid loss")
+    result, trace = _materialize(plan)
+
+    assert result.response == "Visible runtime answer."
+    assert result.loss is None
+    assert loop.loss_calibration.export() == before_calibration
+    assert loop.emotion_engine.state == before_state
+    assert trace.diagnostics.measurement.valid is False
+    assert trace.diagnostics.measurement.invalid_reason is invalid_reason
+    assert trace.diagnostics.measurement.raw_loss is None
+    assert trace.diagnostics.measurement.calibrated_novelty is None
+    assert trace.diagnostics.appraisal.novelty is None
+    assert trace.diagnostics.appraisal.novelty_valid is False
+    assert all(
+        getattr(trace.diagnostics.appraisal, name) is None
+        for name in (
+            "goal_progress",
+            "threat",
+            "controllability",
+            "certainty",
+            "social_relevance",
+            "effort_cost",
+        )
+    )
+    assert PRIVATE_SENTINEL not in repr(trace.diagnostics)
+    assert plan.participants[0].operation.loss is None
+    assert plan.participants[0].operation.schema_version == 3
 
 
 def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
@@ -816,7 +919,7 @@ def test_chat_uses_default_context_provenance(tmp_path: Path) -> None:
     assert plan.participants[0].operation.context_id == "conversation.default"
     assert plan.participants[0].operation.source_channel == "chat"
     assert plan.participants[0].operation.source_session_id is None
-    assert plan.participants[0].operation.schema_version == 2
+    assert plan.participants[0].operation.schema_version == 3
 
 
 def test_chat_captures_current_context_once_and_freezes_it(

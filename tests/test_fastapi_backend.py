@@ -1,8 +1,9 @@
 import json
+import math
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -11,10 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from kagya.api.server import create_app
-from kagya.body import EmotionState
+from kagya.body import EmotionState, EmotionTemporalState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem, MemoryContext
+from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
@@ -36,8 +37,10 @@ from kagya.runtime import (
     AgentStateSnapshotV2 as AgentStateSnapshot,
     AgentStateSnapshotV3,
     AgentStateStore,
+    ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
+    WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
     WorkingMemoryResolutionStatus,
@@ -55,6 +58,7 @@ from kagya.runtime import (
     WorkingMemoryDecisionReason,
     WorkingMemory,
     WorkingMemorySourceKind,
+    working_memory_item_id,
 )
 
 
@@ -67,6 +71,10 @@ class ThinkingProvider(DummyProvider):
     response_text = f"<think>{PRIVATE_SENTINEL}</think>Visible API answer."
 
 
+class NonFiniteLossProvider(ThinkingProvider):
+    loss_value = math.nan
+
+
 class FailOnceAfterEmotionProvider(ThinkingProvider):
     def __init__(self) -> None:
         self.failed = False
@@ -74,6 +82,17 @@ class FailOnceAfterEmotionProvider(ThinkingProvider):
     def generate(self, prompt: str) -> str:
         if not self.failed:
             self.failed = True
+            raise ValueError(PRIVATE_SENTINEL)
+        return super().generate(prompt)
+
+
+class FailOnSecondGenerationProvider(ThinkingProvider):
+    def __init__(self) -> None:
+        self.generation_count = 0
+
+    def generate(self, prompt: str) -> str:
+        self.generation_count += 1
+        if self.generation_count == 2:
             raise ValueError(PRIVATE_SENTINEL)
         return super().generate(prompt)
 
@@ -498,17 +517,51 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
 
 def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
+    legacy_timestamp = datetime(2025, 12, 1, 12, tzinfo=timezone.utc)
+    legacy_context_id = "legacy-context"
+    legacy_source_id = "episode-legacy"
     legacy = AgentStateSnapshotV3(
         saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_processed_event_sequence=0,
         emotion_state=EmotionStateSnapshot(
             valence=0.1, arousal=0.2, optimal_loss=1.0
         ),
-        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        working_memory=WorkingMemorySnapshot(
+            revision=1,
+            items=(
+                WorkingMemoryItemSnapshot(
+                    item_id=working_memory_item_id(
+                        WorkingMemorySourceKind.EPISODIC, legacy_source_id
+                    ),
+                    source_kind=WorkingMemorySourceKind.EPISODIC.value,
+                    source_id=legacy_source_id,
+                    activation=0.6,
+                    salience=0.7,
+                    retention_reason="recent",
+                    created_revision=1,
+                    last_activated_revision=1,
+                ),
+            ),
+        ),
         context_state=ContextStateSnapshot(
-            revision=0,
-            current_context_id=None,
-            frames=(),
+            revision=1,
+            current_context_id=legacy_context_id,
+            frames=(
+                ContextFrameSnapshot(
+                    context_id=legacy_context_id,
+                    context_type="conversation",
+                    source_channel="chat",
+                    source_session_id="legacy-session",
+                    participant_refs=(),
+                    parent_context_id=None,
+                    related_context_ids=(),
+                    status="active",
+                    created_revision=1,
+                    last_modified_revision=1,
+                    started_at=legacy_timestamp,
+                    last_active_at=legacy_timestamp,
+                ),
+            ),
             interlocutor_bindings=(),
         ),
     )
@@ -521,6 +574,17 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
     with _client(tmp_path, settings=settings) as client:
         assert settings.agent_state.path.read_bytes() == legacy_bytes
         assert client.app.state.agent_state_store.load() == legacy
+        assert client.app.state.main_loop.loss_calibration.export() == ()
+        assert client.app.state.main_loop.emotion_engine.temporal_state == (
+            EmotionTemporalState()
+        )
+        assert client.app.state.main_loop.working_memory.revision == 1
+        assert client.app.state.main_loop.working_memory.items[0].source_id == (
+            legacy_source_id
+        )
+        assert client.app.state.main_loop.context_registry.state == (
+            legacy.context_state.to_registry_state()
+        )
 
         response = client.post(
             "/api/chat", json={"message": "upgrade v3", "attachments": []}
@@ -528,8 +592,18 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
         assert upgraded.schema_version == 4
-        assert upgraded.appraisal_state.calibration_entries == ()
-        assert upgraded.appraisal_state.last_emotion_update_at is None
+        assert len(upgraded.appraisal_state.calibration_entries) == 1
+        assert upgraded.appraisal_state.calibration_entries[0].count == 1
+        assert (
+            upgraded.appraisal_state.calibration_entries[0].mean
+            == DummyProvider.loss_value
+        )
+        assert upgraded.appraisal_state.last_emotion_update_at is not None
+        assert upgraded.working_memory.revision >= 1
+        assert any(
+            frame.context_id == legacy_context_id
+            for frame in upgraded.context_state.frames
+        )
         assert settings.agent_state.path.read_bytes() != legacy_bytes
 
 
@@ -668,6 +742,24 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
         assert "prompt" in data
         assert "retrieved_memory" in data
         assert "generation_params" in data
+        measurement = data["diagnostics"]["measurement"]
+        assert measurement["model_key"]
+        assert measurement["raw_loss"] == DummyProvider.loss_value
+        assert measurement["valid"] is True
+        assert measurement["invalid_reason"] is None
+        assert 0.0 <= measurement["calibrated_novelty"] <= 1.0
+        assert data["diagnostics"]["appraisal"]["novelty_valid"] is True
+        assert all(
+            data["diagnostics"]["appraisal"][field] is None
+            for field in (
+                "goal_progress",
+                "threat",
+                "controllability",
+                "certainty",
+                "social_relevance",
+                "effort_cost",
+            )
+        )
         stored = client.app.state.memory_system.db1.get(
             ids=[data["episode_id"]], include=["documents", "metadatas"]
         )
@@ -681,6 +773,37 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
             if path.is_file()
         )
         assert len(client.app.state.main_loop.session_state.turns) == 1
+
+
+def test_api_chat_debug_invalid_loss_is_nullable_and_not_persisted_as_zero(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(
+        tmp_path, settings=settings, provider=NonFiniteLossProvider()
+    ) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "invalid loss", "attachments": [], "debug": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["loss"] is None
+        assert data["diagnostics"]["measurement"]["valid"] is False
+        assert data["diagnostics"]["measurement"]["raw_loss"] is None
+        assert data["diagnostics"]["measurement"]["calibrated_novelty"] is None
+        assert data["diagnostics"]["measurement"]["invalid_reason"] == (
+            "non_finite_loss"
+        )
+        assert data["diagnostics"]["appraisal"]["novelty"] is None
+        stored = client.app.state.memory_system.db1.get(
+            ids=[data["episode_id"]], include=["documents", "metadatas"]
+        )
+        assert stored["metadatas"][0]["coordination_schema"] == 3
+        assert stored["metadatas"][0]["loss_valid"] is False
+        assert "loss" not in stored["metadatas"][0]
 
 
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
@@ -772,6 +895,29 @@ def test_memory_api_does_not_expose_private_fields(tmp_path: Path) -> None:
         assert detail.status_code == 200
         assert "hidden_thought" not in str(search.json())
         assert "hidden_thought" not in detail.json()
+
+
+def test_memory_episode_api_fails_closed_for_invalid_committed_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _client(tmp_path) as client:
+        def invalid_record(_episode_id: str) -> None:
+            raise EpisodicMemoryFormatError("PRIVATE metadata detail")
+
+        monkeypatch.setattr(
+            client.app.state.memory_system,
+            "get_committed_episodic",
+            invalid_record,
+        )
+        response = client.get(
+            "/api/memory/episodes/episode-invalid", headers=admin_headers()
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Committed episodic Memory is invalid"
+        }
+        assert "PRIVATE" not in response.text
 
 
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
@@ -1700,15 +1846,32 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
     app.state.adapter_registry = AdapterRegistry(settings)
 
     with TestClient(app) as client:
+        main_loop = client.app.state.main_loop
+        before_temporal = main_loop.emotion_engine.temporal_state
+        before_calibration = main_loop.loss_calibration.export()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
         with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
             client.post(
                 "/api/chat",
                 json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
             )
 
-        assert client.app.state.main_loop.emotion_engine.state == initial_emotion
-        assert client.app.state.main_loop.context_registry.state.frames == ()
-        assert client.app.state.main_loop.context_registry.current_context_id is None
+        assert main_loop.emotion_engine.state == initial_emotion
+        assert main_loop.emotion_engine.temporal_state == before_temporal
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state.frames == ()
+        assert main_loop.context_registry.current_context_id is None
+        assert main_loop.session_state.turns == []
+        assert client.app.state.memory_system.db1.get(
+            include=["documents", "metadatas"]
+        )["ids"] == []
         failed = client.app.state.event_journal.records[-1]
         assert failed.lifecycle is EventLifecycle.FAILED
         assert failed.processing_sequence == 1
@@ -1731,6 +1894,65 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
     assert PRIVATE_SENTINEL not in journal_bytes
     assert "prompt" not in journal_bytes.casefold()
     assert "message" not in journal_bytes.casefold()
+
+
+def test_handler_failure_rolls_back_elapsed_structured_state_and_success_artifacts(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    provider = FailOnSecondGenerationProvider()
+
+    with _client(tmp_path, settings=settings, provider=provider) as client:
+        main_loop = client.app.state.main_loop
+        clock = {"now": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+        setattr(main_loop.emotion_engine, "_clock", lambda: clock["now"])
+
+        first = client.post(
+            "/api/chat", json={"message": "baseline", "attachments": []}
+        )
+        assert first.status_code == 200
+        baseline_snapshot = client.app.state.agent_state_store.load()
+        before_emotion = main_loop.emotion_engine.state
+        before_temporal = main_loop.emotion_engine.temporal_state
+        before_calibration = main_loop.loss_calibration.export()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
+        before_context = main_loop.context_registry.state
+        before_turns = tuple(main_loop.session_state.turns)
+        before_episode_ids = set(
+            client.app.state.memory_system.db1.get()["ids"]
+        )
+
+        clock["now"] += timedelta(seconds=60)
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat", json={"message": "failed", "attachments": []}
+            )
+
+        assert main_loop.emotion_engine.state == before_emotion
+        assert main_loop.emotion_engine.temporal_state == before_temporal
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state == before_context
+        assert tuple(main_loop.session_state.turns) == before_turns
+        assert set(client.app.state.memory_system.db1.get()["ids"]) == (
+            before_episode_ids
+        )
+        assert client.app.state.agent_state_store.load() == baseline_snapshot
+        failed = client.app.state.event_journal.records[-1]
+        assert failed.lifecycle is EventLifecycle.FAILED
+        assert failed.processing_sequence == 2
+        assert failed.failure_category is EventFailureCategory.HANDLER_FAILURE
+
+        retry = client.post(
+            "/api/chat", json={"message": "retry", "attachments": []}
+        )
+        assert retry.status_code == 200
 
 
 def test_handler_context_mutation_failure_restores_current_and_has_no_success(
@@ -2383,6 +2605,7 @@ def _client(
     settings: Settings | None = None,
     configure_admin_token: bool = True,
     runtime: AgentRuntime | AdmissionRuntime | None = None,
+    provider: DummyProvider | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -2390,7 +2613,7 @@ def _client(
         os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
-    app.state.model_provider = ThinkingProvider()
+    app.state.model_provider = provider or ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
     if runtime is not None:

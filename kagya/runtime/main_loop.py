@@ -7,8 +7,16 @@ from datetime import UTC, datetime
 import inspect
 from typing import TYPE_CHECKING
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.cognition import LossCalibration, SurprisalCalculator, model_key
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from kagya.cognition import (
+    AppraisalResult,
+    AppraisalSignals,
+    CognitiveAppraiser,
+    LossCalibration,
+    LossMeasurement,
+    SurprisalCalculator,
+    model_key,
+)
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
@@ -46,7 +54,7 @@ class ChatResult:
 
     episode_id: str
     response: str
-    loss: float
+    loss: float | None
     valence: float
     arousal: float
     optimal_loss: float
@@ -62,16 +70,28 @@ class DebugChatTrace:
     prompt: str
     memory_context: MemoryContext
     working_memory_view: WorkingMemoryView
+    diagnostics: ChatDiagnostics
+
+
+@dataclass(frozen=True)
+class ChatDiagnostics:
+    """Request-scoped structured cognition diagnostics."""
+
+    measurement: LossMeasurement
+    appraisal: AppraisalResult
+    temporal_update: EmotionUpdate
+    emotion_update: EmotionUpdate
 
 
 @dataclass(frozen=True)
 class _ComputedChat:
     response: str
-    loss: float
+    loss: float | None
     valence: float
     arousal: float
     optimal_loss: float
     trace: DebugChatTrace | None
+    diagnostics: ChatDiagnostics
     memory_participant: MemoryEpisodicParticipant
     session_participant: SessionTurnParticipant
 
@@ -111,10 +131,14 @@ class KagyaMainLoop:
             )
         )
         self.surprisal_calculator = SurprisalCalculator(provider)
+        self.appraiser = CognitiveAppraiser()
+        self.primary_model_key = model_key(
+            settings.model.provider, settings.model.primary_id
+        )
         approved_keys = tuple(
             sorted(
                 {
-                    model_key(settings.model.provider, settings.model.primary_id),
+                    self.primary_model_key,
                     model_key(settings.model.provider, settings.model.fallback_id),
                 }
             )
@@ -248,8 +272,19 @@ class KagyaMainLoop:
         )
         context_view = ContextPromptView.from_frame(current_context)
         context_text = self.session_state.context_text()
-        loss = self.surprisal_calculator.calculate(context_text, user_input)
-        emotion_state = emotion_engine.update(loss)
+        temporal_update = emotion_engine.advance_to()
+        measurement = self.surprisal_calculator.measure(
+            context_text,
+            user_input,
+            model_key=self.primary_model_key,
+            calibration=self.loss_calibration,
+        )
+        appraisal = self.appraiser.appraise(measurement, AppraisalSignals())
+        emotion_update = emotion_engine.update_from_appraisal(
+            appraisal,
+            primary_loss=measurement.raw_loss if measurement.valid else None,
+        )
+        emotion_state = emotion_update.state
         memory_context = self.memory_system.retrieve_context(user_input)
         working_memory.advance()
         candidates = [
@@ -286,7 +321,7 @@ class KagyaMainLoop:
             EpisodicWrite(
                 user_input=user_input,
                 response=processed_response.visible_response,
-                loss=loss,
+                loss=measurement.raw_loss,
                 emotion_valence=emotion_state.valence,
                 emotion_arousal=emotion_state.arousal,
                 record_type=MemoryRecordType.EPISODIC_LOG,
@@ -294,7 +329,7 @@ class KagyaMainLoop:
                 context_id=provenance[0],
                 source_channel=provenance[1],
                 source_session_id=provenance[2],
-                schema_version=2,
+                schema_version=3,
             ),
         )
         session_participant = SessionTurnParticipant(
@@ -305,20 +340,28 @@ class KagyaMainLoop:
             ),
         )
         trace = None
+        diagnostics = ChatDiagnostics(
+            measurement=measurement,
+            appraisal=appraisal,
+            temporal_update=temporal_update,
+            emotion_update=emotion_update,
+        )
         if capture_debug:
             trace = DebugChatTrace(
                 hidden_thought=processed_response.hidden_thought,
                 prompt=prompt,
                 memory_context=memory_context,
                 working_memory_view=working_memory_view,
+                diagnostics=diagnostics,
             )
         return _ComputedChat(
             response=processed_response.visible_response,
-            loss=loss,
+            loss=measurement.raw_loss,
             valence=emotion_state.valence,
             arousal=emotion_state.arousal,
             optimal_loss=emotion_state.optimal_loss,
             trace=trace,
+            diagnostics=diagnostics,
             memory_participant=memory_participant,
             session_participant=session_participant,
         )

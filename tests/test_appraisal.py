@@ -122,6 +122,20 @@ def test_invalid_novelty_is_preserved_as_invalid_without_guessing() -> None:
     )
 
 
+def test_measured_zero_novelty_remains_distinct_from_invalid_novelty() -> None:
+    measured = CognitiveAppraiser().appraise(
+        LossMeasurement(MODEL_KEY, 1.0, True, None, 0.0), AppraisalSignals()
+    )
+    invalid = CognitiveAppraiser().appraise(measurement(None), AppraisalSignals())
+
+    assert measured.novelty == 0.0
+    assert measured.novelty_valid is True
+    assert measured.reasons == (AppraisalReasonCode.NOVELTY_MEASURED,)
+    assert invalid.novelty is None
+    assert invalid.novelty_valid is False
+    assert invalid.reasons == (AppraisalReasonCode.NOVELTY_INVALID,)
+
+
 def test_appraisal_is_pure_deterministic_and_does_not_consume_private_text() -> None:
     signals = AppraisalSignals(threat=None)
     appraiser = CognitiveAppraiser()

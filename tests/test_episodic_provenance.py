@@ -3,6 +3,7 @@
 from dataclasses import fields
 from datetime import UTC, datetime
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,9 @@ def _settings(tmp_path: Path) -> Settings:
 def _operation(
     *,
     schema_version: int = 2,
+    loss: float | None = 0.2,
+    emotion_valence: float = 0.3,
+    emotion_arousal: float = 0.4,
     context_id: str | None = None,
     source_channel: str | None = None,
     source_session_id: str | None = None,
@@ -73,9 +77,9 @@ def _operation(
     return EpisodicWrite(
         user_input="staged user",
         response="visible response",
-        loss=0.2,
-        emotion_valence=0.3,
-        emotion_arousal=0.4,
+        loss=loss,
+        emotion_valence=emotion_valence,
+        emotion_arousal=emotion_arousal,
         record_type=MemoryRecordType.EPISODIC_LOG,
         created_at=NOW.isoformat(),
         context_id=context_id,
@@ -89,6 +93,7 @@ def _participant(
     memory: DualMemorySystem,
     *,
     schema_version: int = 2,
+    loss: float | None = 0.2,
     context_id: str | None = None,
     source_channel: str | None = None,
     source_session_id: str | None = None,
@@ -97,6 +102,7 @@ def _participant(
         memory,
         _operation(
             schema_version=schema_version,
+            loss=loss,
             context_id=context_id,
             source_channel=source_channel,
             source_session_id=source_session_id,
@@ -149,6 +155,20 @@ def test_v2_provenance_changes_digest_and_episode_identity() -> None:
     }
     assert len(digests) == 4
     assert len(episode_ids) == 4
+
+
+def test_v3_loss_none_has_distinct_digest_and_canonical_shape() -> None:
+    operation = _operation(schema_version=3)
+    missing_loss = _operation(schema_version=3, loss=None)
+    assert operation.canonical_dict()["loss"] == 0.2
+    assert missing_loss.canonical_dict()["loss"] is None
+    assert episodic_operation_digest(operation) != episodic_operation_digest(missing_loss)
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_coordinated_schemas_require_finite_loss(schema_version: int) -> None:
+    with pytest.raises(ValueError):
+        _operation(schema_version=schema_version, loss=None)
 
 
 def test_v2_rejects_partial_provenance() -> None:
@@ -262,6 +282,178 @@ def test_v2_pending_without_context_is_explicitly_all_none(tmp_path: Path) -> No
     assert participant.operation.canonical_dict()["context_id"] is None
     assert participant.operation.canonical_dict()["source_channel"] is None
     assert participant.operation.canonical_dict()["source_session_id"] is None
+
+
+def test_v3_valid_loss_pending_commit_and_reopen_preserves_schema(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    participant = _participant(
+        memory,
+        schema_version=3,
+        context_id="context-a",
+        source_channel="chat",
+        source_session_id="session-a",
+    )
+    binding = _binding(participant)
+
+    participant.prepare(binding)
+    reopened = MemoryEpisodicParticipant.from_pending(
+        DualMemorySystem(settings),
+        TRANSACTION_ID,
+        MEMORY_EPISODIC_PARTICIPANT_ID,
+        participant.operation_digest,
+    )
+    assert reopened.finalize(binding) is ParticipantOutcome.FINALIZED
+    committed = reopened.memory.get_committed_episodic(participant.episode_id(TRANSACTION_ID))
+
+    assert committed is not None
+    assert committed.record.coordination_schema == 3
+    assert committed.record.loss == 0.2
+    assert committed.metadata["loss_valid"] is True
+    assert committed.metadata["loss"] == 0.2
+    reconstructed = MemoryEpisodicParticipant.from_pending(
+        DualMemorySystem(settings),
+        TRANSACTION_ID,
+        MEMORY_EPISODIC_PARTICIPANT_ID,
+        participant.operation_digest,
+    )
+    assert reconstructed.operation == participant.operation
+    assert reconstructed.inspect_reconciliation(binding) is StartupParticipantOutcome.VERIFIED_CONSISTENT
+
+
+def test_v3_invalid_loss_pending_commit_and_reopen_preserves_none(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    participant = _participant(memory, schema_version=3, loss=None)
+    binding = _binding(participant)
+
+    participant.prepare(binding)
+    pending = json.loads(participant.pending_path(binding).read_text())
+    assert pending["operation"]["loss"] is None
+    reopened = MemoryEpisodicParticipant.from_pending(
+        DualMemorySystem(settings),
+        TRANSACTION_ID,
+        MEMORY_EPISODIC_PARTICIPANT_ID,
+        participant.operation_digest,
+    )
+    assert reopened.finalize(binding) is ParticipantOutcome.FINALIZED
+    committed = reopened.memory.get_committed_episodic(participant.episode_id(TRANSACTION_ID))
+
+    assert committed is not None
+    assert committed.record.coordination_schema == 3
+    assert committed.record.loss is None
+    assert committed.metadata["loss_valid"] is False
+    assert "loss" not in committed.metadata
+    reconstructed = MemoryEpisodicParticipant.from_pending(
+        DualMemorySystem(settings),
+        TRANSACTION_ID,
+        MEMORY_EPISODIC_PARTICIPANT_ID,
+        participant.operation_digest,
+    )
+    assert reconstructed.operation.loss is None
+    assert reconstructed.inspect_reconciliation(binding) is StartupParticipantOutcome.VERIFIED_CONSISTENT
+
+
+def test_v3_finalize_accepts_backend_float_round_trip(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    participant = MemoryEpisodicParticipant(
+        memory,
+        _operation(schema_version=3, emotion_arousal=0.16223081199964517),
+    )
+    binding = _binding(participant)
+
+    participant.prepare(binding)
+
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+
+
+@pytest.mark.parametrize(
+    "stored_arousal",
+    [
+        math.nextafter(0.4, -math.inf),
+        math.nextafter(0.4, math.inf),
+    ],
+)
+def test_v3_finalize_accepts_one_ulp_backend_round_trip(
+    tmp_path: Path, stored_arousal: float
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    participant = MemoryEpisodicParticipant(memory, _operation(schema_version=3))
+    binding = _binding(participant)
+    participant.prepare(binding)
+    operation = participant.operation
+    episode_id = participant.episode_id(TRANSACTION_ID)
+    memory.publish_coordinated_episodic(
+        episode_id,
+        operation.user_input,
+        operation.response,
+        loss=operation.loss,
+        emotion_valence=operation.emotion_valence,
+        emotion_arousal=operation.emotion_arousal,
+        record_type=operation.record_type,
+        created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
+    )
+    stored = memory.db1.get(ids=[episode_id], include=["metadatas"])
+    metadata = dict(stored["metadatas"][0])
+    metadata["emotion_arousal"] = stored_arousal
+    memory.db1.update(ids=[episode_id], metadatas=[metadata])
+
+    assert participant.finalize(binding) in (
+        ParticipantOutcome.FINALIZED,
+        ParticipantOutcome.ALREADY_CONSISTENT,
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_valence", "tampered_valence"),
+    [
+        (0.0, 9e-13),
+        (1.0, math.nextafter(math.nextafter(1.0, -math.inf), -math.inf)),
+    ],
+)
+def test_v3_finalize_rejects_float_tampering(
+    tmp_path: Path, expected_valence: float, tampered_valence: float
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    participant = MemoryEpisodicParticipant(
+        memory,
+        _operation(schema_version=3, emotion_valence=expected_valence),
+    )
+    binding = _binding(participant)
+    participant.prepare(binding)
+    operation = participant.operation
+    episode_id = participant.episode_id(TRANSACTION_ID)
+    memory.publish_coordinated_episodic(
+        episode_id,
+        operation.user_input,
+        operation.response,
+        loss=operation.loss,
+        emotion_valence=operation.emotion_valence,
+        emotion_arousal=operation.emotion_arousal,
+        record_type=operation.record_type,
+        created_at=operation.created_at,
+        coordination_schema=operation.schema_version,
+        context_id=operation.context_id,
+        source_channel=operation.source_channel,
+        source_session_id=operation.source_session_id,
+    )
+    stored = memory.db1.get(ids=[episode_id], include=["metadatas"])
+    metadata = dict(stored["metadatas"][0])
+    metadata["emotion_valence"] = tampered_valence
+    memory.db1.update(ids=[episode_id], metadatas=[metadata])
+
+    with pytest.raises(ParticipantDivergedError):
+        participant.finalize(binding)
 
 
 def test_pending_provenance_tamper_diverges_without_publication(tmp_path: Path) -> None:

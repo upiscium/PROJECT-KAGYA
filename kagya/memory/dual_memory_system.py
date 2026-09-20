@@ -206,7 +206,7 @@ class DualMemorySystem:
         user_input: str,
         response: str,
         *,
-        loss: float,
+        loss: float | None,
         emotion_valence: float,
         emotion_arousal: float,
         record_type: MemoryRecordType,
@@ -241,7 +241,7 @@ class DualMemorySystem:
         user_input: str,
         response: str,
         *,
-        loss: float,
+        loss: float | None,
         emotion_valence: float,
         emotion_arousal: float,
         record_type: MemoryRecordType,
@@ -483,7 +483,7 @@ def canonical_episodic_metadata(
     user_input: str,
     response: str,
     *,
-    loss: float,
+    loss: float | None,
     emotion_valence: float,
     emotion_arousal: float,
     record_type: MemoryRecordType,
@@ -500,7 +500,6 @@ def canonical_episodic_metadata(
     result: dict[str, str | int | float | bool] = {
         "user_input": user_input,
         "response": response,
-        "loss": float(loss),
         "emotion_valence": float(emotion_valence),
         "emotion_arousal": float(emotion_arousal),
         "record_type": record_type.value,
@@ -509,6 +508,9 @@ def canonical_episodic_metadata(
         "extra": json.dumps(dict(metadata)),
     }
     if not coordinated:
+        if loss is None or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+            raise ValueError("loss must be finite")
+        result["loss"] = float(loss)
         if any(
             value is not None
             for value in (context_id, source_channel, source_session_id)
@@ -525,14 +527,26 @@ def canonical_episodic_metadata(
             else 1
         )
     if coordinated:
-        if type(coordination_schema) is not int or coordination_schema not in (1, 2):
+        if type(coordination_schema) is not int or coordination_schema not in (1, 2, 3):
             raise ValueError("unsupported coordination schema")
-        if coordination_schema == 2:
+        if coordination_schema in (2, 3):
             _validate_provenance(context_id, source_channel, source_session_id)
         elif any(value is not None for value in (context_id, source_channel, source_session_id)):
             raise ValueError("schema 1 does not support provenance")
         result["coordination_schema"] = coordination_schema
-        if coordination_schema == 2:
+        if coordination_schema == 3:
+            if loss is None:
+                result["loss_valid"] = False
+            else:
+                if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+                    raise ValueError("loss must be finite")
+                result["loss"] = float(loss)
+                result["loss_valid"] = True
+        else:
+            if loss is None or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+                raise ValueError("loss must be finite")
+            result["loss"] = float(loss)
+        if coordination_schema in (2, 3):
             for key, value in (
                 ("context_id", context_id),
                 ("source_channel", source_channel),
@@ -599,21 +613,31 @@ def _provenance_from_metadata(
 ) -> tuple[int | None, str | None, str | None, str | None]:
     provenance_keys = ("context_id", "source_channel", "source_session_id")
     if "coordination_schema" not in metadata:
-        if any(key in metadata for key in provenance_keys):
+        if any(key in metadata for key in provenance_keys) or "loss_valid" in metadata:
             raise ValueError
         return None, None, None, None
     coordination_schema = metadata["coordination_schema"]
-    if type(coordination_schema) is not int or coordination_schema not in (1, 2):
+    if type(coordination_schema) is not int or coordination_schema not in (1, 2, 3):
         raise ValueError
     if coordination_schema == 1:
-        if any(key in metadata for key in provenance_keys):
+        if any(key in metadata for key in provenance_keys) or "loss_valid" in metadata:
             raise ValueError
         return 1, None, None, None
+    if coordination_schema == 3:
+        if type(metadata.get("loss_valid")) is not bool:
+            raise ValueError
+        if metadata["loss_valid"]:
+            if "loss" not in metadata or type(metadata["loss"]) not in (int, float) or not math.isfinite(float(metadata["loss"])):
+                raise ValueError
+        elif "loss" in metadata:
+            raise ValueError
+    elif "loss_valid" in metadata:
+        raise ValueError
     values = tuple(metadata.get(key) for key in provenance_keys)
     if any(key in metadata and type(metadata[key]) is not str for key in provenance_keys):
         raise ValueError
     _validate_provenance(*values)
-    return (2, values[0], values[1], values[2])
+    return (coordination_schema, values[0], values[1], values[2])
 
 
 def _episodic_records_from_query(
@@ -680,7 +704,6 @@ def _committed_episodic_record(
     required = (
         "user_input",
         "response",
-        "loss",
         "emotion_valence",
         "emotion_arousal",
         "record_type",
@@ -701,14 +724,19 @@ def _committed_episodic_record(
         for key in ("user_input", "response", "record_type", "created_at", "extra")
     ):
         raise ValueError
-    if not all(
-        type(metadata[key]) in (int, float)
-        for key in ("loss", "emotion_valence", "emotion_arousal")
-    ):
+    if not all(type(metadata[key]) in (int, float) for key in ("emotion_valence", "emotion_arousal")):
+        raise ValueError
+    if coordination_schema == 3:
+        loss = float(metadata["loss"]) if metadata["loss_valid"] else None
+    else:
+        if "loss" not in metadata or type(metadata["loss"]) not in (int, float):
+            raise ValueError
+        loss = float(metadata["loss"])
+    if loss is not None and not math.isfinite(loss):
         raise ValueError
     if not all(
         math.isfinite(float(metadata[key]))
-        for key in ("loss", "emotion_valence", "emotion_arousal")
+        for key in ("emotion_valence", "emotion_arousal")
     ):
         raise ValueError
     if type(metadata["archived"]) is not bool:
@@ -733,7 +761,7 @@ def _committed_episodic_record(
         id=record_id,
         user_input=metadata["user_input"],
         response=metadata["response"],
-        loss=float(metadata["loss"]),
+        loss=loss,
         emotion_valence=float(metadata["emotion_valence"]),
         emotion_arousal=float(metadata["emotion_arousal"]),
         record_type=MemoryRecordType(metadata["record_type"]),
@@ -805,11 +833,24 @@ def _episodic_record_from_metadata(
         raise EpisodicMemoryFormatError(
             "Committed episodic Memory is invalid"
         ) from None
+    try:
+        if coordination_schema == 3:
+            loss = float(metadata["loss"]) if metadata["loss_valid"] else None
+        else:
+            if "loss" not in metadata or type(metadata["loss"]) not in (int, float):
+                raise ValueError
+            loss = float(metadata["loss"])
+        if loss is not None and not math.isfinite(loss):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise EpisodicMemoryFormatError(
+            "Committed episodic Memory is invalid"
+        ) from None
     return EpisodicMemoryRecord(
         id=record_id,
         user_input=str(metadata.get("user_input", "")),
         response=str(metadata.get("response", "")),
-        loss=float(metadata.get("loss", 0.0)),
+        loss=loss,
         emotion_valence=float(metadata.get("emotion_valence", 0.0)),
         emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
         record_type=MemoryRecordType(
