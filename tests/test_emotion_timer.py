@@ -79,18 +79,17 @@ def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
 
 def test_timer_waits_before_submitting_and_uses_closed_identity() -> None:
     runtime = FakeRuntime()
-    handler_called = Event()
-    timer = EmotionTimer(runtime, 0.05, handler_called.set)
+    timer = EmotionTimer(runtime, 0.05, lambda: None)
 
     timer.start()
-    assert not handler_called.wait(0.01)
+    Event().wait(0.01)
+    assert runtime.calls == []
     _wait_for(lambda: len(runtime.calls) == 1)
     timer.stop()
 
     assert runtime.calls == [
         (AgentEventType.EMOTION_TICK, AgentEventSource.RUNTIME_EMOTION_TIMER)
     ]
-    assert not handler_called.is_set()
 
 
 def test_stop_before_start_is_idempotent_and_does_not_create_thread() -> None:

@@ -1149,11 +1149,16 @@ def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> Non
 
 
 def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+    settings = _settings(tmp_path)
+    timer = RecordingTimer()
+    with _client(tmp_path, settings=settings, timer=timer) as client:
         runtime = client.app.state.agent_runtime
         assert runtime is client.app.state.agent_runtime
         assert runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert client.app.state.state_wal.inspect_boot_anchor_optional() is not None
+        assert timer.start_calls == 0
     assert runtime.status is AgentRuntimeStatus.STOPPED
+    assert timer.stop_calls == 1
 
 
 def test_enabled_emotion_timer_starts_after_boot_anchor_and_stops_first(
@@ -1723,7 +1728,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
 def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
     tmp_path: Path,
 ) -> None:
-    settings = _settings(tmp_path)
+    base_settings = _settings(tmp_path)
     class FailingStore(AgentStateStore):
         def save(self, snapshot: AgentStateSnapshot) -> None:
             if snapshot.last_processed_event_sequence > 0:
@@ -1732,13 +1737,13 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
                 )
             super().save(snapshot)
 
-    first = create_app(settings)
+    first = create_app(base_settings)
     first.state.model_provider = ThinkingProvider()
-    first.state.memory_system = DualMemorySystem(settings)
-    first.state.adapter_registry = AdapterRegistry(settings)
+    first.state.memory_system = DualMemorySystem(base_settings)
+    first.state.adapter_registry = AdapterRegistry(base_settings)
     first.state.agent_state_store = FailingStore(
-        settings.agent_state.path,
-        settings.emotion.baseline_surprisal,
+        base_settings.agent_state.path,
+        base_settings.emotion.baseline_surprisal,
     )
     with TestClient(first) as client:
         assert client.post(
@@ -1746,29 +1751,40 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
         ).status_code == 500
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         pending = (
-            settings.memory.persist_directory
+            base_settings.memory.persist_directory
             / ".r07-episodic-pending"
             / f"{transaction.transaction_id}.json"
         )
     pending.write_text('{"conflict":"well-formed"}')
     pending.chmod(0o600)
-    journal_before = settings.event_journal.path.read_bytes()
-    snapshot_before = settings.agent_state.path.read_bytes()
+    journal_before = base_settings.event_journal.path.read_bytes()
+    snapshot_before = base_settings.agent_state.path.read_bytes()
     wal_before = {
-        path.relative_to(settings.state_wal.directory): path.read_bytes()
-        for path in settings.state_wal.directory.rglob("*")
+        path.relative_to(base_settings.state_wal.directory): path.read_bytes()
+        for path in base_settings.state_wal.directory.rglob("*")
         if path.is_file()
     }
 
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
     app = create_app(settings)
     app.state.model_provider = ThinkingProvider()
     app.state.memory_system = DualMemorySystem(settings)
     app.state.adapter_registry = AdapterRegistry(settings)
     runtime = RecordingRuntime()
     app.state.agent_runtime = runtime
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
 
     with TestClient(app) as degraded:
         assert runtime.status is AgentRuntimeStatus.CREATED
+        assert degraded.app.state.external_reconciliation_required
+        assert timer.start_calls == 0
         assert degraded.get("/health").json()["status"] == "degraded"
         assert degraded.app.state.event_journal.inspect().open_transactions
         assert degraded.post(
@@ -1783,6 +1799,7 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
             for path in settings.state_wal.directory.rglob("*")
             if path.is_file()
         } == wal_before
+    assert timer.stop_calls == 1
 
 
 def test_two_true_rollbacks_preserve_reconciliation_authority(
@@ -3002,6 +3019,7 @@ def _client(
     configure_admin_token: bool = True,
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
+    timer: RecordingTimer | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -3014,6 +3032,8 @@ def _client(
     app.state.adapter_registry = AdapterRegistry(app_settings)
     if runtime is not None:
         app.state.agent_runtime = runtime
+    if timer is not None:
+        app.state.emotion_timer = timer
     return TestClient(app)
 
 
