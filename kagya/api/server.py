@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as default_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -276,10 +279,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(
-        _request: Request, error: RequestValidationError
+        request: Request, error: RequestValidationError
     ) -> JSONResponse:
         """Return bounded validation details without echoing request payloads."""
 
+        if request.url.path not in {"/api/chat", "/api/chat/debug"}:
+            return await default_validation_exception_handler(request, error)
         return JSONResponse(
             status_code=422,
             content={

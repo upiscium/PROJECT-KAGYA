@@ -2,10 +2,14 @@
 
 from datetime import UTC, datetime
 import hashlib
+from pathlib import Path
 
 import pytest
 
 from kagya.body import EmotionState
+from kagya.config import Settings, load_settings
+from kagya.memory import DualMemorySystem, MemoryRecordType
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.persona import ContextPromptView, PromptBuilder
 from kagya.runtime import (
     ChatContextSelectors,
@@ -25,6 +29,7 @@ from kagya.runtime import (
 
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 class Clock:
@@ -248,6 +253,162 @@ def test_contextual_working_memory_uses_compatibility_without_mutating_authority
     )
 
 
+def test_contextual_compatibility_can_reverse_r08_order_and_budget_packing() -> None:
+    registry = ContextRegistry(clock=lambda: NOW)
+    current = registry.create("rank-current", ContextType.CONVERSATION, "chat")
+    unrelated = registry.create("rank-unrelated", ContextType.CONVERSATION, "chat")
+    source_contexts = {
+        "item-a": unrelated.context_id,
+        "item-b": current.context_id,
+    }
+
+    def resolver(item):
+        return WorkingMemoryResolution(
+            WorkingMemoryResolutionStatus.RESOLVED,
+            f"body-{item.source_id[-1]}",
+            source_contexts[item.source_id],
+        )
+
+    def populate(memory: WorkingMemory) -> None:
+        memory.admit(WorkingMemorySourceKind.SEMANTIC, "item-a", 1.0, 1.0)
+        memory.admit(WorkingMemorySourceKind.SEMANTIC, "item-b", 0.8, 0.75)
+
+    ordinary = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    contextual = WorkingMemory(item_capacity=2, projection_max_bytes=100)
+    tight = WorkingMemory(item_capacity=2, projection_max_bytes=6)
+    for memory in (ordinary, contextual, tight):
+        populate(memory)
+
+    ordinary_view = ordinary.select(resolver)
+    contextual_view = contextual.select_contextual(
+        resolver, registry, current.context_id
+    )
+    tight_view = tight.select_contextual(resolver, registry, current.context_id)
+
+    ordinary_items = {item.source_id: item for item in ordinary.items}
+    assert ordinary.score(ordinary_items["item-a"]) > ordinary.score(
+        ordinary_items["item-b"]
+    )
+    ordinary_order = [selection.source_id for selection in ordinary_view.selected]
+    contextual_order = [selection.source_id for selection in contextual_view.selected]
+    assert ordinary_order == ["item-a", "item-b"]
+    assert contextual_order == ["item-b", "item-a"]
+    contextual_evidence = {
+        decision.source_id: decision for decision in contextual_view.decisions
+    }
+    assert contextual_evidence["item-a"].effective_score == pytest.approx(0.2)
+    assert contextual_evidence["item-b"].effective_score == pytest.approx(0.78 * 1.0)
+    assert contextual_evidence["item-a"].effective_score < (
+        contextual_evidence["item-b"].effective_score or 0.0
+    )
+    assert [selection.source_id for selection in tight_view.selected] == ["item-b"]
+    assert [decision.source_id for decision in tight_view.decisions] == [
+        "item-b",
+        "item-a",
+    ]
+    assert tight_view.decisions[1].reason is WorkingMemoryDecisionReason.PROJECTION_BUDGET
+
+
+@pytest.mark.parametrize(
+    ("relation", "expected_score"),
+    [
+        (ContextRelation.SAME_CONTEXT, 1.0),
+        (ContextRelation.PARENT_CHILD, 0.8),
+        (ContextRelation.RELATED, 0.75),
+        (ContextRelation.SHARED_INTERLOCUTOR, 0.65),
+        (ContextRelation.LEGACY_UNKNOWN, 0.45),
+        (ContextRelation.UNKNOWN_CONTEXT, 0.35),
+        (ContextRelation.UNRELATED, 0.2),
+    ],
+)
+def test_all_compatibility_classes_cross_the_contextual_projection_path(
+    relation: ContextRelation, expected_score: float
+) -> None:
+    registry = ContextRegistry(clock=lambda: NOW)
+    parent = registry.create("relation-parent", ContextType.CONVERSATION, "chat")
+    current = registry.create(
+        "relation-current",
+        ContextType.CONVERSATION,
+        "chat",
+        parent_context_id=parent.context_id,
+        participant_refs=("shared-ref",),
+    )
+    related = registry.create("relation-related", ContextType.CONVERSATION, "chat")
+    registry.relate(current.context_id, related.context_id)
+    shared = registry.create(
+        "relation-shared",
+        ContextType.CONVERSATION,
+        "chat",
+        participant_refs=("shared-ref",),
+    )
+    unrelated = registry.create("relation-unrelated", ContextType.CONVERSATION, "chat")
+    source_contexts = {
+        ContextRelation.SAME_CONTEXT: current.context_id,
+        ContextRelation.PARENT_CHILD: parent.context_id,
+        ContextRelation.RELATED: related.context_id,
+        ContextRelation.SHARED_INTERLOCUTOR: shared.context_id,
+        ContextRelation.LEGACY_UNKNOWN: None,
+        ContextRelation.UNKNOWN_CONTEXT: "relation-unknown",
+        ContextRelation.UNRELATED: unrelated.context_id,
+    }
+    memory = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    source_id = f"relation-{relation.value}"
+    memory.admit(WorkingMemorySourceKind.SEMANTIC, source_id, 1.0, 1.0)
+    view = memory.select_contextual(
+        lambda _item: WorkingMemoryResolution(
+            WorkingMemoryResolutionStatus.RESOLVED,
+            "projection body",
+            source_contexts[relation],
+        ),
+        registry,
+        current.context_id,
+    )
+    selection = view.selected[0]
+    prompt = PromptBuilder().build("hello", EmotionState(), view)
+
+    assert selection.context_relation is relation
+    assert selection.context_compatibility == pytest.approx(expected_score)
+    assert f"context_relation={relation.value}" in prompt
+    assert f"compatibility={expected_score:.2f}" in prompt
+
+
+def test_real_semantic_provenance_reaches_contextual_selection(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    memory = DualMemorySystem(settings)
+    registry = ContextRegistry(clock=lambda: NOW)
+    current = registry.create("semantic-current", ContextType.CONVERSATION, "chat")
+    episode_id = "episode-semantic-context"
+    memory.publish_coordinated_episodic(
+        episode_id,
+        "source input",
+        "source response",
+        loss=0.1,
+        emotion_valence=0.2,
+        emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG,
+        created_at=NOW.isoformat(),
+        coordination_schema=2,
+        context_id=current.context_id,
+        source_channel="chat",
+    )
+    semantic_id = memory.save_semantic(
+        "semantic body", source_episode_ids=[episode_id]
+    )
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    working.admit(WorkingMemorySourceKind.SEMANTIC, semantic_id, 1.0, 1.0)
+    resolver = MemoryWorkingMemoryResolver(memory)
+
+    resolution = resolver.resolve(working.items[0])
+    view = working.select_contextual(resolver, registry, current.context_id)
+
+    assert resolution.source_context_id == current.context_id
+    assert view.selected[0].source_context_id == current.context_id
+    assert view.selected[0].context_relation is ContextRelation.SAME_CONTEXT
+    assert view.selected[0].context_compatibility == 1.0
+
+
 def test_context_prompt_view_is_bounded_and_memory_labels_are_ephemeral() -> None:
     registry = ContextRegistry(clock=lambda: NOW)
     frame = registry.create(
@@ -278,3 +439,18 @@ def test_context_prompt_view_is_bounded_and_memory_labels_are_ephemeral() -> Non
     assert "compatibility=1.00" in prompt
     assert "episode-source" not in prompt
     assert "bounded body" in prompt
+
+
+def _settings_for_tmp_memory(tmp_path: Path) -> Settings:
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={
+            "memory": settings.memory.model_copy(
+                update={
+                    "persist_directory": tmp_path / "chroma",
+                    "db1_collection": "hippocampus_context_chat_test",
+                    "db2_collection": "cortex_context_chat_test",
+                }
+            )
+        }
+    )

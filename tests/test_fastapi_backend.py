@@ -275,6 +275,22 @@ def test_chat_selector_validation_happens_before_event_admission(
         assert runtime.submissions == []
 
 
+def test_unrelated_validation_keeps_pre_u4_fastapi_error_shape(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/adapters/missing/evaluate",
+            headers=admin_headers(),
+            json={"deterministic_score": "PRIVATE-ADAPTER-INPUT"},
+        )
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert detail[0]["loc"] == ["body", "deterministic_score"]
+        assert detail[0]["input"] == "PRIVATE-ADAPTER-INPUT"
+
+
 def test_chat_session_selector_reuses_one_durable_context_without_response_metadata(
     tmp_path: Path,
 ) -> None:
@@ -312,6 +328,86 @@ def test_chat_session_selector_reuses_one_durable_context_without_response_metad
         )
         assert first_record is not None and second_record is not None
         assert first_record.context_id == second_record.context_id == frames[0].context_id
+
+
+def test_default_context_continuity_survives_process_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as first:
+        response = first.post(
+            "/api/chat", json={"message": "default before restart", "attachments": []}
+        )
+        assert response.status_code == 200
+        episode_id = response.json()["episode_id"]
+        before = first.app.state.main_loop.context_registry.state
+        persisted = first.app.state.agent_state_store.load().context_state
+        assert tuple(frame.context_id for frame in before.frames) == (
+            "conversation.default",
+        )
+        assert tuple(frame.context_id for frame in persisted.frames) == (
+            "conversation.default",
+        )
+        episode = first.app.state.memory_system.get_episodic_record(episode_id)
+        assert episode is not None
+        assert episode.context_id == "conversation.default"
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.app.state.main_loop.context_registry.state
+        assert restored == before
+        response = restarted.post(
+            "/api/chat", json={"message": "default after restart", "attachments": []}
+        )
+        assert response.status_code == 200
+        episode = restarted.app.state.memory_system.get_episodic_record(
+            response.json()["episode_id"]
+        )
+        assert episode is not None
+        assert episode.context_id == "conversation.default"
+        assert restarted.app.state.main_loop.context_registry.state.frames == before.frames
+
+
+def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    session_id = "restart-session"
+    with _client(tmp_path, settings=settings) as first:
+        response = first.post(
+            "/api/chat",
+            json={
+                "message": "session before restart",
+                "attachments": [],
+                "client_session_id": session_id,
+            },
+        )
+        assert response.status_code == 200
+        episode = first.app.state.memory_system.get_episodic_record(
+            response.json()["episode_id"]
+        )
+        assert episode is not None
+        context_id = episode.context_id
+        assert context_id is not None
+        before = first.app.state.main_loop.context_registry.state
+        assert [frame.source_session_id for frame in before.frames] == [session_id]
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.app.state.main_loop.context_registry.state
+        assert restored == before
+        response = restarted.post(
+            "/api/chat",
+            json={
+                "message": "session after restart",
+                "attachments": [],
+                "client_session_id": session_id,
+            },
+        )
+        assert response.status_code == 200
+        episode = restarted.app.state.memory_system.get_episodic_record(
+            response.json()["episode_id"]
+        )
+        assert episode is not None
+        assert episode.context_id == context_id
+        frames = restarted.app.state.main_loop.context_registry.state.frames
+        assert len(frames) == 1
+        assert frames[0].context_id == context_id
+        assert frames[0].source_session_id == session_id
 
 
 def test_chat_context_domain_errors_are_bounded_http_responses(tmp_path: Path) -> None:
