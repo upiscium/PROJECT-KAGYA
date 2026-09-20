@@ -37,6 +37,27 @@ class EmotionSettings(StrictBaseModel):
     baseline_surprisal: float = Field(ge=0.0)
     high_emotion_threshold: float = Field(ge=0.0, le=1.0)
     decay_rate: float = Field(ge=0.0)
+    appraisal_response_rate: float = Field(default=0.4, ge=0.0, le=1.0)
+    resting_valence: float = Field(default=0.0, ge=-1.0, le=1.0)
+    resting_arousal: float = Field(default=0.0, ge=0.0, le=1.0)
+    valence_recovery_rate: float = Field(default=0.01, ge=0.0)
+    arousal_recovery_rate: float = Field(default=0.02, ge=0.0)
+
+    @field_validator(
+        "baseline_surprisal",
+        "high_emotion_threshold",
+        "decay_rate",
+        "appraisal_response_rate",
+        "resting_valence",
+        "resting_arousal",
+        "valence_recovery_rate",
+        "arousal_recovery_rate",
+    )
+    @classmethod
+    def require_finite_emotion_value(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("emotion settings must be finite")
+        return value
 
 
 class AppraisalSettings(StrictBaseModel):
