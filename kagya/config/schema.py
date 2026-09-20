@@ -1,8 +1,9 @@
 """Typed configuration schema for PROJECT-KAGYA."""
 
 from pathlib import Path
+import math
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictBaseModel(BaseModel):
@@ -36,6 +37,18 @@ class EmotionSettings(StrictBaseModel):
     baseline_surprisal: float = Field(ge=0.0)
     high_emotion_threshold: float = Field(ge=0.0, le=1.0)
     decay_rate: float = Field(ge=0.0)
+
+
+class AppraisalSettings(StrictBaseModel):
+    initial_loss_scale: float = Field(default=1.0, gt=0.0)
+    minimum_loss_scale: float = Field(default=0.01, gt=0.0)
+
+    @field_validator("initial_loss_scale", "minimum_loss_scale")
+    @classmethod
+    def require_finite_scale(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("loss calibration scales must be finite")
+        return value
 
 
 class MemorySettings(StrictBaseModel):
@@ -118,6 +131,7 @@ class Settings(StrictBaseModel):
     model: ModelSettings
     generation: GenerationSettings
     emotion: EmotionSettings
+    appraisal: AppraisalSettings = Field(default_factory=AppraisalSettings)
     memory: MemorySettings
     sleep: SleepSettings
     qlora: QloraSettings
