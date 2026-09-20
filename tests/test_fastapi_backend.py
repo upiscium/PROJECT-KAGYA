@@ -32,6 +32,7 @@ from kagya.runtime import (
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
+    AgentStateSnapshotV2,
     AgentStateSnapshotV2 as AgentStateSnapshot,
     AgentStateStore,
     EmotionStateSnapshot,
@@ -457,7 +458,7 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
 
 def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    legacy = AgentStateSnapshot(
+    legacy = AgentStateSnapshotV2(
         saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_processed_event_sequence=0,
         emotion_state=EmotionStateSnapshot(
@@ -485,7 +486,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 3
+        assert upgraded.schema_version == 4
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -912,7 +913,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
         settings.emotion.baseline_surprisal,
     )
     store.save(
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=datetime.now(timezone.utc),
             last_processed_event_sequence=7,
             emotion_state=EmotionStateSnapshot(
@@ -998,7 +999,7 @@ def test_restored_sequence_continues_and_success_checkpoints_chat(
         settings.emotion.baseline_surprisal,
     )
     store.save(
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=datetime.now(timezone.utc),
             last_processed_event_sequence=7,
             emotion_state=EmotionStateSnapshot(
@@ -1442,7 +1443,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 3
+        == 4
     )
 
 
@@ -1453,7 +1454,7 @@ def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
     store = AgentStateStore(
         settings.agent_state.path, settings.emotion.baseline_surprisal
     )
-    snapshot = AgentStateSnapshot(
+    snapshot = AgentStateSnapshotV2(
         saved_at=datetime.now(timezone.utc),
         last_processed_event_sequence=4,
         emotion_state=EmotionStateSnapshot(
@@ -2089,7 +2090,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v3(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -2106,7 +2107,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v3(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 3
+        assert snapshot.schema_version == 4
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )

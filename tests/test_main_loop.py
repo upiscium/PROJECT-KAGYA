@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from kagya.cognition import LossCalibration, model_key
 from kagya.config import Settings, load_settings
 from kagya.memory import (
     DualMemorySystem,
@@ -646,6 +647,113 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
 
     assert result.arousal != before.arousal
     assert result.optimal_loss != before.optimal_loss
+
+
+def test_main_loop_default_loss_calibration_uses_configured_model_keys(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+
+    expected = tuple(
+        sorted(
+            {
+                model_key(settings.model.provider, settings.model.primary_id),
+                model_key(settings.model.provider, settings.model.fallback_id),
+            }
+        )
+    )
+    assert loop.loss_calibration.approved_keys == expected
+    assert len(loop.loss_calibration.approved_keys) == len(set(expected))
+    assert (
+        loop.loss_calibration._initial_baseline
+        == settings.emotion.baseline_surprisal
+    )
+    assert loop.loss_calibration._initial_scale == settings.appraisal.initial_loss_scale
+    assert loop.loss_calibration._minimum_scale == settings.appraisal.minimum_loss_scale
+
+
+def test_main_loop_accepts_only_exactly_matching_injected_calibration(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    approved = tuple(
+        sorted(
+            {
+                model_key(settings.model.provider, settings.model.primary_id),
+                model_key(settings.model.provider, settings.model.fallback_id),
+            }
+        )
+    )
+    calibration = LossCalibration(
+        approved, initial_baseline=1.0, initial_scale=1.0, minimum_scale=0.01
+    )
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        loss_calibration=calibration,
+    )
+    assert loop.loss_calibration is calibration
+
+    mismatched = LossCalibration(
+        (model_key(settings.model.provider, "other-model"),),
+        initial_baseline=1.0,
+        initial_scale=1.0,
+        minimum_scale=0.01,
+    )
+    with pytest.raises(ValueError, match="approved keys"):
+        KagyaMainLoop(
+            settings,
+            ThinkingDummyProvider(),
+            DualMemorySystem(settings),
+            loss_calibration=mismatched,
+        )
+
+
+def test_main_loop_passes_u2_emotion_policy_to_default_engine(tmp_path: Path) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+
+    assert loop.emotion_engine.adaptation_rate == settings.emotion.decay_rate
+    assert (
+        loop.emotion_engine.appraisal_response_rate
+        == settings.emotion.appraisal_response_rate
+    )
+    assert loop.emotion_engine.resting_valence == settings.emotion.resting_valence
+    assert loop.emotion_engine.resting_arousal == settings.emotion.resting_arousal
+    assert (
+        loop.emotion_engine.valence_recovery_rate
+        == settings.emotion.valence_recovery_rate
+    )
+    assert (
+        loop.emotion_engine.arousal_recovery_rate
+        == settings.emotion.arousal_recovery_rate
+    )
+
+
+def test_main_loop_ordinary_chat_keeps_raw_calculate_update_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    calls: list[tuple[str, object]] = []
+    original_update = loop.emotion_engine.update
+
+    def calculate(context: str, target: str) -> float:
+        calls.append(("calculate", (context, target)))
+        return 0.7
+
+    def update(loss: float):
+        calls.append(("update", loss))
+        return original_update(loss)
+
+    monkeypatch.setattr(loop.surprisal_calculator, "calculate", calculate)
+    monkeypatch.setattr(loop.emotion_engine, "update", update)
+    loop.chat("raw path")
+
+    assert [name for name, _value in calls] == ["calculate", "update"]
+    assert calls[1] == ("update", 0.7)
 
 
 def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:

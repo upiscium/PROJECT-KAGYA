@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
+from kagya.cognition import LossCalibration
 from kagya.memory import DualMemorySystem
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import ModelProvider
@@ -18,9 +19,12 @@ from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshot,
+    AgentStateSnapshotV3,
+    AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     AgentStateStore,
+    CalibrationEntrySnapshot,
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
@@ -61,6 +65,7 @@ from kagya.runtime.state_wal import (
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+MODEL_KEY = "model." + "0" * 64
 
 
 class RestoreTarget:
@@ -72,6 +77,12 @@ class RestoreTarget:
             item_capacity=32, projection_max_bytes=2048
         )
         self.context_registry = ContextRegistry(clock=lambda: NOW)
+        self.loss_calibration = LossCalibration(
+            (MODEL_KEY,),
+            initial_baseline=1.0,
+            initial_scale=1.0,
+            minimum_scale=0.1,
+        )
 
 
 def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV2:
@@ -286,6 +297,14 @@ def context_snapshot(
             current_context_id=current_context_id,
             frames=(first, second),
             interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(
+                CalibrationEntrySnapshot(
+                    model_key=MODEL_KEY, count=2, mean=1.0, m2=0.5
+                ),
+            ),
+            last_emotion_update_at=NOW,
         ),
     )
 
@@ -1118,7 +1137,7 @@ def test_committed_before_crash_with_corrupt_wal_keeps_canonical_current(
     assert wal.inspect().records[0].baseline_snapshot == candidate
 
 
-def test_committed_context_mutation_before_crash_restores_exact_v3_context(
+def test_committed_context_mutation_before_crash_restores_exact_v4_context(
     tmp_path: Path,
 ) -> None:
     recovery, store, journal, wal = coordinator(tmp_path)
@@ -1743,7 +1762,7 @@ def test_true_rollback_from_v3_to_retained_v2_clears_context(
         started_at=NOW,
         last_active_at=NOW,
     )
-    candidate = AgentStateSnapshot(
+    candidate = AgentStateSnapshotV3(
         saved_at=NOW,
         last_processed_event_sequence=1,
         emotion_state=EmotionStateSnapshot(

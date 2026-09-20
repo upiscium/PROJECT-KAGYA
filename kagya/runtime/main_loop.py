@@ -8,7 +8,7 @@ import inspect
 from typing import TYPE_CHECKING
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.cognition import SurprisalCalculator
+from kagya.cognition import LossCalibration, SurprisalCalculator, model_key
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
@@ -88,6 +88,7 @@ class KagyaMainLoop:
         session_state: SessionState | None = None,
         working_memory: WorkingMemory | None = None,
         emotion_engine: EmotionEngineAllostasis | None = None,
+        loss_calibration: LossCalibration | None = None,
         prompt_builder: PromptBuilder | None = None,
         agent: ConsciousAgent | None = None,
         postprocessor: ResponsePostprocessor | None = None,
@@ -110,9 +111,37 @@ class KagyaMainLoop:
             )
         )
         self.surprisal_calculator = SurprisalCalculator(provider)
+        approved_keys = tuple(
+            sorted(
+                {
+                    model_key(settings.model.provider, settings.model.primary_id),
+                    model_key(settings.model.provider, settings.model.fallback_id),
+                }
+            )
+        )
+        if loss_calibration is None:
+            self.loss_calibration = LossCalibration(
+                approved_keys,
+                initial_baseline=settings.emotion.baseline_surprisal,
+                initial_scale=settings.appraisal.initial_loss_scale,
+                minimum_scale=settings.appraisal.minimum_loss_scale,
+            )
+        else:
+            if not isinstance(loss_calibration, LossCalibration):
+                raise TypeError("loss_calibration must be LossCalibration")
+            if loss_calibration.approved_keys != approved_keys:
+                raise ValueError(
+                    "loss_calibration approved keys do not match settings"
+                )
+            self.loss_calibration = loss_calibration
         self.emotion_engine = emotion_engine or EmotionEngineAllostasis(
             EmotionState(optimal_loss=settings.emotion.baseline_surprisal),
             adaptation_rate=settings.emotion.decay_rate,
+            appraisal_response_rate=settings.emotion.appraisal_response_rate,
+            resting_valence=settings.emotion.resting_valence,
+            resting_arousal=settings.emotion.resting_arousal,
+            valence_recovery_rate=settings.emotion.valence_recovery_rate,
+            arousal_recovery_rate=settings.emotion.arousal_recovery_rate,
         )
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.agent = agent or ConsciousAgent(provider)

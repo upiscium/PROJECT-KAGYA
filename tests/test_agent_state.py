@@ -9,7 +9,8 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from kagya.cognition.surprisal_calculator import LossCalibration
 from kagya.config import Settings, load_settings
 from kagya.runtime import (
     AgentStateLoadError,
@@ -18,9 +19,12 @@ from kagya.runtime import (
     AgentStateSnapshot,
     AgentStateSnapshotV1,
     AgentStateSnapshotV2,
+    AgentStateSnapshotV3,
+    AppraisalStateSnapshot,
     AgentStateStore,
     ContextRegistry,
     ContextStateSnapshot,
+    ContextType,
     EmotionStateSnapshot,
     UnsupportedAgentStateVersion,
     WorkingMemory,
@@ -35,6 +39,7 @@ import kagya.runtime.agent_state as agent_state_module
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+MODEL_KEY = "model." + "0" * 64
 PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
@@ -53,6 +58,12 @@ class LoopStub:
             projection_max_bytes=projection_max_bytes,
         )
         self.context_registry = ContextRegistry(clock=lambda: NOW)
+        self.loss_calibration = LossCalibration(
+            (MODEL_KEY,),
+            initial_baseline=1.0,
+            initial_scale=1.0,
+            minimum_scale=0.1,
+        )
 
 
 def assert_bounded_exception(error: Exception, sentinel: str) -> None:
@@ -81,6 +92,23 @@ def make_v1_snapshot(sequence: int = 4) -> AgentStateSnapshotV1:
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
             valence=0.2, arousal=0.3, optimal_loss=1.2
+        ),
+    )
+
+
+def make_v3_snapshot(sequence: int = 4) -> AgentStateSnapshotV3:
+    return AgentStateSnapshotV3(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2, arousal=0.3, optimal_loss=1.2
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
         ),
     )
 
@@ -132,7 +160,7 @@ def test_minimal_capture_save_load_restore_round_trip(tmp_path: Path) -> None:
     snapshot = new_store.load()
     new_store.restore_into(restored, snapshot)
 
-    assert snapshot.schema_version == 3
+    assert snapshot.schema_version == 4
     assert snapshot.last_processed_event_sequence == 7
     assert restored.emotion_engine.state == original.emotion_engine.state
     assert restored.working_memory.revision == 0
@@ -140,7 +168,7 @@ def test_minimal_capture_save_load_restore_round_trip(tmp_path: Path) -> None:
     assert restored.context_registry.state.revision == 0
 
 
-def test_current_v3_round_trip_preserves_exact_nonempty_working_memory(
+def test_current_v4_round_trip_preserves_exact_nonempty_working_memory(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "agent_state.json"
@@ -170,10 +198,122 @@ def test_current_v3_round_trip_preserves_exact_nonempty_working_memory(
     loaded = make_store(path).load()
     make_store(path).restore_into(restored, loaded)
 
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert loaded.working_memory == snapshot.working_memory
     assert restored.working_memory.revision == 5
     assert restored.working_memory.items == original.working_memory.items
+
+
+def test_v4_round_trip_preserves_calibration_and_temporal_state(
+    tmp_path: Path,
+) -> None:
+    saved_at = datetime(2026, 1, 2, 3, 4, 6, tzinfo=timezone.utc)
+    store = AgentStateStore(
+        tmp_path / "agent_state.json", baseline_surprisal=1.0, clock=lambda: saved_at
+    )
+    source = LoopStub(EmotionState(valence=0.2, arousal=0.4, optimal_loss=0.8))
+    source.loss_calibration.sample(MODEL_KEY, 0.4)
+    source.loss_calibration.sample(MODEL_KEY, 1.6)
+    source.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+
+    snapshot = store.capture(source, sequence=12)
+    store.save(snapshot)
+    target = LoopStub(EmotionState(valence=-0.8, arousal=0.9, optimal_loss=2.0))
+    target.loss_calibration.sample(MODEL_KEY, 0.2)
+    target.emotion_engine.temporal_state = EmotionTemporalState(
+        datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+
+    loaded = store.load()
+    store.restore_into(target, loaded)
+
+    assert loaded.saved_at == saved_at
+    assert loaded.appraisal_state.last_emotion_update_at == NOW
+    assert loaded.appraisal_state.calibration_entries[0].model_key == MODEL_KEY
+    assert loaded.appraisal_state.calibration_entries[0].count == 2
+    assert target.loss_calibration.export() == source.loss_calibration.export()
+    assert target.emotion_engine.temporal_state == EmotionTemporalState(NOW)
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [make_v1_snapshot(), make_snapshot(), make_v3_snapshot()],
+)
+def test_legacy_snapshot_restore_clears_appraisal_state(
+    tmp_path: Path, legacy
+) -> None:
+    target = LoopStub(EmotionState(valence=0.8, arousal=0.7, optimal_loss=2.0))
+    target.loss_calibration.sample(MODEL_KEY, 0.4)
+    target.loss_calibration.sample(MODEL_KEY, 1.6)
+    target.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+
+    make_store(tmp_path / "agent_state.json").restore_into(target, legacy)
+
+    assert target.loss_calibration.export() == ()
+    assert target.emotion_engine.temporal_state == EmotionTemporalState()
+
+
+def test_restore_failure_rolls_back_all_five_authorities(tmp_path: Path) -> None:
+    source = LoopStub(EmotionState(valence=0.2, arousal=0.4, optimal_loss=0.8))
+    source.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "source-item", 0.6, 0.7
+    )
+    source.context_registry.create(
+        "source-context", ContextType.CONVERSATION, "chat"
+    )
+    source.loss_calibration.sample(MODEL_KEY, 0.4)
+    source.loss_calibration.sample(MODEL_KEY, 1.6)
+    source.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+    snapshot = make_store(tmp_path / "agent_state.json").capture(source, sequence=3)
+
+    class FailingTemporalEmotionEngine(EmotionEngineAllostasis):
+        def __init__(self, state: EmotionState) -> None:
+            self._fail_temporal = False
+            self._temporal_state = EmotionTemporalState()
+            super().__init__(state)
+
+        @property
+        def temporal_state(self) -> EmotionTemporalState:
+            return self._temporal_state
+
+        @temporal_state.setter
+        def temporal_state(self, value: EmotionTemporalState) -> None:
+            if self._fail_temporal:
+                raise RuntimeError("injected temporal restore failure")
+            self._temporal_state = value
+
+    target = LoopStub(EmotionState(valence=-0.8, arousal=0.9, optimal_loss=2.0))
+    target.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "target-item", 0.3, 0.4
+    )
+    target.context_registry.create(
+        "target-context", ContextType.CONVERSATION, "chat"
+    )
+    target.loss_calibration.sample(MODEL_KEY, 0.2)
+    before_emotion = target.emotion_engine.state
+    before_working_memory = (
+        target.working_memory.revision,
+        target.working_memory.items,
+    )
+    before_context = target.context_registry.state
+    before_calibration = target.loss_calibration.export()
+    before_temporal = EmotionTemporalState(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    failing_engine = FailingTemporalEmotionEngine(before_emotion)
+    target.emotion_engine = failing_engine
+    failing_engine.temporal_state = before_temporal
+    failing_engine._fail_temporal = True
+
+    with pytest.raises(AgentStateLoadError):
+        make_store(tmp_path / "agent_state.json").restore_into(target, snapshot)
+
+    assert target.emotion_engine.state == before_emotion
+    assert (
+        target.working_memory.revision,
+        target.working_memory.items,
+    ) == before_working_memory
+    assert target.context_registry.state == before_context
+    assert target.loss_calibration.export() == before_calibration
+    assert target.emotion_engine.temporal_state == before_temporal
 
 
 def test_capacity_decrease_restore_fails_without_trimming_or_rewriting(
@@ -384,7 +524,7 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         optimal_loss=2.5,
     )
     assert isinstance(snapshot, AgentStateSnapshot)
-    assert snapshot.schema_version == 3
+    assert snapshot.schema_version == 4
     assert snapshot.working_memory == WorkingMemorySnapshot(revision=0, items=())
     assert snapshot.context_state == ContextStateSnapshot(
         revision=0,
@@ -404,7 +544,7 @@ def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> Non
     assert compatible.agent_state.path == Path(".kagya/agent_state.json")
 
 
-def test_v0_migrates_strictly_to_v3(tmp_path: Path) -> None:
+def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
     path = tmp_path / "agent_state.json"
     path.write_text(
         json.dumps(
@@ -437,6 +577,9 @@ def test_v0_migrates_strictly_to_v3(tmp_path: Path) -> None:
             current_context_id=None,
             frames=(),
             interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
         ),
     )
 
@@ -654,6 +797,7 @@ def test_agent_state_has_no_working_memory_participant_or_journal_authority() ->
         "emotion_state",
         "working_memory",
         "context_state",
+        "appraisal_state",
         "schema_version",
     }
     assert set(WorkingMemorySnapshot.model_fields) == {"revision", "items"}
@@ -867,7 +1011,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 3
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 4
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(
