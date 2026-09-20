@@ -16,6 +16,7 @@ from kagya.runtime.context import ContextType
 from kagya.models import DummyProvider
 from kagya.persona import PromptBuilder
 from kagya.runtime import (
+    ChatContextSelectors,
     CoordinatedResult,
     ContextRegistry,
     KagyaMainLoop,
@@ -448,16 +449,16 @@ def test_select_and_prompt_build_are_pure_after_explicit_chat_mutations(
     loop = KagyaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
-    original_select = working.select
+    original_select = working.select_contextual
     selection_states: list[tuple[object, object]] = []
 
-    def checked_select(resolver):
+    def checked_select(resolver, context_registry, current_context_id):
         before = (working.revision, working.items)
-        view = original_select(resolver)
+        view = original_select(resolver, context_registry, current_context_id)
         selection_states.append((before, (working.revision, working.items)))
         return view
 
-    monkeypatch.setattr(working, "select", checked_select)
+    monkeypatch.setattr(working, "select_contextual", checked_select)
 
     class PurePromptBuilder:
         def build(self, user_input, emotion_state, working_memory_view):
@@ -652,14 +653,14 @@ def test_chat_plan_has_fixed_memory_then_session_participants(tmp_path: Path) ->
     assert loop.session_state.turns == []
 
 
-def test_chat_freezes_no_context_provenance(tmp_path: Path) -> None:
+def test_chat_uses_default_context_provenance(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
 
     plan = loop.chat("no context")
 
-    assert plan.participants[0].operation.context_id is None
-    assert plan.participants[0].operation.source_channel is None
+    assert plan.participants[0].operation.context_id == "conversation.default"
+    assert plan.participants[0].operation.source_channel == "chat"
     assert plan.participants[0].operation.source_session_id is None
     assert plan.participants[0].operation.schema_version == 2
 
@@ -688,9 +689,11 @@ def test_chat_captures_current_context_once_and_freezes_it(
         return current(registry)
 
     monkeypatch.setattr(type(registry), "current_context", property(counted))
-    plan = loop.chat("capture")
+    plan = loop.chat(
+        "capture", selectors=ChatContextSelectors(context_id="context-a")
+    )
 
-    assert reads == 1
+    assert reads == 0
     operation = plan.participants[0].operation
     assert (operation.context_id, operation.source_channel, operation.source_session_id) == (
         "context-a", "chat", "session-a"
@@ -712,7 +715,9 @@ def test_chat_context_switch_after_compute_does_not_change_frozen_provenance(
         context_registry=registry,
     )
 
-    plan = loop.chat("freeze")
+    plan = loop.chat(
+        "freeze", selectors=ChatContextSelectors(context_id="context-a")
+    )
     registry.set_current(second.context_id)
     participant = plan.participants[0]
     binding = TransactionBinding(

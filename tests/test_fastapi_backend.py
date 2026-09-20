@@ -256,6 +256,103 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert list(pending.glob("*.json")) == []
 
 
+def test_chat_selector_validation_happens_before_event_admission(
+    tmp_path: Path,
+) -> None:
+    runtime = RecordingRuntime()
+    with _client(tmp_path, runtime=runtime) as client:
+        response = client.post(
+            "/api/chat",
+            json={
+                "message": "invalid selector",
+                "attachments": [],
+                "context_id": "../not-an-id",
+            },
+        )
+
+        assert response.status_code == 422
+        assert "not-an-id" not in response.text
+        assert runtime.submissions == []
+
+
+def test_chat_session_selector_reuses_one_durable_context_without_response_metadata(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        first = client.post(
+            "/api/chat",
+            json={
+                "message": "first session turn",
+                "attachments": [],
+                "client_session_id": "client-session",
+                "interlocutor_key": "ref-a",
+            },
+        )
+        second = client.post(
+            "/api/chat",
+            json={
+                "message": "second session turn",
+                "attachments": [],
+                "client_session_id": "client-session",
+            },
+        )
+
+        assert first.status_code == second.status_code == 200
+        assert set(first.json()) == {"episode_id", "response", "emotion", "model"}
+        assert set(second.json()) == {"episode_id", "response", "emotion", "model"}
+        frames = client.app.state.main_loop.context_registry.state.frames
+        assert len(frames) == 1
+        assert frames[0].source_session_id == "client-session"
+        assert frames[0].participant_refs == ("ref-a",)
+        first_record = client.app.state.memory_system.get_episodic_record(
+            first.json()["episode_id"]
+        )
+        second_record = client.app.state.memory_system.get_episodic_record(
+            second.json()["episode_id"]
+        )
+        assert first_record is not None and second_record is not None
+        assert first_record.context_id == second_record.context_id == frames[0].context_id
+
+
+def test_chat_context_domain_errors_are_bounded_http_responses(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        missing = client.post(
+            "/api/chat",
+            json={
+                "message": "missing context",
+                "attachments": [],
+                "context_id": "missing-context",
+            },
+        )
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": "Context not found"}
+        assert "missing-context" not in missing.text
+
+        selected = client.post(
+            "/api/chat",
+            json={
+                "message": "select context",
+                "attachments": [],
+                "client_session_id": "client-session",
+            },
+        )
+        assert selected.status_code == 200
+        context_id = client.app.state.main_loop.context_registry.current_context_id
+        assert context_id is not None
+        conflict = client.post(
+            "/api/chat",
+            json={
+                "message": "conflicting context",
+                "attachments": [],
+                "context_id": context_id,
+                "client_session_id": "other-session",
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json() == {"detail": "Context selection is invalid"}
+        assert "other-session" not in conflict.text
+
+
 def test_api_chat_debug_requires_explicit_opt_in(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.post(
@@ -1322,6 +1419,8 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
             )
 
         assert client.app.state.main_loop.emotion_engine.state == initial_emotion
+        assert client.app.state.main_loop.context_registry.state.frames == ()
+        assert client.app.state.main_loop.context_registry.current_context_id is None
         failed = client.app.state.event_journal.records[-1]
         assert failed.lifecycle is EventLifecycle.FAILED
         assert failed.processing_sequence == 1

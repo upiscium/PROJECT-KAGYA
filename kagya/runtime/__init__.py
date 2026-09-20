@@ -55,6 +55,12 @@ from kagya.runtime.context import (
     InterlocutorBinding,
     validate_context_registry_state,
 )
+from kagya.runtime.chat_context import (
+    CHAT_SOURCE_CHANNEL,
+    DEFAULT_CHAT_CONTEXT_ID,
+    ChatContextSelectors,
+    resolve_chat_context,
+)
 from kagya.runtime.working_memory import (
     WorkingMemory,
     WorkingMemoryAdmission,
@@ -206,7 +212,10 @@ __all__ = [
     "CURRENT_AGENT_STATE_SCHEMA_VERSION",
     "CURRENT_EVENT_JOURNAL_SCHEMA_VERSION",
     "ChatResult",
+    "ChatContextSelectors",
+    "CHAT_SOURCE_CHANNEL",
     "CoordinatedResult",
+    "DEFAULT_CHAT_CONTEXT_ID",
     "KagyaMainLoop",
     "SessionState",
     "SessionTurn",
@@ -286,6 +295,7 @@ __all__ = [
     "TransitionRecord",
     "default_agent_state_snapshot",
     "validate_context_registry_state",
+    "resolve_chat_context",
     "inspect_reset_session_operation",
     "session_turn_operation_digest",
 ]

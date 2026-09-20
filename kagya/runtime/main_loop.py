@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import inspect
 from typing import TYPE_CHECKING
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
@@ -11,7 +12,13 @@ from kagya.cognition import SurprisalCalculator
 from kagya.config import Settings
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
-from kagya.persona import ConsciousAgent, PromptBuilder, ResponsePostprocessor
+from kagya.persona import (
+    ConsciousAgent,
+    ContextPromptView,
+    PromptBuilder,
+    ResponsePostprocessor,
+)
+from kagya.runtime.chat_context import ChatContextSelectors, resolve_chat_context
 from kagya.runtime.session_participant import (
     SessionTurnOperation,
     SessionTurnParticipant,
@@ -115,10 +122,16 @@ class KagyaMainLoop:
             context_registry if context_registry is not None else ContextRegistry()
         )
 
-    def chat(self, user_input: str) -> CoordinatedResult[ChatResult]:
+    def chat(
+        self,
+        user_input: str,
+        selectors: ChatContextSelectors | None = None,
+    ) -> CoordinatedResult[ChatResult]:
         """Compute an ordinary turn and return its process-local mutation plan."""
 
-        computed = self._run_chat(user_input, capture_debug=False)
+        computed = self._run_chat(
+            user_input, capture_debug=False, selectors=selectors
+        )
         return CoordinatedResult(
             TransactionBoundValue(
                 lambda transaction_id: self._chat_result(computed, transaction_id)
@@ -127,11 +140,15 @@ class KagyaMainLoop:
         )
 
     def chat_debug(
-        self, user_input: str
+        self,
+        user_input: str,
+        selectors: ChatContextSelectors | None = None,
     ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
         """Compute a turn with ephemeral diagnostics and the same mutation plan."""
 
-        computed = self._run_chat(user_input, capture_debug=True)
+        computed = self._run_chat(
+            user_input, capture_debug=True, selectors=selectors
+        )
         if computed.trace is None:  # pragma: no cover - internal invariant
             raise RuntimeError("Debug trace was not captured")
         trace = computed.trace
@@ -146,23 +163,24 @@ class KagyaMainLoop:
         )
 
     def _run_chat(
-        self, user_input: str, *, capture_debug: bool
+        self,
+        user_input: str,
+        *,
+        capture_debug: bool,
+        selectors: ChatContextSelectors | None,
     ) -> _ComputedChat:
         from kagya.memory.episodic_participant import (
             EpisodicWrite,
             MemoryEpisodicParticipant,
         )
 
-        current_context = self.context_registry.current_context
+        current_context = resolve_chat_context(self.context_registry, selectors)
         provenance = (
-            (
-                current_context.context_id,
-                current_context.source_channel,
-                current_context.source_session_id,
-            )
-            if current_context is not None
-            else (None, None, None)
+            current_context.context_id,
+            current_context.source_channel,
+            current_context.source_session_id,
         )
+        context_view = ContextPromptView.from_frame(current_context)
         context_text = self.session_state.context_text()
         loss = self.surprisal_calculator.calculate(context_text, user_input)
         emotion_state = self.emotion_engine.update(loss)
@@ -187,9 +205,13 @@ class KagyaMainLoop:
                 activation=1.0,
                 salience=1.0 / (rank + 1),
             )
-        working_memory_view = self.working_memory.select(self.working_memory_resolver)
-        prompt = self.prompt_builder.build(
-            user_input, emotion_state, working_memory_view
+        working_memory_view = self.working_memory.select_contextual(
+            self.working_memory_resolver,
+            self.context_registry,
+            current_context.context_id,
+        )
+        prompt = self._build_prompt(
+            user_input, emotion_state, working_memory_view, context_view
         )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
@@ -234,6 +256,31 @@ class KagyaMainLoop:
             memory_participant=memory_participant,
             session_participant=session_participant,
         )
+
+    def _build_prompt(
+        self,
+        user_input: str,
+        emotion_state: EmotionState,
+        working_memory_view: WorkingMemoryView,
+        context_view: ContextPromptView,
+    ) -> str:
+        """Pass Context projection while retaining older injected builders."""
+
+        build = self.prompt_builder.build
+        parameters = inspect.signature(build).parameters.values()
+        accepts_context = any(
+            parameter.name == "context_view"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_context:
+            return build(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                context_view=context_view,
+            )
+        return build(user_input, emotion_state, working_memory_view)
 
     def _chat_result(
         self, computed: _ComputedChat, transaction_id: str

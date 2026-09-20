@@ -15,6 +15,10 @@ from kagya.runtime import (
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     CoordinatedResult,
+    ContextCapacityExceeded,
+    ContextConflict,
+    ContextNotFound,
+    ContextStateInvalid,
 )
 
 
@@ -69,6 +73,19 @@ def execute(
             detail="Agent runtime durability is temporarily unavailable",
         ) from exc
     except AgentRuntimeExecutionError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, ContextNotFound):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Context not found",
+            ) from exc
+        if isinstance(
+            cause, (ContextConflict, ContextStateInvalid, ContextCapacityExceeded)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Context selection is invalid",
+            ) from exc
         if exc.__cause__ is not None:
             raise exc.__cause__
         raise

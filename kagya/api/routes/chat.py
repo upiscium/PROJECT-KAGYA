@@ -10,6 +10,7 @@ from kagya.runtime import (
     AgentEventType,
     AgentRuntime,
     ChatResult,
+    ChatContextSelectors,
     KagyaMainLoop,
 )
 
@@ -24,11 +25,16 @@ def chat(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatResponse:
     reject_unsupported_attachments(request)
+    selectors = ChatContextSelectors(
+        context_id=request.context_id,
+        client_session_id=request.client_session_id,
+        interlocutor_key=request.interlocutor_key,
+    )
     result = execute(
         runtime,
         AgentEventType.CHAT,
         AgentEventSource.API_CHAT,
-        lambda: main_loop.chat(request.message),
+        lambda: main_loop.chat(request.message, selectors=selectors),
     )
     return chat_response_from_result(result)
 

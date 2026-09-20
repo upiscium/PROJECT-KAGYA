@@ -235,6 +235,34 @@ class ContextRegistry:
             raise ContextNotFound("context not found")
         return frame
 
+    def get(self, context_id: str) -> ContextFrame:
+        """Return one exact frame without changing registry state."""
+
+        with self._lock:
+            checked = _id(context_id)
+            if checked is None:  # pragma: no cover - _id already enforces this
+                raise ContextStateInvalid("invalid identifier")
+            return self._frame(checked)
+
+    def find_by_source_session(
+        self, source_channel: str, source_session_id: str
+    ) -> tuple[ContextFrame, ...]:
+        """Return all frames matching one exact channel/session identity."""
+
+        with self._lock:
+            channel = _id(source_channel)
+            session = _id(source_session_id)
+            if channel is None or session is None:  # pragma: no cover
+                raise ContextStateInvalid("invalid identifier")
+            return tuple(
+                self._frames[context_id]
+                for context_id in sorted(self._frames)
+                if (
+                    self._frames[context_id].source_channel == channel
+                    and self._frames[context_id].source_session_id == session
+                )
+            )
+
     def _tick(self) -> int:
         self._revision += 1
         return self._revision
@@ -301,6 +329,41 @@ class ContextRegistry:
                 return
             self._current = context_id
             self._tick()
+
+    def add_participant_ref(
+        self, context_id: str, participant_ref: str
+    ) -> ContextFrame:
+        """Bind one opaque participant reference to an active Context idempotently."""
+
+        with self._mutation():
+            checked_context = _id(context_id)
+            checked_ref = _id(participant_ref)
+            if checked_context is None or checked_ref is None:  # pragma: no cover
+                raise ContextStateInvalid("invalid identifier")
+            frame = self._frame(checked_context)
+            if frame.status is not ContextStatus.ACTIVE:
+                raise ContextStateInvalid("context must be active")
+            if checked_ref in frame.participant_refs:
+                return frame
+            if len(frame.participant_refs) >= MAX_PARTICIPANTS_PER_CONTEXT:
+                raise ContextCapacityExceeded("participant capacity exceeded")
+            revision = self._tick()
+            updated = ContextFrame(
+                frame.context_id,
+                frame.context_type,
+                frame.source_channel,
+                frame.source_session_id,
+                tuple(sorted((*frame.participant_refs, checked_ref))),
+                frame.parent_context_id,
+                frame.related_context_ids,
+                frame.status,
+                frame.created_revision,
+                revision,
+                frame.started_at,
+                frame.last_active_at,
+            )
+            self._frames[checked_context] = updated
+            return updated
 
     def _transition(self, context_id: str, status: ContextStatus) -> ContextFrame:
         with self._mutation():

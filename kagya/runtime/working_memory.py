@@ -9,8 +9,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from kagya.identifiers import validate_identifier
+from kagya.runtime.context import ContextRelation
+
+if TYPE_CHECKING:
+    from kagya.runtime.context import ContextRegistry
 
 
 MAX_ITEM_CAPACITY = 4_096
@@ -90,6 +95,9 @@ class WorkingMemorySelection:
     score: float
     reason: WorkingMemoryDecisionReason
     source_context_id: str | None = None
+    context_relation: ContextRelation | None = None
+    context_compatibility: float | None = None
+    effective_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +110,9 @@ class WorkingMemoryDecision:
     selected: bool
     score: float
     reason: WorkingMemoryDecisionReason
+    context_relation: ContextRelation | None = None
+    context_compatibility: float | None = None
+    effective_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +459,175 @@ class WorkingMemory:
                             score,
                             reason,
                             source_context_id,
+                        )
+                    )
+            return WorkingMemoryView(
+                tuple(selected),
+                tuple(decisions),
+                projected_bytes,
+                item_capacity,
+                projection_max_bytes,
+                revision,
+            )
+        finally:
+            with self._lock:
+                self._selecting = False
+
+    def select_contextual(
+        self,
+        resolver: WorkingMemoryResolver,
+        context_registry: ContextRegistry,
+        current_context_id: str,
+    ) -> WorkingMemoryView:
+        """Select a pure view ranked by Context compatibility-adjusted score."""
+
+        if not callable(resolver):
+            raise TypeError("resolver must be callable")
+        with self._lock:
+            if self._selecting:
+                raise RuntimeError("Working Memory selection is already active")
+            self._selecting = True
+            items = tuple(self._items.values())
+            item_capacity = self._item_capacity
+            projection_max_bytes = self._projection_max_bytes
+            revision = self._revision
+
+        try:
+            candidates: list[
+                tuple[
+                    WorkingMemoryItem,
+                    float,
+                    str | None,
+                    WorkingMemoryDecisionReason,
+                    str | None,
+                    ContextRelation | None,
+                    float | None,
+                    float | None,
+                ]
+            ] = []
+            for item in items:
+                base_score = self.score(item)
+                rendered: str | None = None
+                source_context_id: str | None = None
+                relation: ContextRelation | None = None
+                compatibility_score: float | None = None
+                effective_score: float | None = None
+                try:
+                    resolved = resolver(item)
+                    if resolved is None:
+                        reason = WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
+                    elif isinstance(resolved, str):
+                        rendered = resolved
+                        reason = WorkingMemoryDecisionReason.SELECTED
+                    elif not isinstance(resolved, WorkingMemoryResolution):
+                        reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE
+                    else:
+                        resolution_reasons = {
+                            WorkingMemoryResolutionStatus.MISSING: (
+                                WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
+                            ),
+                            WorkingMemoryResolutionStatus.ARCHIVED: (
+                                WorkingMemoryDecisionReason.SOURCE_ARCHIVED
+                            ),
+                            WorkingMemoryResolutionStatus.UNAVAILABLE: (
+                                WorkingMemoryDecisionReason.SOURCE_UNAVAILABLE
+                            ),
+                            WorkingMemoryResolutionStatus.MALFORMED: (
+                                WorkingMemoryDecisionReason.SOURCE_MALFORMED
+                            ),
+                        }
+                        if (
+                            resolved.status
+                            is not WorkingMemoryResolutionStatus.RESOLVED
+                        ):
+                            reason = resolution_reasons[resolved.status]
+                        else:
+                            rendered = resolved.rendered_content
+                            source_context_id = resolved.source_context_id
+                            reason = WorkingMemoryDecisionReason.SELECTED
+                except Exception:
+                    reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE
+
+                if rendered is not None:
+                    compatibility = context_registry.compatibility(
+                        source_context_id, current_context_id
+                    )
+                    relation = compatibility.relation
+                    compatibility_score = compatibility.score
+                    effective_score = base_score * compatibility_score
+                candidates.append(
+                    (
+                        item,
+                        base_score,
+                        rendered,
+                        reason,
+                        source_context_id,
+                        relation,
+                        compatibility_score,
+                        effective_score,
+                    )
+                )
+
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate[7] if candidate[7] is not None else float("-inf"),
+                    candidate[1],
+                    candidate[0].activation,
+                    candidate[0].salience,
+                    candidate[0].last_activated_revision,
+                    candidate[0].created_revision,
+                    candidate[0].item_id,
+                ),
+                reverse=True,
+            )
+            selected: list[WorkingMemorySelection] = []
+            decisions: list[WorkingMemoryDecision] = []
+            projected_bytes = 0
+            for (
+                item,
+                base_score,
+                rendered,
+                reason,
+                source_context_id,
+                relation,
+                compatibility_score,
+                effective_score,
+            ) in candidates:
+                if rendered is not None:
+                    rendered_bytes = len(rendered.encode("utf-8"))
+                    if projected_bytes + rendered_bytes > projection_max_bytes:
+                        reason = WorkingMemoryDecisionReason.PROJECTION_BUDGET
+                        rendered = None
+                    else:
+                        projected_bytes += rendered_bytes
+                is_selected = reason is WorkingMemoryDecisionReason.SELECTED
+                decisions.append(
+                    WorkingMemoryDecision(
+                        item_id=item.item_id,
+                        source_kind=item.source_kind,
+                        source_id=item.source_id,
+                        selected=is_selected,
+                        score=base_score,
+                        reason=reason,
+                        context_relation=relation,
+                        context_compatibility=compatibility_score,
+                        effective_score=effective_score,
+                    )
+                )
+                if is_selected:
+                    assert rendered is not None
+                    selected.append(
+                        WorkingMemorySelection(
+                            item_id=item.item_id,
+                            source_kind=item.source_kind,
+                            source_id=item.source_id,
+                            rendered_content=rendered,
+                            score=base_score,
+                            reason=reason,
+                            source_context_id=source_context_id,
+                            context_relation=relation,
+                            context_compatibility=compatibility_score,
+                            effective_score=effective_score,
                         )
                     )
             return WorkingMemoryView(

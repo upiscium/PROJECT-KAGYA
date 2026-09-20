@@ -23,7 +23,13 @@ from kagya.api.schemas.debug import (
     RetrievedSemanticSchema,
 )
 from kagya.config import Settings
-from kagya.runtime import AgentEventSource, AgentEventType, AgentRuntime, KagyaMainLoop
+from kagya.runtime import (
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+    ChatContextSelectors,
+    KagyaMainLoop,
+)
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -41,11 +47,16 @@ def debug_chat(
     if not request.debug:
         raise HTTPException(status_code=400, detail="Debug access requires debug=true")
     reject_unsupported_attachments(request)
+    selectors = ChatContextSelectors(
+        context_id=request.context_id,
+        client_session_id=request.client_session_id,
+        interlocutor_key=request.interlocutor_key,
+    )
     result, trace = execute(
         runtime,
         AgentEventType.DEBUG_CHAT,
         AgentEventSource.API_CHAT_DEBUG,
-        lambda: main_loop.chat_debug(request.message),
+        lambda: main_loop.chat_debug(request.message, selectors=selectors),
     )
     base = chat_response_from_result(result)
     return DebugChatResponse(
