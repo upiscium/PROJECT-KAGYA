@@ -22,6 +22,7 @@ from kagya.runtime import (
     AgentStateSnapshotV3,
     AppraisalStateSnapshot,
     AgentStateStore,
+    CalibrationEntrySnapshot,
     ContextRegistry,
     ContextStateSnapshot,
     ContextType,
@@ -40,6 +41,7 @@ import kagya.runtime.agent_state as agent_state_module
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 MODEL_KEY = "model." + "0" * 64
+UNAPPROVED_MODEL_KEY = "model." + "1" * 64
 PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
@@ -314,6 +316,73 @@ def test_restore_failure_rolls_back_all_five_authorities(tmp_path: Path) -> None
     assert target.context_registry.state == before_context
     assert target.loss_calibration.export() == before_calibration
     assert target.emotion_engine.temporal_state == before_temporal
+
+
+def test_persisted_unapproved_key_restore_fails_and_rolls_back_all_authorities(
+    tmp_path: Path,
+) -> None:
+    source = LoopStub(EmotionState(valence=0.2, arousal=0.4, optimal_loss=0.8))
+    source.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "source-persisted-item", 0.6, 0.7
+    )
+    source.context_registry.create(
+        "source-persisted-context", ContextType.CONVERSATION, "chat"
+    )
+    source.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+    store = make_store(tmp_path / "agent_state.json")
+    snapshot = store.capture(source, sequence=3).model_copy(
+        update={
+            "appraisal_state": AppraisalStateSnapshot(
+                calibration_entries=(
+                    CalibrationEntrySnapshot(
+                        model_key=UNAPPROVED_MODEL_KEY,
+                        count=2,
+                        mean=1.5,
+                        m2=0.5,
+                    ),
+                ),
+                last_emotion_update_at=NOW,
+            )
+        }
+    )
+    store.save(snapshot)
+    persisted_bytes = store.path.read_bytes()
+    persisted = store.load()
+
+    target = LoopStub(EmotionState(valence=-0.8, arousal=0.9, optimal_loss=2.0))
+    target.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "target-persisted-item", 0.3, 0.4
+    )
+    target.context_registry.create(
+        "target-persisted-context", ContextType.CONVERSATION, "chat"
+    )
+    target.loss_calibration.sample(MODEL_KEY, 0.2)
+    target.emotion_engine.temporal_state = EmotionTemporalState(
+        datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    assert target.loss_calibration.approved_keys == (MODEL_KEY,)
+    assert UNAPPROVED_MODEL_KEY not in target.loss_calibration.approved_keys
+    before_emotion = target.emotion_engine.state
+    before_working_memory = (
+        target.working_memory.revision,
+        target.working_memory.items,
+    )
+    before_context = target.context_registry.state
+    before_calibration = target.loss_calibration.export()
+    before_temporal = target.emotion_engine.temporal_state
+
+    with pytest.raises(AgentStateLoadError):
+        store.restore_into(target, persisted)
+
+    assert target.emotion_engine.state == before_emotion
+    assert (
+        target.working_memory.revision,
+        target.working_memory.items,
+    ) == before_working_memory
+    assert target.context_registry.state == before_context
+    assert target.loss_calibration.export() == before_calibration
+    assert target.emotion_engine.temporal_state == before_temporal
+    assert store.path.read_bytes() == persisted_bytes
 
 
 def test_capacity_decrease_restore_fails_without_trimming_or_rewriting(

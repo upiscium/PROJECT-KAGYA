@@ -34,7 +34,9 @@ from kagya.runtime import (
     AgentStateSaveStage,
     AgentStateSnapshotV2,
     AgentStateSnapshotV2 as AgentStateSnapshot,
+    AgentStateSnapshotV3,
     AgentStateStore,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
@@ -491,6 +493,43 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
         ) == ("conversation.default",)
+        assert settings.agent_state.path.read_bytes() != legacy_bytes
+
+
+def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    legacy = AgentStateSnapshotV3(
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_processed_event_sequence=0,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+    )
+    legacy_bytes = json.dumps(
+        legacy.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    settings.agent_state.path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_state.path.write_bytes(legacy_bytes)
+
+    with _client(tmp_path, settings=settings) as client:
+        assert settings.agent_state.path.read_bytes() == legacy_bytes
+        assert client.app.state.agent_state_store.load() == legacy
+
+        response = client.post(
+            "/api/chat", json={"message": "upgrade v3", "attachments": []}
+        )
+        assert response.status_code == 200
+        upgraded = client.app.state.agent_state_store.load()
+        assert upgraded.schema_version == 4
+        assert upgraded.appraisal_state.calibration_entries == ()
+        assert upgraded.appraisal_state.last_emotion_update_at is None
         assert settings.agent_state.path.read_bytes() != legacy_bytes
 
 
