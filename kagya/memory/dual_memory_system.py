@@ -281,18 +281,54 @@ class DualMemorySystem:
         source_episode_ids: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        source_ids = _copy_source_episode_ids(source_episode_ids)
+        context_id = self._derive_semantic_context_id(source_ids)
         extra_metadata = metadata or {}
         reject_private_fields(extra_metadata, context="Semantic memory metadata")
         semantic_id = f"semantic-{uuid4()}"
-        record_metadata: Metadata = {
+        record_metadata: dict[str, str | int | float | bool] = {
             "text": text,
-            "source_episode_ids": json.dumps(source_episode_ids or []),
+            "source_episode_ids": json.dumps(source_ids),
             "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
             "created_at": _now_iso(),
             "extra": json.dumps(extra_metadata),
         }
+        if context_id is not None:
+            record_metadata["context_id"] = context_id
         self.db2.add(ids=[semantic_id], documents=[text], metadatas=[record_metadata])
         return semantic_id
+
+    def _derive_semantic_context_id(
+        self, source_episode_ids: Sequence[str]
+    ) -> str | None:
+        """Derive one Context only from every exact committed source record."""
+
+        if not source_episode_ids:
+            return None
+
+        source_contexts: list[str | None] = []
+        seen: set[str] = set()
+        for source_id in source_episode_ids:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            committed = self.get_committed_episodic(source_id)
+            context_id = None if committed is None else committed.record.context_id
+            if context_id is not None:
+                try:
+                    context_id = _validate_semantic_context_id(context_id)
+                except (TypeError, ValueError):
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    ) from None
+            source_contexts.append(context_id)
+
+        if any(context_id is None for context_id in source_contexts):
+            return None
+        first_context_id = source_contexts[0]
+        if all(context_id == first_context_id for context_id in source_contexts):
+            return first_context_id
+        return None
 
     def retrieve_context(self, query: str) -> MemoryContext:
         db1_results = self.db1.query(
@@ -348,7 +384,7 @@ class DualMemorySystem:
             episodic_metadatas,
             strict=False,
         ):
-            metadata = dict(raw_metadata or {})
+            metadata: dict[str, Any] = dict(raw_metadata or {})
             sanitized = _sanitize_persisted_metadata(metadata)
             visible_document = canonical_episodic_document(
                 str(sanitized.get("user_input", "")),
@@ -375,16 +411,54 @@ class DualMemorySystem:
                 metadatas=[sanitized],
             )
 
-        semantic = self.db2.get(include=["metadatas"])
+        semantic = self.db2.get(include=["documents", "metadatas"])
         semantic_ids = semantic.get("ids") or []
+        semantic_documents = semantic.get("documents") or []
         semantic_metadatas = semantic.get("metadatas") or []
-        for record_id, raw_metadata in zip(
-            semantic_ids, semantic_metadatas, strict=False
+        if not all(
+            isinstance(value, list)
+            for value in (semantic_ids, semantic_documents, semantic_metadatas)
         ):
-            metadata = dict(raw_metadata or {})
-            sanitized = _sanitize_persisted_metadata(metadata)
-            if sanitized != metadata:
-                self.db2.update(ids=[str(record_id)], metadatas=[sanitized])
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        if not (
+            len(semantic_ids)
+            == len(semantic_documents)
+            == len(semantic_metadatas)
+        ):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        for record_id, document, raw_metadata in zip(
+            semantic_ids, semantic_documents, semantic_metadatas, strict=True
+        ):
+            if (
+                not isinstance(record_id, str)
+                or not isinstance(document, str)
+                or not isinstance(raw_metadata, dict)
+            ):
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                )
+            semantic_metadata: dict[str, Any] = dict(raw_metadata or {})
+            try:
+                _semantic_context_id_from_metadata(semantic_metadata)
+            except (TypeError, ValueError):
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                ) from None
+            semantic_sanitized: dict[str, Any] = dict(
+                _sanitize_persisted_metadata(semantic_metadata)
+            )
+            try:
+                _committed_semantic_record(
+                    str(record_id), document, semantic_sanitized
+                )
+            except Exception:
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                ) from None
+            if semantic_sanitized != semantic_metadata:
+                self.db2.update(
+                    ids=[str(record_id)], metadatas=[semantic_sanitized]
+                )
 
 
 def _embed_text(text: str) -> list[float]:
@@ -556,15 +630,21 @@ def _episodic_records_from_query(
 def _semantic_records_from_query(
     result: Mapping[str, Any],
 ) -> list[SemanticMemoryRecord]:
-    ids = _first_result_list(result.get("ids"))
-    documents = _first_result_list(result.get("documents"))
-    metadatas = _first_result_list(result.get("metadatas"))
-    return [
-        _semantic_record_from_metadata(record_id, document or "", metadata or {})
-        for record_id, document, metadata in zip(
-            ids, documents, metadatas, strict=False
-        )
-    ]
+    ids = _semantic_query_list(result.get("ids"))
+    documents = _semantic_query_list(result.get("documents"))
+    metadatas = _semantic_query_list(result.get("metadatas"))
+    if not (len(ids) == len(documents) == len(metadatas)):
+        raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+    records: list[SemanticMemoryRecord] = []
+    for record_id, document, metadata in zip(ids, documents, metadatas, strict=True):
+        if (
+            not isinstance(record_id, str)
+            or not isinstance(document, str)
+            or not isinstance(metadata, dict)
+        ):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        records.append(_semantic_record_from_metadata(record_id, document, metadata))
+    return records
 
 
 def _strict_get_parts(
@@ -679,6 +759,7 @@ def _committed_semantic_record(
         raise ValueError
     if metadata["text"] != document:
         raise ValueError
+    context_id = _semantic_context_id_from_metadata(metadata)
     source_episode_ids = json.loads(metadata["source_episode_ids"])
     extra = json.loads(metadata["extra"])
     if (
@@ -687,6 +768,7 @@ def _committed_semantic_record(
         or not isinstance(extra, dict)
     ):
         raise ValueError
+    reject_private_fields(extra, context="Committed semantic Memory metadata")
     return SemanticMemoryRecord(
         id=record_id,
         text=metadata["text"],
@@ -694,6 +776,7 @@ def _committed_semantic_record(
         record_type=MemoryRecordType.SEMANTIC_MEMORY,
         created_at=metadata["created_at"],
         metadata=extra,
+        context_id=context_id,
     )
 
 
@@ -745,22 +828,28 @@ def _episodic_record_from_metadata(
 def _semantic_record_from_metadata(
     record_id: str, document: str, metadata: dict[str, Any]
 ) -> SemanticMemoryRecord:
-    return SemanticMemoryRecord(
-        id=record_id,
-        text=str(metadata.get("text", document)),
-        source_episode_ids=_loads_json_list(metadata.get("source_episode_ids")),
-        record_type=MemoryRecordType(
-            str(metadata.get("record_type", MemoryRecordType.SEMANTIC_MEMORY.value))
-        ),
-        created_at=str(metadata.get("created_at", "")),
-        metadata=_loads_json_dict(metadata.get("extra")),
-    )
+    try:
+        return _committed_semantic_record(record_id, document, metadata)
+    except Exception:
+        raise SemanticMemoryFormatError(
+            "Committed semantic Memory is invalid"
+        ) from None
 
 
 def _first_result_list(value: Any) -> list[Any]:
     if not value:
         return []
     return value[0] if isinstance(value[0], list) else value
+
+
+def _semantic_query_list(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+    if value and isinstance(value[0], list):
+        if len(value) != 1:
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        return value[0]
+    return value
 
 
 def _loads_json_dict(value: Any) -> dict[str, Any]:
@@ -781,3 +870,29 @@ def _loads_json_list(value: Any) -> list[str]:
     except json.JSONDecodeError:
         return []
     return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _copy_source_episode_ids(source_episode_ids: list[str] | None) -> list[str]:
+    if source_episode_ids is None:
+        return []
+    if not isinstance(source_episode_ids, list):
+        raise TypeError("source_episode_ids must be a list of strings")
+    copied = list(source_episode_ids)
+    if any(type(source_id) is not str for source_id in copied):
+        raise TypeError("source_episode_ids must contain strings")
+    if any(not source_id for source_id in copied):
+        raise ValueError("source_episode_ids must contain non-empty strings")
+    return copied
+
+
+def _semantic_context_id_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    if "context_id" not in metadata:
+        return None
+    return _validate_semantic_context_id(metadata["context_id"])
+
+
+def _validate_semantic_context_id(value: Any) -> str:
+    context_id = validate_identifier(value)
+    if context_id == "None":
+        raise ValueError("semantic context_id cannot use the None sentinel")
+    return context_id

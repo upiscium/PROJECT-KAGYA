@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
 
+from kagya.identifiers import validate_identifier
+
 
 MAX_ITEM_CAPACITY = 4_096
 MAX_PROJECTION_BYTES = 16 * 1024 * 1024
@@ -87,6 +89,7 @@ class WorkingMemorySelection:
     rendered_content: str
     score: float
     reason: WorkingMemoryDecisionReason
+    source_context_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +132,7 @@ class WorkingMemoryResolution:
 
     status: WorkingMemoryResolutionStatus
     rendered_content: str | None = None
+    source_context_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not WorkingMemoryResolutionStatus:
@@ -136,8 +140,12 @@ class WorkingMemoryResolution:
         if self.status is WorkingMemoryResolutionStatus.RESOLVED:
             if type(self.rendered_content) is not str:
                 raise ValueError("resolved Working Memory content must be a string")
+            if self.source_context_id is not None:
+                validate_identifier(self.source_context_id)
         elif self.rendered_content is not None:
             raise ValueError("non-resolved Working Memory content must be None")
+        elif self.source_context_id is not None:
+            raise ValueError("non-resolved Working Memory provenance must be None")
 
 
 WorkingMemoryResolverResult = str | WorkingMemoryResolution | None
@@ -376,6 +384,7 @@ class WorkingMemory:
                 score = self.score(item)
                 reason: WorkingMemoryDecisionReason
                 rendered: str | None = None
+                source_context_id: str | None = None
                 try:
                     resolved = resolver(item)
                     if resolved is None:
@@ -406,6 +415,7 @@ class WorkingMemory:
                             reason = resolution_reasons[resolved.status]
                         else:
                             rendered = resolved.rendered_content
+                            source_context_id = resolved.source_context_id
                     if rendered is not None:
                         resolved_bytes = rendered.encode("utf-8")
                         if projected_bytes + len(resolved_bytes) > projection_max_bytes:
@@ -437,6 +447,7 @@ class WorkingMemory:
                             rendered,
                             score,
                             reason,
+                            source_context_id,
                         )
                     )
             return WorkingMemoryView(

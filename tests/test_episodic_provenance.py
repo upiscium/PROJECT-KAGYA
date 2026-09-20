@@ -346,10 +346,20 @@ def test_legacy_exact_read_has_no_fabricated_provenance(tmp_path: Path) -> None:
     assert record.record.source_session_id is None
 
 
-def test_semantic_and_working_memory_durable_shapes_remain_unchanged() -> None:
+def test_semantic_and_working_memory_durable_shapes_keep_only_allowed_context_field() -> None:
     from kagya.memory import SemanticMemoryRecord
 
-    assert "context_id" not in {field.name for field in fields(SemanticMemoryRecord)}
+    semantic_fields = tuple(field.name for field in fields(SemanticMemoryRecord))
+    assert semantic_fields[-1] == "context_id"
+    assert semantic_fields[:-1] == (
+        "id",
+        "text",
+        "source_episode_ids",
+        "record_type",
+        "created_at",
+        "metadata",
+    )
+    assert SemanticMemoryRecord("semantic-id", "text").context_id is None
     assert "context_id" not in {field.name for field in fields(WorkingMemoryItem)}
     assert "context_id" not in WorkingMemoryItemSnapshot.model_fields
     assert "context_id" not in WorkingMemorySnapshot.model_fields
