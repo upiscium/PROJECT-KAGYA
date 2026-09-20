@@ -34,7 +34,7 @@ def chat(
         runtime,
         AgentEventType.CHAT,
         AgentEventSource.API_CHAT,
-        lambda: main_loop._chat_runtime(request.message, selectors=selectors),
+        lambda: main_loop.chat(request.message, selectors=selectors),
     )
     return chat_response_from_result(result)
 

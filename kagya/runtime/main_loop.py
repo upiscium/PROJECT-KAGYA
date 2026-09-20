@@ -127,31 +127,12 @@ class KagyaMainLoop:
         user_input: str,
         selectors: ChatContextSelectors | None = None,
     ) -> CoordinatedResult[ChatResult]:
-        """Compute an unsubmitted turn without mutating Context authority."""
+        """Compute one live turn inside the serialized AgentRuntime handler."""
 
         return self._chat_plan(
             user_input,
             capture_debug=False,
             selectors=selectors,
-            planning_state=self._planning_state(),
-        )
-
-    def _chat_runtime(
-        self,
-        user_input: str,
-        selectors: ChatContextSelectors | None = None,
-    ) -> CoordinatedResult[ChatResult]:
-        """Compute a turn inside the serialized AgentRuntime handler."""
-
-        return self._chat_plan(
-            user_input,
-            capture_debug=False,
-            selectors=selectors,
-            planning_state=(
-                self.context_registry,
-                self.working_memory,
-                self.emotion_engine,
-            ),
         )
 
     def _chat_plan(
@@ -160,18 +141,14 @@ class KagyaMainLoop:
         *,
         capture_debug: bool,
         selectors: ChatContextSelectors | None,
-        planning_state: tuple[
-            ContextRegistry, WorkingMemory, EmotionEngineAllostasis
-        ],
     ) -> CoordinatedResult[ChatResult]:
-        context_registry, working_memory, emotion_engine = planning_state
         computed = self._run_chat(
             user_input,
             capture_debug=capture_debug,
             selectors=selectors,
-            context_registry=context_registry,
-            working_memory=working_memory,
-            emotion_engine=emotion_engine,
+            context_registry=self.context_registry,
+            working_memory=self.working_memory,
+            emotion_engine=self.emotion_engine,
         )
         return CoordinatedResult(
             TransactionBoundValue(
@@ -185,29 +162,11 @@ class KagyaMainLoop:
         user_input: str,
         selectors: ChatContextSelectors | None = None,
     ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
-        """Compute an unsubmitted debug turn without mutating Context authority."""
+        """Compute one live debug turn inside the serialized AgentRuntime handler."""
 
         return self._debug_chat_plan(
             user_input,
             selectors=selectors,
-            planning_state=self._planning_state(),
-        )
-
-    def _chat_debug_runtime(
-        self,
-        user_input: str,
-        selectors: ChatContextSelectors | None = None,
-    ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
-        """Compute a debug turn inside the serialized AgentRuntime handler."""
-
-        return self._debug_chat_plan(
-            user_input,
-            selectors=selectors,
-            planning_state=(
-                self.context_registry,
-                self.working_memory,
-                self.emotion_engine,
-            ),
         )
 
     def _debug_chat_plan(
@@ -215,18 +174,14 @@ class KagyaMainLoop:
         user_input: str,
         *,
         selectors: ChatContextSelectors | None,
-        planning_state: tuple[
-            ContextRegistry, WorkingMemory, EmotionEngineAllostasis
-        ],
     ) -> CoordinatedResult[tuple[ChatResult, DebugChatTrace]]:
-        context_registry, working_memory, emotion_engine = planning_state
         computed = self._run_chat(
             user_input,
             capture_debug=True,
             selectors=selectors,
-            context_registry=context_registry,
-            working_memory=working_memory,
-            emotion_engine=emotion_engine,
+            context_registry=self.context_registry,
+            working_memory=self.working_memory,
+            emotion_engine=self.emotion_engine,
         )
         if computed.trace is None:  # pragma: no cover - internal invariant
             raise RuntimeError("Debug trace was not captured")
@@ -240,31 +195,6 @@ class KagyaMainLoop:
             ),
             self._participants(computed),
         )
-
-    def _planning_state(
-        self,
-    ) -> tuple[ContextRegistry, WorkingMemory, EmotionEngineAllostasis]:
-        """Copy snapshot-owned state for an unsubmitted compatibility plan."""
-
-        registry = ContextRegistry()
-        registry.restore_exact(self.context_registry.state)
-        working_memory = WorkingMemory(
-            item_capacity=self.working_memory.item_capacity,
-            projection_max_bytes=self.working_memory.projection_max_bytes,
-        )
-        working_memory.restore_exact(
-            self.working_memory.revision, self.working_memory.items
-        )
-        state = self.emotion_engine.state
-        emotion_engine = EmotionEngineAllostasis(
-            EmotionState(
-                valence=state.valence,
-                arousal=state.arousal,
-                optimal_loss=state.optimal_loss,
-            ),
-            adaptation_rate=self.emotion_engine.adaptation_rate,
-        )
-        return registry, working_memory, emotion_engine
 
     def _run_chat(
         self,

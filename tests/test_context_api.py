@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.runtime import ContextType
 
 from test_fastapi_backend import PRIVATE_SENTINEL, _client, admin_headers
@@ -235,10 +236,50 @@ def test_context_api_reads_are_pure_and_unknown_is_not_found(tmp_path: Path) -> 
 
 def test_context_api_reads_preserve_all_authority_hashes(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        first, second = _seed(client)
+        first_chat = client.post(
+            "/api/chat",
+            json={
+                "message": "seed read purity context",
+                "attachments": [],
+                "client_session_id": "read-purity",
+            },
+        )
+        second_chat = client.post(
+            "/api/chat",
+            json={
+                "message": "populate read purity working memory",
+                "attachments": [],
+                "client_session_id": "read-purity",
+            },
+        )
+        third_chat = client.post(
+            "/api/chat",
+            json={
+                "message": "seed second read purity context",
+                "attachments": [],
+                "client_session_id": "read-purity-other",
+            },
+        )
+        assert first_chat.status_code == 200
+        assert second_chat.status_code == 200
+        assert third_chat.status_code == 200
         registry = client.app.state.main_loop.context_registry
-        registry.set_current(first)
+        first = next(
+            frame.context_id
+            for frame in registry.state.frames
+            if frame.source_session_id == "read-purity"
+        )
+        second = next(
+            frame.context_id
+            for frame in registry.state.frames
+            if frame.source_session_id == "read-purity-other"
+        )
         working_memory = client.app.state.main_loop.working_memory
+        resolver = MemoryWorkingMemoryResolver(client.app.state.memory_system)
+        assert working_memory.items
+        assert client.app.state.agent_state_store.load().context_state.to_registry_state() == (
+            registry.state
+        )
         before_registry = registry.state
         before_working_memory = (working_memory.revision, working_memory.items)
         before_snapshot = client.app.state.agent_state_store.load()
@@ -251,6 +292,12 @@ def test_context_api_reads_preserve_all_authority_hashes(tmp_path: Path) -> None
             client.app.state.memory_system.db2.get(),
         )
         before_journal = client.app.state.event_journal.path.read_bytes()
+        before_wal = {
+            path.relative_to(client.app.state.state_wal.root): path.read_bytes()
+            for path in client.app.state.state_wal.root.rglob("*")
+            if path.is_file()
+        }
+        before_emotion = client.app.state.main_loop.emotion_engine.state
 
         for _ in range(3):
             assert client.get("/api/contexts", headers=admin_headers()).status_code == 200
@@ -264,7 +311,7 @@ def test_context_api_reads_preserve_all_authority_hashes(tmp_path: Path) -> None
             )
             registry.compatibility(first, first)
             working_memory.select_contextual(
-                lambda _item: pytest.fail("read-only selection resolved an item"),
+                resolver,
                 registry,
                 first,
             )
@@ -281,6 +328,12 @@ def test_context_api_reads_preserve_all_authority_hashes(tmp_path: Path) -> None
             client.app.state.memory_system.db2.get(),
         ) == before_memory
         assert client.app.state.event_journal.path.read_bytes() == before_journal
+        assert {
+            path.relative_to(client.app.state.state_wal.root): path.read_bytes()
+            for path in client.app.state.state_wal.root.rglob("*")
+            if path.is_file()
+        } == before_wal
+        assert client.app.state.main_loop.emotion_engine.state == before_emotion
 
 
 def test_context_api_privacy_keeps_raw_chat_in_memory_only(tmp_path: Path) -> None:

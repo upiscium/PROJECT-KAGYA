@@ -256,6 +256,51 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert list(pending.glob("*.json")) == []
 
 
+def test_direct_runtime_submit_uses_public_chat_live_authority(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+
+        ordinary = runtime.submit(
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            lambda: main_loop.chat("direct runtime turn"),
+        ).result(timeout=10)
+        debug = runtime.submit(
+            AgentEventType.DEBUG_CHAT,
+            AgentEventSource.API_CHAT_DEBUG,
+            lambda: main_loop.chat_debug("direct runtime debug turn"),
+        ).result(timeout=10)
+
+        assert ordinary.value.response == "Visible API answer."
+        assert debug.value[0].response == "Visible API answer."
+        assert main_loop.context_registry.current_context_id == "conversation.default"
+        assert main_loop.working_memory.revision > 0
+        assert len(main_loop.session_state.turns) == 2
+        assert client.app.state.memory_system.get_episodic_record(
+            ordinary.value.episode_id
+        ) is not None
+        assert client.app.state.memory_system.get_episodic_record(
+            debug.value[0].episode_id
+        ) is not None
+        snapshot = client.app.state.agent_state_store.load()
+        assert snapshot.context_state.to_registry_state() == (
+            main_loop.context_registry.state
+        )
+        assert snapshot.working_memory.revision == main_loop.working_memory.revision
+        assert (
+            snapshot.emotion_state.valence,
+            snapshot.emotion_state.arousal,
+            snapshot.emotion_state.optimal_loss,
+        ) == (
+            main_loop.emotion_engine.state.valence,
+            main_loop.emotion_engine.state.arousal,
+            main_loop.emotion_engine.state.optimal_loss,
+        )
+
+
 def test_chat_selector_validation_happens_before_event_admission(
     tmp_path: Path,
 ) -> None:
