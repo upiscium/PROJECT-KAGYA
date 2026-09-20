@@ -410,6 +410,113 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
         assert frames[0].source_session_id == session_id
 
 
+def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    legacy = AgentStateSnapshot(
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_processed_event_sequence=0,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+    )
+    legacy_bytes = json.dumps(
+        legacy.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    settings.agent_state.path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_state.path.write_bytes(legacy_bytes)
+
+    with _client(tmp_path, settings=settings) as client:
+        assert settings.agent_state.path.read_bytes() == legacy_bytes
+        assert client.app.state.main_loop.context_registry.state.frames == ()
+        assert not [
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_type is not None
+        ]
+
+        response = client.post(
+            "/api/chat", json={"message": "upgrade context", "attachments": []}
+        )
+        assert response.status_code == 200
+        upgraded = client.app.state.agent_state_store.load()
+        assert upgraded.schema_version == 3
+        assert upgraded.context_state.current_context_id == "conversation.default"
+        assert tuple(
+            frame.context_id for frame in upgraded.context_state.frames
+        ) == ("conversation.default",)
+        assert settings.agent_state.path.read_bytes() != legacy_bytes
+
+
+def test_context_lifecycle_and_relation_are_durable_across_restart(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        first = client.post(
+            "/api/chat",
+            json={"message": "create lifecycle context", "attachments": [],
+                  "client_session_id": "lifecycle-a"},
+        )
+        second = client.post(
+            "/api/chat",
+            json={"message": "create relation context", "attachments": [],
+                  "client_session_id": "lifecycle-b"},
+        )
+        assert first.status_code == second.status_code == 200
+        contexts = client.get("/api/contexts", headers=admin_headers()).json()[
+            "contexts"
+        ]
+        context_a = next(
+            item for item in contexts if item["source_session_id"] == "lifecycle-a"
+        )
+        context_b = next(
+            item for item in contexts if item["source_session_id"] == "lifecycle-b"
+        )
+        context_a_id, context_b_id = context_a["context_id"], context_b["context_id"]
+
+        suspended = client.post(
+            f"/api/contexts/{context_a_id}/suspend", headers=admin_headers()
+        )
+        assert suspended.status_code == 200
+        assert suspended.json()["status"] == "suspended"
+        assert suspended.json()["is_current"] is False
+        resumed = client.post(
+            f"/api/contexts/{context_a_id}/resume", headers=admin_headers()
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "active"
+        assert resumed.json()["is_current"] is False
+        related = client.post(
+            f"/api/contexts/{context_a_id}/relations",
+            headers=admin_headers(),
+            json={"related_context_id": context_b_id},
+        )
+        assert related.status_code == 200
+        assert context_b_id in related.json()["contexts"][0]["related_context_ids"]
+        closed = client.post(
+            f"/api/contexts/{context_a_id}/close", headers=admin_headers()
+        )
+        assert closed.status_code == 200
+        assert closed.json()["status"] == "closed"
+        assert closed.json()["is_current"] is False
+        rejected = client.post(
+            "/api/chat",
+            json={"message": "closed selector", "attachments": [],
+                  "context_id": context_a_id},
+        )
+        assert rejected.status_code == 409
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/contexts", headers=admin_headers())
+        assert restored.status_code == 200
+        by_id = {item["context_id"]: item for item in restored.json()["contexts"]}
+        assert by_id[context_a_id]["status"] == "closed"
+        assert by_id[context_a_id]["is_current"] is False
+        assert by_id[context_b_id]["status"] == "active"
+        assert context_b_id in by_id[context_a_id]["related_context_ids"]
+
+
 def test_chat_context_domain_errors_are_bounded_http_responses(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         missing = client.post(
@@ -1539,6 +1646,38 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
     assert PRIVATE_SENTINEL not in journal_bytes
     assert "prompt" not in journal_bytes.casefold()
     assert "message" not in journal_bytes.casefold()
+
+
+def test_handler_context_mutation_failure_restores_current_and_has_no_success(
+    tmp_path: Path,
+) -> None:
+    """A Context mutation made before model failure is inside the rollback boundary."""
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    app.state.model_provider = FailOnceAfterEmotionProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+
+    with TestClient(app) as client:
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat",
+                json={
+                    "message": PRIVATE_SENTINEL,
+                    "attachments": [],
+                    "client_session_id": "failed-context-session",
+                    "debug": False,
+                },
+            )
+
+        registry = client.app.state.main_loop.context_registry
+        assert registry.state.frames == ()
+        assert registry.current_context_id is None
+        records = client.app.state.event_journal.inspect().records
+        assert records[-1].lifecycle is EventLifecycle.FAILED
+        assert records[-1].failure_category is EventFailureCategory.HANDLER_FAILURE
+        assert not any(record.lifecycle is EventLifecycle.COMPLETED for record in records)
+        assert PRIVATE_SENTINEL not in client.app.state.event_journal.path.read_text()
 
 
 def test_handler_failure_restore_failure_enters_fail_stop(tmp_path: Path) -> None:

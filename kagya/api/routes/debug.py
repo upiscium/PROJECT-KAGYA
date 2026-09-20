@@ -56,7 +56,7 @@ def debug_chat(
         runtime,
         AgentEventType.DEBUG_CHAT,
         AgentEventSource.API_CHAT_DEBUG,
-        lambda: main_loop.chat_debug(request.message, selectors=selectors),
+        lambda: main_loop._chat_debug_runtime(request.message, selectors=selectors),
     )
     base = chat_response_from_result(result)
     return DebugChatResponse(

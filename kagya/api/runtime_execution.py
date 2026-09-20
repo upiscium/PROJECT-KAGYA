@@ -17,6 +17,7 @@ from kagya.runtime import (
     CoordinatedResult,
     ContextCapacityExceeded,
     ContextConflict,
+    ContextError,
     ContextNotFound,
     ContextStateInvalid,
 )
@@ -85,6 +86,11 @@ def execute(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Context selection is invalid",
+            ) from exc
+        if isinstance(cause, ContextError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Context operation is invalid",
             ) from exc
         if exc.__cause__ is not None:
             raise exc.__cause__

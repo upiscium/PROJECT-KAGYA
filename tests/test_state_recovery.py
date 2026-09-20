@@ -9,6 +9,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
+from kagya.memory import DualMemorySystem
+from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from kagya.models import ModelProvider
+from kagya.persona.prompt_builder import PromptBuilder
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
     AgentStateSaveError,
@@ -37,6 +41,7 @@ from kagya.runtime.event_journal import (
     EventJournalAppendStage,
     EventJournalLoadError,
     EventLifecycle,
+    EventRecoveryCategory,
     ParticipantCapability,
     ParticipantRequirement,
     TransactionKind,
@@ -233,6 +238,56 @@ def corrupt_active_generation(wal: StateWAL) -> tuple[UUID, Path, bytes]:
     with generation.open("ab") as output:
         output.write(b"corrupt-tail\n")
     return manifest.active_generation_id, generation, generation.read_bytes()
+
+
+def context_snapshot(
+    sequence: int,
+    *,
+    first_status: str = "active",
+    current_context_id: str | None = "context-a",
+) -> AgentStateSnapshot:
+    first = ContextFrameSnapshot(
+        context_id="context-a",
+        context_type="conversation",
+        source_channel="chat",
+        source_session_id="session-a",
+        participant_refs=("participant-a",),
+        parent_context_id=None,
+        related_context_ids=("context-b",),
+        status=first_status,
+        created_revision=1,
+        last_modified_revision=3,
+        started_at=NOW,
+        last_active_at=NOW,
+    )
+    second = ContextFrameSnapshot(
+        context_id="context-b",
+        context_type="conversation",
+        source_channel="chat",
+        source_session_id="session-b",
+        participant_refs=("participant-b",),
+        parent_context_id=None,
+        related_context_ids=("context-a",),
+        status="active",
+        created_revision=2,
+        last_modified_revision=3,
+        started_at=NOW,
+        last_active_at=NOW,
+    )
+    return AgentStateSnapshot(
+        saved_at=NOW,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2, arousal=0.3, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=3,
+            current_context_id=current_context_id,
+            frames=(first, second),
+            interlocutor_bindings=(),
+        ),
+    )
 
 
 def assert_completed_recovery_binding(
@@ -1061,6 +1116,143 @@ def test_committed_before_crash_with_corrupt_wal_keeps_canonical_current(
     )
     assert records[-1].wal_generation_id == str(result.manifest.active_generation_id)
     assert wal.inspect().records[0].baseline_snapshot == candidate
+
+
+def test_committed_context_mutation_before_crash_restores_exact_v3_context(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = context_snapshot(1, first_status="suspended", current_context_id=None)
+    item = replace(
+        event("context-suspend-committed-before-crash", 1),
+        event_type=AgentEventType.CONTEXT_UPDATE,
+        source=AgentEventSource.API_CONTEXT_SUSPEND,
+    )
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    start_event(journal, item)
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=UUID(item.event_id),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+    corrupt_active_generation(wal)
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.snapshot == candidate
+    assert result.snapshot.context_state == candidate.context_state
+    assert result.snapshot.context_state.current_context_id is None
+    assert result.snapshot.context_state.frames[0].status == "suspended"
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert any(
+        record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+        for record in journal.inspect().records
+    )
+
+
+def test_exact_current_repair_restores_nonempty_context_without_cognition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = context_snapshot(1)
+    item = replace(
+        event("context-relation-exact-current", 1),
+        event_type=AgentEventType.CONTEXT_UPDATE,
+        source=AgentEventSource.API_CONTEXT_RELATE,
+    )
+    start_event(journal, item)
+    commit_event(recovery, item, initial, candidate)
+    bootable = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+    _generation_id, _generation, _generation_bytes = corrupt_active_generation(wal)
+    store.path.unlink()
+
+    monkeypatch.setattr(
+        ContextRegistry,
+        "compatibility",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Context compatibility must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        DualMemorySystem,
+        "retrieve_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Memory retrieval must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        MemoryWorkingMemoryResolver,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Working Memory resolution must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        WorkingMemory,
+        "select",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Working Memory selection must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        WorkingMemory,
+        "select_contextual",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Contextual selection must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        PromptBuilder,
+        "build",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Prompt construction must not run during recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        ModelProvider,
+        "generate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Model generation must not run during recovery"
+        ),
+    )
+
+    result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert result.exact_current_reconstructed
+    assert not result.true_rollback_performed
+    assert not result.external_reconciliation_required
+    assert result.snapshot == candidate
+    assert result.snapshot.context_state == candidate.context_state
+    assert result.snapshot.context_state.current_context_id == "context-a"
+    assert tuple(
+        frame.context_id for frame in result.snapshot.context_state.frames
+    ) == ("context-a", "context-b")
+    assert result.snapshot.context_state.frames[0].participant_refs == (
+        "participant-a",
+    )
+    assert result.snapshot.context_state.frames[0].related_context_ids == (
+        "context-b",
+    )
+    assert store.load() == candidate
+    assert any(
+        record.recovery_category is EventRecoveryCategory.EXACT_CURRENT
+        for record in journal.inspect().records
+    )
 
 
 def test_v2_missing_manifest_without_open_recovery_repairs_current(

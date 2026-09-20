@@ -107,6 +107,38 @@ def test_main_loop_accepts_context_registry_without_creating_or_selecting_contex
     assert registry.current_context_id is None
 
 
+def test_unsubmitted_chat_plan_does_not_mutate_context_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    registry = ContextRegistry()
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        context_registry=registry,
+    )
+    before = registry.state
+    before_working_memory = (loop.working_memory.revision, loop.working_memory.items)
+    before_emotion = loop.emotion_engine.state
+
+    plan = loop.chat("preview only")
+
+    assert registry.state == before
+    assert (loop.working_memory.revision, loop.working_memory.items) == (
+        before_working_memory
+    )
+    assert loop.emotion_engine.state == before_emotion
+    assert plan.participants[0].operation.context_id == "conversation.default"
+
+    loop.chat_debug("preview debug only")
+    assert registry.state == before
+    assert (loop.working_memory.revision, loop.working_memory.items) == (
+        before_working_memory
+    )
+    assert loop.emotion_engine.state == before_emotion
+
+
 def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(
     tmp_path: Path,
 ) -> None:
@@ -126,8 +158,8 @@ def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(
         memory,
         working_memory=working_memory,
     )
-    ordinary = _materialize(loop.chat("ordinary"))
-    debug_result, trace = _materialize(loop.chat_debug("debug"))
+    ordinary = _materialize(loop._chat_runtime("ordinary"))
+    debug_result, trace = _materialize(loop._chat_debug_runtime("debug"))
 
     assert ordinary.response == debug_result.response == "Visible runtime answer."
     assert "User: debug\nAssistant:" in trace.prompt
@@ -233,7 +265,7 @@ def test_retrieval_candidates_are_admitted_in_exact_cross_kind_order(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
 
-    loop.chat("rank candidates")
+    loop._chat_runtime("rank candidates")
 
     by_source = {item.source_id: item for item in working.items}
     assert working.revision == 4
@@ -274,7 +306,7 @@ def test_prior_working_memory_decays_and_retrieved_reference_reactivates(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
 
-    loop.chat("reactivate")
+    loop._chat_runtime("reactivate")
 
     by_source = {item.source_id: item for item in working.items}
     assert working.revision == 4
@@ -344,7 +376,7 @@ def test_missing_and_archived_references_remain_but_do_not_enter_prompt(
     )
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
-    result, trace = _materialize(loop.chat_debug("status query"))
+    result, trace = _materialize(loop._chat_debug_runtime("status query"))
 
     assert result.response == "Visible runtime answer."
     assert {item.source_id for item in loop.working_memory.items} == {
@@ -390,7 +422,7 @@ def test_exact_source_failure_is_bounded_and_chat_continues(
     monkeypatch.setattr(memory, "get_committed_semantic", fail_exact)
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
 
-    result, trace = _materialize(loop.chat_debug("failure query"))
+    result, trace = _materialize(loop._chat_debug_runtime("failure query"))
 
     assert result.response == "Visible runtime answer."
     assert trace.working_memory_view.decisions[0].reason is expected_reason
@@ -471,7 +503,7 @@ def test_select_and_prompt_build_are_pure_after_explicit_chat_mutations(
 
     loop.prompt_builder = PurePromptBuilder()  # type: ignore[assignment]
 
-    loop.chat("pure source")
+    loop._chat_runtime("pure source")
 
     assert selection_states == [(selection_states[0][0], selection_states[0][0])]
     assert {item.source_id for item in working.items} == {semantic_id}
@@ -485,7 +517,7 @@ def test_current_future_episode_is_absent_from_its_own_working_memory_view(
         settings, ThinkingDummyProvider(), DualMemorySystem(settings)
     )
 
-    result, trace = _materialize(loop.chat_debug("current turn only"))
+    result, trace = _materialize(loop._chat_debug_runtime("current turn only"))
 
     assert result.episode_id not in {
         selection.source_id for selection in trace.working_memory_view.selected
@@ -521,8 +553,8 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
         working_memory=debug_working,
     )
 
-    ordinary_plan = ordinary_loop.chat("same input")
-    debug_plan = debug_loop.chat_debug("same input")
+    ordinary_plan = ordinary_loop._chat_runtime("same input")
+    debug_plan = debug_loop._chat_debug_runtime("same input")
     ordinary = _materialize(ordinary_plan)
     debug_result, trace = _materialize(debug_plan)
 
@@ -596,7 +628,7 @@ def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     before = loop.emotion_engine.state
 
-    result = _materialize(loop.chat("emotion update"))
+    result = _materialize(loop._chat_runtime("emotion update"))
 
     assert result.arousal != before.arousal
     assert result.optimal_loss != before.optimal_loss
