@@ -892,7 +892,4 @@ def _semantic_context_id_from_metadata(metadata: Mapping[str, Any]) -> str | Non
 
 
 def _validate_semantic_context_id(value: Any) -> str:
-    context_id = validate_identifier(value)
-    if context_id == "None":
-        raise ValueError("semantic context_id cannot use the None sentinel")
-    return context_id
+    return validate_identifier(value)

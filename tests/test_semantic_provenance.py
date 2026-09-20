@@ -81,6 +81,22 @@ def test_singleton_and_all_same_sources_round_trip_context_and_source_ids(
     assert _metadata(memory, all_same_id)["context_id"] == "context-x"
 
 
+def test_literal_none_context_id_round_trips_as_known_provenance(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    _publish_source(memory, "episode-none-string", "None")
+
+    semantic_id = memory.save_semantic(
+        "literal None context fact", source_episode_ids=["episode-none-string"]
+    )
+
+    committed = memory.get_committed_semantic(semantic_id)
+    assert committed is not None
+    assert committed.record.context_id == "None"
+    assert _metadata(memory, semantic_id)["context_id"] == "None"
+
+
 def test_mixed_unknown_missing_and_empty_sources_store_none_without_dropping_refs(
     tmp_path: Path,
 ) -> None:
@@ -323,7 +339,7 @@ def test_legacy_db2_without_context_is_read_without_backfill_or_rewrite(
     assert reopened.db2.get(ids=[semantic_id], include=["documents", "metadatas"]) == before
 
 
-@pytest.mark.parametrize("invalid_context_id", ["", "None", "bad/id", "x\n", "x" * 129])
+@pytest.mark.parametrize("invalid_context_id", ["", "bad/id", "x\n", "x" * 129])
 def test_present_invalid_context_id_fails_exact_read_without_repair(
     tmp_path: Path, invalid_context_id: str
 ) -> None:
