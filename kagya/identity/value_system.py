@@ -35,6 +35,8 @@ __all__ = [
     "ValueMutationStatus",
     "ValueNotFound",
     "ValueOriginReviewDecision",
+    "ValuePromptEntry",
+    "ValuePromptView",
     "ValueProposal",
     "ValueReason",
     "ValueRevisionOperation",
@@ -105,6 +107,7 @@ _MAX_AUTHORITATIVE_VALUES: Final = 128
 _MAX_REVISION_RECORDS: Final = 32
 _MAX_APPLIED_EVIDENCE_REFS: Final = 512
 _MAX_OPPOSITION_COUNT: Final = 6
+_PROMPT_CONCEPT_MAX_BYTES: Final = 256
 _EVENT_UPDATE_BUDGET: Final = 0.10
 _SEED_DOMAIN: Final = "kagya.identity.value-seed/v1"
 _STATE_DOMAIN: Final = "kagya.identity.value-state/v1"
@@ -187,6 +190,15 @@ def _optional_text(value: object, name: str, limit: int) -> str | None:
     if value is None:
         return None
     return _text(value, name, limit)
+
+
+def _prompt_concept(value: str | None) -> str | None:
+    if value is None:
+        return None
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _PROMPT_CONCEPT_MAX_BYTES:
+        return value
+    return encoded[:_PROMPT_CONCEPT_MAX_BYTES].decode("utf-8", errors="ignore")
 
 
 def _validate_seed_digest_format(value: object) -> str:
@@ -328,6 +340,94 @@ class ValueState:
         if context_id is None:
             return False
         return context_id in self.context_ids
+
+
+@dataclass(frozen=True, slots=True)
+class ValuePromptEntry:
+    """Bounded, non-authoritative Value data safe for prompt construction.
+
+    ``context_ids`` is retained only to keep manually assembled views from
+    bypassing applicability validation; PromptBuilder never renders it.
+    """
+
+    value_id: str
+    name: str
+    concept: str | None
+    polarity: int
+    strength: float
+    confidence: float
+    authority_class: ValueAdmissionStatus
+    scope: ValueScope
+    context_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def _from_state(cls, value: ValueState) -> ValuePromptEntry:
+        if not isinstance(value, ValueState):
+            raise TypeError("value must be a ValueState")
+        if value.origin.admission not in {
+            ValueAdmissionStatus.SELF_ENDORSED,
+            ValueAdmissionStatus.SYSTEM_AUTHORIZED,
+        }:
+            raise ValueDomainError("inactive Values cannot enter a prompt view")
+        return cls(
+            value_id=value.value_id,
+            name=value.name,
+            concept=_prompt_concept(value.concept),
+            polarity=value.polarity,
+            strength=value.strength,
+            confidence=value.confidence,
+            authority_class=value.origin.admission,
+            scope=value.scope,
+            context_ids=value.context_ids,
+        )
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.value_id)
+        _text(self.name, "name", _NAME_LIMIT)
+        concept = _optional_text(self.concept, "concept", _CONCEPT_LIMIT)
+        if concept is not None and len(concept.encode("utf-8")) > _PROMPT_CONCEPT_MAX_BYTES:
+            raise ValueError("prompt concept exceeds the byte bound")
+        object.__setattr__(self, "concept", concept)
+        scope = _enum(self.scope, ValueScope, "scope")
+        object.__setattr__(self, "scope", scope)
+        context_ids = _canonical_contexts(self.context_ids, scope, "context_ids")
+        object.__setattr__(self, "context_ids", context_ids)
+        if type(self.polarity) is not int or self.polarity not in (-1, 1):
+            raise TypeError("polarity must be exactly -1 or 1")
+        _fraction(self.strength, "strength")
+        _fraction(self.confidence, "confidence")
+        if type(self.authority_class) is not ValueAdmissionStatus or self.authority_class not in {
+            ValueAdmissionStatus.SELF_ENDORSED,
+            ValueAdmissionStatus.SYSTEM_AUTHORIZED,
+        }:
+            raise TypeError("authority_class must be an active Value admission")
+
+
+@dataclass(frozen=True, slots=True)
+class ValuePromptView:
+    """Immutable, bounded active/applicable Value projection for one prompt."""
+
+    entries: tuple[ValuePromptEntry, ...]
+    context_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.entries) is not tuple:
+            raise TypeError("prompt entries must be a tuple")
+        if len(self.entries) > _MAX_AUTHORITATIVE_VALUES:
+            raise ValueDomainError("prompt view exceeds the authoritative Value bound")
+        for entry in self.entries:
+            if not isinstance(entry, ValuePromptEntry):
+                raise TypeError("prompt entries must contain ValuePromptEntry values")
+        ids = tuple(entry.value_id for entry in self.entries)
+        if ids != tuple(sorted(set(ids))) or len(set(ids)) != len(ids):
+            raise ValueError("prompt entries must be sorted and unique")
+        if self.context_id is not None:
+            validate_identifier(self.context_id)
+        for entry in self.entries:
+            if entry.scope is ValueScope.CONTEXT and (
+                self.context_id is None or self.context_id not in entry.context_ids
+            ):
+                raise ValueError("context-scoped prompt entries must match the view context")
 
 
 def _origin_fields(origin: IdentityOrigin) -> dict[str, object]:
@@ -1126,6 +1226,18 @@ class ValueSystem:
     @property
     def values(self) -> tuple[ValueState, ...]:
         return tuple(self._values[value_id] for value_id in sorted(self._values))
+
+    def prompt_view(self, current_context_id: str | None) -> ValuePromptView:
+        """Return the pure active/applicable Value projection for one context."""
+
+        if current_context_id is not None:
+            validate_identifier(current_context_id)
+        entries = tuple(
+            ValuePromptEntry._from_state(value)
+            for value in self.values
+            if value.is_active() and value.applies_to(current_context_id)
+        )
+        return ValuePromptView(entries=entries, context_id=current_context_id)
 
     @property
     def value_map(self) -> Mapping[str, ValueState]:

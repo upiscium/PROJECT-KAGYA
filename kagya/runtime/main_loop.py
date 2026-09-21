@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import inspect
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, cast
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.cognition import (
@@ -29,6 +29,7 @@ from kagya.identity import (
     ValueMutationResult,
     ValueNotFound,
     ValueOriginReviewDecision,
+    ValuePromptView,
     ValueRevisionOperation,
     ValueSystem,
     ValueSystemSnapshot,
@@ -535,6 +536,7 @@ class KagyaMainLoop:
             current_context.source_session_id,
         )
         context_view = ContextPromptView.from_frame(current_context)
+        value_view = self.value_system.prompt_view(current_context.context_id)
         context_text = self.session_state.context_text()
         temporal_update = emotion_engine.advance_to()
         measurement = self.surprisal_calculator.measure(
@@ -576,7 +578,7 @@ class KagyaMainLoop:
             current_context.context_id,
         )
         prompt = self._build_prompt(
-            user_input, emotion_state, working_memory_view, context_view
+            user_input, emotion_state, working_memory_view, context_view, value_view
         )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
@@ -636,24 +638,32 @@ class KagyaMainLoop:
         emotion_state: EmotionState,
         working_memory_view: WorkingMemoryView,
         context_view: ContextPromptView,
+        value_view: ValuePromptView,
     ) -> str:
-        """Pass Context projection while retaining older injected builders."""
+        """Pass prompt projections while retaining older injected builders."""
 
-        build = self.prompt_builder.build
-        parameters = inspect.signature(build).parameters.values()
-        accepts_context = any(
-            parameter.name == "context_view"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        build = cast(Callable[..., str], self.prompt_builder.build)
+        parameters = tuple(inspect.signature(build).parameters.values())
+        keyword_names = {
+            parameter.name
             for parameter in parameters
+            if parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        }
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
         )
-        if accepts_context:
-            return build(
-                user_input,
-                emotion_state,
-                working_memory_view,
-                context_view=context_view,
-            )
-        return build(user_input, emotion_state, working_memory_view)
+        keyword_arguments: dict[str, object] = {}
+        if accepts_kwargs or "context_view" in keyword_names:
+            keyword_arguments["context_view"] = context_view
+        if accepts_kwargs or "value_view" in keyword_names:
+            keyword_arguments["value_view"] = value_view
+        return build(
+            user_input,
+            emotion_state,
+            working_memory_view,
+            **keyword_arguments,
+        )
 
     def _chat_result(
         self, computed: _ComputedChat, transaction_id: str

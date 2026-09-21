@@ -1,5 +1,5 @@
 import hashlib
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,6 +18,8 @@ from kagya.identity.value_system import (
     ValueMutationReason,
     ValueMutationStatus,
     ValueOriginReviewDecision,
+    ValuePromptEntry,
+    ValuePromptView,
     ValueProposal,
     ValueReason,
     ValueRevisionHistory,
@@ -169,6 +171,153 @@ def test_scope_and_active_read_semantics() -> None:
     assert not contextual.applies_to("context-2")
     with pytest.raises(ValueError):
         contextual.applies_to("bad..id")
+
+
+def test_prompt_view_selects_active_applicable_values_without_mutation() -> None:
+    pending_origin = IdentityOrigin(
+        OriginActor.OPERATOR,
+        OriginInputKind.CONSTRAINT,
+        ValueAdmissionStatus.PENDING,
+        source_ref="operator-source",
+        event_id="event-pending",
+        event_sequence=1,
+    )
+    uncertain_origin = IdentityOrigin(
+        OriginActor.UNKNOWN,
+        OriginInputKind.LEGACY,
+        ValueAdmissionStatus.UNCERTAIN,
+        source_ref="legacy-source",
+    )
+    rejected_origin = IdentityOrigin(
+        OriginActor.INHERITED,
+        OriginInputKind.LEGACY,
+        ValueAdmissionStatus.REJECTED,
+        source_ref="inherited-source",
+    )
+    subject = _value(value_id="subject-care")
+    contextual = _value(
+        value_id="context-care",
+        scope=ValueScope.CONTEXT,
+        context_ids=("context-a",),
+    )
+    pending = _value(value_id="pending-care", origin=pending_origin)
+    uncertain = _value(value_id="uncertain-care", origin=uncertain_origin)
+    rejected = _value(value_id="rejected-care", origin=rejected_origin)
+    system = ValueSystem((rejected, contextual, uncertain, pending, subject))
+    before = system.snapshot()
+
+    in_context_a = system.prompt_view("context-a")
+    in_context_b = system.prompt_view("context-b")
+
+    assert [entry.value_id for entry in in_context_a.entries] == [
+        "context-care",
+        "subject-care",
+    ]
+    assert [entry.value_id for entry in in_context_b.entries] == ["subject-care"]
+    assert all(
+        entry.authority_class is ValueAdmissionStatus.SELF_ENDORSED
+        for entry in in_context_a.entries
+    )
+    assert in_context_a.context_id == "context-a"
+    assert in_context_b.context_id == "context-b"
+    assert system.snapshot() == before
+
+
+def test_prompt_view_preserves_system_authority_conflicts_and_bounds_concept() -> None:
+    seed_a = _seed(value_id="system-care", name="system care", concept="é" * 200)
+    seed_b = _seed(value_id="system-honesty", name="system honesty")
+    system = ValueSystem.from_seed_declarations(
+        (seed_b, seed_a),
+        conflicts=(ValueConflictDefinition("system-care", "system-honesty"),),
+    )
+
+    view = system.prompt_view(None)
+
+    assert [entry.value_id for entry in view.entries] == [
+        "system-care",
+        "system-honesty",
+    ]
+    assert all(
+        entry.authority_class is ValueAdmissionStatus.SYSTEM_AUTHORIZED
+        for entry in view.entries
+    )
+    assert view.entries[0].concept == "é" * 128
+    assert len(view.entries[0].concept.encode("utf-8")) == 256
+
+
+def test_prompt_projection_is_immutable_and_excludes_authority_metadata() -> None:
+    system = ValueSystem((_value(),))
+    view = system.prompt_view(None)
+    entry_fields = {field.name for field in fields(view.entries[0])}
+
+    assert entry_fields == {
+        "value_id",
+        "name",
+        "concept",
+        "polarity",
+        "strength",
+        "confidence",
+        "authority_class",
+        "scope",
+        "context_ids",
+    }
+    with pytest.raises((AttributeError, TypeError)):
+        view.entries[0].name = "changed"  # type: ignore[misc]
+    with pytest.raises((AttributeError, TypeError)):
+        view.entries = ()  # type: ignore[misc]
+
+
+def test_prompt_view_rejects_unsorted_or_oversized_entries() -> None:
+    entry = ValuePromptEntry(
+        value_id="value-1",
+        name="care",
+        concept=None,
+        polarity=1,
+        strength=0.8,
+        confidence=0.9,
+        authority_class=ValueAdmissionStatus.SELF_ENDORSED,
+        scope=ValueScope.SUBJECT,
+    )
+    with pytest.raises(ValueError):
+        ValuePromptView((entry, entry))
+    with pytest.raises(ValueError):
+        ValuePromptEntry(
+            value_id="value-1",
+            name="care",
+            concept="é" * 200,
+            polarity=1,
+            strength=0.8,
+            confidence=0.9,
+            authority_class=ValueAdmissionStatus.SELF_ENDORSED,
+            scope=ValueScope.SUBJECT,
+        )
+    with pytest.raises(ValueDomainError):
+        ValuePromptView(
+            tuple(
+                replace(entry, value_id=f"value-{index:03d}")
+                for index in range(ValueSystem.MAX_AUTHORITATIVE_VALUES + 1)
+            )
+        )
+
+
+def test_prompt_view_rejects_context_entry_outside_its_declared_context() -> None:
+    entry = ValuePromptEntry(
+        value_id="context-value",
+        name="context value",
+        concept=None,
+        polarity=1,
+        strength=0.8,
+        confidence=0.9,
+        authority_class=ValueAdmissionStatus.SELF_ENDORSED,
+        scope=ValueScope.CONTEXT,
+        context_ids=("context-a",),
+    )
+
+    with pytest.raises(ValueError):
+        ValuePromptView((entry,), context_id=None)
+    with pytest.raises(ValueError):
+        ValuePromptView((entry,), context_id="context-b")
+    assert ValuePromptView((entry,), context_id="context-a").entries == (entry,)
 
 
 @pytest.mark.parametrize(

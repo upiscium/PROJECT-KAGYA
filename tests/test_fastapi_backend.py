@@ -762,11 +762,11 @@ def test_chat_and_appraisal_leave_value_system_unchanged_in_u3(
     with _client(tmp_path, settings=settings) as client:
         before = client.app.state.main_loop.value_system.snapshot()
 
-        response = client.post(
-            "/api/chat", json={"message": "value read only", "attachments": []}
-        )
-
-        assert response.status_code == 200
+        for _ in range(2):
+            response = client.post(
+                "/api/chat", json={"message": "value read only", "attachments": []}
+            )
+            assert response.status_code == 200
         assert client.app.state.main_loop.value_system.snapshot() == before
 
 
@@ -1392,6 +1392,14 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
         )
         assert invalid_fields.status_code == 422
         assert PRIVATE_SENTINEL not in invalid_fields.text
+
+        direct_value_fields = client.post(
+            "/api/values/care/freeze",
+            headers=admin_headers(),
+            json={"strength": 0.1, "polarity": -1},
+        )
+        assert direct_value_fields.status_code == 422
+        assert PRIVATE_SENTINEL not in direct_value_fields.text
 
         missing_seed = client.post(
             "/api/values/config-seeds/missing/adopt", headers=admin_headers()

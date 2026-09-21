@@ -7,6 +7,7 @@ import pytest
 
 from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import LossCalibration, LossInvalidReason, model_key
+from kagya.identity import ValuePromptView
 from kagya.config import Settings, load_settings
 from kagya.memory import (
     DualMemorySystem,
@@ -18,7 +19,7 @@ from kagya.memory import (
 )
 from kagya.runtime.context import ContextType
 from kagya.models import DummyProvider
-from kagya.persona import PromptBuilder
+from kagya.persona import ContextPromptView, PromptBuilder
 from kagya.runtime import (
     ChatContextSelectors,
     CoordinatedResult,
@@ -31,6 +32,7 @@ from kagya.runtime import (
     WorkingMemoryDecisionReason,
     WorkingMemoryRetentionReason,
     WorkingMemorySourceKind,
+    WorkingMemoryView,
 )
 from kagya.runtime.main_loop import DebugChatTrace
 
@@ -284,6 +286,174 @@ def test_main_loop_resolves_committed_body_and_passes_view_to_prompt_builder(
     ]
     assert "committed body" in trace.prompt
     assert "stale retrieval body" not in trace.prompt
+
+
+def test_main_loop_passes_committed_active_values_to_prompt_builder(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    captured: list[tuple[ContextPromptView, ValuePromptView]] = []
+
+    class CapturingPromptBuilder:
+        def build(
+            self,
+            user_input,
+            emotion_state,
+            working_memory_view,
+            *,
+            context_view,
+            value_view,
+        ):
+            captured.append((context_view, value_view))
+            return PromptBuilder().build(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                context_view=context_view,
+                value_view=value_view,
+            )
+
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        prompt_builder=CapturingPromptBuilder(),  # type: ignore[arg-type]
+    )
+
+    _result, trace = _materialize(loop.chat_debug("value prompt"))
+
+    assert len(captured) == 1
+    context_view, value_view = captured[0]
+    assert context_view.context_id == "conversation.default"
+    assert value_view == loop.value_system.prompt_view("conversation.default")
+    assert [entry.value_id for entry in value_view.entries] == ["care", "honesty"]
+    assert all(
+        entry.authority_class.value == "system_authorized"
+        for entry in value_view.entries
+    )
+    assert "Active Values:" in trace.prompt
+
+
+def test_main_loop_uses_detached_committed_value_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+    )
+
+    def fail_if_mutable_authority_is_projected(_context_id: str | None) -> ValuePromptView:
+        pytest.fail("chat projected the mutable Value authority")
+
+    monkeypatch.setattr(
+        loop._value_system,
+        "prompt_view",
+        fail_if_mutable_authority_is_projected,
+    )
+
+    _result, trace = _materialize(loop.chat_debug("committed value prompt"))
+
+    assert "value_id=care" in trace.prompt
+
+
+def test_prompt_builder_projection_keywords_preserve_injected_builder_shapes(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = KagyaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+    )
+    working_memory_view = WorkingMemoryView(
+        selected=(),
+        decisions=(),
+        projected_bytes=0,
+        item_capacity=4,
+        projection_max_bytes=1024,
+        revision=0,
+    )
+    context_view = ContextPromptView(
+        context_id="conversation-default",
+        context_type="conversation",
+        source_channel="chat",
+        source_session_id=None,
+        participant_refs=(),
+    )
+    value_view = ValuePromptView(())
+    observed: list[object] = []
+
+    class BothBuilder:
+        def build(
+            self, _user_input, _emotion_state, _working_memory_view, *, context_view, value_view
+        ):
+            observed.append((context_view, value_view))
+            return "both"
+
+    class KwargsBuilder:
+        def build(self, _user_input, _emotion_state, _working_memory_view, **kwargs):
+            observed.append(kwargs)
+            return "kwargs"
+
+    class ContextOnlyBuilder:
+        def build(
+            self, _user_input, _emotion_state, _working_memory_view, *, context_view
+        ):
+            observed.append(context_view)
+            return "context"
+
+    class LegacyBuilder:
+        def build(self, _user_input, _emotion_state, _working_memory_view):
+            observed.append(None)
+            return "legacy"
+
+    for builder, expected in (
+        (BothBuilder(), "both"),
+        (KwargsBuilder(), "kwargs"),
+        (ContextOnlyBuilder(), "context"),
+        (LegacyBuilder(), "legacy"),
+    ):
+        loop.prompt_builder = builder  # type: ignore[assignment]
+        assert (
+            loop._build_prompt(
+                "input",
+                EmotionState(),
+                working_memory_view,
+                context_view,
+                value_view,
+            )
+            == expected
+        )
+
+    assert observed[0] == (context_view, value_view)
+    assert observed[1] == {
+        "context_view": context_view,
+        "value_view": value_view,
+    }
+    assert observed[2] is context_view
+    assert observed[3] is None
+
+    class BodyTypeErrorBuilder:
+        calls = 0
+
+        def build(self, _user_input, _emotion_state, _working_memory_view, **kwargs):
+            del kwargs
+            self.calls += 1
+            raise TypeError("builder body failure")
+
+    failing_builder = BodyTypeErrorBuilder()
+    loop.prompt_builder = failing_builder  # type: ignore[assignment]
+    with pytest.raises(TypeError, match="builder body failure"):
+        loop._build_prompt(
+            "input",
+            EmotionState(),
+            working_memory_view,
+            context_view,
+            value_view,
+        )
+    assert failing_builder.calls == 1
 
 
 def test_retrieval_failure_does_not_age_working_memory(
