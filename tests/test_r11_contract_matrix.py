@@ -30,7 +30,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     (
         "F5",
         "tests/test_value_system.py::test_origin_review_preserves_lineage_and_never_endorses; "
-        "tests/test_value_system.py::test_origin_review_rejects_self_and_system_lineage",
+        "tests/test_value_system.py::test_origin_review_rejects_self_and_system_lineage; "
+        "tests/test_value_system.py::test_prompt_view_selects_active_applicable_values_without_mutation",
     ),
     (
         "F6",
@@ -52,7 +53,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     (
         "F10",
         "tests/test_fastapi_backend.py::test_value_governance_commit_is_published_before_finalization_failure; "
-        "tests/test_fastapi_backend.py::test_finalization_failure_preserves_internal_commit_without_restore",
+        "tests/test_fastapi_backend.py::test_finalization_failure_preserves_internal_commit_without_restore; "
+        "tests/test_state_recovery.py::test_committed_before_crash_v5_reconstructs_value_without_replay",
     ),
     (
         "F11",
@@ -64,6 +66,7 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
         "tests/test_agent_state.py::test_v5_origin_witness_rejects_provenance_tampering_without_rewrite; "
         "tests/test_agent_state.py::test_current_schema_rejects_unknown_root_and_nested_fields; "
         "tests/test_agent_state.py::test_existing_corrupt_snapshot_never_defaults_or_changes; "
+        "tests/test_agent_state.py::test_future_version_is_distinct_and_never_defaults; "
         "tests/test_state_wal.py::test_future_record_version_is_rejected; "
         "tests/test_value_system.py::test_restore_rejects_current_history_and_ledger_inconsistency; "
         "tests/test_value_system.py::test_restore_rejects_surplus_ledger_ref_with_exact_digest_witness; "
@@ -71,7 +74,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F13",
-        "tests/test_fastapi_backend.py::test_values_api_reads_are_pure_and_governance_is_runtime_bound",
+        "tests/test_fastapi_backend.py::test_values_api_reads_are_pure_and_governance_is_runtime_bound; "
+        "tests/test_value_system.py::test_prompt_view_selects_active_applicable_values_without_mutation",
     ),
     (
         "F14",
