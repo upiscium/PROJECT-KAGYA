@@ -1226,6 +1226,42 @@ def test_canonical_snapshot_contains_no_private_or_independent_store_data(
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_v5_canonical_snapshot_contains_value_authority_but_no_prompt_or_independent_store_data(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    store = AgentStateStore(
+        tmp_path / "agent_state.json",
+        baseline_surprisal=1.0,
+        value_seeds=(seed,),
+        clock=lambda: NOW,
+    )
+    snapshot = store.capture(
+        ValueLoopStub(value_system_with_history(seed)), sequence=33
+    )
+
+    raw = json.loads(store.canonical_bytes(snapshot))
+    assert snapshot.schema_version == 5
+    assert raw["value_state"]["values"]
+    assert raw["value_state"]["histories"]
+    assert raw["value_state"]["evidence_ledgers"]
+    rendered = json.dumps(raw, separators=(",", ":")).casefold()
+    assert PRIVATE_SENTINEL.casefold() not in rendered
+    for forbidden in (
+        "prompt",
+        "hidden_thought",
+        "raw_prompt",
+        "transcript",
+        "semantic",
+        "episodic",
+        "adapter",
+        "evaluation",
+        "authority_class",
+        "value_prompt_view",
+    ):
+        assert forbidden not in rendered
+
+
 def test_agent_state_has_no_working_memory_participant_or_journal_authority() -> None:
     assert set(AgentStateSnapshotV4.model_fields) == {
         "saved_at",

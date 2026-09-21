@@ -342,7 +342,7 @@ class ValueState:
         return context_id in self.context_ids
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ValuePromptEntry:
     """Bounded, non-authoritative Value data safe for prompt construction.
 
@@ -360,6 +360,9 @@ class ValuePromptEntry:
     scope: ValueScope
     context_ids: tuple[str, ...] = ()
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("ValuePromptEntry instances are created by ValueSystem")
+
     @classmethod
     def _from_state(cls, value: ValueState) -> ValuePromptEntry:
         if not isinstance(value, ValueState):
@@ -369,17 +372,18 @@ class ValuePromptEntry:
             ValueAdmissionStatus.SYSTEM_AUTHORIZED,
         }:
             raise ValueDomainError("inactive Values cannot enter a prompt view")
-        return cls(
-            value_id=value.value_id,
-            name=value.name,
-            concept=_prompt_concept(value.concept),
-            polarity=value.polarity,
-            strength=value.strength,
-            confidence=value.confidence,
-            authority_class=value.origin.admission,
-            scope=value.scope,
-            context_ids=value.context_ids,
-        )
+        entry = object.__new__(cls)
+        object.__setattr__(entry, "value_id", value.value_id)
+        object.__setattr__(entry, "name", value.name)
+        object.__setattr__(entry, "concept", _prompt_concept(value.concept))
+        object.__setattr__(entry, "polarity", value.polarity)
+        object.__setattr__(entry, "strength", value.strength)
+        object.__setattr__(entry, "confidence", value.confidence)
+        object.__setattr__(entry, "authority_class", value.origin.admission)
+        object.__setattr__(entry, "scope", value.scope)
+        object.__setattr__(entry, "context_ids", value.context_ids)
+        entry.__post_init__()
+        return entry
 
     def __post_init__(self) -> None:
         validate_identifier(self.value_id)

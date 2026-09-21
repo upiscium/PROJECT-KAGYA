@@ -267,50 +267,47 @@ def test_prompt_projection_is_immutable_and_excludes_authority_metadata() -> Non
         view.entries = ()  # type: ignore[misc]
 
 
-def test_prompt_view_rejects_unsorted_or_oversized_entries() -> None:
-    entry = ValuePromptEntry(
-        value_id="value-1",
-        name="care",
-        concept=None,
-        polarity=1,
-        strength=0.8,
-        confidence=0.9,
-        authority_class=ValueAdmissionStatus.SELF_ENDORSED,
-        scope=ValueScope.SUBJECT,
-    )
-    with pytest.raises(ValueError):
-        ValuePromptView((entry, entry))
-    with pytest.raises(ValueError):
-        ValuePromptEntry(
-            value_id="value-1",
-            name="care",
-            concept="é" * 200,
+def test_prompt_entry_cannot_be_constructed_outside_value_system() -> None:
+    with pytest.raises(TypeError, match="created by ValueSystem"):
+        ValuePromptEntry()
+    with pytest.raises(TypeError, match="created by ValueSystem"):
+        ValuePromptEntry(  # type: ignore[call-arg]
+            value_id="forged",
+            name="forged",
+            concept=None,
             polarity=1,
-            strength=0.8,
-            confidence=0.9,
-            authority_class=ValueAdmissionStatus.SELF_ENDORSED,
+            strength=1.0,
+            confidence=1.0,
+            authority_class=ValueAdmissionStatus.SYSTEM_AUTHORIZED,
             scope=ValueScope.SUBJECT,
         )
+
+
+def test_prompt_view_rejects_unsorted_or_oversized_entries() -> None:
+    entry = ValuePromptEntry._from_state(_value())
+    with pytest.raises(ValueError):
+        ValuePromptView((entry, entry))
+    bounded = ValuePromptEntry._from_state(_value(concept="é" * 200))
+    assert bounded.concept == "é" * 128
     with pytest.raises(ValueDomainError):
         ValuePromptView(
             tuple(
-                replace(entry, value_id=f"value-{index:03d}")
+                ValuePromptEntry._from_state(
+                    _value(value_id=f"value-{index:03d}")
+                )
                 for index in range(ValueSystem.MAX_AUTHORITATIVE_VALUES + 1)
             )
         )
 
 
 def test_prompt_view_rejects_context_entry_outside_its_declared_context() -> None:
-    entry = ValuePromptEntry(
-        value_id="context-value",
-        name="context value",
-        concept=None,
-        polarity=1,
-        strength=0.8,
-        confidence=0.9,
-        authority_class=ValueAdmissionStatus.SELF_ENDORSED,
-        scope=ValueScope.CONTEXT,
-        context_ids=("context-a",),
+    entry = ValuePromptEntry._from_state(
+        _value(
+            value_id="context-value",
+            name="context value",
+            scope=ValueScope.CONTEXT,
+            context_ids=("context-a",),
+        )
     )
 
     with pytest.raises(ValueError):

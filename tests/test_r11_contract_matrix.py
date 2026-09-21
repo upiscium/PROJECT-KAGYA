@@ -5,6 +5,10 @@ modules. This matrix gives focused and whole-R11 reviewers one stable index of
 the evidence without adding a second authority or duplicating those tests.
 """
 
+import ast
+from pathlib import Path
+
+
 R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     (
         "F1",
@@ -16,6 +20,7 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F3",
+        "tests/test_value_system.py::test_prompt_view_selects_active_applicable_values_without_mutation; "
         "tests/test_value_system.py::test_prompt_view_preserves_system_authority_conflicts_and_bounds_concept",
     ),
     (
@@ -24,7 +29,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F5",
-        "tests/test_value_system.py::test_origin_review_preserves_lineage_and_never_endorses",
+        "tests/test_value_system.py::test_origin_review_preserves_lineage_and_never_endorses; "
+        "tests/test_value_system.py::test_origin_review_rejects_self_and_system_lineage",
     ),
     (
         "F6",
@@ -32,7 +38,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F7",
-        "tests/test_value_system.py::test_replayed_evidence_makes_the_whole_event_idempotent",
+        "tests/test_value_system.py::test_support_and_opposition_policy_is_bounded_and_deterministic; "
+        "tests/test_value_system.py::test_duplicate_targets_and_duplicate_evidence_are_fail_closed",
     ),
     (
         "F8",
@@ -44,7 +51,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F10",
-        "tests/test_fastapi_backend.py::test_value_governance_commit_is_published_before_finalization_failure",
+        "tests/test_fastapi_backend.py::test_value_governance_commit_is_published_before_finalization_failure; "
+        "tests/test_fastapi_backend.py::test_finalization_failure_preserves_internal_commit_without_restore",
     ),
     (
         "F11",
@@ -52,7 +60,14 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F12",
-        "tests/test_agent_state.py::test_v5_noncanonical_value_order_fails_closed_without_rewrite",
+        "tests/test_agent_state.py::test_v5_noncanonical_value_order_fails_closed_without_rewrite; "
+        "tests/test_agent_state.py::test_v5_origin_witness_rejects_provenance_tampering_without_rewrite; "
+        "tests/test_agent_state.py::test_current_schema_rejects_unknown_root_and_nested_fields; "
+        "tests/test_agent_state.py::test_existing_corrupt_snapshot_never_defaults_or_changes; "
+        "tests/test_state_wal.py::test_future_record_version_is_rejected; "
+        "tests/test_value_system.py::test_restore_rejects_current_history_and_ledger_inconsistency; "
+        "tests/test_value_system.py::test_restore_rejects_surplus_ledger_ref_with_exact_digest_witness; "
+        "tests/test_value_system.py::test_revision_history_rejects_broken_state_continuity",
     ),
     (
         "F13",
@@ -61,7 +76,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     (
         "F14",
         "tests/test_prompt_builder.py::test_build_renders_bounded_active_value_projection_deterministically; "
-        "tests/test_fastapi_backend.py::test_values_api_reads_are_pure_and_governance_is_runtime_bound",
+        "tests/test_fastapi_backend.py::test_values_api_reads_are_pure_and_governance_is_runtime_bound; "
+        "tests/test_agent_state.py::test_v5_canonical_snapshot_contains_value_authority_but_no_prompt_or_independent_store_data",
     ),
     (
         "F15",
@@ -87,3 +103,24 @@ def test_r11_f_matrix_is_complete_and_explicit() -> None:
         f"F{index}" for index in range(1, 19)
     )
     assert all(reference for _item, reference in R11_F_MATRIX)
+
+
+def test_r11_f_matrix_references_existing_test_evidence() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    for requirement, references in R11_F_MATRIX:
+        for reference in references.split("; "):
+            if "::" not in reference:
+                continue
+            test_path, test_name = reference.split("::", 1)
+            path = repository_root / test_path
+            assert path.is_file(), f"{requirement} references missing file {test_path}"
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            names = {
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            assert test_name in names, (
+                f"{requirement} references missing test "
+                f"{test_path}::{test_name}"
+            )

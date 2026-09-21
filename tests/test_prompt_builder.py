@@ -2,10 +2,10 @@
 
 from kagya.body import EmotionState
 from kagya.identity import (
-    ValueAdmissionStatus,
-    ValuePromptEntry,
+    ValueSeedDeclaration,
     ValuePromptView,
     ValueScope,
+    ValueSystem,
 )
 from kagya.persona import PromptBuilder
 from kagya.runtime import (
@@ -103,21 +103,24 @@ def test_build_is_purely_repeatable() -> None:
 
 
 def test_build_renders_bounded_active_value_projection_deterministically() -> None:
-    value_view = ValuePromptView(
+    value_view = ValueSystem.from_seed_declarations(
         (
-            ValuePromptEntry(
+            ValueSeedDeclaration(
                 value_id="care",
                 name="care",
                 concept="Protect wellbeing.",
-                polarity=1,
-                strength=0.8,
-                confidence=0.9,
-                authority_class=ValueAdmissionStatus.SYSTEM_AUTHORIZED,
                 scope=ValueScope.SUBJECT,
+                context_ids=(),
+                polarity=1,
+                initial_strength=0.8,
+                confidence=0.9,
+                stability=0.0,
+                protectedness=0.0,
+                negotiability=1.0,
+                allowed_update_rate=0.1,
             ),
-        ),
-        context_id="conversation-default",
-    )
+        )
+    ).prompt_view("conversation-default")
 
     prompt = PromptBuilder().build(
         "hello",
