@@ -18,7 +18,7 @@ from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEvent
 from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
+    AgentStateSnapshotV4,
     AgentStateSnapshotV3,
     AppraisalStateSnapshot,
     AgentStateSnapshotV2,
@@ -257,7 +257,7 @@ def context_snapshot(
     *,
     first_status: str = "active",
     current_context_id: str | None = "context-a",
-) -> AgentStateSnapshot:
+) -> AgentStateSnapshotV4:
     first = ContextFrameSnapshot(
         context_id="context-a",
         context_type="conversation",
@@ -286,7 +286,7 @@ def context_snapshot(
         started_at=NOW,
         last_active_at=NOW,
     )
-    return AgentStateSnapshot(
+    return AgentStateSnapshotV4(
         saved_at=NOW,
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
@@ -310,7 +310,7 @@ def context_snapshot(
     )
 
 
-def retained_v3(snapshot: AgentStateSnapshot) -> AgentStateSnapshotV3:
+def retained_v3(snapshot: AgentStateSnapshotV4) -> AgentStateSnapshotV3:
     return AgentStateSnapshotV3(
         saved_at=snapshot.saved_at,
         last_processed_event_sequence=snapshot.last_processed_event_sequence,
@@ -327,7 +327,7 @@ def v4_with_appraisal(
     mean: float,
     m2: float,
     updated_at: datetime,
-) -> AgentStateSnapshot:
+) -> AgentStateSnapshotV4:
     return context_snapshot(sequence).model_copy(
         update={
             "appraisal_state": AppraisalStateSnapshot(
@@ -1982,7 +1982,7 @@ def test_true_rollback_from_v4_to_older_v4_restores_exact_appraisal_state(
     rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
     assert rolled_back.snapshot == older
-    assert isinstance(rolled_back.snapshot, AgentStateSnapshot)
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV4)
     assert rolled_back.snapshot.appraisal_state == older.appraisal_state
     assert rolled_back.processing_high_water == 5
     assert rolled_back.true_rollback_performed

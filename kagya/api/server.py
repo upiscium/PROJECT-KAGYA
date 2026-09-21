@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep
 from kagya.config import Settings, get_settings
+from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
@@ -64,11 +65,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 app.state.event_journal = existing_journal
 
+            configured_value_seeds = tuple(
+                seed.to_declaration() for seed in app_settings.values.seeds
+            )
+            configured_value_conflicts = tuple(
+                ValueConflictDefinition(
+                    left_value_id=conflict.left_value_id,
+                    right_value_id=conflict.right_value_id,
+                )
+                for conflict in app_settings.values.conflicts
+            )
             app.state.agent_state_store = getattr(
                 app.state, "agent_state_store", None
             ) or AgentStateStore(
                 app_settings.agent_state.path,
                 app_settings.emotion.baseline_surprisal,
+            )
+            app.state.agent_state_store.configure_value_contract(
+                configured_value_seeds, configured_value_conflicts
             )
             app.state.state_wal = getattr(app.state, "state_wal", None) or StateWAL(
                 app_settings.state_wal.directory

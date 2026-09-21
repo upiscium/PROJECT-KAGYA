@@ -14,6 +14,7 @@ import yaml
 from kagya.body import EmotionEngineAllostasis, EmotionState
 from kagya.cognition import LossCalibration
 from kagya.config import Settings, load_settings
+from kagya.identity import ValueSystem
 from kagya.memory import DualMemorySystem, MemoryRecordType
 from kagya.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
@@ -63,6 +64,7 @@ def capture_loop(memory: WorkingMemory) -> SimpleNamespace:
         emotion_engine=EmotionEngineAllostasis(EmotionState()),
         working_memory=memory,
         context_registry=ContextRegistry(clock=lambda: NOW),
+        value_system=ValueSystem(),
         loss_calibration=LossCalibration(
             (MODEL_KEY,),
             initial_baseline=1.0,

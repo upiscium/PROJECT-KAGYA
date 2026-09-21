@@ -29,6 +29,7 @@ from kagya.identity.value_system import (
     ValueSystem,
     canonical_seed_payload,
     canonical_value_state_payload,
+    evidence_ledger_digest,
     recompute_revision_record_digest,
     recompute_seed_contract_digest,
     validate_revision_record_digest,
@@ -309,6 +310,42 @@ def test_system_value_can_evolve_without_rewriting_seed_digest() -> None:
     assert bootstrap.seed_contract_digest == learned.seed_contract_digest == seed_digest
     assert bootstrap.strength != learned.strength
     assert bootstrap.confidence != learned.confidence
+
+
+def test_from_seed_declarations_is_deterministic_and_preserves_seed_lineage() -> None:
+    care = _seed(value_id="care", name="care")
+    honesty = _seed(
+        value_id="honesty", name="honesty", concept="Represent what is true."
+    )
+    conflicts = (ValueConflictDefinition("care", "honesty"),)
+
+    first = ValueSystem.from_seed_declarations((honesty, care), conflicts)
+    second = ValueSystem.from_seed_declarations((care, honesty), conflicts)
+
+    assert first.values == second.values
+    assert first.conflicts == conflicts
+    for seed in (care, honesty):
+        value = first.get(seed.value_id)
+        assert value.seed_contract_digest == recompute_seed_contract_digest(seed)
+        assert value.origin.actor is OriginActor.SYSTEM
+        assert value.origin.input_kind is OriginInputKind.CONFIG_SEED
+        assert value.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED
+        assert value.origin.source_ref == f"config-seed:{seed.value_id}"
+        assert value.origin.event_id is None
+        assert value.origin.event_sequence is None
+        assert value.revision == 0
+        assert not value.frozen
+        assert value.opposition_count == 0
+        assert value.evidence_refs == ()
+        assert first.applied_evidence(seed.value_id) == ()
+
+
+def test_from_seed_declarations_uses_domain_authority_for_conflict_ids() -> None:
+    with pytest.raises(ValueDomainError):
+        ValueSystem.from_seed_declarations(
+            (_seed(value_id="care"),),
+            (ValueConflictDefinition("care", "honesty"),),
+        )
 
 
 @pytest.mark.parametrize(
@@ -736,10 +773,12 @@ def test_restore_reconstructs_revision_history_and_exact_ledger_without_replay()
         conflicts=source.conflicts,
         histories=source.histories,
         evidence_ledgers=source.evidence_ledgers,
+        evidence_ledger_digests=source.evidence_ledger_digests,
     )
     assert restored.values == source.values
     assert restored.histories == source.histories
     assert restored.evidence_ledgers == source.evidence_ledgers
+    assert restored.evidence_ledger_digests == source.evidence_ledger_digests
     replay = restored.apply_update(
         _admission(
             event_id="restore-replay",
@@ -838,6 +877,32 @@ def test_restore_rejects_current_history_and_ledger_inconsistency() -> None:
         evidence_ledgers=long_source.evidence_ledgers,
     )
     assert historical_ref in valid.applied_evidence("value-1")
+
+
+def test_restore_rejects_surplus_ledger_ref_with_exact_digest_witness() -> None:
+    source = _restorable_system(33)
+    refs = tuple(sorted((*source.applied_evidence("value-1"), "surplus-ref")))
+    with pytest.raises(ValueDomainError):
+        ValueSystem.restore(
+            values=source.value_map,
+            conflicts=(),
+            histories=source.histories,
+            evidence_ledgers={"value-1": refs},
+            evidence_ledger_digests=source.evidence_ledger_digests,
+        )
+
+    assert evidence_ledger_digest("value-1", refs) != source.evidence_ledger_digests[
+        "value-1"
+    ]
+
+
+def test_value_system_snapshot_round_trip_is_replay_free() -> None:
+    source = _restorable_system(33)
+    restored = ValueSystem.restore_snapshot(source.snapshot())
+    assert restored.values == source.values
+    assert restored.histories == source.histories
+    assert restored.evidence_ledgers == source.evidence_ledgers
+    assert restored.evidence_ledger_digests == source.evidence_ledger_digests
 
 
 def test_revision_history_rejects_broken_state_continuity() -> None:

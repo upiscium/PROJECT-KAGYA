@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from kagya.api.server import create_app
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.config import Settings, load_settings
+from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
@@ -700,7 +701,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 4
+        assert upgraded.schema_version == 5
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -784,7 +785,7 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 4
+        assert upgraded.schema_version == 5
         assert len(upgraded.appraisal_state.calibration_entries) == 1
         assert upgraded.appraisal_state.calibration_entries[0].count == 1
         assert (
@@ -1927,6 +1928,14 @@ def test_journal_continuity_is_checked_before_v0_snapshot_rewrite(
     store = AgentStateStore(
         settings.agent_state.path,
         settings.emotion.baseline_surprisal,
+        value_seeds=tuple(seed.to_declaration() for seed in settings.values.seeds),
+        value_conflicts=tuple(
+            ValueConflictDefinition(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in settings.values.conflicts
+        ),
         clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
     journal = EventJournal(
@@ -1961,6 +1970,14 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
     store = AgentStateStore(
         settings.agent_state.path,
         settings.emotion.baseline_surprisal,
+        value_seeds=tuple(seed.to_declaration() for seed in settings.values.seeds),
+        value_conflicts=tuple(
+            ValueConflictDefinition(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in settings.values.conflicts
+        ),
         clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
     migrated = store.load()
@@ -1982,7 +1999,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 4
+        == 5
     )
 
 
@@ -2781,7 +2798,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 4
+        assert snapshot.schema_version == 5
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )

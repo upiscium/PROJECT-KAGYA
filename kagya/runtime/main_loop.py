@@ -18,6 +18,7 @@ from kagya.cognition import (
     model_key,
 )
 from kagya.config import Settings
+from kagya.identity import ValueConflictDefinition, ValueSystem
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
 from kagya.persona import (
@@ -114,6 +115,7 @@ class KagyaMainLoop:
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
         context_registry: ContextRegistry | None = None,
+        value_system: ValueSystem | None = None,
     ) -> None:
         from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
@@ -174,6 +176,22 @@ class KagyaMainLoop:
         self.context_registry = (
             context_registry if context_registry is not None else ContextRegistry()
         )
+        configured_seeds = tuple(seed.to_declaration() for seed in settings.values.seeds)
+        configured_conflicts = tuple(
+            ValueConflictDefinition(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in settings.values.conflicts
+        )
+        if value_system is None:
+            self.value_system = ValueSystem.from_seed_declarations(
+                configured_seeds, configured_conflicts
+            )
+        else:
+            if not isinstance(value_system, ValueSystem):
+                raise TypeError("value_system must be ValueSystem")
+            self.value_system = value_system
 
     def chat(
         self,

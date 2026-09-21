@@ -29,6 +29,24 @@ from kagya.cognition.surprisal_calculator import (
     CalibrationEntry,
     LossCalibration,
 )
+from kagya.identity.origin import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    ValueAdmissionStatus,
+)
+from kagya.identity.value_system import (
+    ValueConflictDefinition,
+    ValueDomainError,
+    ValueRevisionHistory,
+    ValueRevisionOperation,
+    ValueRevisionRecord,
+    ValueSeedDeclaration,
+    ValueScope,
+    ValueState,
+    ValueSystem,
+    recompute_seed_contract_digest,
+)
 from kagya.privacy import normalize_private_key
 from kagya.runtime.context import (
     ContextFrame,
@@ -51,7 +69,7 @@ if TYPE_CHECKING:
     from kagya.runtime.main_loop import KagyaMainLoop
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[4] = 4
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[5] = 5
 
 
 class _StateModel(BaseModel):
@@ -427,10 +445,204 @@ class AppraisalStateSnapshot(_StateModel):
         return self
 
 
-class AgentStateSnapshot(_AgentStateSnapshotBase):
-    """Current AgentState v4 canonical snapshot."""
+class IdentityOriginSnapshot(_StateModel):
+    """Strict durable projection of one Value provenance record."""
 
-    schema_version: Literal[4] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    actor: Literal[
+        "self",
+        "user",
+        "operator",
+        "system",
+        "external_source",
+        "model_inference",
+        "inherited",
+        "unknown",
+    ]
+    input_kind: Literal[
+        "internal_state",
+        "request",
+        "suggestion",
+        "constraint",
+        "feedback",
+        "evidence",
+        "config_seed",
+        "legacy",
+    ]
+    admission: Literal[
+        "pending",
+        "self_endorsed",
+        "system_authorized",
+        "rejected",
+        "uncertain",
+    ]
+    source_ref: str | None
+    event_id: str | None
+    context_id: str | None
+    event_sequence: int | None
+    confidence: float
+
+    @field_validator("confidence")
+    @classmethod
+    def require_finite_confidence(cls, value: float) -> float:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("Value origin confidence must be finite and bounded")
+        return value
+
+    @field_validator("event_sequence", mode="before")
+    @classmethod
+    def reject_boolean_event_sequence(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Value origin event_sequence must be an integer")
+        return value
+
+
+class ValueStateSnapshot(_StateModel):
+    """Strict durable projection of one complete current Value state."""
+
+    value_id: str
+    revision: int = Field(ge=0)
+    name: str
+    concept: str | None
+    scope: Literal["subject", "context"]
+    context_ids: tuple[str, ...]
+    polarity: int
+    strength: float
+    confidence: float
+    stability: float
+    protectedness: float
+    negotiability: float
+    allowed_update_rate: float
+    frozen: bool
+    origin: IdentityOriginSnapshot
+    evidence_refs: tuple[str, ...]
+    seed_contract_digest: str | None
+    opposition_count: int = Field(ge=0, le=6)
+
+    @field_validator("context_ids", "evidence_refs", mode="before")
+    @classmethod
+    def parse_value_lists(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator(
+        "strength",
+        "confidence",
+        "stability",
+        "protectedness",
+        "negotiability",
+        "allowed_update_rate",
+    )
+    @classmethod
+    def require_finite_value(cls, value: float) -> float:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("Value scalar must be finite and bounded")
+        return value
+
+    @field_validator("revision", "opposition_count", mode="before")
+    @classmethod
+    def reject_boolean_value_integer(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Value integer fields must be integers")
+        return value
+
+
+class ValueConflictSnapshot(_StateModel):
+    left_value_id: str
+    right_value_id: str
+
+
+class ValueRevisionRecordSnapshot(_StateModel):
+    """Strict durable projection of one immutable Value revision record."""
+
+    value_id: str
+    from_revision: int
+    to_revision: int
+    before_digest: str
+    after_state_projection: ValueStateSnapshot
+    after_digest: str
+    operation: Literal["admission", "update", "freeze", "unfreeze", "rollback"]
+    origin_id: str
+    evidence_refs: tuple[str, ...]
+    event_id: str
+    event_sequence: int
+    recorded_at: datetime
+    previous_record_digest: str | None
+    target_revision: int | None
+    record_digest: str
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def parse_record_refs(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("recorded_at", mode="before")
+    @classmethod
+    def parse_record_timestamp(cls, value: object) -> object:
+        return _parse_context_timestamp(value)
+
+    @field_validator("recorded_at")
+    @classmethod
+    def require_record_utc(cls, value: datetime) -> datetime:
+        return _require_context_utc(value)
+
+    @field_validator(
+        "from_revision", "to_revision", "event_sequence", "target_revision", mode="before"
+    )
+    @classmethod
+    def reject_boolean_record_integer(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Value revision fields must be integers")
+        return value
+
+
+class ValueRevisionHistorySnapshot(_StateModel):
+    value_id: str
+    history_anchor_revision: int | None
+    history_anchor_digest: str | None
+    history_anchor_state_digest: str | None
+    records: tuple[ValueRevisionRecordSnapshot, ...]
+
+    @field_validator("records", mode="before")
+    @classmethod
+    def parse_history_records(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("history_anchor_revision", mode="before")
+    @classmethod
+    def reject_boolean_anchor_revision(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("history_anchor_revision must be an integer")
+        return value
+
+
+class ValueEvidenceLedgerSnapshot(_StateModel):
+    value_id: str
+    evidence_refs: tuple[str, ...]
+    ledger_digest: str
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def parse_ledger_refs(cls, value: object) -> object:
+        return _tuple_value(value)
+
+
+class ValueSystemStateSnapshot(_StateModel):
+    """Complete durable Value authority embedded in AgentState v5."""
+
+    schema_version: Literal[1] = 1
+    values: tuple[ValueStateSnapshot, ...]
+    conflicts: tuple[ValueConflictSnapshot, ...]
+    histories: tuple[ValueRevisionHistorySnapshot, ...]
+    evidence_ledgers: tuple[ValueEvidenceLedgerSnapshot, ...]
+
+    @field_validator("values", "conflicts", "histories", "evidence_ledgers", mode="before")
+    @classmethod
+    def parse_value_snapshot_lists(cls, value: object) -> object:
+        return _tuple_value(value)
+
+class AgentStateSnapshotV4(_AgentStateSnapshotBase):
+    """Exact retained R10 canonical AgentState v4 schema."""
+
+    schema_version: Literal[4] = 4
     working_memory: WorkingMemorySnapshot
     context_state: ContextStateSnapshot
     appraisal_state: AppraisalStateSnapshot
@@ -443,11 +655,34 @@ class AgentStateSnapshot(_AgentStateSnapshotBase):
         return value.astimezone(timezone.utc)
 
 
+class AgentStateSnapshotV5(_AgentStateSnapshotBase):
+    """Current AgentState v5 with complete Value authority continuity."""
+
+    schema_version: Literal[5] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+    appraisal_state: AppraisalStateSnapshot
+    value_state: ValueSystemStateSnapshot
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+
+# The unqualified name denotes the current schema; retained callers should use
+# AgentStateSnapshotV4 when they intentionally construct the exact v4 shape.
+AgentStateSnapshot = AgentStateSnapshotV5
+
+
 CompatibleAgentStateSnapshot = Annotated[
     AgentStateSnapshotV1
     | AgentStateSnapshotV2
     | AgentStateSnapshotV3
-    | AgentStateSnapshot,
+    | AgentStateSnapshotV4
+    | AgentStateSnapshotV5,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -495,6 +730,10 @@ class AgentStateError(Exception):
 
 class AgentStateLoadError(AgentStateError):
     """The canonical snapshot exists but cannot be loaded safely."""
+
+
+class AgentStateConfigurationDrift(AgentStateLoadError):
+    """Persisted Value seed/configuration evidence no longer matches settings."""
 
 
 class UnsupportedAgentStateVersion(AgentStateLoadError):
@@ -564,14 +803,214 @@ def _reject_private_keys(value: object) -> None:
             _reject_private_keys(child)
 
 
+def _origin_snapshot(origin: IdentityOrigin) -> IdentityOriginSnapshot:
+    return IdentityOriginSnapshot(
+        actor=origin.actor.value,
+        input_kind=origin.input_kind.value,
+        admission=origin.admission.value,
+        source_ref=origin.source_ref,
+        event_id=origin.event_id,
+        context_id=origin.context_id,
+        event_sequence=origin.event_sequence,
+        confidence=origin.confidence,
+    )
+
+
+def _value_snapshot(value: ValueState) -> ValueStateSnapshot:
+    return ValueStateSnapshot(
+        value_id=value.value_id,
+        revision=value.revision,
+        name=value.name,
+        concept=value.concept,
+        scope=value.scope.value,
+        context_ids=value.context_ids,
+        polarity=value.polarity,
+        strength=value.strength,
+        confidence=value.confidence,
+        stability=value.stability,
+        protectedness=value.protectedness,
+        negotiability=value.negotiability,
+        allowed_update_rate=value.allowed_update_rate,
+        frozen=value.frozen,
+        origin=_origin_snapshot(value.origin),
+        evidence_refs=value.evidence_refs,
+        seed_contract_digest=value.seed_contract_digest,
+        opposition_count=value.opposition_count,
+    )
+
+
+def _revision_record_snapshot(record: ValueRevisionRecord) -> ValueRevisionRecordSnapshot:
+    return ValueRevisionRecordSnapshot(
+        value_id=record.value_id,
+        from_revision=record.from_revision,
+        to_revision=record.to_revision,
+        before_digest=record.before_digest,
+        after_state_projection=_value_snapshot(record.after_state_projection),
+        after_digest=record.after_digest,
+        operation=record.operation.value,
+        origin_id=record.origin_id,
+        evidence_refs=record.evidence_refs,
+        event_id=record.event_id,
+        event_sequence=record.event_sequence,
+        recorded_at=record.recorded_at,
+        previous_record_digest=record.previous_record_digest,
+        target_revision=record.target_revision,
+        record_digest=record.record_digest,
+    )
+
+
+def _history_snapshot(history: ValueRevisionHistory) -> ValueRevisionHistorySnapshot:
+    return ValueRevisionHistorySnapshot(
+        value_id=history.value_id,
+        history_anchor_revision=history.history_anchor_revision,
+        history_anchor_digest=history.history_anchor_digest,
+        history_anchor_state_digest=history.history_anchor_state_digest,
+        records=tuple(_revision_record_snapshot(record) for record in history.records),
+    )
+
+
+def _value_state_snapshot(system: ValueSystem) -> ValueSystemStateSnapshot:
+    snapshot = system.snapshot()
+    digests = dict(snapshot.evidence_ledger_digests)
+    return ValueSystemStateSnapshot(
+        schema_version=1,
+        values=tuple(_value_snapshot(value) for value in snapshot.values),
+        conflicts=tuple(
+            ValueConflictSnapshot(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in snapshot.conflicts
+        ),
+        histories=tuple(_history_snapshot(history) for history in snapshot.histories),
+        evidence_ledgers=tuple(
+            ValueEvidenceLedgerSnapshot(
+                value_id=value_id,
+                evidence_refs=ledger,
+                ledger_digest=digests[value_id],
+            )
+            for value_id, ledger in snapshot.evidence_ledgers
+        ),
+    )
+
+
+def _identity_origin(snapshot: IdentityOriginSnapshot) -> IdentityOrigin:
+    return IdentityOrigin(
+        OriginActor(snapshot.actor),
+        OriginInputKind(snapshot.input_kind),
+        ValueAdmissionStatus(snapshot.admission),
+        source_ref=snapshot.source_ref,
+        event_id=snapshot.event_id,
+        context_id=snapshot.context_id,
+        event_sequence=snapshot.event_sequence,
+        confidence=snapshot.confidence,
+    )
+
+
+def _domain_value(snapshot: ValueStateSnapshot) -> ValueState:
+    return ValueState(
+        value_id=snapshot.value_id,
+        revision=snapshot.revision,
+        name=snapshot.name,
+        concept=snapshot.concept,
+        scope=ValueScope(snapshot.scope),
+        context_ids=snapshot.context_ids,
+        polarity=snapshot.polarity,
+        strength=snapshot.strength,
+        confidence=snapshot.confidence,
+        stability=snapshot.stability,
+        protectedness=snapshot.protectedness,
+        negotiability=snapshot.negotiability,
+        allowed_update_rate=snapshot.allowed_update_rate,
+        frozen=snapshot.frozen,
+        origin=_identity_origin(snapshot.origin),
+        evidence_refs=snapshot.evidence_refs,
+        seed_contract_digest=snapshot.seed_contract_digest,
+        opposition_count=snapshot.opposition_count,
+    )
+
+
+def _domain_record(snapshot: ValueRevisionRecordSnapshot) -> ValueRevisionRecord:
+    record = ValueRevisionRecord(
+        value_id=snapshot.value_id,
+        from_revision=snapshot.from_revision,
+        to_revision=snapshot.to_revision,
+        before_digest=snapshot.before_digest,
+        after_state_projection=_domain_value(snapshot.after_state_projection),
+        after_digest=snapshot.after_digest,
+        operation=ValueRevisionOperation(snapshot.operation),
+        origin_id=snapshot.origin_id,
+        evidence_refs=snapshot.evidence_refs,
+        event_id=snapshot.event_id,
+        event_sequence=snapshot.event_sequence,
+        recorded_at=snapshot.recorded_at,
+        previous_record_digest=snapshot.previous_record_digest,
+        target_revision=snapshot.target_revision,
+    )
+    if record.record_digest != snapshot.record_digest:
+        raise ValueDomainError("revision record digest does not match persisted record")
+    return record
+
+
+def _domain_history(snapshot: ValueRevisionHistorySnapshot) -> ValueRevisionHistory:
+    return ValueRevisionHistory(
+        value_id=snapshot.value_id,
+        history_anchor_revision=snapshot.history_anchor_revision,
+        history_anchor_digest=snapshot.history_anchor_digest,
+        history_anchor_state_digest=snapshot.history_anchor_state_digest,
+        records=tuple(_domain_record(record) for record in snapshot.records),
+    )
+
+
+def _domain_value_system(snapshot: ValueSystemStateSnapshot) -> ValueSystem:
+    try:
+        values = {_value.value_id: _domain_value(_value) for _value in snapshot.values}
+        histories = {
+            _history.value_id: _domain_history(_history)
+            for _history in snapshot.histories
+        }
+        ledgers = {
+            ledger.value_id: ledger.evidence_refs
+            for ledger in snapshot.evidence_ledgers
+        }
+        ledger_digests = {
+            ledger.value_id: ledger.ledger_digest
+            for ledger in snapshot.evidence_ledgers
+        }
+        if len(values) != len(snapshot.values):
+            raise ValueDomainError("Value snapshot contains duplicate Value IDs")
+        if len(histories) != len(snapshot.histories):
+            raise ValueDomainError("Value snapshot contains duplicate history IDs")
+        if len(ledgers) != len(snapshot.evidence_ledgers):
+            raise ValueDomainError("Value snapshot contains duplicate ledger IDs")
+        conflicts = tuple(
+            ValueConflictDefinition(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in snapshot.conflicts
+        )
+        return ValueSystem.restore(
+            values=values,
+            conflicts=conflicts,
+            histories=histories,
+            evidence_ledgers=ledgers,
+            evidence_ledger_digests=ledger_digests,
+        )
+    except Exception:
+        raise AgentStateLoadError("ValueSystem snapshot is invalid") from None
+
+
 def default_agent_state_snapshot(
     baseline_surprisal: float,
     *,
     saved_at: datetime | None = None,
-) -> AgentStateSnapshot:
+    value_system: ValueSystem | None = None,
+) -> AgentStateSnapshotV5:
     """Return the bootstrap state used only when the canonical file is absent."""
 
-    return AgentStateSnapshot(
+    system = value_system if value_system is not None else ValueSystem()
+    return AgentStateSnapshotV5(
         saved_at=saved_at or datetime.now(timezone.utc),
         last_processed_event_sequence=0,
         emotion_state=EmotionStateSnapshot(
@@ -589,6 +1028,7 @@ def default_agent_state_snapshot(
         appraisal_state=AppraisalStateSnapshot(
             calibration_entries=(), last_emotion_update_at=None
         ),
+        value_state=_value_state_snapshot(system),
     )
 
 
@@ -600,13 +1040,54 @@ class AgentStateStore:
         path: str | Path,
         baseline_surprisal: float,
         *,
+        value_seeds: tuple[ValueSeedDeclaration, ...] = (),
+        value_conflicts: tuple[ValueConflictDefinition, ...] = (),
         clock: Callable[[], datetime] | None = None,
         save_stage_hook: Callable[[AgentStateSaveStage], None] | None = None,
     ) -> None:
         self.path = Path(path)
         self._baseline_surprisal = baseline_surprisal
+        self._value_seeds: tuple[ValueSeedDeclaration, ...] = ()
+        self._value_conflicts: tuple[ValueConflictDefinition, ...] = ()
+        self._configured_value_system = ValueSystem()
+        self.configure_value_contract(value_seeds, value_conflicts)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._save_stage_hook = save_stage_hook
+
+    @property
+    def configured_value_system(self) -> ValueSystem:
+        """Return a fresh configured baseline for legacy/fresh startup."""
+
+        return ValueSystem.restore_snapshot(self._configured_value_system.snapshot())
+
+    def configure_value_contract(
+        self,
+        value_seeds: tuple[ValueSeedDeclaration, ...],
+        value_conflicts: tuple[ValueConflictDefinition, ...],
+    ) -> None:
+        """Bind immutable configuration evidence before loading durable state."""
+
+        seeds = tuple(value_seeds)
+        conflicts = tuple(value_conflicts)
+        if any(not isinstance(seed, ValueSeedDeclaration) for seed in seeds):
+            raise TypeError("value_seeds must contain ValueSeedDeclaration values")
+        if any(not isinstance(conflict, ValueConflictDefinition) for conflict in conflicts):
+            raise TypeError(
+                "value_conflicts must contain ValueConflictDefinition values"
+            )
+        conflicts = tuple(
+            sorted(
+                conflicts,
+                key=lambda conflict: (
+                    conflict.left_value_id,
+                    conflict.right_value_id,
+                ),
+            )
+        )
+        configured = ValueSystem.from_seed_declarations(seeds, conflicts)
+        self._value_seeds = seeds
+        self._value_conflicts = conflicts
+        self._configured_value_system = configured
 
     def snapshot_exists(self) -> bool:
         """Inspect canonical snapshot presence without following its final path."""
@@ -628,7 +1109,9 @@ class AgentStateStore:
         except FileNotFoundError:
             try:
                 return default_agent_state_snapshot(
-                    self._baseline_surprisal, saved_at=self._now()
+                    self._baseline_surprisal,
+                    saved_at=self._now(),
+                    value_system=self.configured_value_system,
                 )
             except Exception:
                 inspection_failure = AgentStateLoadError("AgentState bootstrap failed")
@@ -704,11 +1187,27 @@ class AgentStateStore:
                 raise AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
                 ) from None
+        if version == 4:
+            try:
+                return AgentStateSnapshotV4.model_validate(raw)
+            except ValidationError:
+                raise AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                ) from None
         if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
             schema_failure = None
             try:
-                return AgentStateSnapshot.model_validate(raw)
+                loaded = AgentStateSnapshotV5.model_validate(raw)
+                self._validate_value_configuration(loaded)
+                _domain_value_system(loaded.value_state)
+                return loaded
             except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            except AgentStateLoadError:
+                raise
+            except Exception:
                 schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
                 )
@@ -720,6 +1219,26 @@ class AgentStateStore:
                 "AgentState schema version is unsupported"
             )
         raise AgentStateLoadError("AgentState schema version is invalid")
+
+    def _validate_value_configuration(self, snapshot: AgentStateSnapshotV5) -> None:
+        """Check configuration as compatibility evidence, never as overwrite authority."""
+
+        if not self._value_seeds and not self._value_conflicts:
+            return
+        persisted = {value.value_id: value for value in snapshot.value_state.values}
+        for seed in self._value_seeds:
+            value = persisted.get(seed.value_id)
+            if value is None:
+                # A newly declared seed is not adopted into an existing snapshot.
+                continue
+            if value.origin.admission != ValueAdmissionStatus.SYSTEM_AUTHORIZED.value:
+                raise AgentStateConfigurationDrift(
+                    "Value configuration collides with persisted non-system state"
+                )
+            if value.seed_contract_digest != recompute_seed_contract_digest(seed):
+                raise AgentStateConfigurationDrift(
+                    "Persisted system Value seed declaration has drifted"
+                )
 
     def save(self, snapshot: CompatibleAgentStateSnapshot) -> None:
         stage = AgentStateSaveStage.TEMP_WRITE
@@ -783,7 +1302,12 @@ class AgentStateStore:
             raw: object = snapshot.model_dump(mode="python")
             _reject_private_keys(raw)
             validated = validate_compatible_agent_state_snapshot(raw)
+            if isinstance(validated, AgentStateSnapshotV5):
+                self._validate_value_configuration(validated)
+                _domain_value_system(validated.value_state)
             return self._canonical_bytes(validated)
+        except (AgentStateConfigurationDrift, AgentStateLoadError):
+            raise
         except Exception:
             canonical_failure = AgentStateSaveError(
                 AgentStateSaveStage.CAPTURE, published=False
@@ -802,7 +1326,12 @@ class AgentStateStore:
             preserve_legacy = (
                 isinstance(
                     snapshot,
-                    (AgentStateSnapshotV1, AgentStateSnapshotV2, AgentStateSnapshotV3),
+                    (
+                        AgentStateSnapshotV1,
+                        AgentStateSnapshotV2,
+                        AgentStateSnapshotV3,
+                        AgentStateSnapshotV4,
+                    ),
                 )
                 and self.snapshot_exists()
             )
@@ -857,7 +1386,9 @@ class AgentStateStore:
             raise inspection_failure
         self.save(snapshot)
 
-    def capture(self, main_loop: KagyaMainLoop, sequence: int) -> AgentStateSnapshot:
+    def capture(
+        self, main_loop: KagyaMainLoop, sequence: int
+    ) -> AgentStateSnapshotV5:
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion_engine = getattr(main_loop, "emotion_engine", None)
@@ -890,7 +1421,10 @@ class AgentStateStore:
             temporal = getattr(emotion_engine, "temporal_state")
             if not isinstance(temporal, EmotionTemporalState):
                 raise ValueError("Emotion temporal authority is malformed")
-            return AgentStateSnapshot(
+            value_system = getattr(main_loop, "value_system", None)
+            if not isinstance(value_system, ValueSystem):
+                raise ValueError("Value authority is unavailable")
+            common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
                 emotion_state=EmotionStateSnapshot(
@@ -956,6 +1490,10 @@ class AgentStateStore:
                     last_emotion_update_at=temporal.last_update_at,
                 ),
             )
+            return AgentStateSnapshotV5(
+                **common,
+                value_state=_value_state_snapshot(value_system),
+            )
         except Exception:
             capture_failure = AgentStateSaveError(
                 AgentStateSaveStage.CAPTURE, published=False
@@ -974,12 +1512,20 @@ class AgentStateStore:
         previous_context: ContextRegistryState | None = None
         previous_calibration: tuple[CalibrationEntry, ...] | None = None
         previous_temporal: EmotionTemporalState | None = None
+        previous_value_system: ValueSystem | None = None
+        value_system_authority: ValueSystem | None = None
+        value_system_was_present = False
         emotion_engine: EmotionEngineAllostasis | None = None
         working_memory_authority: WorkingMemory | None = None
         try:
             validated = validate_compatible_agent_state_snapshot(
                 snapshot.model_dump(mode="python")
             )
+            if isinstance(validated, AgentStateSnapshotV5):
+                self._validate_value_configuration(validated)
+                restored_value_system = _domain_value_system(validated.value_state)
+            else:
+                restored_value_system = self.configured_value_system
             emotion_engine = getattr(main_loop, "emotion_engine", None)
             if not isinstance(emotion_engine, EmotionEngineAllostasis):
                 raise AgentStateLoadError("AgentState restore requires EmotionEngine")
@@ -991,7 +1537,12 @@ class AgentStateStore:
                 validated.working_memory
                 if isinstance(
                     validated,
-                    (AgentStateSnapshotV2, AgentStateSnapshotV3, AgentStateSnapshot),
+                    (
+                        AgentStateSnapshotV2,
+                        AgentStateSnapshotV3,
+                        AgentStateSnapshotV4,
+                        AgentStateSnapshotV5,
+                    ),
                 )
                 else WorkingMemorySnapshot(revision=0, items=())
             )
@@ -1002,7 +1553,10 @@ class AgentStateStore:
                 raise AgentStateLoadError("AgentState restore requires ContextRegistry")
             context_state = (
                 validated.context_state.to_registry_state()
-                if isinstance(validated, (AgentStateSnapshotV3, AgentStateSnapshot))
+                if isinstance(
+                    validated,
+                    (AgentStateSnapshotV3, AgentStateSnapshotV4, AgentStateSnapshotV5),
+                )
                 else ContextRegistryState(0, None, (), ())
             )
             validate_context_registry_state(context_state)
@@ -1011,7 +1565,7 @@ class AgentStateStore:
                 raise AgentStateLoadError("AgentState restore requires LossCalibration")
             appraisal = (
                 validated.appraisal_state
-                if isinstance(validated, AgentStateSnapshot)
+                if isinstance(validated, (AgentStateSnapshotV4, AgentStateSnapshotV5))
                 else AppraisalStateSnapshot(
                     calibration_entries=(), last_emotion_update_at=None
                 )
@@ -1041,10 +1595,27 @@ class AgentStateStore:
                 for item in working_memory.items
             )
             if (
-                isinstance(validated, (AgentStateSnapshotV3, AgentStateSnapshot))
+                isinstance(
+                    validated,
+                    (AgentStateSnapshotV3, AgentStateSnapshotV4, AgentStateSnapshotV5),
+                )
                 and context_registry is None
             ):
                 raise AgentStateLoadError("AgentState restore requires ContextRegistry")
+
+            current_value_system = getattr(main_loop, "value_system", None)
+            if isinstance(validated, AgentStateSnapshotV5):
+                if not isinstance(current_value_system, ValueSystem):
+                    raise AgentStateLoadError(
+                        "AgentState restore requires ValueSystem authority"
+                    )
+                value_system_authority = current_value_system
+                previous_value_system = current_value_system
+                value_system_was_present = True
+            elif isinstance(current_value_system, ValueSystem):
+                value_system_authority = current_value_system
+                previous_value_system = current_value_system
+                value_system_was_present = True
 
             previous_emotion = emotion_engine.state
             previous_working_memory_revision = working_memory_authority.revision
@@ -1061,12 +1632,16 @@ class AgentStateStore:
             if context_registry is not None:
                 context_registry.restore_exact(context_state)
             calibration.restore_exact(restored_calibration)
+            if value_system_authority is not None:
+                main_loop.value_system = restored_value_system
             emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
+        except (AgentStateConfigurationDrift, AgentStateLoadError):
+            raise
         except Exception:
             if (
                 previous_working_memory_revision is not None
@@ -1100,32 +1675,32 @@ class AgentStateStore:
                     emotion_engine.temporal_state = previous_temporal
                 except Exception:
                     pass
+            if value_system_was_present and previous_value_system is not None:
+                try:
+                    main_loop.value_system = previous_value_system
+                except Exception:
+                    pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
         if restore_failure is not None:
             raise restore_failure
 
-    def _migrate_v0(self, raw: dict[str, Any]) -> AgentStateSnapshot:
+    def _migrate_v0(self, raw: dict[str, Any]) -> AgentStateSnapshotV5:
         migration_failure: AgentStateLoadError | None = None
         try:
             legacy = _LegacyAgentStateV0.model_validate(raw)
-            return AgentStateSnapshot(
+            return default_agent_state_snapshot(
+                legacy.emotion.optimal_loss,
                 saved_at=self._now(),
-                last_processed_event_sequence=legacy.last_event_sequence,
-                emotion_state=EmotionStateSnapshot(
-                    valence=legacy.emotion.valence,
-                    arousal=legacy.emotion.arousal,
-                    optimal_loss=legacy.emotion.optimal_loss,
-                ),
-                working_memory=WorkingMemorySnapshot(revision=0, items=()),
-                context_state=ContextStateSnapshot(
-                    revision=0,
-                    current_context_id=None,
-                    frames=(),
-                    interlocutor_bindings=(),
-                ),
-                appraisal_state=AppraisalStateSnapshot(
-                    calibration_entries=(), last_emotion_update_at=None
-                ),
+                value_system=self.configured_value_system,
+            ).model_copy(
+                update={
+                    "last_processed_event_sequence": legacy.last_event_sequence,
+                    "emotion_state": EmotionStateSnapshot(
+                        valence=legacy.emotion.valence,
+                        arousal=legacy.emotion.arousal,
+                        optimal_loss=legacy.emotion.optimal_loss,
+                    ),
+                }
             )
         except Exception:
             migration_failure = AgentStateLoadError("AgentState v0 migration failed")
@@ -1143,6 +1718,8 @@ class AgentStateStore:
 
     @staticmethod
     def _canonical_bytes(snapshot: CompatibleAgentStateSnapshot) -> bytes:
+        if isinstance(snapshot, AgentStateSnapshotV5):
+            _domain_value_system(snapshot.value_state)
         return json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,

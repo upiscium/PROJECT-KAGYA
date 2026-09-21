@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -12,14 +13,29 @@ from pydantic import ValidationError
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.cognition.surprisal_calculator import LossCalibration
 from kagya.config import Settings, load_settings
+from kagya.identity import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    ValueAdmissionStatus,
+    ValueMutationEvidence,
+    ValueMutationReason,
+    ValueSeedDeclaration,
+    ValueScope,
+    ValueSelfAdmission,
+    ValueState,
+    ValueSystem,
+)
 from kagya.runtime import (
+    AgentStateConfigurationDrift,
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
     AgentStateSnapshotV1,
     AgentStateSnapshotV2,
     AgentStateSnapshotV3,
+    AgentStateSnapshotV4,
+    AgentStateSnapshotV5,
     AppraisalStateSnapshot,
     AgentStateStore,
     CalibrationEntrySnapshot,
@@ -35,6 +51,7 @@ from kagya.runtime import (
     WorkingMemoryRetentionReason,
     WorkingMemorySourceKind,
     working_memory_item_id,
+    ValueSystemStateSnapshot,
 )
 import kagya.runtime.agent_state as agent_state_module
 
@@ -66,6 +83,59 @@ class LoopStub:
             initial_scale=1.0,
             minimum_scale=0.1,
         )
+        self.value_system = ValueSystem()
+
+
+def value_seed(value_id: str = "value-1", name: str = "care") -> ValueSeedDeclaration:
+    return ValueSeedDeclaration(
+        value_id=value_id,
+        name=name,
+        concept="Protect the wellbeing of the subject.",
+        scope=ValueScope.SUBJECT,
+        context_ids=(),
+        polarity=1,
+        initial_strength=0.8,
+        confidence=0.9,
+        stability=0.0,
+        protectedness=0.0,
+        negotiability=1.0,
+        allowed_update_rate=0.1,
+    )
+
+
+class ValueLoopStub(LoopStub):
+    def __init__(self, value_system: ValueSystem) -> None:
+        super().__init__(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+        self.value_system = value_system
+
+
+def value_system_with_history(seed: ValueSeedDeclaration) -> ValueSystem:
+    system = ValueSystem.from_seed_declarations((seed,))
+    for index in range(33):
+        event_id = f"value-event-{index}"
+        origin = IdentityOrigin(
+            OriginActor.SELF,
+            OriginInputKind.INTERNAL_STATE,
+            ValueAdmissionStatus.SELF_ENDORSED,
+            event_id=event_id,
+            event_sequence=index,
+        )
+        system.apply_update(
+            ValueSelfAdmission(
+                target_value_id=seed.value_id,
+                subject_origin=origin,
+                evidence_refs=(f"value-evidence-{index}",),
+                requested_delta=1.0,
+                confidence=1.0,
+                reason=ValueMutationReason.ADMITTED_UPDATE,
+            ),
+            ValueMutationEvidence(
+                event_id=event_id,
+                event_sequence=index,
+                recorded_at=NOW,
+            ),
+        )
+    return system
 
 
 def assert_bounded_exception(error: Exception, sentinel: str) -> None:
@@ -162,7 +232,7 @@ def test_minimal_capture_save_load_restore_round_trip(tmp_path: Path) -> None:
     snapshot = new_store.load()
     new_store.restore_into(restored, snapshot)
 
-    assert snapshot.schema_version == 4
+    assert snapshot.schema_version == 5
     assert snapshot.last_processed_event_sequence == 7
     assert restored.emotion_engine.state == original.emotion_engine.state
     assert restored.working_memory.revision == 0
@@ -200,7 +270,7 @@ def test_current_v4_round_trip_preserves_exact_nonempty_working_memory(
     loaded = make_store(path).load()
     make_store(path).restore_into(restored, loaded)
 
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 5
     assert loaded.working_memory == snapshot.working_memory
     assert restored.working_memory.revision == 5
     assert restored.working_memory.items == original.working_memory.items
@@ -235,6 +305,126 @@ def test_v4_round_trip_preserves_calibration_and_temporal_state(
     assert loaded.appraisal_state.calibration_entries[0].count == 2
     assert target.loss_calibration.export() == source.loss_calibration.export()
     assert target.emotion_engine.temporal_state == EmotionTemporalState(NOW)
+
+
+def test_v5_round_trip_preserves_complete_value_authority_without_replay(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    source_system = value_system_with_history(seed)
+    store = AgentStateStore(
+        tmp_path / "agent_state.json",
+        baseline_surprisal=1.0,
+        value_seeds=(seed,),
+        clock=lambda: NOW,
+    )
+    source = ValueLoopStub(source_system)
+
+    snapshot = store.capture(source, sequence=33)
+    assert isinstance(snapshot, AgentStateSnapshotV5)
+    assert len(snapshot.value_state.values) == 1
+    assert len(snapshot.value_state.histories[0].records) == 32
+    assert len(snapshot.value_state.evidence_ledgers[0].evidence_refs) == 33
+    store.save(snapshot)
+
+    target_system = ValueSystem.from_seed_declarations((seed,))
+    target = ValueLoopStub(target_system)
+    loaded = store.load()
+    store.restore_into(target, loaded)
+
+    assert target.value_system is not source_system
+    assert target.value_system.snapshot() == source_system.snapshot()
+    assert target.value_system.history(seed.value_id).history_anchor_revision == 1
+
+
+def test_v5_seed_drift_fails_closed_without_rewriting_snapshot(tmp_path: Path) -> None:
+    seed = value_seed()
+    path = tmp_path / "agent_state.json"
+    store = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    store.save(
+        store.capture(ValueLoopStub(ValueSystem.from_seed_declarations((seed,))), 1)
+    )
+    original = path.read_bytes()
+    changed = replace(seed, name="different-care")
+
+    drifted = AgentStateStore(path, 1.0, value_seeds=(changed,), clock=lambda: NOW)
+    with pytest.raises(AgentStateConfigurationDrift):
+        drifted.load()
+    assert path.read_bytes() == original
+
+
+def test_v5_removed_and_new_config_seeds_do_not_rewrite_persisted_values(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    path = tmp_path / "agent_state.json"
+    original_store = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    original_store.save(
+        original_store.capture(
+            ValueLoopStub(ValueSystem.from_seed_declarations((seed,))), 1
+        )
+    )
+    added = value_seed("value-2", "honesty")
+    changed_config = AgentStateStore(
+        path, 1.0, value_seeds=(seed, added), clock=lambda: NOW
+    )
+
+    loaded = changed_config.load()
+    assert tuple(value.value_id for value in loaded.value_state.values) == (seed.value_id,)
+
+    removed_config = AgentStateStore(path, 1.0, value_seeds=(), clock=lambda: NOW)
+    retained = removed_config.load()
+    assert tuple(value.value_id for value in retained.value_state.values) == (seed.value_id,)
+
+
+def test_v5_config_seed_id_collision_with_self_value_fails_closed(tmp_path: Path) -> None:
+    seed = value_seed()
+    event_id = "self-admission"
+    origin = IdentityOrigin(
+        OriginActor.SELF,
+        OriginInputKind.INTERNAL_STATE,
+        ValueAdmissionStatus.SELF_ENDORSED,
+        event_id=event_id,
+        event_sequence=0,
+    )
+    candidate = ValueState(
+        value_id=seed.value_id,
+        revision=0,
+        name=seed.name,
+        concept=seed.concept,
+        scope=seed.scope,
+        context_ids=seed.context_ids,
+        polarity=seed.polarity,
+        strength=seed.initial_strength,
+        confidence=seed.confidence,
+        stability=seed.stability,
+        protectedness=seed.protectedness,
+        negotiability=seed.negotiability,
+        allowed_update_rate=seed.allowed_update_rate,
+        frozen=False,
+        origin=origin,
+        evidence_refs=("self-admission-evidence",),
+    )
+    self_system = ValueSystem()
+    self_system.admit_self_value(
+        candidate,
+        ValueSelfAdmission(
+            target_value_id=seed.value_id,
+            subject_origin=origin,
+            evidence_refs=("self-admission-evidence",),
+            requested_delta=0.0,
+            confidence=1.0,
+            reason=ValueMutationReason.SELF_ADMISSION,
+        ),
+        ValueMutationEvidence(event_id=event_id, event_sequence=0, recorded_at=NOW),
+    )
+    path = tmp_path / "agent_state.json"
+    unconfigured = AgentStateStore(path, 1.0, clock=lambda: NOW)
+    unconfigured.save(unconfigured.capture(ValueLoopStub(self_system), 1))
+
+    configured = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    with pytest.raises(AgentStateConfigurationDrift):
+        configured.load()
 
 
 @pytest.mark.parametrize(
@@ -316,6 +506,48 @@ def test_restore_failure_rolls_back_all_five_authorities(tmp_path: Path) -> None
     assert target.context_registry.state == before_context
     assert target.loss_calibration.export() == before_calibration
     assert target.emotion_engine.temporal_state == before_temporal
+
+
+def test_v5_restore_failure_rolls_back_value_authority_with_other_five(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    store = AgentStateStore(
+        tmp_path / "agent_state.json",
+        1.0,
+        value_seeds=(seed,),
+        clock=lambda: NOW,
+    )
+    source = ValueLoopStub(value_system_with_history(seed))
+    snapshot = store.capture(source, sequence=33)
+
+    class FailingTemporalEmotionEngine(EmotionEngineAllostasis):
+        def __init__(self, state: EmotionState) -> None:
+            self._fail_temporal = False
+            self._temporal_state = EmotionTemporalState()
+            super().__init__(state)
+
+        @property
+        def temporal_state(self) -> EmotionTemporalState:
+            return self._temporal_state
+
+        @temporal_state.setter
+        def temporal_state(self, value: EmotionTemporalState) -> None:
+            if self._fail_temporal:
+                raise RuntimeError("injected temporal restore failure")
+            self._temporal_state = value
+
+    target = ValueLoopStub(ValueSystem.from_seed_declarations((seed,)))
+    failing_engine = FailingTemporalEmotionEngine(target.emotion_engine.state)
+    target.emotion_engine = failing_engine
+    before_value_system = target.value_system
+    failing_engine._fail_temporal = True
+
+    with pytest.raises(AgentStateLoadError):
+        store.restore_into(target, snapshot)
+
+    assert target.value_system is before_value_system
+    assert target.value_system.snapshot() != source.value_system.snapshot()
 
 
 def test_persisted_unapproved_key_restore_fails_and_rolls_back_all_authorities(
@@ -592,8 +824,11 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         arousal=0.0,
         optimal_loss=2.5,
     )
-    assert isinstance(snapshot, AgentStateSnapshot)
-    assert snapshot.schema_version == 4
+    assert isinstance(snapshot, AgentStateSnapshotV5)
+    assert snapshot.schema_version == 5
+    assert snapshot.value_state == ValueSystemStateSnapshot(
+        values=(), conflicts=(), histories=(), evidence_ledgers=()
+    )
     assert snapshot.working_memory == WorkingMemorySnapshot(revision=0, items=())
     assert snapshot.context_state == ContextStateSnapshot(
         revision=0,
@@ -632,7 +867,7 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
 
     migrated = make_store(path).load()
 
-    assert migrated == AgentStateSnapshot(
+    assert migrated == AgentStateSnapshotV5(
         saved_at=NOW,
         last_processed_event_sequence=7,
         emotion_state=EmotionStateSnapshot(
@@ -649,6 +884,9 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
         ),
         appraisal_state=AppraisalStateSnapshot(
             calibration_entries=(), last_emotion_update_at=None
+        ),
+        value_state=ValueSystemStateSnapshot(
+            values=(), conflicts=(), histories=(), evidence_ledgers=()
         ),
     )
 
@@ -860,7 +1098,7 @@ def test_canonical_snapshot_contains_no_private_or_independent_store_data(
 
 
 def test_agent_state_has_no_working_memory_participant_or_journal_authority() -> None:
-    assert set(AgentStateSnapshot.model_fields) == {
+    assert set(AgentStateSnapshotV4.model_fields) == {
         "saved_at",
         "last_processed_event_sequence",
         "emotion_state",
@@ -875,7 +1113,7 @@ def test_agent_state_has_no_working_memory_participant_or_journal_authority() ->
         "store",
         "journal",
         "journaling",
-    }.intersection(AgentStateSnapshot.model_fields)
+    }.intersection(AgentStateSnapshotV4.model_fields)
 
 
 @pytest.mark.parametrize(
@@ -912,7 +1150,7 @@ def test_save_validation_detail_is_absent_from_full_exception(tmp_path: Path) ->
     raw["emotion_state"]["valence"] = PRIVATE_SENTINEL
 
     with pytest.raises(AgentStateSaveError) as error:
-        make_store(tmp_path / "agent_state.json").save(cast(AgentStateSnapshot, raw))
+        make_store(tmp_path / "agent_state.json").save(cast(AgentStateSnapshotV4, raw))
 
     assert error.value.stage is AgentStateSaveStage.TEMP_WRITE
     assert error.value.published is False
@@ -1015,7 +1253,7 @@ def test_restore_failure_is_absent_from_full_exception(tmp_path: Path) -> None:
     loop = LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
 
     with pytest.raises(AgentStateLoadError) as error:
-        store.restore_into(loop, cast(AgentStateSnapshot, BrokenSnapshot()))
+        store.restore_into(loop, cast(AgentStateSnapshotV4, BrokenSnapshot()))
 
     assert_bounded_exception(error.value, PRIVATE_SENTINEL)
 
@@ -1033,7 +1271,7 @@ def test_restore_validation_detail_is_absent_from_full_exception(
     loop = LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
 
     with pytest.raises(AgentStateLoadError) as error:
-        store.restore_into(loop, cast(AgentStateSnapshot, InvalidSnapshot()))
+        store.restore_into(loop, cast(AgentStateSnapshotV4, InvalidSnapshot()))
 
     assert_bounded_exception(error.value, PRIVATE_SENTINEL)
 
@@ -1080,7 +1318,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 4
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 5
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(

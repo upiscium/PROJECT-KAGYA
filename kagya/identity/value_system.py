@@ -42,10 +42,13 @@ __all__ = [
     "ValueSelfAdmission",
     "ValueScope",
     "ValueState",
+    "ValueSystemSnapshot",
     "ValueSystem",
+    "canonical_evidence_ledger_payload",
     "canonical_revision_record_payload",
     "canonical_seed_payload",
     "canonical_value_state_payload",
+    "evidence_ledger_digest",
     "recompute_revision_record_digest",
     "recompute_seed_contract_digest",
     "validate_seed_contract_digest",
@@ -99,6 +102,7 @@ _SEED_DOMAIN: Final = "kagya.identity.value-seed/v1"
 _STATE_DOMAIN: Final = "kagya.identity.value-state/v1"
 _RECORD_DOMAIN: Final = "kagya.identity.value-revision/v1"
 _GENESIS_DOMAIN: Final = "kagya.identity.value-genesis/v1"
+_LEDGER_DOMAIN: Final = "kagya.identity.value-evidence-ledger/v1"
 
 
 _ValueEnum = TypeVar("_ValueEnum", bound=Enum)
@@ -132,6 +136,17 @@ def _refs(value: object, name: str) -> tuple[str, ...]:
     if type(value) is not tuple:
         raise TypeError(f"{name} must be a tuple of identifiers")
     if len(value) > _MAX_REFS:
+        raise ValueError(f"{name} has too many entries")
+    checked = tuple(validate_identifier(item) for item in value)
+    if checked != tuple(sorted(set(checked))) or len(set(checked)) != len(checked):
+        raise ValueError(f"{name} must be sorted and unique")
+    return checked
+
+
+def _ledger_refs(value: object, name: str) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple of identifiers")
+    if len(value) > _MAX_APPLIED_EVIDENCE_REFS:
         raise ValueError(f"{name} has too many entries")
     checked = tuple(validate_identifier(item) for item in value)
     if checked != tuple(sorted(set(checked))) or len(set(checked)) != len(checked):
@@ -359,6 +374,30 @@ def value_state_digest(value: ValueState) -> str:
     """Return the content address of all authoritative current Value fields."""
 
     return hashlib.sha256(canonical_value_state_payload(value)).hexdigest()
+
+
+def canonical_evidence_ledger_payload(
+    value_id: str, evidence_refs: tuple[str, ...]
+) -> bytes:
+    """Return canonical bytes authenticating one complete evidence ledger."""
+
+    checked_value_id = validate_identifier(value_id)
+    checked_refs = _ledger_refs(evidence_refs, "evidence_refs")
+    encoded = json.dumps(
+        {"evidence_refs": list(checked_refs), "value_id": checked_value_id},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return _LEDGER_DOMAIN.encode("ascii") + b"\0" + encoded
+
+
+def evidence_ledger_digest(value_id: str, evidence_refs: tuple[str, ...]) -> str:
+    """Return the content address of one complete bounded evidence ledger."""
+
+    return hashlib.sha256(
+        canonical_evidence_ledger_payload(value_id, evidence_refs)
+    ).hexdigest()
 
 
 class ValueDomainError(ValueError):
@@ -708,6 +747,51 @@ class ValueRevisionHistory:
 
 
 @dataclass(frozen=True, slots=True)
+class ValueSystemSnapshot:
+    """I/O-free, exact domain snapshot used by durable AgentState."""
+
+    schema_version: int
+    values: tuple[ValueState, ...]
+    conflicts: tuple[ValueConflictDefinition, ...]
+    histories: tuple[ValueRevisionHistory, ...]
+    evidence_ledgers: tuple[tuple[str, tuple[str, ...]], ...]
+    evidence_ledger_digests: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("ValueSystem snapshot schema version must be 1")
+        if type(self.values) is not tuple:
+            raise TypeError("snapshot values must be a tuple")
+        if type(self.conflicts) is not tuple:
+            raise TypeError("snapshot conflicts must be a tuple")
+        if type(self.histories) is not tuple:
+            raise TypeError("snapshot histories must be a tuple")
+        if type(self.evidence_ledgers) is not tuple:
+            raise TypeError("snapshot evidence_ledgers must be a tuple")
+        if type(self.evidence_ledger_digests) is not tuple:
+            raise TypeError("snapshot evidence_ledger_digests must be a tuple")
+        for value in self.values:
+            if not isinstance(value, ValueState):
+                raise TypeError("snapshot values must contain ValueState values")
+        for conflict in self.conflicts:
+            if not isinstance(conflict, ValueConflictDefinition):
+                raise TypeError(
+                    "snapshot conflicts must contain ValueConflictDefinition values"
+                )
+        for history in self.histories:
+            if not isinstance(history, ValueRevisionHistory):
+                raise TypeError(
+                    "snapshot histories must contain ValueRevisionHistory values"
+                )
+        for value_id, ledger in self.evidence_ledgers:
+            validate_identifier(value_id)
+            _ledger_refs(ledger, "snapshot evidence ledger")
+        for value_id, digest in self.evidence_ledger_digests:
+            validate_identifier(value_id)
+            _validate_sha256_digest(digest, "evidence_ledger_digest")
+
+
+@dataclass(frozen=True, slots=True)
 class ValueMutationResult:
     """Typed outcome of one domain mutation attempt."""
 
@@ -810,7 +894,53 @@ class ValueSystem:
             value_id: tuple(value.evidence_refs)
             for value_id, value in self._values.items()
         }
+        self._evidence_ledger_digests = {
+            value_id: evidence_ledger_digest(value_id, ledger)
+            for value_id, ledger in self._evidence_ledgers.items()
+        }
         self.validate()
+
+    @classmethod
+    def from_seed_declarations(
+        cls,
+        seeds: Iterable[ValueSeedDeclaration],
+        conflicts: Iterable[ValueConflictDefinition] = (),
+    ) -> ValueSystem:
+        """Bootstrap authoritative Values from immutable configuration seeds."""
+
+        seed_items = tuple(seeds)
+        values: list[ValueState] = []
+        for seed in seed_items:
+            if not isinstance(seed, ValueSeedDeclaration):
+                raise TypeError("seeds must contain ValueSeedDeclaration values")
+            values.append(
+                ValueState(
+                    value_id=seed.value_id,
+                    revision=0,
+                    name=seed.name,
+                    concept=seed.concept,
+                    scope=seed.scope,
+                    context_ids=seed.context_ids,
+                    polarity=seed.polarity,
+                    strength=seed.initial_strength,
+                    confidence=seed.confidence,
+                    stability=seed.stability,
+                    protectedness=seed.protectedness,
+                    negotiability=seed.negotiability,
+                    allowed_update_rate=seed.allowed_update_rate,
+                    frozen=False,
+                    origin=IdentityOrigin(
+                        OriginActor.SYSTEM,
+                        OriginInputKind.CONFIG_SEED,
+                        ValueAdmissionStatus.SYSTEM_AUTHORIZED,
+                        source_ref=f"config-seed:{seed.value_id}",
+                    ),
+                    evidence_refs=(),
+                    seed_contract_digest=recompute_seed_contract_digest(seed),
+                    opposition_count=0,
+                )
+            )
+        return cls(values, conflicts)
 
     @classmethod
     def restore(
@@ -820,6 +950,7 @@ class ValueSystem:
         conflicts: Iterable[ValueConflictDefinition] = (),
         histories: Mapping[str, ValueRevisionHistory],
         evidence_ledgers: Mapping[str, tuple[str, ...]],
+        evidence_ledger_digests: Mapping[str, str] | None = None,
     ) -> ValueSystem:
         """Restore a complete domain snapshot without I/O or replay."""
 
@@ -857,14 +988,38 @@ class ValueSystem:
         ledger_map: dict[str, tuple[str, ...]] = {}
         for key, ledger in evidence_ledgers.items():
             validate_identifier(key)
-            if type(ledger) is not tuple:
-                raise TypeError("restore evidence ledgers must contain tuples")
-            if len(ledger) > _MAX_APPLIED_EVIDENCE_REFS:
-                raise ValueDomainError("restore evidence ledger exceeds its bound")
-            checked_ledger = tuple(validate_identifier(ref) for ref in ledger)
-            if checked_ledger != tuple(sorted(set(checked_ledger))):
-                raise ValueDomainError("restore evidence ledgers must be sorted and unique")
-            ledger_map[key] = checked_ledger
+            try:
+                ledger_map[key] = _ledger_refs(ledger, "restore evidence ledger")
+            except (TypeError, ValueError) as exc:
+                raise ValueDomainError("restore evidence ledger is invalid") from exc
+
+        if evidence_ledger_digests is None:
+            digest_map = {
+                value_id: evidence_ledger_digest(value_id, ledger)
+                for value_id, ledger in ledger_map.items()
+            }
+        else:
+            if not isinstance(evidence_ledger_digests, Mapping):
+                raise TypeError("restore evidence_ledger_digests must be a mapping")
+            if set(value_map) != set(evidence_ledger_digests):
+                raise ValueDomainError(
+                    "restore Value and ledger-digest keys must match exactly"
+                )
+            digest_map = {}
+            for key, digest in evidence_ledger_digests.items():
+                validate_identifier(key)
+                try:
+                    checked_digest = _validate_sha256_digest(
+                        digest, "evidence_ledger_digest"
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueDomainError("restore evidence ledger digest is invalid") from exc
+                expected_digest = evidence_ledger_digest(key, ledger_map[key])
+                if checked_digest != expected_digest:
+                    raise ValueDomainError(
+                        "restore evidence ledger digest does not match its ledger"
+                    )
+                digest_map[key] = checked_digest
 
         conflict_items = tuple(conflicts)
         conflict_map: dict[tuple[str, str], ValueConflictDefinition] = {}
@@ -887,8 +1042,55 @@ class ValueSystem:
         system._evidence_ledgers = {
             value_id: ledger_map[value_id] for value_id in sorted(ledger_map)
         }
+        system._evidence_ledger_digests = {
+            value_id: digest_map[value_id] for value_id in sorted(digest_map)
+        }
         system.validate()
         return system
+
+    def snapshot(self) -> ValueSystemSnapshot:
+        """Return the complete domain state without replay or I/O."""
+
+        return ValueSystemSnapshot(
+            schema_version=1,
+            values=self.values,
+            conflicts=self.conflicts,
+            histories=tuple(
+                self._histories[value_id] for value_id in sorted(self._histories)
+            ),
+            evidence_ledgers=tuple(
+                (value_id, self._evidence_ledgers[value_id])
+                for value_id in sorted(self._evidence_ledgers)
+            ),
+            evidence_ledger_digests=tuple(
+                (value_id, self._evidence_ledger_digests[value_id])
+                for value_id in sorted(self._evidence_ledger_digests)
+            ),
+        )
+
+    @classmethod
+    def restore_snapshot(cls, snapshot: ValueSystemSnapshot) -> ValueSystem:
+        """Restore an exact domain snapshot through the normal validator."""
+
+        if not isinstance(snapshot, ValueSystemSnapshot):
+            raise TypeError("snapshot must be a ValueSystemSnapshot")
+        values = {value.value_id: value for value in snapshot.values}
+        histories = {history.value_id: history for history in snapshot.histories}
+        evidence_ledgers = dict(snapshot.evidence_ledgers)
+        evidence_ledger_digests = dict(snapshot.evidence_ledger_digests)
+        if len(values) != len(snapshot.values) or len(histories) != len(snapshot.histories):
+            raise ValueDomainError("snapshot contains duplicate Value IDs")
+        if len(evidence_ledgers) != len(snapshot.evidence_ledgers):
+            raise ValueDomainError("snapshot contains duplicate evidence-ledger IDs")
+        if len(evidence_ledger_digests) != len(snapshot.evidence_ledger_digests):
+            raise ValueDomainError("snapshot contains duplicate ledger-digest IDs")
+        return cls.restore(
+            values=values,
+            conflicts=snapshot.conflicts,
+            histories=histories,
+            evidence_ledgers=evidence_ledgers,
+            evidence_ledger_digests=evidence_ledger_digests,
+        )
 
     @property
     def values(self) -> tuple[ValueState, ...]:
@@ -914,6 +1116,15 @@ class ValueSystem:
             {
                 value_id: self._evidence_ledgers[value_id]
                 for value_id in sorted(self._evidence_ledgers)
+            }
+        )
+
+    @property
+    def evidence_ledger_digests(self) -> Mapping[str, str]:
+        return MappingProxyType(
+            {
+                value_id: self._evidence_ledger_digests[value_id]
+                for value_id in sorted(self._evidence_ledger_digests)
             }
         )
 
@@ -1061,6 +1272,9 @@ class ValueSystem:
             candidate.value_id, records=(record,)
         )
         self._evidence_ledgers[candidate.value_id] = candidate.evidence_refs
+        self._evidence_ledger_digests[candidate.value_id] = evidence_ledger_digest(
+            candidate.value_id, candidate.evidence_refs
+        )
         return ValueMutationResult(
             status=ValueMutationStatus.APPLIED,
             value_id=candidate.value_id,
@@ -1225,6 +1439,9 @@ class ValueSystem:
                 continue
             if applied_delta == 0.0:
                 self._evidence_ledgers[current.value_id] = planned_ledger or ()
+                self._evidence_ledger_digests[current.value_id] = evidence_ledger_digest(
+                    current.value_id, planned_ledger or ()
+                )
                 results.append(
                     ValueMutationResult(
                         status=ValueMutationStatus.NO_CHANGE,
@@ -1244,6 +1461,9 @@ class ValueSystem:
             )
             self._commit_record(planned_state, record)
             self._evidence_ledgers[current.value_id] = planned_ledger
+            self._evidence_ledger_digests[current.value_id] = evidence_ledger_digest(
+                current.value_id, planned_ledger
+            )
             results.append(
                 ValueMutationResult(
                     status=ValueMutationStatus.APPLIED,
@@ -1368,6 +1588,8 @@ class ValueSystem:
             raise ValueDomainError("ValueSystem exceeds the authoritative Value bound")
         if value_ids != set(self._histories) or value_ids != set(self._evidence_ledgers):
             raise ValueDomainError("Value, history, and evidence-ledger keys must match")
+        if value_ids != set(self._evidence_ledger_digests):
+            raise ValueDomainError("Value and evidence-ledger digest keys must match")
         if tuple(self._values) != tuple(sorted(self._values)):
             raise ValueDomainError("Value mapping must be canonically sorted")
         if tuple(self._histories) != tuple(sorted(self._histories)):
@@ -1394,6 +1616,9 @@ class ValueSystem:
                 raise ValueDomainError("applied evidence ledger is not canonical")
             for evidence_ref in ledger:
                 validate_identifier(evidence_ref)
+            expected_ledger_digest = evidence_ledger_digest(value_id, ledger)
+            if self._evidence_ledger_digests[value_id] != expected_ledger_digest:
+                raise ValueDomainError("evidence ledger digest does not match its ledger")
             if not set(value.evidence_refs) <= set(ledger):
                 raise ValueDomainError("current Value evidence is missing from its ledger")
 

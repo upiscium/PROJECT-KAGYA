@@ -15,8 +15,8 @@ from kagya.runtime import (
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
     AgentStateSnapshotV3,
+    AgentStateSnapshotV5,
     AgentStateSnapshotV2,
     AppraisalStateSnapshot,
     CalibrationEntrySnapshot,
@@ -33,6 +33,7 @@ from kagya.runtime import (
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
+from kagya.identity import ValueSystem
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -52,6 +53,7 @@ class LoopStub:
             initial_scale=1.0,
             minimum_scale=0.1,
         )
+        self.value_system = ValueSystem()
 
 
 def make_store(path: Path) -> AgentStateStore:
@@ -96,7 +98,7 @@ def make_context_loop() -> LoopStub:
     return loop
 
 
-def as_v3(snapshot: AgentStateSnapshot) -> AgentStateSnapshotV3:
+def as_v3(snapshot: AgentStateSnapshotV5) -> AgentStateSnapshotV3:
     return AgentStateSnapshotV3(
         saved_at=snapshot.saved_at,
         last_processed_event_sequence=snapshot.last_processed_event_sequence,
@@ -211,7 +213,9 @@ def test_capture_without_context_authority_is_a_bounded_capture_failure(
     assert not (tmp_path / "agent_state.json").exists()
 
 
-@pytest.mark.parametrize("missing", ["emotion_engine", "working_memory", "loss_calibration"])
+@pytest.mark.parametrize(
+    "missing", ["emotion_engine", "working_memory", "loss_calibration", "value_system"]
+)
 def test_capture_requires_all_runtime_authorities(
     tmp_path: Path, missing: str
 ) -> None:
@@ -346,8 +350,8 @@ def test_v4_capture_restore_round_trips_exact_context_without_clock_reads(
     loaded = store.load()
     store.restore_into(target, loaded)
 
-    assert isinstance(loaded, AgentStateSnapshot)
-    assert loaded.schema_version == 4
+    assert isinstance(loaded, AgentStateSnapshotV5)
+    assert loaded.schema_version == 5
     assert loaded.context_state == snapshot.context_state
     assert target.context_registry.state == source.context_registry.state
     assert clock_calls == 0
@@ -434,7 +438,7 @@ def test_state_wal_reconstructs_v4_context_without_new_record_schema(
 
     assert inspection.records[0].schema_version == 1
     assert reconstructed == snapshot
-    assert isinstance(reconstructed, AgentStateSnapshot)
+    assert isinstance(reconstructed, AgentStateSnapshotV5)
 
 
 def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> None:
@@ -487,5 +491,5 @@ def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> Non
         ),
     )
 
-    assert reconstructed.schema_version == 4
-    assert isinstance(reconstructed, AgentStateSnapshot)
+    assert reconstructed.schema_version == 5
+    assert isinstance(reconstructed, AgentStateSnapshotV5)
