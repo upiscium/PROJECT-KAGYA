@@ -48,7 +48,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F9",
-        "tests/test_fastapi_backend.py::test_value_governance_failure_restores_the_last_committed_view",
+        "tests/test_fastapi_backend.py::test_value_governance_failure_restores_the_last_committed_view; "
+        "tests/test_agent_state.py::test_v5_restore_failure_rolls_back_value_authority_with_other_five",
     ),
     (
         "F10",
@@ -68,6 +69,11 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
         "tests/test_agent_state.py::test_existing_corrupt_snapshot_never_defaults_or_changes; "
         "tests/test_agent_state.py::test_future_version_is_distinct_and_never_defaults; "
         "tests/test_state_wal.py::test_future_record_version_is_rejected; "
+        "tests/test_bootstrap_config.py::test_value_seed_bounds_and_finiteness; "
+        "tests/test_bootstrap_config.py::test_value_seed_ids_must_be_unique; "
+        "tests/test_value_system.py::test_scalar_bounds_are_strict; "
+        "tests/test_value_system.py::test_revision_requires_a_nonnegative_exact_integer; "
+        "tests/test_value_system.py::test_refs_conflicts_and_non_authoritative_types; "
         "tests/test_value_system.py::test_restore_rejects_current_history_and_ledger_inconsistency; "
         "tests/test_value_system.py::test_restore_rejects_surplus_ledger_ref_with_exact_digest_witness; "
         "tests/test_value_system.py::test_revision_history_rejects_broken_state_continuity",
@@ -81,7 +87,10 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
         "F14",
         "tests/test_prompt_builder.py::test_build_renders_bounded_active_value_projection_deterministically; "
         "tests/test_fastapi_backend.py::test_values_api_reads_are_pure_and_governance_is_runtime_bound; "
-        "tests/test_agent_state.py::test_v5_canonical_snapshot_contains_value_authority_but_no_prompt_or_independent_store_data",
+        "tests/test_agent_state.py::test_v5_canonical_snapshot_contains_value_authority_but_no_prompt_or_independent_store_data; "
+        "tests/test_state_wal.py::test_private_sentinel_and_bounded_errors; "
+        "tests/test_event_journal.py::test_schema_is_strict_and_has_no_metadata_escape_hatch; "
+        "tests/test_event_journal.py::test_u1_f11_invalid_transaction_fields_are_bounded_and_private_free",
     ),
     (
         "F15",
