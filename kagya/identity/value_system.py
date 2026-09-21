@@ -119,6 +119,14 @@ def _optional_text(value: object, name: str, limit: int) -> str | None:
     return _text(value, name, limit)
 
 
+def _validate_seed_digest_format(value: object) -> str:
+    if type(value) is not str or len(value) != 64 or any(
+        char not in "0123456789abcdef" for char in value
+    ):
+        raise ValueError("seed_contract_digest must be a lowercase SHA-256 digest")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ValueSeedDeclaration:
     """Immutable seed semantics, independent of admission or runtime state."""
@@ -155,28 +163,6 @@ class ValueSeedDeclaration:
         ):
             _fraction(getattr(self, field_name), field_name)
         _fraction(self.allowed_update_rate, "allowed_update_rate", nonzero=True)
-
-    @classmethod
-    def from_value(cls, value: ValueState) -> ValueSeedDeclaration:
-        """Project immutable seed fields from a Value without admission data."""
-
-        if not isinstance(value, ValueState):
-            raise TypeError("value must be a ValueState")
-        return cls(
-            value_id=value.value_id,
-            name=value.name,
-            concept=value.concept,
-            scope=value.scope,
-            context_ids=value.context_ids,
-            polarity=value.polarity,
-            initial_strength=value.strength,
-            confidence=value.confidence,
-            stability=value.stability,
-            protectedness=value.protectedness,
-            negotiability=value.negotiability,
-            allowed_update_rate=value.allowed_update_rate,
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class ValueState:
@@ -220,16 +206,10 @@ class ValueState:
         evidence = _refs(self.evidence_refs, "evidence_refs")
         object.__setattr__(self, "evidence_refs", evidence)
         if self.seed_contract_digest is not None:
-            if type(self.seed_contract_digest) is not str or len(self.seed_contract_digest) != 64:
-                raise ValueError("seed_contract_digest must be a lowercase SHA-256 digest")
-            if any(char not in "0123456789abcdef" for char in self.seed_contract_digest):
-                raise ValueError("seed_contract_digest must be a lowercase SHA-256 digest")
+            _validate_seed_digest_format(self.seed_contract_digest)
         if self.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED:
             if self.seed_contract_digest is None:
                 raise ValueError("system-authorized values require a seed contract digest")
-            validate_seed_contract_digest(
-                ValueSeedDeclaration.from_value(self), self.seed_contract_digest
-            )
         elif self.seed_contract_digest is not None:
             raise ValueError("only system-authorized values may carry a seed contract digest")
 
@@ -286,10 +266,7 @@ def recompute_seed_contract_digest(seed: ValueSeedDeclaration) -> str:
 
 
 def validate_seed_contract_digest(seed: ValueSeedDeclaration, digest: str) -> str:
-    if type(digest) is not str or len(digest) != 64 or any(
-        char not in "0123456789abcdef" for char in digest
-    ):
-        raise ValueError("seed_contract_digest must be a lowercase SHA-256 digest")
+    _validate_seed_digest_format(digest)
     expected = recompute_seed_contract_digest(seed)
     if digest != expected:
         raise ValueError("seed_contract_digest does not match the seed declaration")

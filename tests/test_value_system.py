@@ -206,7 +206,7 @@ def test_seed_scope_and_context_ids_change_contract_digest() -> None:
     )
 
 
-def test_system_seed_digest_must_match_its_declaration() -> None:
+def test_system_seed_digest_requires_a_valid_shape() -> None:
     seed = _seed()
     digest = recompute_seed_contract_digest(seed)
     system_value = _value(
@@ -220,38 +220,34 @@ def test_system_seed_digest_must_match_its_declaration() -> None:
         origin=_origin(system=True),
         seed_contract_digest=recompute_seed_contract_digest(nullable_concept_seed),
     ).is_active()
-    with pytest.raises(ValueError):
-        _value(
-            origin=_origin(system=True),
-            seed_contract_digest="0" * 64,
-        )
+    assert _value(
+        origin=_origin(system=True),
+        seed_contract_digest="0" * 64,
+    ).seed_contract_digest == "0" * 64
+    for malformed in ("", "0" * 63, "0" * 63 + "G"):
+        with pytest.raises(ValueError):
+            _value(origin=_origin(system=True), seed_contract_digest=malformed)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("value_id", "other-value"),
-        ("name", "different"),
-        ("concept", "different concept"),
-        ("scope", ValueScope.CONTEXT),
-        ("context_ids", ("context-1",)),
-        ("polarity", -1),
-        ("strength", 0.7),
-        ("confidence", 0.8),
-        ("stability", 0.6),
-        ("protectedness", 0.5),
-        ("negotiability", 0.3),
-        ("allowed_update_rate", 0.2),
-    ],
-)
-def test_system_value_fields_must_match_seed_digest(field: str, value: object) -> None:
-    seed = _seed()
-    with pytest.raises(ValueError):
-        _value(
-            **{field: value},
-            origin=_origin(system=True),
-            seed_contract_digest=recompute_seed_contract_digest(seed),
-        )
+def test_system_value_can_evolve_without_rewriting_seed_digest() -> None:
+    seed_digest = recompute_seed_contract_digest(_seed())
+    bootstrap = _value(
+        revision=0,
+        strength=0.8,
+        confidence=0.9,
+        origin=_origin(system=True),
+        seed_contract_digest=seed_digest,
+    )
+    learned = _value(
+        revision=1,
+        strength=0.79,
+        confidence=0.88,
+        origin=_origin(system=True),
+        seed_contract_digest=seed_digest,
+    )
+    assert bootstrap.seed_contract_digest == learned.seed_contract_digest == seed_digest
+    assert bootstrap.strength != learned.strength
+    assert bootstrap.confidence != learned.confidence
 
 
 @pytest.mark.parametrize(
