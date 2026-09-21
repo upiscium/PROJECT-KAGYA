@@ -17,6 +17,7 @@ from kagya.runtime import (
     AgentStateSaveStage,
     AgentStateSnapshotV3,
     AgentStateSnapshotV5,
+    AgentStateSnapshotV4,
     AgentStateSnapshotV2,
     AppraisalStateSnapshot,
     CalibrationEntrySnapshot,
@@ -108,6 +109,17 @@ def as_v3(snapshot: AgentStateSnapshotV5) -> AgentStateSnapshotV3:
     )
 
 
+def as_v4(snapshot: AgentStateSnapshotV5) -> AgentStateSnapshotV4:
+    return AgentStateSnapshotV4(
+        saved_at=snapshot.saved_at,
+        last_processed_event_sequence=snapshot.last_processed_event_sequence,
+        emotion_state=snapshot.emotion_state,
+        working_memory=snapshot.working_memory,
+        context_state=snapshot.context_state,
+        appraisal_state=snapshot.appraisal_state,
+    )
+
+
 def test_v2_canonical_bytes_and_hash_remain_exact() -> None:
     snapshot = make_v2_snapshot()
     fixture = (
@@ -188,6 +200,40 @@ def test_v3_canonical_bytes_and_hash_remain_exact() -> None:
     assert AgentStateStore._canonical_bytes(snapshot) == fixture
     assert hashlib.sha256(fixture).hexdigest() == (
         "08a14b6263c2a690fa4105589aaae2da68d0387bd59fa42eeaeef4b0b3d79700"
+    )
+
+
+def test_v4_canonical_bytes_and_hash_remain_exact() -> None:
+    snapshot = AgentStateSnapshotV4(
+        saved_at=NOW,
+        last_processed_event_sequence=4,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2, arousal=0.3, optimal_loss=1.2
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
+    )
+
+    fixture = (
+        b'{"appraisal_state":{"calibration_entries":[],"last_emotion_update_at":null},'
+        b'"context_state":{"current_context_id":null,"frames":[],'
+        b'"interlocutor_bindings":[],"revision":0},'
+        b'"emotion_state":{"arousal":0.3,"optimal_loss":1.2,"valence":0.2},'
+        b'"last_processed_event_sequence":4,"saved_at":"2026-01-02T03:04:05Z",'
+        b'"schema_version":4,"working_memory":{"items":[],"revision":0}}'
+    )
+
+    assert AgentStateStore._canonical_bytes(snapshot) == fixture
+    assert hashlib.sha256(fixture).hexdigest() == (
+        "486644c1456625fde9bb9b3554a235ff0ff4d031680111b54ef4a5cd906f6ad7"
     )
 
 
@@ -441,7 +487,7 @@ def test_state_wal_reconstructs_v4_context_without_new_record_schema(
     assert isinstance(reconstructed, AgentStateSnapshotV5)
 
 
-def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> None:
+def test_state_wal_reconstructs_mixed_pre_v5_and_v5_history(tmp_path: Path) -> None:
     store = make_store(tmp_path / "agent_state.json")
     v1 = AgentStateSnapshotV1(
         saved_at=NOW,
@@ -453,8 +499,10 @@ def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> Non
     v2 = make_v2_snapshot().model_copy(
         update={"last_processed_event_sequence": 1}
     )
-    captured = store.capture(make_context_loop(), sequence=2)
-    v3 = as_v3(captured)
+    captured = store.capture(make_context_loop(), sequence=4)
+    v3 = as_v3(captured.model_copy(update={"last_processed_event_sequence": 2}))
+    v4 = as_v4(captured.model_copy(update={"last_processed_event_sequence": 3}))
+    v5 = captured
     wal = StateWAL(tmp_path / "wal")
     wal.bootstrap(v1, 0)
     wal.append_transition(
@@ -479,17 +527,22 @@ def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> Non
         event_source="test",
         processing_sequence=3,
         prior_snapshot=v3,
-        candidate_snapshot=captured.model_copy(
-            update={"last_processed_event_sequence": 3}
-        ),
+        candidate_snapshot=v4,
+    )
+    wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=4,
+        prior_snapshot=v4,
+        candidate_snapshot=v5,
     )
 
     reconstructed = wal.reconstruct(
-        sequence=3,
-        snapshot_hash=store.snapshot_hash(
-            captured.model_copy(update={"last_processed_event_sequence": 3})
-        ),
+        sequence=4,
+        snapshot_hash=store.snapshot_hash(v5),
     )
 
     assert reconstructed.schema_version == 5
     assert isinstance(reconstructed, AgentStateSnapshotV5)
+    assert all(record.schema_version == 1 for record in wal.inspect().records)

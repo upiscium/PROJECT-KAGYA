@@ -18,6 +18,7 @@ from kagya.identity import (
     OriginActor,
     OriginInputKind,
     ValueAdmissionStatus,
+    ValueConflictDefinition,
     ValueMutationEvidence,
     ValueMutationReason,
     ValueSeedDeclaration,
@@ -337,6 +338,102 @@ def test_v5_round_trip_preserves_complete_value_authority_without_replay(
     assert target.value_system.history(seed.value_id).history_anchor_revision == 1
 
 
+def test_v5_origin_witness_rejects_provenance_tampering_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    path = tmp_path / "agent_state.json"
+    store = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    snapshot = store.capture(
+        ValueLoopStub(ValueSystem.from_seed_declarations((seed,))), sequence=1
+    )
+    raw = json.loads(store.canonical_bytes(snapshot))
+    raw["value_state"]["values"][0]["origin"]["source_ref"] = (
+        "config-seed:tampered"
+    )
+    persisted = json.dumps(raw, separators=(",", ":")).encode()
+    path.write_bytes(persisted)
+
+    with pytest.raises(AgentStateLoadError) as error:
+        store.load()
+
+    assert_bounded_exception(error.value, "config-seed:tampered")
+    assert path.read_bytes() == persisted
+
+
+@pytest.mark.parametrize("field", ["values", "conflicts", "histories", "evidence_ledgers"])
+def test_v5_noncanonical_value_order_fails_closed_without_rewrite(
+    tmp_path: Path, field: str
+) -> None:
+    seeds = (
+        value_seed("value-1", "care"),
+        value_seed("value-2", "honesty"),
+        value_seed("value-3", "compassion"),
+    )
+    conflicts = (
+        ValueConflictDefinition("value-1", "value-2"),
+        ValueConflictDefinition("value-1", "value-3"),
+    )
+    path = tmp_path / "agent_state.json"
+    store = AgentStateStore(
+        path,
+        1.0,
+        value_seeds=seeds,
+        value_conflicts=conflicts,
+        clock=lambda: NOW,
+    )
+    snapshot = store.capture(
+        ValueLoopStub(ValueSystem.from_seed_declarations(seeds, conflicts)), 1
+    )
+    raw = json.loads(store.canonical_bytes(snapshot))
+    raw["value_state"][field].reverse()
+    persisted = json.dumps(raw, separators=(",", ":")).encode()
+    path.write_bytes(persisted)
+
+    with pytest.raises(AgentStateLoadError):
+        store.load()
+
+    assert path.read_bytes() == persisted
+
+
+def test_capture_validates_value_authority_before_projection(tmp_path: Path) -> None:
+    seed = value_seed()
+    path = tmp_path / "agent_state.json"
+    store = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    system = ValueSystem.from_seed_declarations((seed,))
+    system._values[seed.value_id] = replace(
+        system.get(seed.value_id), evidence_refs=("not-applied",)
+    )
+    loop = ValueLoopStub(system)
+    before = system.snapshot()
+
+    with pytest.raises(AgentStateSaveError) as error:
+        store.capture(loop, sequence=1)
+
+    assert error.value.stage is AgentStateSaveStage.CAPTURE
+    assert error.value.published is False
+    assert system.snapshot() == before
+    assert not path.exists()
+
+
+def test_capture_rejects_same_id_seed_drift_at_capture_boundary(tmp_path: Path) -> None:
+    seed = value_seed()
+    changed = replace(seed, name="different-care")
+    path = tmp_path / "agent_state.json"
+    store = AgentStateStore(path, 1.0, value_seeds=(seed,), clock=lambda: NOW)
+    system = ValueSystem.from_seed_declarations((changed,))
+    loop = ValueLoopStub(system)
+    before = system.snapshot()
+
+    with pytest.raises(AgentStateSaveError) as error:
+        store.capture(loop, sequence=1)
+
+    assert error.value.stage is AgentStateSaveStage.CAPTURE
+    assert error.value.published is False
+    assert system.snapshot() == before
+    assert not path.exists()
+
+
 def test_v5_seed_drift_fails_closed_without_rewriting_snapshot(tmp_path: Path) -> None:
     seed = value_seed()
     path = tmp_path / "agent_state.json"
@@ -375,6 +472,38 @@ def test_v5_removed_and_new_config_seeds_do_not_rewrite_persisted_values(
     removed_config = AgentStateStore(path, 1.0, value_seeds=(), clock=lambda: NOW)
     retained = removed_config.load()
     assert tuple(value.value_id for value in retained.value_state.values) == (seed.value_id,)
+
+
+def test_v5_config_conflict_drift_does_not_rewrite_persisted_conflicts(
+    tmp_path: Path,
+) -> None:
+    seeds = (value_seed("value-1", "care"), value_seed("value-2", "honesty"))
+    conflict = ValueConflictDefinition("value-1", "value-2")
+    path = tmp_path / "agent_state.json"
+    original_store = AgentStateStore(
+        path,
+        1.0,
+        value_seeds=seeds,
+        value_conflicts=(conflict,),
+        clock=lambda: NOW,
+    )
+    original_store.save(
+        original_store.capture(
+            ValueLoopStub(ValueSystem.from_seed_declarations(seeds, (conflict,))), 1
+        )
+    )
+    original_bytes = path.read_bytes()
+
+    changed_config = AgentStateStore(
+        path, 1.0, value_seeds=seeds, value_conflicts=(), clock=lambda: NOW
+    )
+    loaded = changed_config.load()
+
+    assert tuple(
+        (item.left_value_id, item.right_value_id)
+        for item in loaded.value_state.conflicts
+    ) == (("value-1", "value-2"),)
+    assert path.read_bytes() == original_bytes
 
 
 def test_v5_config_seed_id_collision_with_self_value_fails_closed(tmp_path: Path) -> None:

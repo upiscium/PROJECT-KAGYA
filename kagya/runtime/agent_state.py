@@ -480,6 +480,7 @@ class IdentityOriginSnapshot(_StateModel):
     context_id: str | None
     event_sequence: int | None
     confidence: float
+    origin_id: str
 
     @field_validator("confidence")
     @classmethod
@@ -638,6 +639,30 @@ class ValueSystemStateSnapshot(_StateModel):
     @classmethod
     def parse_value_snapshot_lists(cls, value: object) -> object:
         return _tuple_value(value)
+
+    @model_validator(mode="after")
+    def require_canonical_order(self) -> ValueSystemStateSnapshot:
+        value_ids = tuple(value.value_id for value in self.values)
+        if value_ids != tuple(sorted(set(value_ids))):
+            raise ValueError("Value snapshots must be ordered and unique")
+
+        history_ids = tuple(history.value_id for history in self.histories)
+        if history_ids != tuple(sorted(set(history_ids))):
+            raise ValueError("Value histories must be ordered and unique")
+
+        ledger_ids = tuple(ledger.value_id for ledger in self.evidence_ledgers)
+        if ledger_ids != tuple(sorted(set(ledger_ids))):
+            raise ValueError("Value evidence ledgers must be ordered and unique")
+
+        conflict_pairs = tuple(
+            (conflict.left_value_id, conflict.right_value_id)
+            for conflict in self.conflicts
+        )
+        if any(left >= right for left, right in conflict_pairs):
+            raise ValueError("Value conflict pairs must use canonical order")
+        if conflict_pairs != tuple(sorted(set(conflict_pairs))):
+            raise ValueError("Value conflict pairs must be ordered and unique")
+        return self
 
 class AgentStateSnapshotV4(_AgentStateSnapshotBase):
     """Exact retained R10 canonical AgentState v4 schema."""
@@ -813,6 +838,7 @@ def _origin_snapshot(origin: IdentityOrigin) -> IdentityOriginSnapshot:
         context_id=origin.context_id,
         event_sequence=origin.event_sequence,
         confidence=origin.confidence,
+        origin_id=origin.origin_id,
     )
 
 
@@ -895,7 +921,7 @@ def _value_state_snapshot(system: ValueSystem) -> ValueSystemStateSnapshot:
 
 
 def _identity_origin(snapshot: IdentityOriginSnapshot) -> IdentityOrigin:
-    return IdentityOrigin(
+    origin = IdentityOrigin(
         OriginActor(snapshot.actor),
         OriginInputKind(snapshot.input_kind),
         ValueAdmissionStatus(snapshot.admission),
@@ -905,6 +931,9 @@ def _identity_origin(snapshot: IdentityOriginSnapshot) -> IdentityOrigin:
         event_sequence=snapshot.event_sequence,
         confidence=snapshot.confidence,
     )
+    if origin.origin_id != snapshot.origin_id:
+        raise ValueDomainError("Value origin witness does not match provenance")
+    return origin
 
 
 def _domain_value(snapshot: ValueStateSnapshot) -> ValueState:
@@ -998,7 +1027,8 @@ def _domain_value_system(snapshot: ValueSystemStateSnapshot) -> ValueSystem:
             evidence_ledger_digests=ledger_digests,
         )
     except Exception:
-        raise AgentStateLoadError("ValueSystem snapshot is invalid") from None
+        pass
+    raise AgentStateLoadError("ValueSystem snapshot is invalid")
 
 
 def default_agent_state_snapshot(
@@ -1223,9 +1253,13 @@ class AgentStateStore:
     def _validate_value_configuration(self, snapshot: AgentStateSnapshotV5) -> None:
         """Check configuration as compatibility evidence, never as overwrite authority."""
 
-        if not self._value_seeds and not self._value_conflicts:
-            return
-        persisted = {value.value_id: value for value in snapshot.value_state.values}
+        value_system = _domain_value_system(snapshot.value_state)
+        self._validate_value_system_configuration(value_system)
+
+    def _validate_value_system_configuration(self, value_system: ValueSystem) -> None:
+        """Check configured seed lineage without adopting or mutating Values."""
+
+        persisted = value_system.value_map
         for seed in self._value_seeds:
             value = persisted.get(seed.value_id)
             if value is None:
@@ -1424,6 +1458,8 @@ class AgentStateStore:
             value_system = getattr(main_loop, "value_system", None)
             if not isinstance(value_system, ValueSystem):
                 raise ValueError("Value authority is unavailable")
+            value_system.validate()
+            self._validate_value_system_configuration(value_system)
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,

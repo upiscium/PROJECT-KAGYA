@@ -41,6 +41,8 @@ from kagya.runtime import (
     AgentStateSnapshotV2,
     AgentStateSnapshotV2 as AgentStateSnapshot,
     AgentStateSnapshotV3,
+    AgentStateSnapshotV4,
+    AppraisalStateSnapshot,
     AgentStateStore,
     ContextFrameSnapshot,
     ContextStateSnapshot,
@@ -669,6 +671,95 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
         assert len(frames) == 1
         assert frames[0].context_id == context_id
         assert frames[0].source_session_id == session_id
+
+
+def test_fresh_configured_bootstrap_publishes_v5_value_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    with _client(tmp_path, settings=settings) as client:
+        snapshot = client.app.state.agent_state_store.load()
+
+        assert snapshot.schema_version == 5
+        assert tuple(value.value_id for value in snapshot.value_state.values) == tuple(
+            seed.value_id for seed in settings.values.seeds
+        )
+        assert tuple(
+            (conflict.left_value_id, conflict.right_value_id)
+            for conflict in snapshot.value_state.conflicts
+        ) == tuple(
+            (conflict.left_value_id, conflict.right_value_id)
+            for conflict in settings.values.conflicts
+        )
+        assert tuple(value.value_id for value in client.app.state.main_loop.value_system.values) == (
+            "care",
+            "honesty",
+        )
+
+
+def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v5(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    legacy = AgentStateSnapshotV4(
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_processed_event_sequence=0,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
+    )
+    legacy_bytes = json.dumps(
+        legacy.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    settings.agent_state.path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_state.path.write_bytes(legacy_bytes)
+
+    with _client(tmp_path, settings=settings) as client:
+        assert settings.agent_state.path.read_bytes() == legacy_bytes
+        assert client.app.state.agent_state_store.load() == legacy
+        assert tuple(
+            value.value_id for value in client.app.state.main_loop.value_system.values
+        ) == ("care", "honesty")
+
+        response = client.post(
+            "/api/chat", json={"message": "upgrade v4", "attachments": []}
+        )
+        assert response.status_code == 200
+
+        upgraded = client.app.state.agent_state_store.load()
+        assert upgraded.schema_version == 5
+        assert tuple(value.value_id for value in upgraded.value_state.values) == (
+            "care",
+            "honesty",
+        )
+        assert settings.agent_state.path.read_bytes() != legacy_bytes
+
+
+def test_chat_and_appraisal_leave_value_system_unchanged_in_u3(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    with _client(tmp_path, settings=settings) as client:
+        before = client.app.state.main_loop.value_system.snapshot()
+
+        response = client.post(
+            "/api/chat", json={"message": "value read only", "attachments": []}
+        )
+
+        assert response.status_code == 200
+        assert client.app.state.main_loop.value_system.snapshot() == before
 
 
 def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:

@@ -10,6 +10,18 @@ import pytest
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.cognition import CognitiveAppraiser, LossCalibration, SurprisalCalculator
+from kagya.identity import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    ValueAdmissionStatus,
+    ValueMutationEvidence,
+    ValueMutationReason,
+    ValueSeedDeclaration,
+    ValueScope,
+    ValueSelfAdmission,
+    ValueSystem,
+)
 from kagya.memory import DualMemorySystem
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import ModelProvider
@@ -19,6 +31,7 @@ from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshotV4,
+    AgentStateSnapshotV5,
     AgentStateSnapshotV3,
     AppraisalStateSnapshot,
     AgentStateSnapshotV2,
@@ -84,6 +97,75 @@ class RestoreTarget:
             initial_scale=1.0,
             minimum_scale=0.1,
         )
+        self.value_system = ValueSystem()
+
+
+def value_seed(value_id: str = "care", name: str = "care") -> ValueSeedDeclaration:
+    return ValueSeedDeclaration(
+        value_id=value_id,
+        name=name,
+        concept="Protect the wellbeing of the subject.",
+        scope=ValueScope.SUBJECT,
+        context_ids=(),
+        polarity=1,
+        initial_strength=0.8,
+        confidence=0.9,
+        stability=0.0,
+        protectedness=0.0,
+        negotiability=1.0,
+        allowed_update_rate=0.1,
+    )
+
+
+def value_system_with_update(seed: ValueSeedDeclaration, index: int) -> ValueSystem:
+    system = ValueSystem.from_seed_declarations((seed,))
+    event_id = f"value-event-{index}"
+    system.apply_update(
+        ValueSelfAdmission(
+            target_value_id=seed.value_id,
+            subject_origin=IdentityOrigin(
+                OriginActor.SELF,
+                OriginInputKind.INTERNAL_STATE,
+                ValueAdmissionStatus.SELF_ENDORSED,
+                event_id=event_id,
+                event_sequence=index,
+            ),
+            evidence_refs=(f"value-evidence-{index}",),
+            requested_delta=1.0,
+            confidence=1.0,
+            reason=ValueMutationReason.ADMITTED_UPDATE,
+        ),
+        ValueMutationEvidence(
+            event_id=event_id,
+            event_sequence=index,
+            recorded_at=NOW,
+        ),
+    )
+    return system
+
+
+def capture_v5(
+    store: AgentStateStore, sequence: int, value_system: ValueSystem
+) -> AgentStateSnapshotV5:
+    target = RestoreTarget()
+    target.value_system = value_system
+    snapshot = store.capture(target, sequence)
+    assert isinstance(snapshot, AgentStateSnapshotV5)
+    return snapshot
+
+
+def configured_graph(
+    tmp_path: Path, seed: ValueSeedDeclaration
+) -> tuple[AgentStateStore, EventJournal, StateWAL]:
+    store = AgentStateStore(
+        tmp_path / "agent_state.json",
+        baseline_surprisal=1.0,
+        value_seeds=(seed,),
+        clock=lambda: NOW,
+    )
+    journal = EventJournal(tmp_path / "events.jsonl", 100_000, 4, clock=lambda: NOW)
+    wal = StateWAL(tmp_path / "wal")
+    return store, journal, wal
 
 
 def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV2:
@@ -435,6 +517,47 @@ def test_v3_committed_crash_recovery_publishes_current_checkpoint(
     assert checkpoint.schema_version == 3
     assert checkpoint.lifecycle is EventLifecycle.CHECKPOINT
     assert checkpoint.v3_migration_anchor_hash == migration_anchor
+
+
+def test_committed_before_crash_v5_reconstructs_value_without_replay(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    store, journal, wal = configured_graph(tmp_path, seed)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    initial = recovery.prepare_startup().snapshot
+    assert isinstance(initial, AgentStateSnapshotV5)
+    journal.append_v3_migration_checkpoint()
+
+    candidate = capture_v5(store, 1, value_system_with_update(seed, 1))
+    item = event("v5-committed-crash", 1)
+    start_event(journal, item)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    journal.append_prepared(
+        item,
+        store.snapshot_hash(initial),
+        store.snapshot_hash(candidate),
+        str(manifest.active_generation_id),
+    )
+    wal.append_transition(
+        event_id=uuid5(NAMESPACE_URL, "v5-committed-crash"),
+        event_type=item.event_type.value,
+        event_source=item.source.value,
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+    store.save(candidate)
+
+    reconciled = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert reconciled.snapshot == candidate
+    assert isinstance(reconciled.snapshot, AgentStateSnapshotV5)
+    target = RestoreTarget()
+    store.restore_into(target, reconciled.snapshot)
+    assert target.value_system.snapshot() == value_system_with_update(seed, 1).snapshot()
+    assert journal.records[-1].lifecycle is EventLifecycle.CHECKPOINT
 
 
 def test_r05_migration_preserves_high_water_above_snapshot_sequence(
@@ -1872,6 +1995,120 @@ def test_true_rollback_from_v3_to_retained_v2_clears_context(
     assert restored.context_registry.state.current_context_id is None
     assert restored.context_registry.state.frames == ()
     assert restored.context_registry.state.interlocutor_bindings == ()
+
+
+def test_true_rollback_from_v5_to_retained_v4_resets_value_system(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    store, journal, wal = configured_graph(tmp_path, seed)
+    retained = context_snapshot(0)
+    store.save(retained)
+    journal.verify_and_reconcile(0, store.snapshot_hash(retained))
+    wal.bootstrap(retained, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+
+    newer_system = value_system_with_update(seed, 1)
+    newer = capture_v5(store, 1, newer_system)
+    item = event("v5-to-v4-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, retained, newer)
+    for sequence in range(2, 6):
+        later = event(f"v5-to-v4-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
+
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == retained
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV4)
+    assert rolled_back.true_rollback_performed
+    target = RestoreTarget()
+    target.value_system = ValueSystem.restore_snapshot(newer_system.snapshot())
+    store.restore_into(target, rolled_back.snapshot)
+    assert target.value_system.snapshot() == store.configured_value_system.snapshot()
+    assert target.value_system.snapshot() != newer_system.snapshot()
+
+
+def test_true_rollback_to_older_v5_restores_exact_value_authority(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed()
+    store, journal, wal = configured_graph(tmp_path, seed)
+    older_system = value_system_with_update(seed, 1)
+    older = capture_v5(store, 0, older_system)
+    store.save(older)
+    journal.verify_and_reconcile(0, store.snapshot_hash(older))
+    wal.bootstrap(older, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+
+    newer_system = ValueSystem.restore_snapshot(older_system.snapshot())
+    newer_system.apply_update(
+        ValueSelfAdmission(
+            target_value_id=seed.value_id,
+            subject_origin=IdentityOrigin(
+                OriginActor.SELF,
+                OriginInputKind.INTERNAL_STATE,
+                ValueAdmissionStatus.SELF_ENDORSED,
+                event_id="value-event-2",
+                event_sequence=2,
+            ),
+            evidence_refs=("value-evidence-2",),
+            requested_delta=1.0,
+            confidence=1.0,
+            reason=ValueMutationReason.ADMITTED_UPDATE,
+        ),
+        ValueMutationEvidence(
+            event_id="value-event-2", event_sequence=2, recorded_at=NOW
+        ),
+    )
+    newer = capture_v5(store, 1, newer_system)
+    item = event("v5-to-older-v5-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, older, newer)
+    for sequence in range(2, 6):
+        later = event(f"v5-to-older-v5-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
+
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == older
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV5)
+    assert rolled_back.true_rollback_performed
+    target = RestoreTarget()
+    store.restore_into(target, rolled_back.snapshot)
+    assert target.value_system.snapshot() == older_system.snapshot()
 
 
 def test_true_rollback_from_v4_to_retained_v3_clears_appraisal_state(
