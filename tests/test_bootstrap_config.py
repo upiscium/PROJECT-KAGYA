@@ -7,7 +7,13 @@ from pydantic import ValidationError
 
 from kagya.api.server import app
 from kagya.config import Settings, load_settings
-from kagya.config.schema import AppraisalSettings, EmotionSettings
+from kagya.config.schema import (
+    AppraisalSettings,
+    EmotionSettings,
+    ValueConflictSettings,
+    ValueSeedSettings,
+    ValueSystemSettings,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -23,6 +29,130 @@ def test_config_yaml_loads_into_typed_settings() -> None:
 
     assert isinstance(settings, Settings)
     assert settings.project.name == read_raw_config()["project"]["name"]
+
+
+def test_baseline_values_are_loaded() -> None:
+    values = load_settings(CONFIG_PATH).values
+
+    assert [(seed.value_id, seed.name) for seed in values.seeds] == [
+        ("care", "care"),
+        ("honesty", "honesty"),
+    ]
+    assert values.seeds[0].scope == "subject"
+    assert values.seeds[0].polarity == 1
+    assert (values.seeds[0].strength, values.seeds[0].confidence) == (0.8, 0.8)
+    assert (values.seeds[0].stability, values.seeds[0].allowed_update_rate) == (
+        0.8,
+        0.05,
+    )
+    assert (values.seeds[1].stability, values.seeds[1].allowed_update_rate) == (0.85, 0.04)
+    assert values.seeds[0].protectedness == 0.0
+    assert values.seeds[0].negotiability == 1.0
+    assert values.conflicts[0].conflict_id == "compassionate-honesty"
+
+
+def test_values_are_optional_for_pre_r11_config() -> None:
+    raw = read_raw_config()
+    raw.pop("values")
+
+    settings = Settings.model_validate(raw)
+
+    assert settings.values.seeds == []
+    assert settings.values.conflicts == []
+
+
+def _seed_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "value_id": "care",
+        "name": "care",
+        "scope": "subject",
+        "polarity": 1,
+        "strength": 0.8,
+        "confidence": 0.8,
+        "stability": 0.8,
+        "allowed_update_rate": 0.05,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("polarity", 0),
+        ("strength", -0.1),
+        ("strength", 1.1),
+        ("allowed_update_rate", 0.0),
+        ("allowed_update_rate", 1.1),
+        ("strength", math.nan),
+        ("confidence", math.inf),
+        ("stability", -math.inf),
+    ],
+)
+def test_value_seed_bounds_and_finiteness(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        ValueSeedSettings.model_validate(_seed_payload(**{field: value}))
+
+
+@pytest.mark.parametrize("value", [1.0, True, "1"])
+def test_value_polarity_requires_exact_integer(value: object) -> None:
+    with pytest.raises(ValidationError):
+        ValueSeedSettings.model_validate(_seed_payload(polarity=value))
+
+
+def test_value_models_reject_unknown_keys() -> None:
+    with pytest.raises(ValidationError):
+        ValueSeedSettings.model_validate(_seed_payload(weight=0.5))
+    with pytest.raises(ValidationError):
+        ValueConflictSettings.model_validate(
+            {
+                "conflict_id": "a-b",
+                "name": "a-b",
+                "left_value_id": "a",
+                "right_value_id": "b",
+                "reason": "not configuration authority",
+            }
+        )
+
+
+def test_value_seed_ids_must_be_unique() -> None:
+    seed = _seed_payload()
+    with pytest.raises(ValidationError):
+        ValueSystemSettings.model_validate({"seeds": [seed, seed]})
+
+
+def _conflict(left: str = "care", right: str = "honesty") -> dict[str, str]:
+    return {
+        "conflict_id": "care-honesty",
+        "name": "care-honesty",
+        "left_value_id": left,
+        "right_value_id": right,
+    }
+
+
+def test_value_conflicts_reject_duplicate_reversed_self_and_unknown_pairs() -> None:
+    seeds = [_seed_payload(), _seed_payload(value_id="honesty", name="honesty")]
+    with pytest.raises(ValidationError):
+        ValueSystemSettings.model_validate(
+            {"seeds": seeds, "conflicts": [_conflict(), _conflict()]}
+        )
+    with pytest.raises(ValidationError):
+        ValueConflictSettings.model_validate(_conflict("honesty", "care"))
+    with pytest.raises(ValidationError):
+        ValueConflictSettings.model_validate(_conflict("care", "care"))
+    with pytest.raises(ValidationError):
+        ValueSystemSettings.model_validate(
+            {"seeds": seeds, "conflicts": [_conflict("care", "other")]}
+        )
+
+
+def test_value_seed_and_conflict_lists_have_maximum_sizes() -> None:
+    seed = _seed_payload()
+    with pytest.raises(ValidationError):
+        ValueSystemSettings.model_validate({"seeds": [seed] * 129})
+    conflicts = [_conflict(f"care{i}", f"honesty{i}") for i in range(257)]
+    with pytest.raises(ValidationError):
+        ValueSystemSettings.model_validate({"conflicts": conflicts})
 
 
 def test_existing_config_uses_appraisal_defaults() -> None:

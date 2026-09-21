@@ -93,3 +93,27 @@ event_journal:
 
 state_wal:
   directory: .kagya/private/state_wal
+
+values:
+  seeds:
+    - value_id: care
+      name: care
+      scope: subject
+      polarity: 1
+      strength: 0.8
+      confidence: 0.8
+      stability: 0.8
+      allowed_update_rate: 0.05
+    - value_id: honesty
+      name: honesty
+      scope: subject
+      polarity: 1
+      strength: 0.8
+      confidence: 0.8
+      stability: 0.85
+      allowed_update_rate: 0.04
+  conflicts:
+    - conflict_id: compassionate-honesty
+      name: compassionate-honesty
+      left_value_id: care
+      right_value_id: honesty
