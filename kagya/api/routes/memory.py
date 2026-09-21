@@ -1,6 +1,5 @@
 """Memory routes."""
 
-from collections.abc import Mapping
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,7 +10,13 @@ from kagya.api.schemas.memory import (
     MemorySearchResponse,
     SemanticMemoryResponse,
 )
-from kagya.memory import DualMemorySystem, EpisodicMemoryRecord, SemanticMemoryRecord
+from kagya.memory import (
+    DualMemorySystem,
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+    EpisodicMemoryRecord,
+    SemanticMemoryRecord,
+)
 
 
 router = APIRouter(
@@ -34,22 +39,19 @@ def search_memory(
 def get_episode(
     episode_id: str, memory: DualMemorySystem = Depends(get_memory_system)
 ) -> EpisodeMemoryResponse:
-    result = memory.db1.get(ids=[episode_id], include=["metadatas"])
-    ids = result.get("ids") or []
-    if not ids:
+    try:
+        committed = memory.get_committed_episodic(episode_id)
+    except EpisodicMemoryReadError:
+        raise HTTPException(
+            status_code=503, detail="Committed episodic Memory is unavailable"
+        ) from None
+    except EpisodicMemoryFormatError:
+        raise HTTPException(
+            status_code=500, detail="Committed episodic Memory is invalid"
+        ) from None
+    if committed is None:
         raise HTTPException(status_code=404, detail="Episode not found")
-    metadata = (result.get("metadatas") or [{}])[0] or {}
-    return EpisodeMemoryResponse(
-        id=episode_id,
-        user_input=str(metadata.get("user_input", "")),
-        response=str(metadata.get("response", "")),
-        loss=_metadata_float(metadata, "loss"),
-        emotion_valence=_metadata_float(metadata, "emotion_valence"),
-        emotion_arousal=_metadata_float(metadata, "emotion_arousal"),
-        record_type=str(metadata.get("record_type", "episodic_log")),
-        archived=bool(metadata.get("archived", False)),
-        created_at=str(metadata.get("created_at", "")),
-    )
+    return episode_response(committed.record)
 
 
 @router.get("/semantic/{memory_id}", response_model=SemanticMemoryResponse)
@@ -94,10 +96,3 @@ def semantic_response(record: SemanticMemoryRecord) -> SemanticMemoryResponse:
         record_type=record.record_type.value,
         created_at=record.created_at,
     )
-
-
-def _metadata_float(metadata: Mapping[str, object], key: str) -> float:
-    value = metadata.get(key, 0.0)
-    if isinstance(value, (str, int, float)):
-        return float(value)
-    raise ValueError(f"Memory metadata {key!r} is not numeric")

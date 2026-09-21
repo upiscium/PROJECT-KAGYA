@@ -14,6 +14,7 @@ from kagya.runtime.agent_state import (
     AgentStateLoadError,
     AgentStateSnapshotV1,
     AgentStateSnapshotV2,
+    AgentStateSnapshotV3,
     AgentStateStore,
     CompatibleAgentStateSnapshot,
 )
@@ -1332,7 +1333,9 @@ class StateRecoveryCoordinator:
         wal_record, wal_record_hash = self._record_for_snapshot(
             post_wal, target, target_hash
         )
-        if isinstance(target, (AgentStateSnapshotV1, AgentStateSnapshotV2)):
+        if isinstance(
+            target, (AgentStateSnapshotV1, AgentStateSnapshotV2, AgentStateSnapshotV3)
+        ):
             try:
                 published = self.state_store.load()
             except AgentStateLoadError:

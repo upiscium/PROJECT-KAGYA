@@ -7,7 +7,7 @@ class EpisodeMemoryResponse(BaseModel):
     id: str
     user_input: str
     response: str
-    loss: float
+    loss: float | None
     emotion_valence: float
     emotion_arousal: float
     record_type: str

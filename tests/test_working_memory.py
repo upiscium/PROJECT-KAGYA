@@ -11,7 +11,8 @@ from threading import Thread
 import pytest
 import yaml
 
-from kagya.body import EmotionState
+from kagya.body import EmotionEngineAllostasis, EmotionState
+from kagya.cognition import LossCalibration
 from kagya.config import Settings, load_settings
 from kagya.memory import DualMemorySystem, MemoryRecordType
 from kagya.memory.dual_memory_system import (
@@ -43,6 +44,7 @@ from kagya.runtime.event_journal import EventJournal
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
+MODEL_KEY = "model." + "0" * 64
 
 
 def admit(
@@ -54,6 +56,20 @@ def admit(
     kind: WorkingMemorySourceKind = WorkingMemorySourceKind.EPISODIC,
 ) -> WorkingMemoryItem:
     return memory.admit(kind, source_id, activation, salience).item
+
+
+def capture_loop(memory: WorkingMemory) -> SimpleNamespace:
+    return SimpleNamespace(
+        emotion_engine=EmotionEngineAllostasis(EmotionState()),
+        working_memory=memory,
+        context_registry=ContextRegistry(clock=lambda: NOW),
+        loss_calibration=LossCalibration(
+            (MODEL_KEY,),
+            initial_baseline=1.0,
+            initial_scale=1.0,
+            minimum_scale=0.1,
+        ),
+    )
 
 
 def test_hard_item_bound_evicts_deterministic_lowest_rank() -> None:
@@ -189,11 +205,7 @@ def test_repeated_selection_and_prompt_builds_preserve_canonical_evidence(
     memory = WorkingMemory(item_capacity=2, projection_max_bytes=100)
     admit(memory, "episode-repeat", activation=0.8, salience=0.6)
     before = (memory.revision, memory.items)
-    loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()),
-        working_memory=memory,
-        context_registry=ContextRegistry(clock=lambda: NOW),
-    )
+    loop = capture_loop(memory)
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
 
     views = [
@@ -554,11 +566,7 @@ def test_resolution_outcomes_preserve_wm_wal_and_journal_evidence(
     memory = WorkingMemory(item_capacity=1, projection_max_bytes=100)
     admit(memory, "episode-evidence")
     before = (memory.revision, memory.items)
-    loop = SimpleNamespace(
-        emotion_engine=SimpleNamespace(state=EmotionState()),
-        working_memory=memory,
-        context_registry=ContextRegistry(clock=lambda: NOW),
-    )
+    loop = capture_loop(memory)
     store = AgentStateStore(tmp_path / "agent-state.json", 1.0, clock=lambda: NOW)
     snapshot = store.capture(loop, sequence=0)
     snapshot_hash = store.snapshot_hash(snapshot)

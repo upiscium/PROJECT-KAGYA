@@ -15,13 +15,21 @@ from kagya.api.routes.chat import (
 )
 from kagya.api.schemas.chat import ChatRequest
 from kagya.api.schemas.debug import (
+    AppraisalSchema,
+    ArousalContributionsSchema,
+    ChatDiagnosticsSchema,
     DebugChatResponse,
     EmotionStateResponse,
+    EmotionUpdateSchema,
     GenerationParamsSchema,
+    LossMeasurementSchema,
     RetrievedEpisodeSchema,
     RetrievedMemorySchema,
     RetrievedSemanticSchema,
+    ValenceContributionsSchema,
 )
+from kagya.body import EmotionUpdate
+from kagya.cognition import AppraisalResult, LossMeasurement
 from kagya.config import Settings
 from kagya.runtime import (
     AgentEventSource,
@@ -30,6 +38,7 @@ from kagya.runtime import (
     ChatContextSelectors,
     KagyaMainLoop,
 )
+from kagya.runtime.main_loop import ChatDiagnostics
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -89,6 +98,65 @@ def debug_chat(
             top_p=settings.generation.top_p,
             do_sample=settings.generation.do_sample,
         ),
+        diagnostics=_diagnostics_response(trace.diagnostics),
+    )
+
+
+def _diagnostics_response(diagnostics: ChatDiagnostics) -> ChatDiagnosticsSchema:
+    return ChatDiagnosticsSchema(
+        measurement=_measurement_response(diagnostics.measurement),
+        appraisal=_appraisal_response(diagnostics.appraisal),
+        temporal_update=_emotion_update_response(diagnostics.temporal_update),
+        emotion_update=_emotion_update_response(diagnostics.emotion_update),
+    )
+
+
+def _measurement_response(measurement: LossMeasurement) -> LossMeasurementSchema:
+    return LossMeasurementSchema(
+        model_key=measurement.model_key,
+        raw_loss=measurement.raw_loss,
+        valid=measurement.valid,
+        invalid_reason=measurement.invalid_reason,
+        calibrated_novelty=measurement.calibrated_novelty,
+    )
+
+
+def _appraisal_response(appraisal: AppraisalResult) -> AppraisalSchema:
+    return AppraisalSchema(
+        novelty=appraisal.novelty,
+        novelty_valid=appraisal.novelty_valid,
+        goal_progress=appraisal.goal_progress,
+        threat=appraisal.threat,
+        controllability=appraisal.controllability,
+        certainty=appraisal.certainty,
+        social_relevance=appraisal.social_relevance,
+        effort_cost=appraisal.effort_cost,
+        reasons=list(appraisal.reasons),
+    )
+
+
+def _emotion_update_response(update: EmotionUpdate) -> EmotionUpdateSchema:
+    return EmotionUpdateSchema(
+        state=EmotionStateResponse(
+            valence=update.state.valence,
+            arousal=update.state.arousal,
+            optimal_loss=update.state.optimal_loss,
+        ),
+        valence_contributions=ValenceContributionsSchema(
+            goal_progress=update.valence_contributions.goal_progress,
+            threat=update.valence_contributions.threat,
+            effort_cost=update.valence_contributions.effort_cost,
+            controllability=update.valence_contributions.controllability,
+        ),
+        arousal_contributions=ArousalContributionsSchema(
+            novelty=update.arousal_contributions.novelty,
+            threat=update.arousal_contributions.threat,
+            effort_cost=update.arousal_contributions.effort_cost,
+            social_relevance=update.arousal_contributions.social_relevance,
+            uncertainty=update.arousal_contributions.uncertainty,
+            low_controllability=update.arousal_contributions.low_controllability,
+        ),
+        reasons=list(update.reasons),
     )
 
 

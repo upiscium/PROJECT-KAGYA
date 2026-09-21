@@ -18,8 +18,8 @@ from kagya.models import ModelProvider
 from kagya.persona.prompt_builder import PromptBuilder
 from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from kagya.runtime.agent_state import (
-    AgentStateSnapshot,
     AgentStateSnapshotV2,
+    AgentStateSnapshotV3,
     AgentStateStore,
     EmotionStateSnapshot,
     ContextFrameSnapshot,
@@ -101,7 +101,7 @@ def _snapshot_with_working_memory(
     revision: int,
     *,
     context_id: str | None = None,
-) -> AgentStateSnapshotV2 | AgentStateSnapshot:
+) -> AgentStateSnapshotV2 | AgentStateSnapshotV3:
     items = tuple(
         WorkingMemoryItemSnapshot(
             item_id=working_memory_item_id(WorkingMemorySourceKind(kind), source_id),
@@ -147,7 +147,7 @@ def _snapshot_with_working_memory(
         frames=(frame,),
         interlocutor_bindings=(),
     )
-    return AgentStateSnapshot.model_validate(payload)
+    return AgentStateSnapshotV3.model_validate(payload)
 
 
 def _graph(tmp_path: Path):

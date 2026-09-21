@@ -18,7 +18,7 @@ class EpisodicMemoryRecord:
     id: str
     user_input: str
     response: str
-    loss: float = 0.0
+    loss: float | None = 0.0
     emotion_valence: float = 0.0
     emotion_arousal: float = 0.0
     record_type: MemoryRecordType = MemoryRecordType.EPISODIC_LOG

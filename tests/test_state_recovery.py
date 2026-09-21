@@ -8,7 +8,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from kagya.cognition import CognitiveAppraiser, LossCalibration, SurprisalCalculator
 from kagya.memory import DualMemorySystem
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import ModelProvider
@@ -18,9 +19,13 @@ from kagya.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshot,
+    AgentStateSnapshotV3,
+    AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     AgentStateStore,
+    CalibrationEntrySnapshot,
+    CompatibleAgentStateSnapshot,
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
@@ -61,6 +66,7 @@ from kagya.runtime.state_wal import (
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+MODEL_KEY = "model." + "0" * 64
 
 
 class RestoreTarget:
@@ -72,6 +78,12 @@ class RestoreTarget:
             item_capacity=32, projection_max_bytes=2048
         )
         self.context_registry = ContextRegistry(clock=lambda: NOW)
+        self.loss_calibration = LossCalibration(
+            (MODEL_KEY,),
+            initial_baseline=1.0,
+            initial_scale=1.0,
+            minimum_scale=0.1,
+        )
 
 
 def snapshot(sequence: int, value: float = 0.1) -> AgentStateSnapshotV2:
@@ -194,8 +206,8 @@ def start_transaction(journal: EventJournal, item: AgentEvent) -> None:
 def commit_event(
     recovery: StateRecoveryCoordinator,
     item: AgentEvent,
-    prior: AgentStateSnapshotV2,
-    candidate: AgentStateSnapshotV2,
+    prior: CompatibleAgentStateSnapshot,
+    candidate: CompatibleAgentStateSnapshot,
 ) -> None:
     evidence = recovery.commit_internal_candidate(item, prior, candidate)
     recovery.complete_committed_event(item, evidence)
@@ -287,6 +299,49 @@ def context_snapshot(
             frames=(first, second),
             interlocutor_bindings=(),
         ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(
+                CalibrationEntrySnapshot(
+                    model_key=MODEL_KEY, count=2, mean=1.0, m2=0.5
+                ),
+            ),
+            last_emotion_update_at=NOW,
+        ),
+    )
+
+
+def retained_v3(snapshot: AgentStateSnapshot) -> AgentStateSnapshotV3:
+    return AgentStateSnapshotV3(
+        saved_at=snapshot.saved_at,
+        last_processed_event_sequence=snapshot.last_processed_event_sequence,
+        emotion_state=snapshot.emotion_state,
+        working_memory=snapshot.working_memory,
+        context_state=snapshot.context_state,
+    )
+
+
+def v4_with_appraisal(
+    sequence: int,
+    *,
+    count: int,
+    mean: float,
+    m2: float,
+    updated_at: datetime,
+) -> AgentStateSnapshot:
+    return context_snapshot(sequence).model_copy(
+        update={
+            "appraisal_state": AppraisalStateSnapshot(
+                calibration_entries=(
+                    CalibrationEntrySnapshot(
+                        model_key=MODEL_KEY,
+                        count=count,
+                        mean=mean,
+                        m2=m2,
+                    ),
+                ),
+                last_emotion_update_at=updated_at,
+            )
+        }
     )
 
 
@@ -1118,7 +1173,7 @@ def test_committed_before_crash_with_corrupt_wal_keeps_canonical_current(
     assert wal.inspect().records[0].baseline_snapshot == candidate
 
 
-def test_committed_context_mutation_before_crash_restores_exact_v3_context(
+def test_committed_context_mutation_before_crash_restores_exact_v4_context(
     tmp_path: Path,
 ) -> None:
     recovery, store, journal, wal = coordinator(tmp_path)
@@ -1230,6 +1285,19 @@ def test_exact_current_repair_restores_nonempty_context_without_cognition(
             "Model generation must not run during recovery"
         ),
     )
+
+    def fail_r10_call(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("R10 loss, appraisal, or temporal update must not run during recovery")
+
+    for owner, method_name in (
+        (SurprisalCalculator, "calculate"),
+        (SurprisalCalculator, "measure"),
+        (CognitiveAppraiser, "appraise"),
+        (EmotionEngineAllostasis, "update_from_appraisal"),
+        (EmotionEngineAllostasis, "advance_time"),
+        (EmotionEngineAllostasis, "advance_to"),
+    ):
+        monkeypatch.setattr(owner, method_name, fail_r10_call)
 
     result = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
 
@@ -1743,7 +1811,7 @@ def test_true_rollback_from_v3_to_retained_v2_clears_context(
         started_at=NOW,
         last_active_at=NOW,
     )
-    candidate = AgentStateSnapshot(
+    candidate = AgentStateSnapshotV3(
         saved_at=NOW,
         last_processed_event_sequence=1,
         emotion_state=EmotionStateSnapshot(
@@ -1804,6 +1872,135 @@ def test_true_rollback_from_v3_to_retained_v2_clears_context(
     assert restored.context_registry.state.current_context_id is None
     assert restored.context_registry.state.frames == ()
     assert restored.context_registry.state.interlocutor_bindings == ()
+
+
+def test_true_rollback_from_v4_to_retained_v3_clears_appraisal_state(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    retained = retained_v3(context_snapshot(0))
+    store.save(retained)
+    journal.verify_and_reconcile(0, store.snapshot_hash(retained))
+    wal.bootstrap(retained, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+
+    newer = v4_with_appraisal(
+        1,
+        count=2,
+        mean=2.0,
+        m2=0.75,
+        updated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    item = event("v4-to-v3-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, retained, newer)
+    for sequence in range(2, 6):
+        later = event(f"v4-to-v3-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
+
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == retained
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshotV3)
+    assert not hasattr(rolled_back.snapshot, "appraisal_state")
+    assert rolled_back.processing_high_water == 5
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.external_reconciliation_required
+
+    restored = RestoreTarget()
+    restored.loss_calibration.sample(MODEL_KEY, 0.2)
+    restored.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+    store.restore_into(restored, rolled_back.snapshot)
+
+    assert restored.loss_calibration.export() == ()
+    assert restored.emotion_engine.temporal_state == EmotionTemporalState()
+    assert restored.context_registry.state == retained.context_state.to_registry_state()
+
+
+def test_true_rollback_from_v4_to_older_v4_restores_exact_appraisal_state(
+    tmp_path: Path,
+) -> None:
+    store, journal, wal = graph(tmp_path)
+    older = v4_with_appraisal(
+        0,
+        count=1,
+        mean=0.25,
+        m2=0.0,
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    store.save(older)
+    journal.verify_and_reconcile(0, store.snapshot_hash(older))
+    wal.bootstrap(older, 0)
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+    bootable = recovery.prepare_startup()
+    recovery.publish_boot_anchor(bootable)
+
+    newer = v4_with_appraisal(
+        1,
+        count=2,
+        mean=2.0,
+        m2=0.75,
+        updated_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    item = event("v4-to-older-v4-rollback-target", 1)
+    start_event(journal, item)
+    commit_event(recovery, item, older, newer)
+    for sequence in range(2, 6):
+        later = event(f"v4-to-older-v4-rollback-later-{sequence}", sequence)
+        start_event(journal, later)
+        journal.append_failed(later, 1, store.snapshot_hash(store.load()))
+
+    corrupt_manifest = wal.inspect().active_manifest
+    assert corrupt_manifest is not None
+    generation = (
+        wal.root / "generations" / f"{corrupt_manifest.active_generation_id}.jsonl"
+    )
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    generation.chmod(0o600)
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+
+    assert rolled_back.snapshot == older
+    assert isinstance(rolled_back.snapshot, AgentStateSnapshot)
+    assert rolled_back.snapshot.appraisal_state == older.appraisal_state
+    assert rolled_back.processing_high_water == 5
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.external_reconciliation_required
+
+    restored = RestoreTarget()
+    restored.loss_calibration.sample(MODEL_KEY, 9.0)
+    restored.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+    store.restore_into(restored, rolled_back.snapshot)
+
+    expected_entries = tuple(
+        entry.to_entry()
+        for entry in older.appraisal_state.calibration_entries
+    )
+    assert restored.loss_calibration.export() == expected_entries
+    assert restored.emotion_engine.temporal_state == EmotionTemporalState(
+        older.appraisal_state.last_emotion_update_at
+    )
 
 
 def test_true_rollback_to_retained_v1_preserves_high_water_and_legacy_state(

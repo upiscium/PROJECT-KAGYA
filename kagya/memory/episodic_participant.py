@@ -8,8 +8,10 @@ import math
 import os
 import re
 import stat
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -46,6 +48,7 @@ _PENDING_SCHEMA_VERSION = 1
 _OPERATION_HASH_DOMAINS = {
     1: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V1\x00",
     2: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V2\x00",
+    3: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V3\x00",
 }
 _EPISODE_ID_NAMESPACE = UUID("f0ced3ab-ad3f-5acb-b190-edea7fff6aff")
 _STAGING_DIRECTORY = ".r07-episodic-pending"
@@ -56,7 +59,7 @@ _MAX_PENDING_BYTES = 4 * 1024 * 1024
 class EpisodicWrite:
     user_input: str
     response: str
-    loss: float
+    loss: float | None
     emotion_valence: float
     emotion_arousal: float
     record_type: MemoryRecordType
@@ -69,13 +72,23 @@ class EpisodicWrite:
     def __post_init__(self) -> None:
         if not isinstance(self.user_input, str) or not isinstance(self.response, str):
             raise ValueError("Episodic text is invalid")
-        for value in (self.loss, self.emotion_valence, self.emotion_arousal):
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2, 3):
+            raise ValueError("Episodic schema version is unsupported")
+        if self.loss is None and self.schema_version != 3:
+            raise ValueError("Episodic loss is required")
+        for value in (self.emotion_valence, self.emotion_arousal):
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
                 or not math.isfinite(value)
             ):
                 raise ValueError("Episodic numeric value is invalid")
+        if self.loss is not None and (
+            isinstance(self.loss, bool)
+            or not isinstance(self.loss, (int, float))
+            or not math.isfinite(self.loss)
+        ):
+            raise ValueError("Episodic loss is invalid")
         if self.record_type is not MemoryRecordType.EPISODIC_LOG:
             raise ValueError("Coordinated record type is unsupported")
         try:
@@ -84,14 +97,12 @@ class EpisodicWrite:
             raise ValueError("Episodic timestamp is invalid") from None
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             raise ValueError("Episodic timestamp must be timezone-aware")
-        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
-            raise ValueError("Episodic schema version is unsupported")
         if self.schema_version == 1 and any(
             value is not None
             for value in (self.context_id, self.source_channel, self.source_session_id)
         ):
             raise ValueError("Schema 1 does not support provenance")
-        if self.schema_version == 2:
+        if self.schema_version in (2, 3):
             _validate_provenance(
                 self.context_id, self.source_channel, self.source_session_id
             )
@@ -101,13 +112,13 @@ class EpisodicWrite:
             "schema_version": self.schema_version,
             "user_input": self.user_input,
             "response": self.response,
-            "loss": float(self.loss),
+            "loss": None if self.loss is None else float(self.loss),
             "emotion_valence": float(self.emotion_valence),
             "emotion_arousal": float(self.emotion_arousal),
             "record_type": self.record_type.value,
             "created_at": self.created_at,
         }
-        if self.schema_version == 2:
+        if self.schema_version in (2, 3):
             result.update(
                 context_id=self.context_id,
                 source_channel=self.source_channel,
@@ -166,7 +177,7 @@ class MemoryEpisodicParticipant:
                 raise UnsupportedParticipantReconciliationError(
                     "Memory operation evidence is absent"
                 )
-            operation = _operation_from_record(committed.record)
+            operation = _operation_from_record(committed.record, operation_digest)
         else:
             operation = _operation_from_dict(loaded.get("operation"))
         participant = cls(memory, operation)
@@ -401,33 +412,29 @@ class MemoryEpisodicParticipant:
         self, committed: CommittedEpisodicMemory, expected_episode_id: str
     ) -> bool:
         record = committed.record
-        return (
+        expected_metadata = canonical_episodic_metadata(
+            self.operation.user_input,
+            self.operation.response,
+            loss=self.operation.loss,
+            emotion_valence=self.operation.emotion_valence,
+            emotion_arousal=self.operation.emotion_arousal,
+            record_type=self.operation.record_type,
+            created_at=self.operation.created_at,
+            metadata={},
+            coordinated=True,
+            coordination_schema=self.operation.schema_version,
+            context_id=self.operation.context_id,
+            source_channel=self.operation.source_channel,
+            source_session_id=self.operation.source_session_id,
+        )
+        common_matches = (
             committed.document
             == canonical_episodic_document(
                 self.operation.user_input, self.operation.response
             )
-            and committed.metadata
-            == canonical_episodic_metadata(
-                self.operation.user_input,
-                self.operation.response,
-                loss=self.operation.loss,
-                emotion_valence=self.operation.emotion_valence,
-                emotion_arousal=self.operation.emotion_arousal,
-                record_type=self.operation.record_type,
-                created_at=self.operation.created_at,
-                metadata={},
-                coordinated=True,
-                coordination_schema=self.operation.schema_version,
-                context_id=self.operation.context_id,
-                source_channel=self.operation.source_channel,
-                source_session_id=self.operation.source_session_id,
-            )
             and record.id == expected_episode_id
             and record.user_input == self.operation.user_input
             and record.response == self.operation.response
-            and record.loss == float(self.operation.loss)
-            and record.emotion_valence == float(self.operation.emotion_valence)
-            and record.emotion_arousal == float(self.operation.emotion_arousal)
             and record.record_type is self.operation.record_type
             and not record.archived
             and record.created_at == self.operation.created_at
@@ -436,6 +443,35 @@ class MemoryEpisodicParticipant:
             and record.context_id == self.operation.context_id
             and record.source_channel == self.operation.source_channel
             and record.source_session_id == self.operation.source_session_id
+        )
+        if not common_matches:
+            return False
+        if self.operation.schema_version in (1, 2):
+            expected_loss = self.operation.loss
+            if expected_loss is None:
+                return False
+            return (
+                committed.metadata == expected_metadata
+                and record.loss == float(expected_loss)
+                and record.emotion_valence == float(self.operation.emotion_valence)
+                and record.emotion_arousal == float(self.operation.emotion_arousal)
+            )
+        expected_loss = self.operation.loss
+        if expected_loss is None:
+            loss_matches = record.loss is None
+        else:
+            loss_matches = record.loss is not None and _float_round_trip_matches(
+                record.loss, float(expected_loss)
+            )
+        return (
+            _metadata_round_trip_matches(committed.metadata, expected_metadata)
+            and loss_matches
+            and _float_round_trip_matches(
+                record.emotion_valence, float(self.operation.emotion_valence)
+            )
+            and _float_round_trip_matches(
+                record.emotion_arousal, float(self.operation.emotion_arousal)
+            )
         )
 
     def _staging_directory(self) -> Path:
@@ -610,6 +646,38 @@ class MemoryEpisodicParticipant:
                 pass
 
 
+def _float_round_trip_matches(actual: float, expected: float) -> bool:
+    # Chroma may round one representable float during metadata storage; no
+    # wider tolerance is allowed because the operation evidence is authoritative.
+    if not math.isfinite(actual) or not math.isfinite(expected):
+        return False
+    if actual == expected:
+        return True
+    return actual in (
+        math.nextafter(expected, -math.inf),
+        math.nextafter(expected, math.inf),
+    )
+
+
+def _metadata_round_trip_matches(
+    actual: Mapping[str, object], expected: Mapping[str, object]
+) -> bool:
+    if actual.keys() != expected.keys():
+        return False
+    for key, expected_value in expected.items():
+        actual_value = actual[key]
+        if isinstance(expected_value, float):
+            if (
+                not isinstance(actual_value, (int, float))
+                or isinstance(actual_value, bool)
+                or not _float_round_trip_matches(float(actual_value), expected_value)
+            ):
+                return False
+        elif type(actual_value) is not type(expected_value) or actual_value != expected_value:
+            return False
+    return True
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -632,29 +700,67 @@ def _episode_id(
     return f"episode-{uuid5(_EPISODE_ID_NAMESPACE, canonical)}"
 
 
-def _operation_from_record(record: EpisodicMemoryRecord) -> EpisodicWrite:
+def _operation_from_record(
+    record: EpisodicMemoryRecord, expected_digest: str
+) -> EpisodicWrite:
     if (
         record.metadata
         or record.archived
-        or record.coordination_schema not in (1, 2)
+        or record.coordination_schema not in (1, 2, 3)
     ):
         raise ParticipantDivergedError("Committed Memory record conflicts")
-    try:
-        return EpisodicWrite(
-            user_input=record.user_input,
-            response=record.response,
-            loss=record.loss,
-            emotion_valence=record.emotion_valence,
-            emotion_arousal=record.emotion_arousal,
-            record_type=record.record_type,
-            created_at=record.created_at,
-            context_id=record.context_id,
-            source_channel=record.source_channel,
-            source_session_id=record.source_session_id,
-            schema_version=record.coordination_schema,
+    candidates: Iterable[tuple[float | None, float | None, float | None]]
+    if record.coordination_schema == 3:
+        candidates = product(
+            _float_candidates(record.loss),
+            _float_candidates(record.emotion_valence),
+            _float_candidates(record.emotion_arousal),
         )
-    except (TypeError, ValueError):
-        raise ParticipantDivergedError("Committed Memory record conflicts") from None
+    else:
+        candidates = (
+            (record.loss, record.emotion_valence, record.emotion_arousal),
+        )
+    matches: list[EpisodicWrite] = []
+    for loss, emotion_valence, emotion_arousal in candidates:
+        if emotion_valence is None or emotion_arousal is None:
+            continue
+        try:
+            operation = EpisodicWrite(
+                user_input=record.user_input,
+                response=record.response,
+                loss=loss,
+                emotion_valence=emotion_valence,
+                emotion_arousal=emotion_arousal,
+                record_type=record.record_type,
+                created_at=record.created_at,
+                context_id=record.context_id,
+                source_channel=record.source_channel,
+                source_session_id=record.source_session_id,
+                schema_version=record.coordination_schema,
+            )
+        except (TypeError, ValueError):
+            continue
+        if episodic_operation_digest(operation) == expected_digest:
+            matches.append(operation)
+    if len(matches) != 1:
+        raise ParticipantDivergedError("Committed Memory record conflicts")
+    return matches[0]
+
+
+def _float_candidates(value: float | None) -> tuple[float | None, ...]:
+    if value is None:
+        return (None,)
+    candidates = [value]
+    for direction in (-math.inf, math.inf):
+        neighbor = math.nextafter(value, direction)
+        if math.isfinite(neighbor):
+            candidates.append(neighbor)
+    if value == 0.0:
+        candidates.extend((0.0, -0.0))
+    unique: dict[str, float] = {}
+    for candidate in candidates:
+        unique[candidate.hex()] = candidate
+    return tuple(unique.values())
 
 
 def _operation_from_dict(value: object) -> EpisodicWrite:
@@ -673,17 +779,18 @@ def _operation_from_dict(value: object) -> EpisodicWrite:
     schema = value["schema_version"]
     expected_keys = base_keys | (
         {"context_id", "source_channel", "source_session_id"}
-        if schema == 2
+        if schema in (2, 3)
         else set()
     )
     if set(value) != expected_keys:
         raise ParticipantDivergedError("Pending Memory operation is invalid")
     if (
         type(value["schema_version"]) is not int
-        or schema not in (1, 2)
+        or schema not in (1, 2, 3)
         or not isinstance(value["user_input"], str)
         or not isinstance(value["response"], str)
-        or not isinstance(value["loss"], float)
+        or (schema != 3 and not isinstance(value["loss"], float))
+        or (schema == 3 and value["loss"] is not None and not isinstance(value["loss"], float))
         or not isinstance(value["emotion_valence"], float)
         or not isinstance(value["emotion_arousal"], float)
         or not isinstance(value["record_type"], str)

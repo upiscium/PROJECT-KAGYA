@@ -1,9 +1,11 @@
 import json
+import math
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock, current_thread
 from typing import Any, NoReturn
 
 import pytest
@@ -11,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from kagya.api.server import create_app
-from kagya.body import EmotionState
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem, MemoryContext
+from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
@@ -26,20 +28,29 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeDurabilityError,
+    AgentRuntimeDurabilityPhase,
+    AgentRuntimeExecutionError,
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
     AgentRuntimeStatus,
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
+    AgentStateSnapshotV2,
     AgentStateSnapshotV2 as AgentStateSnapshot,
+    AgentStateSnapshotV3,
     AgentStateStore,
+    ContextFrameSnapshot,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
+    WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
     WorkingMemoryResolutionStatus,
     EventFailureCategory,
     EventJournal,
+    EventJournalAdmissionStatus,
     EventJournalAppendError,
     EventJournalAppendStage,
     EventJournalLoadError,
@@ -52,6 +63,7 @@ from kagya.runtime import (
     WorkingMemoryDecisionReason,
     WorkingMemory,
     WorkingMemorySourceKind,
+    working_memory_item_id,
 )
 
 
@@ -64,6 +76,10 @@ class ThinkingProvider(DummyProvider):
     response_text = f"<think>{PRIVATE_SENTINEL}</think>Visible API answer."
 
 
+class NonFiniteLossProvider(ThinkingProvider):
+    loss_value = math.nan
+
+
 class FailOnceAfterEmotionProvider(ThinkingProvider):
     def __init__(self) -> None:
         self.failed = False
@@ -71,6 +87,17 @@ class FailOnceAfterEmotionProvider(ThinkingProvider):
     def generate(self, prompt: str) -> str:
         if not self.failed:
             self.failed = True
+            raise ValueError(PRIVATE_SENTINEL)
+        return super().generate(prompt)
+
+
+class FailOnSecondGenerationProvider(ThinkingProvider):
+    def __init__(self) -> None:
+        self.generation_count = 0
+
+    def generate(self, prompt: str) -> str:
+        self.generation_count += 1
+        if self.generation_count == 2:
             raise ValueError(PRIVATE_SENTINEL)
         return super().generate(prompt)
 
@@ -112,6 +139,28 @@ class AdmissionRuntime:
     ) -> NoReturn:
         event = AgentEvent("test-event", event_type, source, datetime.now(timezone.utc))
         raise self.error_type(event)
+
+
+class RecordingTimer:
+    def __init__(
+        self,
+        on_start: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
+    ) -> None:
+        self.on_start = on_start
+        self.on_stop = on_stop
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+        if self.on_start is not None:
+            self.on_start()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if self.on_stop is not None:
+            self.on_stop()
 
 
 def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
@@ -301,6 +350,172 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
         )
 
 
+def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        clock_values = iter((t0, t1))
+        main_loop.emotion_engine._clock = lambda: next(clock_values)  # type: ignore[method-assign]
+        original_advance_to = main_loop.emotion_engine.advance_to
+        active = 0
+        max_active = 0
+        lock = Lock()
+        threads: list[str] = []
+        chat_state: list[tuple[EmotionState, EmotionTemporalState]] = []
+
+        def tracked_advance_to(now=None):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+                threads.append(current_thread().name)
+            try:
+                return original_advance_to(now)
+            finally:
+                with lock:
+                    active -= 1
+
+        main_loop.emotion_engine.advance_to = tracked_advance_to  # type: ignore[method-assign]
+
+        def chat_handler():
+            result = main_loop.chat("FIFO chat")
+            chat_state.append(
+                (main_loop.emotion_engine.state, main_loop.emotion_engine.temporal_state)
+            )
+            return result
+
+        chat_future = runtime.submit(
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            chat_handler,
+        )
+        tick_future = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        )
+        chat = chat_future.result(timeout=10)
+        tick = tick_future.result(timeout=10)
+
+        assert chat.event.processing_sequence == 1
+        assert tick.event.processing_sequence == 2
+        assert tick.value is None
+        assert max_active == 1
+        assert threads == ["kagya-agent-runtime", "kagya-agent-runtime"]
+        assert len(chat_state) == 1
+        assert main_loop.emotion_engine.temporal_state.last_update_at == t1
+
+        chat_emotion, chat_temporal = chat_state[0]
+        expected = EmotionEngineAllostasis(
+            chat_emotion,
+            adaptation_rate=main_loop.emotion_engine.adaptation_rate,
+            appraisal_response_rate=main_loop.emotion_engine.appraisal_response_rate,
+            resting_valence=main_loop.emotion_engine.resting_valence,
+            resting_arousal=main_loop.emotion_engine.resting_arousal,
+            valence_recovery_rate=main_loop.emotion_engine.valence_recovery_rate,
+            arousal_recovery_rate=main_loop.emotion_engine.arousal_recovery_rate,
+            temporal_state=chat_temporal,
+            clock=lambda: t1,
+        )
+        expected.advance_to()
+        assert main_loop.emotion_engine.state == expected.state
+
+        snapshot = client.app.state.agent_state_store.load()
+        assert snapshot.last_processed_event_sequence == 2
+        assert snapshot.appraisal_state.last_emotion_update_at == t1
+        tick_records = [
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_id == tick.event.event_id
+        ]
+        assert [record.lifecycle for record in tick_records] == [
+            EventLifecycle.ACCEPTED,
+            EventLifecycle.STARTED,
+            EventLifecycle.PREPARED,
+            EventLifecycle.COMPLETED,
+        ]
+        assert all(record.transaction_id is None for record in tick_records)
+
+
+def test_emotion_tick_clock_regression_restores_and_later_tick_recovers(
+    tmp_path: Path,
+) -> None:
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t1 = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        current_time = [t0]
+        main_loop.emotion_engine._clock = lambda: current_time[0]  # type: ignore[method-assign]
+
+        first = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        ).result(timeout=10)
+        committed = client.app.state.agent_state_store.load()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
+        before_context = main_loop.context_registry.state
+        before_calibration = main_loop.loss_calibration.export()
+        before_turns = main_loop.session_state.turns
+        before_memory = client.app.state.memory_system.db1.get()
+
+        current_time[0] = t0 - timedelta(seconds=1)
+        failing = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        )
+        with pytest.raises(AgentRuntimeExecutionError) as error:
+            failing.result(timeout=10)
+
+        assert first.event.processing_sequence == 1
+        assert error.value.event.processing_sequence == 2
+        assert isinstance(error.value.__cause__, ValueError)
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert client.app.state.agent_state_store.load() == committed
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state == before_context
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert main_loop.session_state.turns == before_turns
+        assert client.app.state.memory_system.db1.get() == before_memory
+        failed_records = [
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_id == error.value.event.event_id
+        ]
+        assert [record.lifecycle for record in failed_records] == [
+            EventLifecycle.ACCEPTED,
+            EventLifecycle.STARTED,
+            EventLifecycle.FAILED,
+        ]
+
+        current_time[0] = t1
+        recovered = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            main_loop.emotion_tick,
+        ).result(timeout=10)
+
+        assert recovered.event.processing_sequence == 3
+        assert main_loop.emotion_engine.temporal_state.last_update_at == t1
+        assert (
+            client.app.state.agent_state_store.load().last_processed_event_sequence
+            == 3
+        )
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+
+
 def test_chat_selector_validation_happens_before_event_admission(
     tmp_path: Path,
 ) -> None:
@@ -457,7 +672,7 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
 
 def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    legacy = AgentStateSnapshot(
+    legacy = AgentStateSnapshotV2(
         saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         last_processed_event_sequence=0,
         emotion_state=EmotionStateSnapshot(
@@ -485,11 +700,103 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 3
+        assert upgraded.schema_version == 4
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
         ) == ("conversation.default",)
+        assert settings.agent_state.path.read_bytes() != legacy_bytes
+
+
+def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    legacy_timestamp = datetime(2025, 12, 1, 12, tzinfo=timezone.utc)
+    legacy_context_id = "legacy-context"
+    legacy_source_id = "episode-legacy"
+    legacy = AgentStateSnapshotV3(
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_processed_event_sequence=0,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(
+            revision=1,
+            items=(
+                WorkingMemoryItemSnapshot(
+                    item_id=working_memory_item_id(
+                        WorkingMemorySourceKind.EPISODIC, legacy_source_id
+                    ),
+                    source_kind=WorkingMemorySourceKind.EPISODIC.value,
+                    source_id=legacy_source_id,
+                    activation=0.6,
+                    salience=0.7,
+                    retention_reason="recent",
+                    created_revision=1,
+                    last_activated_revision=1,
+                ),
+            ),
+        ),
+        context_state=ContextStateSnapshot(
+            revision=1,
+            current_context_id=legacy_context_id,
+            frames=(
+                ContextFrameSnapshot(
+                    context_id=legacy_context_id,
+                    context_type="conversation",
+                    source_channel="chat",
+                    source_session_id="legacy-session",
+                    participant_refs=(),
+                    parent_context_id=None,
+                    related_context_ids=(),
+                    status="active",
+                    created_revision=1,
+                    last_modified_revision=1,
+                    started_at=legacy_timestamp,
+                    last_active_at=legacy_timestamp,
+                ),
+            ),
+            interlocutor_bindings=(),
+        ),
+    )
+    legacy_bytes = json.dumps(
+        legacy.model_dump(mode="json"), indent=2, sort_keys=False
+    ).encode()
+    settings.agent_state.path.parent.mkdir(parents=True, exist_ok=True)
+    settings.agent_state.path.write_bytes(legacy_bytes)
+
+    with _client(tmp_path, settings=settings) as client:
+        assert settings.agent_state.path.read_bytes() == legacy_bytes
+        assert client.app.state.agent_state_store.load() == legacy
+        assert client.app.state.main_loop.loss_calibration.export() == ()
+        assert client.app.state.main_loop.emotion_engine.temporal_state == (
+            EmotionTemporalState()
+        )
+        assert client.app.state.main_loop.working_memory.revision == 1
+        assert client.app.state.main_loop.working_memory.items[0].source_id == (
+            legacy_source_id
+        )
+        assert client.app.state.main_loop.context_registry.state == (
+            legacy.context_state.to_registry_state()
+        )
+
+        response = client.post(
+            "/api/chat", json={"message": "upgrade v3", "attachments": []}
+        )
+        assert response.status_code == 200
+        upgraded = client.app.state.agent_state_store.load()
+        assert upgraded.schema_version == 4
+        assert len(upgraded.appraisal_state.calibration_entries) == 1
+        assert upgraded.appraisal_state.calibration_entries[0].count == 1
+        assert (
+            upgraded.appraisal_state.calibration_entries[0].mean
+            == DummyProvider.loss_value
+        )
+        assert upgraded.appraisal_state.last_emotion_update_at is not None
+        assert upgraded.working_memory.revision >= 1
+        assert any(
+            frame.context_id == legacy_context_id
+            for frame in upgraded.context_state.frames
+        )
         assert settings.agent_state.path.read_bytes() != legacy_bytes
 
 
@@ -628,6 +935,24 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
         assert "prompt" in data
         assert "retrieved_memory" in data
         assert "generation_params" in data
+        measurement = data["diagnostics"]["measurement"]
+        assert measurement["model_key"]
+        assert measurement["raw_loss"] == DummyProvider.loss_value
+        assert measurement["valid"] is True
+        assert measurement["invalid_reason"] is None
+        assert 0.0 <= measurement["calibrated_novelty"] <= 1.0
+        assert data["diagnostics"]["appraisal"]["novelty_valid"] is True
+        assert all(
+            data["diagnostics"]["appraisal"][field] is None
+            for field in (
+                "goal_progress",
+                "threat",
+                "controllability",
+                "certainty",
+                "social_relevance",
+                "effort_cost",
+            )
+        )
         stored = client.app.state.memory_system.db1.get(
             ids=[data["episode_id"]], include=["documents", "metadatas"]
         )
@@ -641,6 +966,37 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
             if path.is_file()
         )
         assert len(client.app.state.main_loop.session_state.turns) == 1
+
+
+def test_api_chat_debug_invalid_loss_is_nullable_and_not_persisted_as_zero(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(
+        tmp_path, settings=settings, provider=NonFiniteLossProvider()
+    ) as client:
+        response = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": "invalid loss", "attachments": [], "debug": True},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["loss"] is None
+        assert data["diagnostics"]["measurement"]["valid"] is False
+        assert data["diagnostics"]["measurement"]["raw_loss"] is None
+        assert data["diagnostics"]["measurement"]["calibrated_novelty"] is None
+        assert data["diagnostics"]["measurement"]["invalid_reason"] == (
+            "non_finite_loss"
+        )
+        assert data["diagnostics"]["appraisal"]["novelty"] is None
+        stored = client.app.state.memory_system.db1.get(
+            ids=[data["episode_id"]], include=["documents", "metadatas"]
+        )
+        assert stored["metadatas"][0]["coordination_schema"] == 3
+        assert stored["metadatas"][0]["loss_valid"] is False
+        assert "loss" not in stored["metadatas"][0]
 
 
 def test_cors_middleware_uses_configured_origins(tmp_path: Path) -> None:
@@ -734,6 +1090,29 @@ def test_memory_api_does_not_expose_private_fields(tmp_path: Path) -> None:
         assert "hidden_thought" not in detail.json()
 
 
+def test_memory_episode_api_fails_closed_for_invalid_committed_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _client(tmp_path) as client:
+        def invalid_record(_episode_id: str) -> None:
+            raise EpisodicMemoryFormatError("PRIVATE metadata detail")
+
+        monkeypatch.setattr(
+            client.app.state.memory_system,
+            "get_committed_episodic",
+            invalid_record,
+        )
+        response = client.get(
+            "/api/memory/episodes/episode-invalid", headers=admin_headers()
+        )
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Committed episodic Memory is invalid"
+        }
+        assert "PRIVATE" not in response.text
+
+
 def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         assert (
@@ -770,11 +1149,160 @@ def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> Non
 
 
 def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+    settings = _settings(tmp_path)
+    timer = RecordingTimer()
+    with _client(tmp_path, settings=settings, timer=timer) as client:
         runtime = client.app.state.agent_runtime
         assert runtime is client.app.state.agent_runtime
         assert runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert client.app.state.state_wal.inspect_boot_anchor_optional() is not None
+        assert timer.start_calls == 0
     assert runtime.status is AgentRuntimeStatus.STOPPED
+    assert timer.stop_calls == 1
+
+
+def test_enabled_emotion_timer_starts_after_boot_anchor_and_stops_first(
+    tmp_path: Path,
+) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+
+    def assert_start_order() -> None:
+        assert app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert app.state.state_wal.inspect_boot_anchor_optional() is not None
+
+    def assert_stop_order() -> None:
+        assert app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert app.state.event_journal.path.exists()
+
+    timer = RecordingTimer(assert_start_order, assert_stop_order)
+    app.state.emotion_timer = timer
+
+    with TestClient(app) as client:
+        assert client.app.state.emotion_timer is timer
+        assert timer.start_calls == 1
+        assert timer.stop_calls == 0
+
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_timer_is_not_started_when_retention_admission_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class ExhaustedJournal(EventJournal):
+        def admission_status(self) -> EventJournalAdmissionStatus:
+            return EventJournalAdmissionStatus(
+                available=False,
+                reason="test retention gate",
+                active_file_bytes=0,
+                max_bytes=self.max_bytes,
+                rotated_segment_count=0,
+                retained_files=self.retained_files,
+                safe_rotation_possible=False,
+                lifecycle_blocks_rotation=False,
+                proof_retention_blocks_safe_pruning=True,
+            )
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.event_journal = ExhaustedJournal(
+        settings.event_journal.path,
+        settings.event_journal.max_bytes,
+        settings.event_journal.retained_files,
+    )
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
+
+    with TestClient(app) as client:
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.CREATED
+        assert timer.start_calls == 0
+        assert client.get("/health").json()["status"] == "degraded"
+
+    assert timer.stop_calls == 1
+
+
+def test_boot_anchor_failure_prevents_timer_start(tmp_path: Path) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class FailingBootAnchorWAL(StateWAL):
+        def publish_boot_anchor(self, **_kwargs: Any) -> NoReturn:
+            raise OSError("private boot anchor failure")
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    app.state.state_wal = FailingBootAnchorWAL(settings.state_wal.directory)
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
+
+    with pytest.raises(OSError, match="private boot anchor failure"):
+        with TestClient(app):
+            pass
+
+    assert timer.start_calls == 0
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_timer_start_failure_stops_runtime_before_startup_raises(tmp_path: Path) -> None:
+    base_settings = _settings(tmp_path)
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
+
+    class FailingTimer(RecordingTimer):
+        def start(self) -> None:
+            super().start()
+            raise OSError("private timer start failure")
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    timer = FailingTimer()
+    app.state.emotion_timer = timer
+
+    with pytest.raises(OSError, match="private timer start failure"):
+        with TestClient(app):
+            pass
+
+    assert timer.start_calls == 1
+    assert timer.stop_calls == 1
+    assert app.state.agent_runtime.status is AgentRuntimeStatus.STOPPED
 
 
 def test_mutating_routes_submit_events_without_private_metadata(tmp_path: Path) -> None:
@@ -912,7 +1440,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
         settings.emotion.baseline_surprisal,
     )
     store.save(
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=datetime.now(timezone.utc),
             last_processed_event_sequence=7,
             emotion_state=EmotionStateSnapshot(
@@ -998,7 +1526,7 @@ def test_restored_sequence_continues_and_success_checkpoints_chat(
         settings.emotion.baseline_surprisal,
     )
     store.save(
-        AgentStateSnapshot(
+        AgentStateSnapshotV2(
             saved_at=datetime.now(timezone.utc),
             last_processed_event_sequence=7,
             emotion_state=EmotionStateSnapshot(
@@ -1200,7 +1728,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
 def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
     tmp_path: Path,
 ) -> None:
-    settings = _settings(tmp_path)
+    base_settings = _settings(tmp_path)
     class FailingStore(AgentStateStore):
         def save(self, snapshot: AgentStateSnapshot) -> None:
             if snapshot.last_processed_event_sequence > 0:
@@ -1209,13 +1737,13 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
                 )
             super().save(snapshot)
 
-    first = create_app(settings)
+    first = create_app(base_settings)
     first.state.model_provider = ThinkingProvider()
-    first.state.memory_system = DualMemorySystem(settings)
-    first.state.adapter_registry = AdapterRegistry(settings)
+    first.state.memory_system = DualMemorySystem(base_settings)
+    first.state.adapter_registry = AdapterRegistry(base_settings)
     first.state.agent_state_store = FailingStore(
-        settings.agent_state.path,
-        settings.emotion.baseline_surprisal,
+        base_settings.agent_state.path,
+        base_settings.emotion.baseline_surprisal,
     )
     with TestClient(first) as client:
         assert client.post(
@@ -1223,29 +1751,40 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
         ).status_code == 500
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         pending = (
-            settings.memory.persist_directory
+            base_settings.memory.persist_directory
             / ".r07-episodic-pending"
             / f"{transaction.transaction_id}.json"
         )
     pending.write_text('{"conflict":"well-formed"}')
     pending.chmod(0o600)
-    journal_before = settings.event_journal.path.read_bytes()
-    snapshot_before = settings.agent_state.path.read_bytes()
+    journal_before = base_settings.event_journal.path.read_bytes()
+    snapshot_before = base_settings.agent_state.path.read_bytes()
     wal_before = {
-        path.relative_to(settings.state_wal.directory): path.read_bytes()
-        for path in settings.state_wal.directory.rglob("*")
+        path.relative_to(base_settings.state_wal.directory): path.read_bytes()
+        for path in base_settings.state_wal.directory.rglob("*")
         if path.is_file()
     }
 
+    settings = base_settings.model_copy(
+        update={
+            "emotion": base_settings.emotion.model_copy(
+                update={"timer_enabled": True, "timer_interval_seconds": 60.0}
+            )
+        }
+    )
     app = create_app(settings)
     app.state.model_provider = ThinkingProvider()
     app.state.memory_system = DualMemorySystem(settings)
     app.state.adapter_registry = AdapterRegistry(settings)
     runtime = RecordingRuntime()
     app.state.agent_runtime = runtime
+    timer = RecordingTimer()
+    app.state.emotion_timer = timer
 
     with TestClient(app) as degraded:
         assert runtime.status is AgentRuntimeStatus.CREATED
+        assert degraded.app.state.external_reconciliation_required
+        assert timer.start_calls == 0
         assert degraded.get("/health").json()["status"] == "degraded"
         assert degraded.app.state.event_journal.inspect().open_transactions
         assert degraded.post(
@@ -1260,6 +1799,7 @@ def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(
             for path in settings.state_wal.directory.rglob("*")
             if path.is_file()
         } == wal_before
+    assert timer.stop_calls == 1
 
 
 def test_two_true_rollbacks_preserve_reconciliation_authority(
@@ -1442,7 +1982,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 3
+        == 4
     )
 
 
@@ -1453,7 +1993,7 @@ def test_pre_r05_owner_owned_directory_is_hardened_before_startup(
     store = AgentStateStore(
         settings.agent_state.path, settings.emotion.baseline_surprisal
     )
-    snapshot = AgentStateSnapshot(
+    snapshot = AgentStateSnapshotV2(
         saved_at=datetime.now(timezone.utc),
         last_processed_event_sequence=4,
         emotion_state=EmotionStateSnapshot(
@@ -1660,15 +2200,32 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
     app.state.adapter_registry = AdapterRegistry(settings)
 
     with TestClient(app) as client:
+        main_loop = client.app.state.main_loop
+        before_temporal = main_loop.emotion_engine.temporal_state
+        before_calibration = main_loop.loss_calibration.export()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
         with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
             client.post(
                 "/api/chat",
                 json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": False},
             )
 
-        assert client.app.state.main_loop.emotion_engine.state == initial_emotion
-        assert client.app.state.main_loop.context_registry.state.frames == ()
-        assert client.app.state.main_loop.context_registry.current_context_id is None
+        assert main_loop.emotion_engine.state == initial_emotion
+        assert main_loop.emotion_engine.temporal_state == before_temporal
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state.frames == ()
+        assert main_loop.context_registry.current_context_id is None
+        assert main_loop.session_state.turns == []
+        assert client.app.state.memory_system.db1.get(
+            include=["documents", "metadatas"]
+        )["ids"] == []
         failed = client.app.state.event_journal.records[-1]
         assert failed.lifecycle is EventLifecycle.FAILED
         assert failed.processing_sequence == 1
@@ -1691,6 +2248,65 @@ def test_handler_failure_restores_r04_state_records_failed_and_continues(
     assert PRIVATE_SENTINEL not in journal_bytes
     assert "prompt" not in journal_bytes.casefold()
     assert "message" not in journal_bytes.casefold()
+
+
+def test_handler_failure_rolls_back_elapsed_structured_state_and_success_artifacts(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    provider = FailOnSecondGenerationProvider()
+
+    with _client(tmp_path, settings=settings, provider=provider) as client:
+        main_loop = client.app.state.main_loop
+        clock = {"now": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+        setattr(main_loop.emotion_engine, "_clock", lambda: clock["now"])
+
+        first = client.post(
+            "/api/chat", json={"message": "baseline", "attachments": []}
+        )
+        assert first.status_code == 200
+        baseline_snapshot = client.app.state.agent_state_store.load()
+        before_emotion = main_loop.emotion_engine.state
+        before_temporal = main_loop.emotion_engine.temporal_state
+        before_calibration = main_loop.loss_calibration.export()
+        before_working_memory = (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        )
+        before_context = main_loop.context_registry.state
+        before_turns = tuple(main_loop.session_state.turns)
+        before_episode_ids = set(
+            client.app.state.memory_system.db1.get()["ids"]
+        )
+
+        clock["now"] += timedelta(seconds=60)
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post(
+                "/api/chat", json={"message": "failed", "attachments": []}
+            )
+
+        assert main_loop.emotion_engine.state == before_emotion
+        assert main_loop.emotion_engine.temporal_state == before_temporal
+        assert main_loop.loss_calibration.export() == before_calibration
+        assert (
+            main_loop.working_memory.revision,
+            main_loop.working_memory.items,
+        ) == before_working_memory
+        assert main_loop.context_registry.state == before_context
+        assert tuple(main_loop.session_state.turns) == before_turns
+        assert set(client.app.state.memory_system.db1.get()["ids"]) == (
+            before_episode_ids
+        )
+        assert client.app.state.agent_state_store.load() == baseline_snapshot
+        failed = client.app.state.event_journal.records[-1]
+        assert failed.lifecycle is EventLifecycle.FAILED
+        assert failed.processing_sequence == 2
+        assert failed.failure_category is EventFailureCategory.HANDLER_FAILURE
+
+        retry = client.post(
+            "/api/chat", json={"message": "retry", "attachments": []}
+        )
+        assert retry.status_code == 200
 
 
 def test_handler_context_mutation_failure_restores_current_and_has_no_success(
@@ -1982,6 +2598,65 @@ def test_finalization_failure_preserves_internal_commit_without_restore(
         )
 
 
+def test_emotion_tick_committed_before_crash_recovers_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+
+    class FinalizationFailingRuntime(RecordingRuntime):
+        def configure_durability(self, **kwargs: Any) -> None:
+            def fail_finalization(
+                _event: AgentEvent, _evidence: object
+            ) -> NoReturn:
+                raise OSError("private emotion tick finalization failure")
+
+            kwargs["finalization_checkpoint"] = fail_finalization
+            super().configure_durability(**kwargs)
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    runtime = FinalizationFailingRuntime()
+    app.state.agent_runtime = runtime
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        client.app.state.main_loop.emotion_engine._clock = (  # type: ignore[method-assign]
+            lambda: t0
+        )
+        future = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            client.app.state.main_loop.emotion_tick,
+        )
+        with pytest.raises(AgentRuntimeDurabilityError) as error:
+            future.result(timeout=10)
+
+        assert error.value.phase is AgentRuntimeDurabilityPhase.FINALIZATION
+        committed = client.app.state.agent_state_store.load()
+        assert committed.last_processed_event_sequence == 1
+        assert committed.appraisal_state.last_emotion_update_at == t0
+        assert runtime.status is AgentRuntimeStatus.FAILED
+        assert client.app.state.event_journal.records[-1].lifecycle is (
+            EventLifecycle.PREPARED
+        )
+
+    def fail_if_replayed(*_args: object, **_kwargs: object) -> NoReturn:
+        pytest.fail("committed emotion tick was replayed during startup")
+
+    monkeypatch.setattr(EmotionEngineAllostasis, "advance_to", fail_if_replayed)
+    with _client(tmp_path, settings=settings) as restarted:
+        assert restarted.app.state.agent_state_store.load() == committed
+        assert restarted.app.state.main_loop.emotion_engine.temporal_state.last_update_at == t0
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert restarted.app.state.event_journal.inspect().processing_high_water == 1
+        assert any(
+            record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+            for record in restarted.app.state.event_journal.records
+        )
+
+
 def test_completed_append_failure_is_reconciled_as_committed(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
@@ -2089,7 +2764,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v3(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -2106,7 +2781,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v3(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 3
+        assert snapshot.schema_version == 4
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )
@@ -2343,6 +3018,8 @@ def _client(
     settings: Settings | None = None,
     configure_admin_token: bool = True,
     runtime: AgentRuntime | AdmissionRuntime | None = None,
+    provider: DummyProvider | None = None,
+    timer: RecordingTimer | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -2350,11 +3027,13 @@ def _client(
         os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
-    app.state.model_provider = ThinkingProvider()
+    app.state.model_provider = provider or ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
     if runtime is not None:
         app.state.agent_runtime = runtime
+    if timer is not None:
+        app.state.emotion_timer = timer
     return TestClient(app)
 
 

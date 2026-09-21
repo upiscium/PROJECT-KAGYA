@@ -24,10 +24,15 @@ from pydantic import (
     model_validator,
 )
 
-from kagya.body import EmotionState
+from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from kagya.cognition.surprisal_calculator import (
+    CalibrationEntry,
+    LossCalibration,
+)
 from kagya.privacy import normalize_private_key
 from kagya.runtime.context import (
     ContextFrame,
+    ContextRegistry,
     ContextRegistryState,
     ContextStatus,
     ContextType,
@@ -35,6 +40,7 @@ from kagya.runtime.context import (
     validate_context_registry_state,
 )
 from kagya.runtime.working_memory import (
+    WorkingMemory,
     WorkingMemoryItem,
     WorkingMemoryRetentionReason,
     WorkingMemorySourceKind,
@@ -45,7 +51,7 @@ if TYPE_CHECKING:
     from kagya.runtime.main_loop import KagyaMainLoop
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[3] = 3
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[4] = 4
 
 
 class _StateModel(BaseModel):
@@ -336,10 +342,10 @@ class ContextStateSnapshot(_StateModel):
         return self
 
 
-class AgentStateSnapshot(_AgentStateSnapshotBase):
-    """Current AgentState v3 canonical snapshot."""
+class AgentStateSnapshotV3(_AgentStateSnapshotBase):
+    """Exact retained R09 v3 canonical snapshot."""
 
-    schema_version: Literal[3] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[3] = 3
     working_memory: WorkingMemorySnapshot
     context_state: ContextStateSnapshot
 
@@ -351,8 +357,97 @@ class AgentStateSnapshot(_AgentStateSnapshotBase):
         return value.astimezone(timezone.utc)
 
 
+class CalibrationEntrySnapshot(_StateModel):
+    """Opaque, exact persisted Welford calibration state."""
+
+    model_key: str
+    count: int = Field(ge=0)
+    mean: float
+    m2: float = Field(ge=0.0)
+
+    @field_validator("model_key")
+    @classmethod
+    def require_opaque_key(cls, value: str) -> str:
+        if len(value) != 70 or not value.startswith("model.") or any(
+            character not in "0123456789abcdef" for character in value[6:]
+        ):
+            raise ValueError("model_key must be an opaque model key")
+        return value
+
+    @field_validator("count", mode="before")
+    @classmethod
+    def reject_boolean_count(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("count must be an integer")
+        return value
+
+    @field_validator("mean", "m2")
+    @classmethod
+    def require_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("calibration values must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def require_exact_statistics(self) -> CalibrationEntrySnapshot:
+        # Use the authoritative U1 validator rather than duplicating its rules.
+        CalibrationEntry(self.model_key, self.count, self.mean, self.m2)
+        return self
+
+    def to_entry(self) -> CalibrationEntry:
+        return CalibrationEntry(self.model_key, self.count, self.mean, self.m2)
+
+
+class AppraisalStateSnapshot(_StateModel):
+    calibration_entries: tuple[CalibrationEntrySnapshot, ...]
+    last_emotion_update_at: datetime | None
+
+    @field_validator("calibration_entries", mode="before")
+    @classmethod
+    def parse_entries(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("last_emotion_update_at", mode="before")
+    @classmethod
+    def parse_timestamp(cls, value: object) -> object:
+        return _parse_context_timestamp(value)
+
+    @field_validator("last_emotion_update_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _require_context_utc(value)
+
+    @model_validator(mode="after")
+    def require_ordered_unique_entries(self) -> AppraisalStateSnapshot:
+        keys = tuple(entry.model_key for entry in self.calibration_entries)
+        if len(keys) > 64:
+            raise ValueError("calibration entries are bounded")
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("calibration entries must be ordered and unique")
+        return self
+
+
+class AgentStateSnapshot(_AgentStateSnapshotBase):
+    """Current AgentState v4 canonical snapshot."""
+
+    schema_version: Literal[4] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+    appraisal_state: AppraisalStateSnapshot
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+
 CompatibleAgentStateSnapshot = Annotated[
-    AgentStateSnapshotV1 | AgentStateSnapshotV2 | AgentStateSnapshot,
+    AgentStateSnapshotV1
+    | AgentStateSnapshotV2
+    | AgentStateSnapshotV3
+    | AgentStateSnapshot,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -491,6 +586,9 @@ def default_agent_state_snapshot(
             frames=(),
             interlocutor_bindings=(),
         ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
     )
 
 
@@ -599,6 +697,13 @@ class AgentStateStore:
                     "AgentState snapshot schema is invalid"
                 )
             raise schema_failure
+        if version == 3:
+            try:
+                return AgentStateSnapshotV3.model_validate(raw)
+            except ValidationError:
+                raise AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                ) from None
         if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
             schema_failure = None
             try:
@@ -695,7 +800,10 @@ class AgentStateStore:
 
         try:
             preserve_legacy = (
-                isinstance(snapshot, (AgentStateSnapshotV1, AgentStateSnapshotV2))
+                isinstance(
+                    snapshot,
+                    (AgentStateSnapshotV1, AgentStateSnapshotV2, AgentStateSnapshotV3),
+                )
                 and self.snapshot_exists()
             )
         except AgentStateLoadError:
@@ -752,12 +860,36 @@ class AgentStateStore:
     def capture(self, main_loop: KagyaMainLoop, sequence: int) -> AgentStateSnapshot:
         capture_failure: AgentStateSaveError | None = None
         try:
-            emotion = main_loop.emotion_engine.state
-            context_registry = main_loop.context_registry
-            if context_registry is None:
+            emotion_engine = getattr(main_loop, "emotion_engine", None)
+            if not isinstance(emotion_engine, EmotionEngineAllostasis):
+                raise ValueError("Emotion authority is unavailable")
+            working_memory = getattr(main_loop, "working_memory", None)
+            if not isinstance(working_memory, WorkingMemory):
+                raise ValueError("Working Memory authority is unavailable")
+            context_registry = getattr(main_loop, "context_registry", None)
+            if not isinstance(context_registry, ContextRegistry):
                 raise ValueError("Context authority is unavailable")
+            emotion = emotion_engine.state
             context_state = context_registry.state
             validate_context_registry_state(context_state)
+            calibration = getattr(main_loop, "loss_calibration")
+            if not isinstance(calibration, LossCalibration):
+                raise ValueError("Calibration authority is unavailable")
+            exported_calibration = calibration.export()
+            if not isinstance(exported_calibration, tuple):
+                raise ValueError("Calibration authority is malformed")
+            calibration_entries = tuple(
+                CalibrationEntrySnapshot(
+                    model_key=entry.model_key,
+                    count=entry.count,
+                    mean=entry.mean,
+                    m2=entry.m2,
+                )
+                for entry in exported_calibration
+            )
+            temporal = getattr(emotion_engine, "temporal_state")
+            if not isinstance(temporal, EmotionTemporalState):
+                raise ValueError("Emotion temporal authority is malformed")
             return AgentStateSnapshot(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -767,7 +899,7 @@ class AgentStateStore:
                     optimal_loss=emotion.optimal_loss,
                 ),
                 working_memory=WorkingMemorySnapshot(
-                    revision=main_loop.working_memory.revision,
+                    revision=working_memory.revision,
                     items=tuple(
                         WorkingMemoryItemSnapshot(
                             item_id=item.item_id,
@@ -779,7 +911,7 @@ class AgentStateStore:
                             created_revision=item.created_revision,
                             last_activated_revision=item.last_activated_revision,
                         )
-                        for item in main_loop.working_memory.items
+                        for item in working_memory.items
                     ),
                 ),
                 context_state=ContextStateSnapshot(
@@ -819,6 +951,10 @@ class AgentStateStore:
                         for binding in context_state.interlocutor_bindings
                     ),
                 ),
+                appraisal_state=AppraisalStateSnapshot(
+                    calibration_entries=calibration_entries,
+                    last_emotion_update_at=temporal.last_update_at,
+                ),
             )
         except Exception:
             capture_failure = AgentStateSaveError(
@@ -830,23 +966,65 @@ class AgentStateStore:
         self, main_loop: KagyaMainLoop, snapshot: CompatibleAgentStateSnapshot
     ) -> None:
         restore_failure: AgentStateLoadError | None = None
+        context_registry: ContextRegistry | None = None
+        calibration: LossCalibration | None = None
+        previous_emotion: EmotionState | None = None
+        previous_working_memory_revision: int | None = None
+        previous_working_memory_items: tuple[WorkingMemoryItem, ...] | None = None
+        previous_context: ContextRegistryState | None = None
+        previous_calibration: tuple[CalibrationEntry, ...] | None = None
+        previous_temporal: EmotionTemporalState | None = None
+        emotion_engine: EmotionEngineAllostasis | None = None
+        working_memory_authority: WorkingMemory | None = None
         try:
             validated = validate_compatible_agent_state_snapshot(
                 snapshot.model_dump(mode="python")
             )
+            emotion_engine = getattr(main_loop, "emotion_engine", None)
+            if not isinstance(emotion_engine, EmotionEngineAllostasis):
+                raise AgentStateLoadError("AgentState restore requires EmotionEngine")
+            working_memory_authority = getattr(main_loop, "working_memory", None)
+            if not isinstance(working_memory_authority, WorkingMemory):
+                raise AgentStateLoadError("AgentState restore requires WorkingMemory")
             emotion = validated.emotion_state
             working_memory = (
                 validated.working_memory
-                if isinstance(validated, (AgentStateSnapshotV2, AgentStateSnapshot))
+                if isinstance(
+                    validated,
+                    (AgentStateSnapshotV2, AgentStateSnapshotV3, AgentStateSnapshot),
+                )
                 else WorkingMemorySnapshot(revision=0, items=())
             )
             context_registry = getattr(main_loop, "context_registry", None)
+            if context_registry is not None and not isinstance(
+                context_registry, ContextRegistry
+            ):
+                raise AgentStateLoadError("AgentState restore requires ContextRegistry")
             context_state = (
                 validated.context_state.to_registry_state()
-                if isinstance(validated, AgentStateSnapshot)
+                if isinstance(validated, (AgentStateSnapshotV3, AgentStateSnapshot))
                 else ContextRegistryState(0, None, (), ())
             )
             validate_context_registry_state(context_state)
+            calibration = getattr(main_loop, "loss_calibration", None)
+            if not isinstance(calibration, LossCalibration):
+                raise AgentStateLoadError("AgentState restore requires LossCalibration")
+            appraisal = (
+                validated.appraisal_state
+                if isinstance(validated, AgentStateSnapshot)
+                else AppraisalStateSnapshot(
+                    calibration_entries=(), last_emotion_update_at=None
+                )
+            )
+            restored_calibration = tuple(
+                entry.to_entry() for entry in appraisal.calibration_entries
+            )
+            restored_temporal = EmotionTemporalState(appraisal.last_emotion_update_at)
+            current_temporal = getattr(emotion_engine, "temporal_state", None)
+            if not isinstance(current_temporal, EmotionTemporalState):
+                raise AgentStateLoadError(
+                    "AgentState restore requires EmotionTemporalState"
+                )
             restored_items = tuple(
                 WorkingMemoryItem(
                     item_id=item.item_id,
@@ -862,39 +1040,66 @@ class AgentStateStore:
                 )
                 for item in working_memory.items
             )
-            if isinstance(validated, AgentStateSnapshot) and context_registry is None:
+            if (
+                isinstance(validated, (AgentStateSnapshotV3, AgentStateSnapshot))
+                and context_registry is None
+            ):
                 raise AgentStateLoadError("AgentState restore requires ContextRegistry")
 
-            previous_emotion = main_loop.emotion_engine.state
-            previous_working_memory_revision = main_loop.working_memory.revision
-            previous_working_memory_items = main_loop.working_memory.items
+            previous_emotion = emotion_engine.state
+            previous_working_memory_revision = working_memory_authority.revision
+            previous_working_memory_items = working_memory_authority.items
             previous_context = (
                 context_registry.state if context_registry is not None else None
             )
-            main_loop.working_memory.restore_exact(
+            previous_calibration = calibration.export()
+            previous_temporal = current_temporal
+            working_memory_authority.restore_exact(
                 working_memory.revision,
                 restored_items,
             )
             if context_registry is not None:
                 context_registry.restore_exact(context_state)
-            main_loop.emotion_engine.state = EmotionState(
+            calibration.restore_exact(restored_calibration)
+            emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
                 optimal_loss=emotion.optimal_loss,
             )
+            emotion_engine.temporal_state = restored_temporal
         except Exception:
-            try:
-                if "previous_working_memory_revision" in locals():
-                    main_loop.working_memory.restore_exact(
+            if (
+                previous_working_memory_revision is not None
+                and previous_working_memory_items is not None
+                and working_memory_authority is not None
+            ):
+                try:
+                    working_memory_authority.restore_exact(
                         previous_working_memory_revision,
                         previous_working_memory_items,
                     )
-                if previous_context is not None and context_registry is not None:
+                except Exception:
+                    pass
+            if previous_context is not None and context_registry is not None:
+                try:
                     context_registry.restore_exact(previous_context)
-                if "previous_emotion" in locals():
-                    main_loop.emotion_engine.state = previous_emotion
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            if previous_calibration is not None and calibration is not None:
+                try:
+                    calibration.restore_exact(previous_calibration)
+                except Exception:
+                    pass
+            if previous_emotion is not None and emotion_engine is not None:
+                try:
+                    emotion_engine.state = previous_emotion
+                except Exception:
+                    pass
+            if previous_temporal is not None and emotion_engine is not None:
+                try:
+                    emotion_engine.temporal_state = previous_temporal
+                except Exception:
+                    pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
         if restore_failure is not None:
             raise restore_failure
@@ -917,6 +1122,9 @@ class AgentStateStore:
                     current_context_id=None,
                     frames=(),
                     interlocutor_bindings=(),
+                ),
+                appraisal_state=AppraisalStateSnapshot(
+                    calibration_entries=(), last_emotion_update_at=None
                 ),
             )
         except Exception:

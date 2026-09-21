@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 
 import pytest
@@ -177,6 +178,126 @@ def test_coordinated_schema2_omits_absent_provenance(tmp_path: Path) -> None:
         "record_type": "episodic_log", "archived": False, "created_at": "now",
         "extra": "{}", "coordination_schema": 2,
     }]
+
+
+def test_coordinated_schema3_valid_loss_persists_loss_valid_and_loss(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory.publish_coordinated_episodic(
+        "episode-schema3-valid", "input", "response", loss=0.25,
+        emotion_valence=0.2, emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG, created_at="now",
+        coordination_schema=3, context_id="context-a", source_channel="chat",
+        source_session_id="session-a",
+    )
+
+    committed = memory.get_committed_episodic("episode-schema3-valid")
+
+    assert committed is not None
+    assert committed.metadata["coordination_schema"] == 3
+    assert committed.metadata["loss_valid"] is True
+    assert committed.metadata["loss"] == 0.25
+    assert committed.record.loss == 0.25
+    assert committed.record.context_id == "context-a"
+
+
+def test_coordinated_schema3_invalid_loss_omits_loss_and_retrieves_none(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    memory.publish_coordinated_episodic(
+        "episode-schema3-invalid", "invalid input", "response", loss=None,
+        emotion_valence=0.2, emotion_arousal=0.3,
+        record_type=MemoryRecordType.EPISODIC_LOG, created_at="now",
+        coordination_schema=3,
+    )
+
+    committed = memory.get_committed_episodic("episode-schema3-invalid")
+    context = memory.retrieve_context("invalid input")
+
+    assert committed is not None
+    assert committed.metadata["coordination_schema"] == 3
+    assert committed.metadata["loss_valid"] is False
+    assert "loss" not in committed.metadata
+    assert committed.record.loss is None
+    assert context.db1_results[0].loss is None
+
+
+@pytest.mark.parametrize(
+    "metadata_update",
+    [
+        {"loss_valid": True},
+        {"loss_valid": True, "loss": math.nan},
+        {"loss_valid": False, "loss": 0.1},
+        {"loss_valid": False, "loss": None},
+        {"loss_valid": "false"},
+    ],
+)
+def test_coordinated_schema3_malformed_loss_metadata_fails_closed(
+    tmp_path: Path,
+    metadata_update: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    metadata: dict[str, object] = {
+        "user_input": "input",
+        "response": "response",
+        "emotion_valence": 0.2,
+        "emotion_arousal": 0.3,
+        "record_type": "episodic_log",
+        "archived": False,
+        "created_at": "now",
+        "extra": "{}",
+        "coordination_schema": 3,
+        "loss_valid": False,
+    }
+    metadata.update(metadata_update)
+    monkeypatch.setattr(
+        memory.db1,
+        "get",
+        lambda **_kwargs: {
+            "ids": ["episode-malformed-v3"],
+            "documents": ["User: input\nAssistant: response"],
+            "metadatas": [metadata],
+        },
+    )
+
+    with pytest.raises(EpisodicMemoryFormatError):
+        memory.get_committed_episodic("episode-malformed-v3")
+
+
+def test_query_rejects_uncoordinated_missing_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+    monkeypatch.setattr(
+        memory.db1,
+        "query",
+        lambda **_kwargs: {
+            "ids": [["episode-missing-loss"]],
+            "metadatas": [[
+                {
+                    "user_input": "input",
+                    "response": "response",
+                    "emotion_valence": 0.2,
+                    "emotion_arousal": 0.3,
+                    "record_type": "episodic_log",
+                    "archived": False,
+                    "created_at": "now",
+                    "extra": "{}",
+                }
+            ]],
+        },
+    )
+    monkeypatch.setattr(
+        memory.db2,
+        "query",
+        lambda **_kwargs: {"ids": [[]], "documents": [[]], "metadatas": [[]]},
+    )
+
+    with pytest.raises(EpisodicMemoryFormatError):
+        memory.retrieve_context("input")
 
 
 def test_future_coordination_schema_fails_closed(tmp_path: Path) -> None:
