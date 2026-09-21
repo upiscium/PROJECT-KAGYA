@@ -26,6 +26,7 @@ __all__ = [
     "ValueEvidence",
     "ValueProposal",
     "ValueReason",
+    "ValueSeedDeclaration",
     "ValueScope",
     "ValueState",
     "canonical_seed_payload",
@@ -97,12 +98,92 @@ def _optional_identifier(value: object, name: str) -> str | None:
     return validate_identifier(value)
 
 
+def _canonical_contexts(
+    value: object, scope: ValueScope, name: str
+) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple of identifiers")
+    contexts = tuple(validate_identifier(item) for item in value)
+    if contexts != tuple(sorted(set(contexts))) or len(set(contexts)) != len(contexts):
+        raise ValueError(f"{name} must be sorted and unique")
+    if scope is ValueScope.SUBJECT and contexts:
+        raise ValueError("subject values cannot have contexts")
+    if scope is ValueScope.CONTEXT and not 1 <= len(contexts) <= _MAX_REFS:
+        raise ValueError("context values require one to sixteen contexts")
+    return contexts
+
+
+def _optional_text(value: object, name: str, limit: int) -> str | None:
+    if value is None:
+        return None
+    return _text(value, name, limit)
+
+
+@dataclass(frozen=True, slots=True)
+class ValueSeedDeclaration:
+    """Immutable seed semantics, independent of admission or runtime state."""
+
+    value_id: str
+    name: str
+    concept: str | None
+    scope: ValueScope
+    context_ids: tuple[str, ...]
+    polarity: int
+    initial_strength: float
+    confidence: float
+    stability: float
+    protectedness: float
+    negotiability: float
+    allowed_update_rate: float
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.value_id)
+        _text(self.name, "name", _NAME_LIMIT)
+        _optional_text(self.concept, "concept", _CONCEPT_LIMIT)
+        scope = _enum(self.scope, ValueScope, "scope")
+        object.__setattr__(self, "scope", scope)
+        contexts = _canonical_contexts(self.context_ids, scope, "context_ids")
+        object.__setattr__(self, "context_ids", contexts)
+        if type(self.polarity) is not int or self.polarity not in (-1, 1):
+            raise TypeError("polarity must be exactly -1 or 1")
+        _fraction(self.initial_strength, "initial_strength")
+        for field_name in (
+            "confidence",
+            "stability",
+            "protectedness",
+            "negotiability",
+        ):
+            _fraction(getattr(self, field_name), field_name)
+        _fraction(self.allowed_update_rate, "allowed_update_rate", nonzero=True)
+
+    @classmethod
+    def from_value(cls, value: ValueState) -> ValueSeedDeclaration:
+        """Project immutable seed fields from a Value without admission data."""
+
+        if not isinstance(value, ValueState):
+            raise TypeError("value must be a ValueState")
+        return cls(
+            value_id=value.value_id,
+            name=value.name,
+            concept=value.concept,
+            scope=value.scope,
+            context_ids=value.context_ids,
+            polarity=value.polarity,
+            initial_strength=value.strength,
+            confidence=value.confidence,
+            stability=value.stability,
+            protectedness=value.protectedness,
+            negotiability=value.negotiability,
+            allowed_update_rate=value.allowed_update_rate,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ValueState:
     value_id: str
     revision: int
     name: str
-    concept: str
+    concept: str | None
     scope: ValueScope
     context_ids: tuple[str, ...]
     polarity: int
@@ -122,18 +203,10 @@ class ValueState:
         if type(self.revision) is not int or self.revision < 0:
             raise TypeError("revision must be a nonnegative exact integer")
         _text(self.name, "name", _NAME_LIMIT)
-        _text(self.concept, "concept", _CONCEPT_LIMIT)
+        _optional_text(self.concept, "concept", _CONCEPT_LIMIT)
         scope = _enum(self.scope, ValueScope, "scope")
         object.__setattr__(self, "scope", scope)
-        if type(self.context_ids) is not tuple:
-            raise TypeError("context_ids must be a tuple of identifiers")
-        contexts = tuple(validate_identifier(item) for item in self.context_ids)
-        if contexts != tuple(sorted(set(contexts))) or len(set(contexts)) != len(contexts):
-            raise ValueError("context_ids must be sorted and unique")
-        if scope is ValueScope.SUBJECT and contexts:
-            raise ValueError("subject values cannot have contexts")
-        if scope is ValueScope.CONTEXT and not 1 <= len(contexts) <= _MAX_REFS:
-            raise ValueError("context values require one to sixteen contexts")
+        contexts = _canonical_contexts(self.context_ids, scope, "context_ids")
         object.__setattr__(self, "context_ids", contexts)
         if type(self.polarity) is not int or self.polarity not in (-1, 1):
             raise TypeError("polarity must be exactly -1 or 1")
@@ -154,7 +227,9 @@ class ValueState:
         if self.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED:
             if self.seed_contract_digest is None:
                 raise ValueError("system-authorized values require a seed contract digest")
-            validate_seed_contract_digest(self)
+            validate_seed_contract_digest(
+                ValueSeedDeclaration.from_value(self), self.seed_contract_digest
+            )
         elif self.seed_contract_digest is not None:
             raise ValueError("only system-authorized values may carry a seed contract digest")
 
@@ -172,49 +247,53 @@ class ValueState:
         if context_id is not None:
             validate_identifier(context_id)
         if self.scope is ValueScope.SUBJECT:
-            return context_id is None
+            return True
         if context_id is None:
             return False
         return context_id in self.context_ids
 
 
-def _seed_fields(value: ValueState) -> dict[str, object]:
+def _seed_fields(seed: ValueSeedDeclaration) -> dict[str, object]:
     return {
-        "allowed_update_rate": value.allowed_update_rate,
-        "confidence": value.confidence,
-        "concept": value.concept,
-        "context_ids": list(value.context_ids),
-        "initial_strength": value.strength,
-        "negotiability": value.negotiability,
-        "name": value.name,
-        "polarity": value.polarity,
-        "protectedness": value.protectedness,
-        "scope": value.scope.value,
-        "stability": value.stability,
-        "value_id": value.value_id,
+        "allowed_update_rate": seed.allowed_update_rate,
+        "confidence": seed.confidence,
+        "concept": seed.concept,
+        "context_ids": list(seed.context_ids),
+        "initial_strength": seed.initial_strength,
+        "negotiability": seed.negotiability,
+        "name": seed.name,
+        "polarity": seed.polarity,
+        "protectedness": seed.protectedness,
+        "scope": seed.scope.value,
+        "stability": seed.stability,
+        "value_id": seed.value_id,
     }
 
 
-def canonical_seed_payload(value: ValueState) -> bytes:
+def canonical_seed_payload(seed: ValueSeedDeclaration) -> bytes:
     """Return the domain-separated canonical seed declaration bytes."""
 
-    if not isinstance(value, ValueState):
-        raise TypeError("value must be a ValueState")
+    if not isinstance(seed, ValueSeedDeclaration):
+        raise TypeError("seed must be a ValueSeedDeclaration")
     encoded = json.dumps(
-        _seed_fields(value), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        _seed_fields(seed), ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("ascii")
     return _SEED_DOMAIN.encode("ascii") + b"\0" + encoded
 
 
-def recompute_seed_contract_digest(value: ValueState) -> str:
-    return hashlib.sha256(canonical_seed_payload(value)).hexdigest()
+def recompute_seed_contract_digest(seed: ValueSeedDeclaration) -> str:
+    return hashlib.sha256(canonical_seed_payload(seed)).hexdigest()
 
 
-def validate_seed_contract_digest(value: ValueState) -> str:
-    expected = recompute_seed_contract_digest(value)
-    if value.seed_contract_digest != expected:
+def validate_seed_contract_digest(seed: ValueSeedDeclaration, digest: str) -> str:
+    if type(digest) is not str or len(digest) != 64 or any(
+        char not in "0123456789abcdef" for char in digest
+    ):
+        raise ValueError("seed_contract_digest must be a lowercase SHA-256 digest")
+    expected = recompute_seed_contract_digest(seed)
+    if digest != expected:
         raise ValueError("seed_contract_digest does not match the seed declaration")
-    return value.seed_contract_digest
+    return digest
 
 
 @dataclass(frozen=True, slots=True)

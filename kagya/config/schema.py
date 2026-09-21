@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from kagya.identifiers import validate_identifier
+from kagya.identity.value_system import ValueSeedDeclaration, ValueScope
 
 
 class StrictBaseModel(BaseModel):
@@ -239,6 +240,24 @@ class ValueSeedSettings(StrictBaseModel):
         if self.scope == "context" and not self.context_ids:
             raise ValueError("context values require contexts")
         return self
+
+    def to_declaration(self) -> ValueSeedDeclaration:
+        """Convert inert config into an immutable, digestable seed declaration."""
+
+        return ValueSeedDeclaration(
+            value_id=self.value_id,
+            name=self.name,
+            concept=self.concept,
+            scope=ValueScope(self.scope),
+            context_ids=tuple(self.context_ids),
+            polarity=self.polarity,
+            initial_strength=self.strength,
+            confidence=self.confidence,
+            stability=self.stability,
+            protectedness=self.protectedness,
+            negotiability=self.negotiability,
+            allowed_update_rate=self.allowed_update_rate,
+        )
 
 
 class ValueConflictSettings(StrictBaseModel):

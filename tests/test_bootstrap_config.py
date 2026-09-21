@@ -14,6 +14,10 @@ from kagya.config.schema import (
     ValueSeedSettings,
     ValueSystemSettings,
 )
+from kagya.identity.value_system import (
+    ValueScope,
+    recompute_seed_contract_digest,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -49,6 +53,18 @@ def test_baseline_values_are_loaded() -> None:
     assert values.seeds[0].protectedness == 0.0
     assert values.seeds[0].negotiability == 1.0
     assert values.conflicts[0].conflict_id == "compassionate-honesty"
+
+
+def test_baseline_seeds_convert_to_exact_declarations_without_admission() -> None:
+    seeds = load_settings(CONFIG_PATH).values.seeds
+
+    declarations = [seed.to_declaration() for seed in seeds]
+
+    assert [declaration.value_id for declaration in declarations] == ["care", "honesty"]
+    assert all(declaration.concept is None for declaration in declarations)
+    assert all(declaration.scope is ValueScope.SUBJECT for declaration in declarations)
+    assert all(declaration.context_ids == () for declaration in declarations)
+    assert all(len(recompute_seed_contract_digest(declaration)) == 64 for declaration in declarations)
 
 
 def test_values_are_optional_for_pre_r11_config() -> None:

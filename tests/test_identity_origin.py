@@ -61,6 +61,41 @@ def test_admission_rules_and_required_self_evidence() -> None:
                        ValueAdmissionStatus.SELF_ENDORSED)
 
 
+@pytest.mark.parametrize(
+    "actor",
+    [
+        OriginActor.USER,
+        OriginActor.OPERATOR,
+        OriginActor.EXTERNAL_SOURCE,
+        OriginActor.MODEL_INFERENCE,
+    ],
+)
+def test_external_actors_cannot_construct_active_admissions(actor: OriginActor) -> None:
+    with pytest.raises(ValueError):
+        IdentityOrigin(actor, OriginInputKind.EVIDENCE, ValueAdmissionStatus.SELF_ENDORSED)
+    with pytest.raises(ValueError):
+        IdentityOrigin(actor, OriginInputKind.EVIDENCE, ValueAdmissionStatus.SYSTEM_AUTHORIZED)
+
+
+@pytest.mark.parametrize("actor", [OriginActor.OPERATOR, OriginActor.SYSTEM])
+def test_constraints_cannot_construct_active_admissions(actor: OriginActor) -> None:
+    with pytest.raises(ValueError):
+        IdentityOrigin(actor, OriginInputKind.CONSTRAINT, ValueAdmissionStatus.SELF_ENDORSED)
+    with pytest.raises(ValueError):
+        IdentityOrigin(actor, OriginInputKind.CONSTRAINT, ValueAdmissionStatus.SYSTEM_AUTHORIZED)
+
+
+@pytest.mark.parametrize("kwargs", [{"event_id": "event-1"}, {"event_sequence": 0}])
+def test_self_endorsement_requires_event_id_and_sequence(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        IdentityOrigin(
+            OriginActor.SELF,
+            OriginInputKind.INTERNAL_STATE,
+            ValueAdmissionStatus.SELF_ENDORSED,
+            **kwargs,
+        )
+
+
 def test_origin_is_deterministic_and_admission_independent() -> None:
     kwargs = dict(actor=OriginActor.USER, input_kind=OriginInputKind.EVIDENCE,
                   source_ref="source:1", event_id="event:1", context_id="ctx:1",
