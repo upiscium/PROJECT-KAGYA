@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -11,19 +12,31 @@ from kagya.identity.origin import (
 )
 from kagya.identity.value_system import (
     ValueConflictDefinition,
+    ValueDomainError,
     ValueEvidence,
+    ValueMutationEvidence,
+    ValueMutationReason,
+    ValueMutationStatus,
     ValueProposal,
     ValueReason,
     ValueSeedDeclaration,
+    ValueSelfAdmission,
     ValueScope,
     ValueState,
+    ValueSystem,
     canonical_seed_payload,
+    canonical_value_state_payload,
+    recompute_revision_record_digest,
     recompute_seed_contract_digest,
+    validate_revision_record_digest,
     validate_seed_contract_digest,
+    value_state_digest,
 )
 
 
-def _origin(*, system: bool = False) -> IdentityOrigin:
+def _origin(
+    *, system: bool = False, event_id: str = "event-1", event_sequence: int = 0
+) -> IdentityOrigin:
     if system:
         return IdentityOrigin(
             OriginActor.SYSTEM,
@@ -34,8 +47,8 @@ def _origin(*, system: bool = False) -> IdentityOrigin:
         OriginActor.SELF,
         OriginInputKind.INTERNAL_STATE,
         ValueAdmissionStatus.SELF_ENDORSED,
-        event_id="event-1",
-        event_sequence=0,
+        event_id=event_id,
+        event_sequence=event_sequence,
     )
 
 
@@ -79,6 +92,51 @@ def _seed(**changes: object) -> ValueSeedDeclaration:
     }
     fields.update(changes)
     return ValueSeedDeclaration(**fields)  # type: ignore[arg-type]
+
+
+def _event(event_id: str = "event-1", event_sequence: int = 0) -> ValueMutationEvidence:
+    return ValueMutationEvidence(
+        event_id=event_id,
+        event_sequence=event_sequence,
+        recorded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        + timedelta(seconds=event_sequence),
+    )
+
+
+def _admission(
+    *,
+    value_id: str = "value-1",
+    event_id: str = "event-1",
+    event_sequence: int = 0,
+    evidence_ref: str = "update-1",
+    requested_delta: float = 1.0,
+    confidence: float = 1.0,
+    reason: ValueMutationReason = ValueMutationReason.ADMITTED_UPDATE,
+) -> ValueSelfAdmission:
+    return ValueSelfAdmission(
+        target_value_id=value_id,
+        subject_origin=_origin(
+            event_id=event_id, event_sequence=event_sequence
+        ),
+        evidence_refs=(evidence_ref,),
+        requested_delta=requested_delta,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
+def _mutable_value(value_id: str = "value-1", **changes: object) -> ValueState:
+    fields: dict[str, object] = {
+        "value_id": value_id,
+        "stability": 0.0,
+        "protectedness": 0.0,
+        "negotiability": 1.0,
+        "allowed_update_rate": 0.1,
+        "confidence": 1.0,
+        "evidence_refs": (f"seed-{value_id}",),
+    }
+    fields.update(changes)
+    return _value(**fields)
 
 
 def test_scope_and_active_read_semantics() -> None:
@@ -297,3 +355,336 @@ def test_evidence_and_proposal_do_not_mutate_value_state() -> None:
     assert evidence and proposal
     assert value == before
     assert not hasattr(proposal, "apply")
+
+
+def test_mutation_evidence_requires_canonical_utc() -> None:
+    assert _event().recorded_at.tzinfo is timezone.utc
+    with pytest.raises(ValueError):
+        ValueMutationEvidence("event-1", 0, datetime(2026, 1, 1))
+    with pytest.raises(ValueError):
+        ValueMutationEvidence(
+            "event-1", 0, datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=1)))
+        )
+    with pytest.raises(TypeError):
+        ValueMutationEvidence("event-1", True, _event().recorded_at)  # type: ignore[arg-type]
+
+
+def test_self_admission_requires_exact_event_binding_and_candidate_shape() -> None:
+    system = ValueSystem()
+    candidate = _value(evidence_refs=("admission-1",))
+    admission = _admission(
+        reason=ValueMutationReason.SELF_ADMISSION,
+        evidence_ref="admission-1",
+    )
+    result = system.admit_self_value(candidate, admission, _event())
+    assert result.status is ValueMutationStatus.APPLIED
+    assert system.get("value-1") == candidate
+    assert system.history("value-1").records[0].operation.value == "admission"
+    assert system.history("value-1").records[0].from_revision == -1
+    retry = system.admit_self_value(candidate, admission, _event())
+    assert retry.status is ValueMutationStatus.IDEMPOTENT
+
+    with pytest.raises(ValueDomainError):
+        system.admit_self_value(candidate, admission, _event("event-2", 1))
+    with pytest.raises(ValueDomainError):
+        system.admit_self_value(replace(candidate, strength=0.7), admission, _event())
+
+    with pytest.raises(ValueDomainError):
+        ValueSystem((_value(revision=1),))
+
+    external = IdentityOrigin(
+        OriginActor.USER,
+        OriginInputKind.EVIDENCE,
+        ValueAdmissionStatus.PENDING,
+    )
+    with pytest.raises(ValueError):
+        ValueSelfAdmission(
+            "value-2",
+            external,
+            ("admission-2",),
+            0.0,
+            1.0,
+            ValueMutationReason.SELF_ADMISSION,
+        )
+
+
+def test_system_update_uses_per_value_cap_and_canonical_global_budget() -> None:
+    first = _mutable_value("value-1")
+    second = _mutable_value("value-2")
+    system = ValueSystem((second, first))
+    result = system.apply_updates(
+        _event(),
+        (
+            _admission(value_id="value-2", evidence_ref="update-2"),
+            _admission(value_id="value-1", evidence_ref="update-1"),
+        ),
+    )
+    assert tuple(item.value_id for item in result.results) == ("value-1", "value-2")
+    assert result[0].applied_delta == pytest.approx(0.1)
+    assert result[1].applied_delta == pytest.approx(0.0)
+    assert abs(result.total_applied_delta) <= 0.1
+    assert system.get("value-1").revision == 1
+    assert system.get("value-2").revision == 0
+
+
+def test_zero_cap_records_evidence_without_creating_a_revision() -> None:
+    value = _mutable_value(negotiability=0.0)
+    system = ValueSystem((value,))
+    result = system.apply_update(_admission(), _event())
+    assert result.status is ValueMutationStatus.NO_CHANGE
+    assert result.value == value
+    assert system.get("value-1").revision == 0
+    assert system.history("value-1").records == ()
+    assert system.applied_evidence("value-1") == ("seed-value-1", "update-1")
+
+
+def test_evidence_ledger_overflow_fails_without_mutation() -> None:
+    system = ValueSystem((_mutable_value(),))
+    for index in range(31):
+        event_id = f"ledger-event-{index}"
+        refs = tuple(f"ledger-{index:02d}-{slot:02d}" for slot in range(16))
+        system.apply_update(
+            ValueSelfAdmission(
+                "value-1",
+                _origin(event_id=event_id, event_sequence=index),
+                refs,
+                0.0,
+                1.0,
+                ValueMutationReason.ADMITTED_UPDATE,
+            ),
+            _event(event_id, index),
+        )
+    before_value = system.get("value-1")
+    before_ledger = system.applied_evidence("value-1")
+    refs = tuple(f"overflow-{slot:02d}" for slot in range(16))
+    with pytest.raises(ValueDomainError):
+        system.apply_update(
+            ValueSelfAdmission(
+                "value-1",
+                _origin(event_id="ledger-overflow", event_sequence=31),
+                refs,
+                0.0,
+                1.0,
+                ValueMutationReason.ADMITTED_UPDATE,
+            ),
+            _event("ledger-overflow", 31),
+        )
+    assert system.get("value-1") == before_value
+    assert system.applied_evidence("value-1") == before_ledger
+
+
+def test_support_and_opposition_policy_is_bounded_and_deterministic() -> None:
+    value = _mutable_value(strength=0.05)
+    system = ValueSystem((value,))
+    first_opposition = system.apply_update(
+        _admission(requested_delta=-1.0, evidence_ref="opp-1"), _event()
+    )
+    assert first_opposition.status is ValueMutationStatus.APPLIED
+    assert first_opposition.value.strength == pytest.approx(0.0)
+    assert first_opposition.value.polarity == 1
+    assert first_opposition.value.opposition_count == 1
+
+    for index in range(2, 4):
+        result = system.apply_update(
+            _admission(
+                event_id=f"event-{index}",
+                event_sequence=index - 1,
+                evidence_ref=f"opp-{index}",
+                requested_delta=-1.0,
+            ),
+            _event(f"event-{index}", index - 1),
+        )
+        assert result.value.polarity == 1
+    reversal = system.apply_update(
+        _admission(
+            event_id="event-4",
+            event_sequence=3,
+            evidence_ref="opp-4",
+            requested_delta=-1.0,
+        ),
+        _event("event-4", 3),
+    )
+    assert reversal.value.polarity == -1
+    assert reversal.value.opposition_count == 0
+
+    support = system.apply_update(
+        _admission(
+            event_id="event-5",
+            event_sequence=4,
+            evidence_ref="support-1",
+            requested_delta=1.0,
+        ),
+        _event("event-5", 4),
+    )
+    assert support.value.opposition_count == 0
+    assert support.value.confidence > reversal.value.confidence
+
+
+def test_protectedness_raises_reversal_threshold() -> None:
+    value = _mutable_value(strength=0.0, protectedness=0.9)
+    system = ValueSystem((value,))
+    for index in range(1, 7):
+        event_id = f"protected-event-{index}"
+        result = system.apply_update(
+            _admission(
+                event_id=event_id,
+                event_sequence=index,
+                evidence_ref=f"protected-{index}",
+                requested_delta=-1.0,
+            ),
+            _event(event_id, index),
+        )
+        assert result.value.polarity == 1
+    result = system.apply_update(
+        _admission(
+            event_id="protected-event-7",
+            event_sequence=7,
+            evidence_ref="protected-7",
+            requested_delta=-1.0,
+        ),
+        _event("protected-event-7", 7),
+    )
+    assert result.value.polarity == -1
+
+
+def test_duplicate_targets_and_duplicate_evidence_are_fail_closed() -> None:
+    value = _mutable_value()
+    system = ValueSystem((value,))
+    duplicate = _admission(evidence_ref="duplicate-1")
+    with pytest.raises(ValueDomainError):
+        system.apply_updates(_event(), (duplicate, duplicate))
+    first = system.apply_update(duplicate, _event())
+    before = system.get("value-1")
+    history = system.history("value-1")
+    duplicate_result = system.apply_update(duplicate, _event())
+    assert first.status is ValueMutationStatus.APPLIED
+    assert duplicate_result.status is ValueMutationStatus.IDEMPOTENT
+    assert system.get("value-1") == before
+    assert system.history("value-1") == history
+
+
+def test_replayed_evidence_makes_the_whole_event_idempotent() -> None:
+    first = _mutable_value("value-1")
+    second = _mutable_value("value-2")
+    system = ValueSystem((first, second))
+    system.apply_update(_admission(evidence_ref="replayed-1"), _event())
+    before_second = system.get("value-2")
+    result = system.apply_updates(
+        _event("event-2", 1),
+        (
+            _admission(
+                event_id="event-2",
+                event_sequence=1,
+                evidence_ref="replayed-1",
+            ),
+            _admission(
+                value_id="value-2",
+                event_id="event-2",
+                event_sequence=1,
+                evidence_ref="new-2",
+            ),
+        ),
+    )
+    assert all(item.status is ValueMutationStatus.IDEMPOTENT for item in result.results)
+    assert system.get("value-2") == before_second
+
+
+def test_freeze_unfreeze_and_frozen_updates_have_no_hidden_mutation() -> None:
+    value = _mutable_value()
+    system = ValueSystem((value,))
+    frozen = system.freeze("value-1", _event())
+    assert frozen.status is ValueMutationStatus.APPLIED
+    before_frozen = system.get("value-1")
+    before_history = system.history("value-1")
+    before_ledger = system.applied_evidence("value-1")
+    blocked = system.apply_update(
+        _admission(event_id="event-2", event_sequence=1, evidence_ref="blocked-1"),
+        _event("event-2", 1),
+    )
+    assert blocked.status is ValueMutationStatus.FROZEN
+    assert system.get("value-1") == before_frozen
+    assert system.history("value-1") == before_history
+    assert system.applied_evidence("value-1") == before_ledger
+    assert system.freeze("value-1", _event("event-3", 2)).status is ValueMutationStatus.IDEMPOTENT
+    unfrozen = system.unfreeze("value-1", _event("event-4", 3))
+    assert unfrozen.status is ValueMutationStatus.APPLIED
+    assert unfrozen.value.revision == before_frozen.revision + 1
+    assert system.unfreeze("value-1", _event("event-5", 4)).status is ValueMutationStatus.IDEMPOTENT
+
+
+def test_revision_state_and_record_digests_are_canonical() -> None:
+    value = _mutable_value()
+    payload = canonical_value_state_payload(value)
+    expected_payload = (
+        b'kagya.identity.value-state/v1\x00{"allowed_update_rate":0.1,"concept":"Protect the wellbeing of the subject.",'
+        b'"confidence":1.0,"context_ids":[],'
+        b'"evidence_refs":["seed-value-1"],"frozen":false,"name":"care",'
+        b'"negotiability":1.0,"opposition_count":0,"origin":{"actor":"self","admission":"self_endorsed",'
+        b'"confidence":1.0,"context_id":null,"event_id":"event-1",'
+        b'"event_sequence":0,"input_kind":"internal_state","origin_id":"'
+        + value.origin.origin_id.encode("ascii")
+        + b'","source_ref":null},"polarity":1,"protectedness":0.0,'
+        b'"revision":0,"scope":"subject",'
+        b'"seed_contract_digest":null,"stability":0.0,"strength":0.8,'
+        b'"value_id":"value-1"}'
+    )
+    assert payload == expected_payload
+    assert value_state_digest(value) == hashlib.sha256(payload).hexdigest()
+
+    system = ValueSystem((value,))
+    result = system.apply_update(_admission(), _event())
+    assert result.revision_record is not None
+    record = result.revision_record
+    assert validate_revision_record_digest(record) == record.record_digest
+    assert recompute_revision_record_digest(record) == record.record_digest
+    tampered = record
+    object.__setattr__(tampered, "after_digest", "0" * 64)
+    with pytest.raises(ValueError):
+        validate_revision_record_digest(tampered)
+
+
+def test_revision_history_compacts_without_rewriting_chain_or_ledger() -> None:
+    value = _mutable_value()
+    system = ValueSystem((value,))
+    for index in range(33):
+        event_id = f"chain-event-{index}"
+        system.apply_update(
+            _admission(
+                event_id=event_id,
+                event_sequence=index,
+                evidence_ref=f"chain-{index}",
+            ),
+            _event(event_id, index),
+        )
+    history = system.history("value-1")
+    assert len(history.records) == 32
+    assert history.history_anchor_revision == 1
+    assert history.records[0].from_revision == 1
+    assert history.records[0].previous_record_digest == history.history_anchor_digest
+    assert len(system.applied_evidence("value-1")) == 34
+    history.validate()
+
+    current = system.get("value-1")
+    rolled_back = system.rollback("value-1", 2, _event("rollback-event", 100))
+    assert rolled_back.status is ValueMutationStatus.APPLIED
+    assert rolled_back.value.revision == current.revision + 1
+    assert rolled_back.value.origin == current.origin
+    assert rolled_back.value.seed_contract_digest == current.seed_contract_digest
+    assert rolled_back.revision_record is not None
+    assert rolled_back.revision_record.target_revision == 2
+    assert len(system.applied_evidence("value-1")) == 34
+    with pytest.raises(ValueDomainError):
+        system.rollback("value-1", 1, _event("old-rollback", 101))
+
+
+def test_system_authorized_value_retains_seed_lineage_during_updates() -> None:
+    digest = recompute_seed_contract_digest(_seed())
+    system_value = _mutable_value(
+        origin=_origin(system=True),
+        seed_contract_digest=digest,
+    )
+    system = ValueSystem((system_value,))
+    result = system.apply_update(_admission(), _event())
+    assert result.value.seed_contract_digest == digest
+    assert result.value.strength != system_value.strength
+    assert result.value.origin == system_value.origin
