@@ -582,6 +582,60 @@ def test_current_event_is_cleared_when_a_handler_raises() -> None:
     assert runtime.current_event() is None
 
 
+def test_current_event_is_cleared_before_failure_checkpoint() -> None:
+    checkpoint_observations: list[bool] = []
+
+    def failure_checkpoint(_event: object) -> None:
+        checkpoint_observations.append(runtime.current_event() is None)
+
+    runtime = AgentRuntime(1, failure_checkpoint=failure_checkpoint)
+    runtime.start()
+
+    def fail() -> None:
+        assert runtime.current_event() is not None
+        raise ValueError("handler failed")
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        fail,
+    )
+    with pytest.raises(AgentRuntimeExecutionError):
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert checkpoint_observations == [True]
+
+
+def test_current_event_is_cleared_before_preparation_failure_checkpoint() -> None:
+    checkpoint_observations: list[bool] = []
+
+    def failure_checkpoint(_event: object) -> None:
+        checkpoint_observations.append(runtime.current_event() is None)
+
+    def preparation_checkpoint(_event: object, _value: object) -> object:
+        raise ValueError("preparation failed")
+
+    runtime = AgentRuntime(
+        1,
+        preparation_checkpoint=preparation_checkpoint,
+        failure_checkpoint=failure_checkpoint,
+    )
+    runtime.start()
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        lambda: None,
+    )
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert error.value.phase is AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION
+    assert checkpoint_observations == [True]
+
+
 def test_current_event_is_cleared_before_every_durability_checkpoint() -> None:
     checkpoint_observations: list[bool] = []
 

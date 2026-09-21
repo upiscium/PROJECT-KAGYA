@@ -2985,6 +2985,52 @@ def test_finalization_failure_preserves_internal_commit_without_restore(
         )
 
 
+def test_value_governance_commit_is_published_before_finalization_failure(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    class FinalizationFailingRuntime(RecordingRuntime):
+        def configure_durability(self, **kwargs: Any) -> None:
+            def fail_finalization(
+                _event: AgentEvent, _evidence: object
+            ) -> NoReturn:
+                raise OSError("private Value finalization failure")
+
+            kwargs["finalization_checkpoint"] = fail_finalization
+            super().configure_durability(**kwargs)
+
+    with _client(
+        tmp_path,
+        settings=settings,
+        runtime=FinalizationFailingRuntime(),
+    ) as client:
+        response = client.post(
+            "/api/values/care/freeze", headers=admin_headers()
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
+        assert client.app.state.agent_state_store.load().last_processed_event_sequence == 1
+
+        visible = client.get("/api/values/care", headers=admin_headers())
+        assert visible.status_code == 200
+        assert visible.json()["revision"] == 1
+        assert visible.json()["frozen"] is True
+
+        committed = client.app.state.agent_state_store.load()
+        assert committed.value_state.values[0].revision == 1
+        assert committed.value_state.values[0].frozen is True
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/values/care", headers=admin_headers())
+        assert restored.status_code == 200
+        assert restored.json()["revision"] == 1
+        assert restored.json()["frozen"] is True
+
+
 def test_emotion_tick_committed_before_crash_recovers_without_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

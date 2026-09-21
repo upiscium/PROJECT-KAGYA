@@ -219,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
+            app.state.main_loop._publish_committed_value_view()
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
             return evidence
@@ -232,7 +233,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(evidence, InternalCommitEvidence):
                 raise StateRecoveryError("Internal commit evidence is unavailable")
             app.state.state_recovery.complete_committed_event(event, evidence)
-            app.state.main_loop._publish_committed_value_view()
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
