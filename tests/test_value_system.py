@@ -17,6 +17,7 @@ from kagya.identity.value_system import (
     ValueMutationEvidence,
     ValueMutationReason,
     ValueMutationStatus,
+    ValueOriginReviewDecision,
     ValueProposal,
     ValueReason,
     ValueRevisionHistory,
@@ -104,6 +105,19 @@ def _event(event_id: str = "event-1", event_sequence: int = 0) -> ValueMutationE
         event_sequence=event_sequence,
         recorded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
         + timedelta(seconds=event_sequence),
+    )
+
+
+def _governance_origin(
+    evidence: ValueMutationEvidence, source: str
+) -> IdentityOrigin:
+    return IdentityOrigin(
+        OriginActor.OPERATOR,
+        OriginInputKind.CONSTRAINT,
+        ValueAdmissionStatus.PENDING,
+        source_ref=source,
+        event_id=evidence.event_id,
+        event_sequence=evidence.event_sequence,
     )
 
 
@@ -632,7 +646,12 @@ def test_replayed_evidence_makes_the_whole_event_idempotent() -> None:
 def test_freeze_unfreeze_and_frozen_updates_have_no_hidden_mutation() -> None:
     value = _mutable_value()
     system = ValueSystem((value,))
-    frozen = system.freeze("value-1", _event())
+    frozen_event = _event()
+    frozen = system.freeze(
+        "value-1",
+        frozen_event,
+        governance_origin=_governance_origin(frozen_event, "api.values.freeze"),
+    )
     assert frozen.status is ValueMutationStatus.APPLIED
     before_frozen = system.get("value-1")
     before_history = system.history("value-1")
@@ -645,11 +664,203 @@ def test_freeze_unfreeze_and_frozen_updates_have_no_hidden_mutation() -> None:
     assert system.get("value-1") == before_frozen
     assert system.history("value-1") == before_history
     assert system.applied_evidence("value-1") == before_ledger
-    assert system.freeze("value-1", _event("event-3", 2)).status is ValueMutationStatus.IDEMPOTENT
-    unfrozen = system.unfreeze("value-1", _event("event-4", 3))
+    idempotent_event = _event("event-3", 2)
+    assert (
+        system.freeze(
+            "value-1",
+            idempotent_event,
+            governance_origin=_governance_origin(
+                idempotent_event, "api.values.freeze"
+            ),
+        ).status
+        is ValueMutationStatus.IDEMPOTENT
+    )
+    unfrozen_event = _event("event-4", 3)
+    unfrozen = system.unfreeze(
+        "value-1",
+        unfrozen_event,
+        governance_origin=_governance_origin(unfrozen_event, "api.values.unfreeze"),
+    )
     assert unfrozen.status is ValueMutationStatus.APPLIED
     assert unfrozen.value.revision == before_frozen.revision + 1
-    assert system.unfreeze("value-1", _event("event-5", 4)).status is ValueMutationStatus.IDEMPOTENT
+    retry_event = _event("event-5", 4)
+    assert (
+        system.unfreeze(
+            "value-1",
+            retry_event,
+            governance_origin=_governance_origin(retry_event, "api.values.unfreeze"),
+        ).status
+        is ValueMutationStatus.IDEMPOTENT
+    )
+
+
+def test_governance_freeze_accepts_quarantined_values_and_binds_origin() -> None:
+    quarantine = _value(
+        origin=IdentityOrigin(
+            OriginActor.INHERITED,
+            OriginInputKind.LEGACY,
+            ValueAdmissionStatus.UNCERTAIN,
+        ),
+        evidence_refs=(),
+    )
+    system = ValueSystem((quarantine,))
+    evidence = _event("freeze-quarantine", 7)
+    result = system.freeze(
+        "value-1",
+        evidence,
+        governance_origin=_governance_origin(evidence, "api.values.freeze"),
+    )
+
+    assert result.status is ValueMutationStatus.APPLIED
+    assert not result.value.is_active()
+    assert result.revision_record is not None
+    assert result.revision_record.origin_id == _governance_origin(
+        evidence, "api.values.freeze"
+    ).origin_id
+    with pytest.raises(ValueDomainError):
+        system.freeze(
+            "value-1",
+            evidence,
+            governance_origin=_governance_origin(evidence, "api.values.rollback"),
+        )
+
+
+def test_config_seed_adoption_is_exact_idempotent_and_collision_safe() -> None:
+    seed = _seed(value_id="new-seed", name="new-seed")
+    system = ValueSystem()
+    evidence = _event("seed-adopt", 3)
+    origin = _governance_origin(evidence, "api.values.seed_adopt")
+    result = system.adopt_seed(seed, evidence, governance_origin=origin)
+
+    adopted = system.get("new-seed")
+    assert result.status is ValueMutationStatus.APPLIED
+    assert adopted.origin.actor is OriginActor.SYSTEM
+    assert adopted.origin.input_kind is OriginInputKind.CONFIG_SEED
+    assert adopted.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED
+    assert adopted.seed_contract_digest == recompute_seed_contract_digest(seed)
+    assert result.revision_record is not None
+    assert result.revision_record.operation is ValueRevisionOperation.ADMISSION
+    assert result.revision_record.origin_id == origin.origin_id
+    assert system.conflicts == ()
+
+    retry = system.adopt_seed(
+        seed,
+        _event("seed-adopt-retry", 4),
+        governance_origin=_governance_origin(
+            _event("seed-adopt-retry", 4), "api.values.seed_adopt"
+        ),
+    )
+    assert retry.status is ValueMutationStatus.IDEMPOTENT
+
+    with pytest.raises(ValueDomainError):
+        system.adopt_seed(
+            _seed(value_id="new-seed", name="changed"),
+            _event("seed-collision", 5),
+            governance_origin=_governance_origin(
+                _event("seed-collision", 5), "api.values.seed_adopt"
+            ),
+        )
+
+    non_system = ValueSystem((_value(value_id="new-seed", evidence_refs=()),))
+    with pytest.raises(ValueDomainError):
+        non_system.adopt_seed(
+            seed,
+            _event("seed-non-system", 6),
+            governance_origin=_governance_origin(
+                _event("seed-non-system", 6), "api.values.seed_adopt"
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("actor", "initial_admission"),
+    [
+        (OriginActor.INHERITED, ValueAdmissionStatus.UNCERTAIN),
+        (OriginActor.UNKNOWN, ValueAdmissionStatus.UNCERTAIN),
+    ],
+)
+def test_origin_review_preserves_lineage_and_never_endorses(
+    actor: OriginActor, initial_admission: ValueAdmissionStatus
+) -> None:
+    original_origin = IdentityOrigin(
+        actor, OriginInputKind.LEGACY, initial_admission
+    )
+    system = ValueSystem(
+        (_value(origin=original_origin, evidence_refs=()),)
+    )
+    accept_event = _event(f"review-accept-{actor.value}", 8)
+    accepted = system.review_origin(
+        "value-1",
+        ValueOriginReviewDecision.ACCEPT_PROVENANCE,
+        accept_event,
+        governance_origin=_governance_origin(
+            accept_event, "api.values.origin_review"
+        ),
+    )
+    assert accepted.value.origin.origin_id == original_origin.origin_id
+    assert accepted.value.origin.admission is ValueAdmissionStatus.PENDING
+    assert accepted.value.origin.actor is actor
+    assert not accepted.value.is_active()
+    assert accepted.revision_record is not None
+    assert accepted.revision_record.operation is ValueRevisionOperation.ORIGIN_REVIEW
+    assert accepted.revision_record.origin_id != original_origin.origin_id
+
+    reject_event = _event(f"review-reject-{actor.value}", 9)
+    rejected = system.review_origin(
+        "value-1",
+        ValueOriginReviewDecision.REJECT,
+        reject_event,
+        governance_origin=_governance_origin(
+            reject_event, "api.values.origin_review"
+        ),
+    )
+    assert rejected.value.origin.origin_id == original_origin.origin_id
+    assert rejected.value.origin.admission is ValueAdmissionStatus.REJECTED
+    assert not rejected.value.is_active()
+
+    retry = system.review_origin(
+        "value-1",
+        ValueOriginReviewDecision.REJECT,
+        _event("review-reject-retry", 10),
+        governance_origin=_governance_origin(
+            _event("review-reject-retry", 10), "api.values.origin_review"
+        ),
+    )
+    assert retry.status is ValueMutationStatus.IDEMPOTENT
+
+    with pytest.raises(ValueDomainError):
+        system.review_origin(
+            "value-1",
+            ValueOriginReviewDecision.ACCEPT_PROVENANCE,
+            _event("review-reopen", 11),
+            governance_origin=_governance_origin(
+                _event("review-reopen", 11), "api.values.origin_review"
+            ),
+        )
+
+
+def test_origin_review_rejects_self_and_system_lineage() -> None:
+    system_value = _value(
+        value_id="system-value",
+        origin=_origin(system=True),
+        seed_contract_digest=recompute_seed_contract_digest(_seed()),
+        evidence_refs=(),
+    )
+    system = ValueSystem((_value(), system_value))
+    for value_id, event_id, sequence in (
+        ("value-1", "review-self", 12),
+        ("system-value", "review-system", 13),
+    ):
+        event = _event(event_id, sequence)
+        with pytest.raises(ValueDomainError):
+            system.review_origin(
+                value_id,
+                ValueOriginReviewDecision.REJECT,
+                event,
+                governance_origin=_governance_origin(
+                    event, "api.values.origin_review"
+                ),
+            )
 
 
 def test_revision_state_and_record_digests_are_canonical() -> None:
@@ -706,7 +917,13 @@ def test_revision_history_compacts_without_rewriting_chain_or_ledger() -> None:
     history.validate()
 
     current = system.get("value-1")
-    rolled_back = system.rollback("value-1", 2, _event("rollback-event", 100))
+    rollback_event = _event("rollback-event", 100)
+    rolled_back = system.rollback(
+        "value-1",
+        2,
+        rollback_event,
+        governance_origin=_governance_origin(rollback_event, "api.values.rollback"),
+    )
     assert rolled_back.status is ValueMutationStatus.APPLIED
     assert rolled_back.value.revision == current.revision + 1
     assert rolled_back.value.origin == current.origin
@@ -715,7 +932,15 @@ def test_revision_history_compacts_without_rewriting_chain_or_ledger() -> None:
     assert rolled_back.revision_record.target_revision == 2
     assert len(system.applied_evidence("value-1")) == 34
     with pytest.raises(ValueDomainError):
-        system.rollback("value-1", 1, _event("old-rollback", 101))
+        old_rollback_event = _event("old-rollback", 101)
+        system.rollback(
+            "value-1",
+            1,
+            old_rollback_event,
+            governance_origin=_governance_origin(
+                old_rollback_event, "api.values.rollback"
+            ),
+        )
 
 
 def test_system_authorized_value_retains_seed_lineage_during_updates() -> None:

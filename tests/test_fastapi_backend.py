@@ -15,7 +15,15 @@ from fastapi.testclient import TestClient
 from kagya.api.server import create_app
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from kagya.config import Settings, load_settings
-from kagya.identity import ValueConflictDefinition
+from kagya.identity import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    ValueAdmissionStatus,
+    ValueConflictDefinition,
+    ValueDomainError,
+    ValueMutationEvidence,
+)
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
@@ -1227,6 +1235,277 @@ def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
         )
         assert client.post("/api/sleep/run").status_code == 401
         assert client.get("/api/adapters").status_code == 401
+        assert client.get("/api/values").status_code == 401
+
+
+def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        journal = client.app.state.event_journal
+        with pytest.raises(ValueDomainError):
+            client.app.state.main_loop.freeze_value(
+                client.app.state.agent_runtime, "care"
+            )
+        foreign_runtime = AgentRuntime(1, allow_volatile=True)
+        foreign_runtime.start()
+        before_foreign = client.app.state.main_loop.value_system.snapshot()
+        foreign_future = foreign_runtime.submit(
+            AgentEventType.VALUE_GOVERNANCE,
+            AgentEventSource.API_VALUES_FREEZE,
+            lambda: client.app.state.main_loop.freeze_value(foreign_runtime, "care"),
+        )
+        with pytest.raises(AgentRuntimeExecutionError) as foreign_error:
+            foreign_future.result(timeout=2)
+        foreign_runtime.shutdown()
+        assert isinstance(foreign_error.value.__cause__, ValueDomainError)
+        assert client.app.state.main_loop.value_system.snapshot() == before_foreign
+        before_records = len(journal.records)
+
+        values = client.get("/api/values", headers=admin_headers())
+        value = client.get("/api/values/care", headers=admin_headers())
+        revisions = client.get(
+            "/api/values/care/revisions", headers=admin_headers()
+        )
+        seeds = client.get(
+            "/api/values/config-seeds", headers=admin_headers()
+        )
+
+        assert values.status_code == 200
+        assert {item["value_id"] for item in values.json()["values"]} == {
+            "care",
+            "honesty",
+        }
+        assert value.status_code == 200
+        assert value.json()["value_id"] == "care"
+        assert "evidence_refs" not in value.json()
+        assert "source_ref" not in value.json()
+        assert revisions.status_code == 200
+        assert revisions.json() == {"revisions": []}
+        assert seeds.status_code == 200
+        assert {item["value_id"] for item in seeds.json()["seeds"]} == {
+            "care",
+            "honesty",
+        }
+        assert len(journal.records) == before_records
+
+        frozen = client.post(
+            "/api/values/care/freeze", headers=admin_headers()
+        )
+        assert frozen.status_code == 200
+        assert frozen.json()["status"] == "applied"
+        assert frozen.json()["revision"] == 1
+        assert frozen.json()["frozen"] is True
+
+        governance_records = [
+            record
+            for record in journal.records
+            if record.event_type is AgentEventType.VALUE_GOVERNANCE
+        ]
+        assert len(governance_records) == 4
+        assert {record.source for record in governance_records} == {
+            AgentEventSource.API_VALUES_FREEZE
+        }
+        event_ids = {record.event_id for record in governance_records}
+        assert len(event_ids) == 1
+
+        unfreezed = client.post(
+            "/api/values/care/unfreeze", headers=admin_headers()
+        )
+        assert unfreezed.status_code == 200
+        assert unfreezed.json()["revision"] == 2
+        rollback = client.post(
+            "/api/values/care/rollback",
+            headers=admin_headers(),
+            json={"target_revision": 1},
+        )
+        assert rollback.status_code == 200
+        assert rollback.json()["revision"] == 3
+        assert rollback.json()["frozen"] is True
+
+        revisions = client.get(
+            "/api/values/care/revisions", headers=admin_headers()
+        )
+        assert revisions.status_code == 200
+        revision_items = revisions.json()["revisions"]
+        assert [item["operation"] for item in revision_items] == [
+            "freeze",
+            "unfreeze",
+            "rollback",
+        ]
+        assert revision_items[-1]["target_revision"] == 1
+        assert all("evidence_refs" not in item for item in revision_items)
+
+        invalid = client.post(
+            "/api/values/care/rollback",
+            headers=admin_headers(),
+            json={"target_revision": 1, "PRIVATE-SENTINEL": PRIVATE_SENTINEL},
+        )
+        assert invalid.status_code == 422
+        assert PRIVATE_SENTINEL not in invalid.text
+
+        assert client.get(
+            "/api/values/missing", headers=admin_headers()
+        ).status_code == 404
+        assert client.post(
+            "/api/values/missing/freeze", headers=admin_headers()
+        ).status_code == 404
+        invalid_target = client.post(
+            "/api/values/care/rollback",
+            headers=admin_headers(),
+            json={"target_revision": 999},
+        )
+        assert invalid_target.status_code == 409
+
+    with _client(tmp_path, settings=settings) as restarted:
+        restored = restarted.get("/api/values/care", headers=admin_headers())
+        assert restored.status_code == 200
+        assert restored.json()["revision"] == 3
+        assert restored.json()["frozen"] is True
+
+
+def test_values_api_origin_review_and_seed_adoption_are_narrow(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        seed = client.post(
+            "/api/values/config-seeds/care/adopt", headers=admin_headers()
+        )
+        assert seed.status_code == 200
+        assert seed.json()["status"] == "idempotent"
+        assert seed.json()["revision"] == 0
+
+        invalid_decision = client.post(
+            "/api/values/care/origin-review",
+            headers=admin_headers(),
+            json={"decision": "self_endorse"},
+        )
+        assert invalid_decision.status_code == 422
+        assert PRIVATE_SENTINEL not in invalid_decision.text
+
+        invalid_fields = client.post(
+            "/api/values/care/freeze",
+            headers=admin_headers(),
+            json={"event_id": PRIVATE_SENTINEL},
+        )
+        assert invalid_fields.status_code == 422
+        assert PRIVATE_SENTINEL not in invalid_fields.text
+
+        missing_seed = client.post(
+            "/api/values/config-seeds/missing/adopt", headers=admin_headers()
+        )
+        assert missing_seed.status_code == 404
+
+
+def test_values_api_explicitly_adopts_a_new_config_seed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        assert client.get("/api/values/new-seed", headers=admin_headers()).status_code == 404
+
+    new_seed = settings.values.seeds[0].model_copy(
+        update={"value_id": "new-seed", "name": "new-seed"}
+    )
+    expanded = settings.model_copy(
+        update={
+            "values": settings.values.model_copy(
+                update={"seeds": [*settings.values.seeds, new_seed]}
+            )
+        }
+    )
+    with _client(tmp_path, settings=expanded) as client:
+        listed = client.get("/api/values/config-seeds", headers=admin_headers())
+        assert listed.status_code == 200
+        new_seed_projection = next(
+            item for item in listed.json()["seeds"] if item["value_id"] == "new-seed"
+        )
+        assert new_seed_projection["adopted"] is False
+        assert client.get("/api/values/new-seed", headers=admin_headers()).status_code == 404
+
+        adopted = client.post(
+            "/api/values/config-seeds/new-seed/adopt", headers=admin_headers()
+        )
+        assert adopted.status_code == 200
+        assert adopted.json()["status"] == "applied"
+        assert adopted.json()["revision"] == 0
+        assert client.get(
+            "/api/values/new-seed", headers=admin_headers()
+        ).json()["origin_actor"] == "system"
+        revisions = client.get(
+            "/api/values/new-seed/revisions", headers=admin_headers()
+        )
+        assert [item["operation"] for item in revisions.json()["revisions"]] == [
+            "admission"
+        ]
+
+
+def test_value_governance_failure_restores_the_last_committed_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        before = main_loop.value_system.snapshot()
+        original_freeze = main_loop._value_system.freeze
+
+        def mutate_then_fail(
+            value_id: str,
+            evidence: object,
+            *,
+            governance_origin: object,
+        ) -> object:
+            original_freeze(
+                value_id,
+                evidence,
+                governance_origin=governance_origin,
+            )
+            raise RuntimeError("PRIVATE-SENTINEL governance failure")
+
+        monkeypatch.setattr(main_loop._value_system, "freeze", mutate_then_fail)
+        with pytest.raises(RuntimeError, match="PRIVATE-SENTINEL governance failure"):
+            client.post("/api/values/care/freeze", headers=admin_headers())
+
+        assert main_loop.value_system.snapshot() == before
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+
+
+def test_unbound_value_mutation_cannot_be_published_by_a_later_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        main_loop = client.app.state.main_loop
+        before = main_loop.value_system.snapshot()
+        forged_event = ValueMutationEvidence(
+            "forged-event", 999, datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+        forged_origin = IdentityOrigin(
+            OriginActor.OPERATOR,
+            OriginInputKind.CONSTRAINT,
+            ValueAdmissionStatus.PENDING,
+            source_ref=AgentEventSource.API_VALUES_FREEZE.value,
+            event_id=forged_event.event_id,
+            event_sequence=forged_event.event_sequence,
+        )
+        main_loop._value_system.freeze(
+            "care", forged_event, governance_origin=forged_origin
+        )
+        assert main_loop.value_system.snapshot() == before
+
+        response = client.post(
+            "/api/chat", json={"message": "later event", "attachments": []}
+        )
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": "Agent mutation durability is indeterminate"
+        }
+        assert main_loop.value_system.snapshot() == before
+
+    with _client(tmp_path, settings=settings) as restarted:
+        assert restarted.get(
+            "/api/values/care", headers=admin_headers()
+        ).json()["revision"] == 0
 
 
 def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:

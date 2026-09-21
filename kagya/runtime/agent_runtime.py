@@ -20,6 +20,7 @@ class AgentEventType(str, Enum):
     ADAPTER_UPDATE = "adapter_update"
     CONTEXT_UPDATE = "context_update"
     EMOTION_TICK = "emotion_tick"
+    VALUE_GOVERNANCE = "value_governance"
 
 
 class AgentEventSource(str, Enum):
@@ -32,6 +33,11 @@ class AgentEventSource(str, Enum):
     API_CONTEXT_RESUME = "api.contexts.resume"
     API_CONTEXT_CLOSE = "api.contexts.close"
     API_CONTEXT_RELATE = "api.contexts.relate"
+    API_VALUES_FREEZE = "api.values.freeze"
+    API_VALUES_UNFREEZE = "api.values.unfreeze"
+    API_VALUES_SEED_ADOPT = "api.values.seed_adopt"
+    API_VALUES_ORIGIN_REVIEW = "api.values.origin_review"
+    API_VALUES_ROLLBACK = "api.values.rollback"
     API_ADAPTER_EVALUATE = "api.adapters.evaluate"
     API_ADAPTER_TRIAL = "api.adapters.trial"
     API_ADAPTER_APPROVE = "api.adapters.approve"
@@ -177,6 +183,7 @@ class AgentRuntime:
         self._worker: Thread | None = None
         self._sequence = initial_sequence
         self._active: tuple[_PendingEvent, AgentEvent] | None = None
+        self._handler_event: AgentEvent | None = None
         self._failed_phase: AgentRuntimeDurabilityPhase | None = None
         self._allow_volatile = allow_volatile
         self._durability_configured = all(
@@ -196,6 +203,14 @@ class AgentRuntime:
     def status(self) -> AgentRuntimeStatus:
         with self._condition:
             return self._status
+
+    def current_event(self) -> AgentEvent | None:
+        """Return the event only while its handler runs on the worker thread."""
+
+        with self._condition:
+            if current_thread() is not self._worker:
+                return None
+            return self._handler_event
 
     def start(self) -> None:
         with self._condition:
@@ -328,6 +343,15 @@ class AgentRuntime:
         if worker is not None and worker is not current_thread():
             worker.join()
 
+    def _invoke_handler(self, pending: _PendingEvent, event: AgentEvent) -> object:
+        with self._condition:
+            self._handler_event = event
+        try:
+            return pending.handler()
+        finally:
+            with self._condition:
+                self._handler_event = None
+
     def _consume(self) -> None:
         while True:
             with self._condition:
@@ -369,7 +393,7 @@ class AgentRuntime:
                     self._finish_active_locked()
                     return
             try:
-                value = pending.handler()
+                value = self._invoke_handler(pending, event)
             except Exception as error:
                 if self._failure_checkpoint is not None:
                     try:

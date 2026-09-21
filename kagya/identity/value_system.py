@@ -33,6 +33,8 @@ __all__ = [
     "ValueMutationReason",
     "ValueMutationResult",
     "ValueMutationStatus",
+    "ValueNotFound",
+    "ValueOriginReviewDecision",
     "ValueProposal",
     "ValueReason",
     "ValueRevisionOperation",
@@ -81,6 +83,12 @@ class ValueRevisionOperation(str, Enum):
     FREEZE = "freeze"
     UNFREEZE = "unfreeze"
     ROLLBACK = "rollback"
+    ORIGIN_REVIEW = "origin_review"
+
+
+class ValueOriginReviewDecision(str, Enum):
+    ACCEPT_PROVENANCE = "accept_provenance"
+    REJECT = "reject"
 
 
 class ValueMutationStatus(str, Enum):
@@ -402,6 +410,10 @@ def evidence_ledger_digest(value_id: str, evidence_refs: tuple[str, ...]) -> str
 
 class ValueDomainError(ValueError):
     """A fail-closed domain error raised by the process-local Value authority."""
+
+
+class ValueNotFound(ValueDomainError):
+    """The requested stored Value does not exist."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,6 +859,25 @@ def _project_evidence_refs(
     return tuple(sorted(retained[:_MAX_REFS]))
 
 
+def _validate_governance_origin(
+    origin: IdentityOrigin,
+    evidence: ValueMutationEvidence,
+    expected_source: str,
+) -> None:
+    if not isinstance(origin, IdentityOrigin):
+        raise TypeError("governance_origin must be an IdentityOrigin")
+    if (
+        origin.actor is not OriginActor.OPERATOR
+        or origin.input_kind is not OriginInputKind.CONSTRAINT
+        or origin.admission is not ValueAdmissionStatus.PENDING
+    ):
+        raise ValueDomainError("governance origin is not an operator constraint")
+    if origin.source_ref != expected_source:
+        raise ValueDomainError("governance origin source is not allowlisted")
+    if origin.event_id != evidence.event_id or origin.event_sequence != evidence.event_sequence:
+        raise ValueDomainError("governance origin is not bound to event evidence")
+
+
 class ValueSystem:
     """Process-local authority for bounded Value mutation and revision history."""
 
@@ -1133,14 +1164,14 @@ class ValueSystem:
         try:
             return self._values[value_id]
         except KeyError as exc:
-            raise ValueDomainError("unknown Value ID") from exc
+            raise ValueNotFound("unknown Value ID") from exc
 
     def history(self, value_id: str) -> ValueRevisionHistory:
         validate_identifier(value_id)
         try:
             return self._histories[value_id]
         except KeyError as exc:
-            raise ValueDomainError("unknown Value ID") from exc
+            raise ValueNotFound("unknown Value ID") from exc
 
     def revision_history(self, value_id: str) -> ValueRevisionHistory:
         return self.history(value_id)
@@ -1150,7 +1181,7 @@ class ValueSystem:
         try:
             return self._evidence_ledgers[value_id]
         except KeyError as exc:
-            raise ValueDomainError("unknown Value ID") from exc
+            raise ValueNotFound("unknown Value ID") from exc
 
     @staticmethod
     def _validate_event(evidence: ValueMutationEvidence) -> None:
@@ -1494,9 +1525,15 @@ class ValueSystem:
         value_id: str,
         frozen: bool,
         evidence: ValueMutationEvidence,
+        governance_origin: IdentityOrigin,
     ) -> ValueMutationResult:
         self._validate_event(evidence)
-        value = self._require_active(value_id)
+        _validate_governance_origin(
+            governance_origin,
+            evidence,
+            "api.values.freeze" if frozen else "api.values.unfreeze",
+        )
+        value = self.get(value_id)
         if value.frozen is frozen:
             return ValueMutationResult(
                 status=ValueMutationStatus.IDEMPOTENT,
@@ -1513,7 +1550,7 @@ class ValueSystem:
             value,
             updated,
             operation,
-            value.origin.origin_id,
+            governance_origin.origin_id,
             (),
             evidence,
         )
@@ -1525,22 +1562,39 @@ class ValueSystem:
             revision_record=record,
         )
 
-    def freeze(self, value_id: str, evidence: ValueMutationEvidence) -> ValueMutationResult:
-        return self._set_frozen(value_id, True, evidence)
+    def freeze(
+        self,
+        value_id: str,
+        evidence: ValueMutationEvidence,
+        *,
+        governance_origin: IdentityOrigin,
+    ) -> ValueMutationResult:
+        return self._set_frozen(value_id, True, evidence, governance_origin)
 
-    def unfreeze(self, value_id: str, evidence: ValueMutationEvidence) -> ValueMutationResult:
-        return self._set_frozen(value_id, False, evidence)
+    def unfreeze(
+        self,
+        value_id: str,
+        evidence: ValueMutationEvidence,
+        *,
+        governance_origin: IdentityOrigin,
+    ) -> ValueMutationResult:
+        return self._set_frozen(value_id, False, evidence, governance_origin)
 
     def rollback(
         self,
         value_id: str,
         target_revision: int,
         evidence: ValueMutationEvidence,
+        *,
+        governance_origin: IdentityOrigin,
     ) -> ValueMutationResult:
         self._validate_event(evidence)
+        _validate_governance_origin(
+            governance_origin, evidence, "api.values.rollback"
+        )
         if type(target_revision) is not int or target_revision < 0:
             raise TypeError("target_revision must be a nonnegative exact integer")
-        current = self._require_active(value_id)
+        current = self.get(value_id)
         history = self._histories[value_id]
         target_record = next(
             (
@@ -1567,7 +1621,7 @@ class ValueSystem:
             current,
             restored,
             ValueRevisionOperation.ROLLBACK,
-            current.origin.origin_id,
+            governance_origin.origin_id,
             target.evidence_refs,
             evidence,
             target_revision=target_revision,
@@ -1577,6 +1631,174 @@ class ValueSystem:
             status=ValueMutationStatus.APPLIED,
             value_id=value_id,
             value=restored,
+            revision_record=record,
+        )
+
+    def adopt_seed(
+        self,
+        seed: ValueSeedDeclaration,
+        evidence: ValueMutationEvidence,
+        *,
+        governance_origin: IdentityOrigin,
+    ) -> ValueMutationResult:
+        self._validate_event(evidence)
+        if not isinstance(seed, ValueSeedDeclaration):
+            raise TypeError("seed must be a ValueSeedDeclaration")
+        _validate_governance_origin(
+            governance_origin, evidence, "api.values.seed_adopt"
+        )
+        seed_digest = recompute_seed_contract_digest(seed)
+        existing = self._values.get(seed.value_id)
+        if existing is not None:
+            if (
+                existing.origin.actor is OriginActor.SYSTEM
+                and existing.origin.input_kind is OriginInputKind.CONFIG_SEED
+                and existing.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED
+                and existing.seed_contract_digest == seed_digest
+            ):
+                return ValueMutationResult(
+                    status=ValueMutationStatus.IDEMPOTENT,
+                    value_id=seed.value_id,
+                    value=existing,
+                )
+            raise ValueDomainError("Value ID collides with existing state")
+        if len(self._values) >= _MAX_AUTHORITATIVE_VALUES:
+            raise ValueDomainError("ValueSystem has reached its authoritative Value bound")
+
+        candidate = ValueState(
+            value_id=seed.value_id,
+            revision=0,
+            name=seed.name,
+            concept=seed.concept,
+            scope=seed.scope,
+            context_ids=seed.context_ids,
+            polarity=seed.polarity,
+            strength=seed.initial_strength,
+            confidence=seed.confidence,
+            stability=seed.stability,
+            protectedness=seed.protectedness,
+            negotiability=seed.negotiability,
+            allowed_update_rate=seed.allowed_update_rate,
+            frozen=False,
+            origin=IdentityOrigin(
+                OriginActor.SYSTEM,
+                OriginInputKind.CONFIG_SEED,
+                ValueAdmissionStatus.SYSTEM_AUTHORIZED,
+                source_ref=f"config-seed:{seed.value_id}",
+            ),
+            evidence_refs=(),
+            seed_contract_digest=seed_digest,
+            opposition_count=0,
+        )
+        record = ValueRevisionRecord(
+            value_id=candidate.value_id,
+            from_revision=-1,
+            to_revision=0,
+            before_digest=_genesis_digest(candidate.value_id),
+            after_state_projection=candidate,
+            after_digest=value_state_digest(candidate),
+            operation=ValueRevisionOperation.ADMISSION,
+            origin_id=governance_origin.origin_id,
+            evidence_refs=(),
+            event_id=evidence.event_id,
+            event_sequence=evidence.event_sequence,
+            recorded_at=evidence.recorded_at,
+        )
+        self._values[candidate.value_id] = candidate
+        self._histories[candidate.value_id] = ValueRevisionHistory(
+            candidate.value_id, records=(record,)
+        )
+        self._evidence_ledgers[candidate.value_id] = ()
+        self._evidence_ledger_digests[candidate.value_id] = evidence_ledger_digest(
+            candidate.value_id, ()
+        )
+        self._values = {value_id: self._values[value_id] for value_id in sorted(self._values)}
+        self._histories = {
+            value_id: self._histories[value_id] for value_id in sorted(self._histories)
+        }
+        self._evidence_ledgers = {
+            value_id: self._evidence_ledgers[value_id]
+            for value_id in sorted(self._evidence_ledgers)
+        }
+        self._evidence_ledger_digests = {
+            value_id: self._evidence_ledger_digests[value_id]
+            for value_id in sorted(self._evidence_ledger_digests)
+        }
+        return ValueMutationResult(
+            status=ValueMutationStatus.APPLIED,
+            value_id=candidate.value_id,
+            value=candidate,
+            revision_record=record,
+        )
+
+    def review_origin(
+        self,
+        value_id: str,
+        decision: ValueOriginReviewDecision,
+        evidence: ValueMutationEvidence,
+        *,
+        governance_origin: IdentityOrigin,
+    ) -> ValueMutationResult:
+        self._validate_event(evidence)
+        _enum(decision, ValueOriginReviewDecision, "decision")
+        _validate_governance_origin(
+            governance_origin, evidence, "api.values.origin_review"
+        )
+        value = self.get(value_id)
+        if value.origin.actor not in {OriginActor.INHERITED, OriginActor.UNKNOWN}:
+            raise ValueDomainError("only inherited or unknown Values may be reviewed")
+
+        current_admission = value.origin.admission
+        if decision is ValueOriginReviewDecision.ACCEPT_PROVENANCE:
+            if current_admission is ValueAdmissionStatus.PENDING:
+                return ValueMutationResult(
+                    status=ValueMutationStatus.IDEMPOTENT,
+                    value_id=value_id,
+                    value=value,
+                )
+            if current_admission is not ValueAdmissionStatus.UNCERTAIN:
+                raise ValueDomainError("Value origin review transition is invalid")
+            admission = ValueAdmissionStatus.PENDING
+        else:
+            if current_admission is ValueAdmissionStatus.REJECTED:
+                return ValueMutationResult(
+                    status=ValueMutationStatus.IDEMPOTENT,
+                    value_id=value_id,
+                    value=value,
+                )
+            if current_admission not in {
+                ValueAdmissionStatus.UNCERTAIN,
+                ValueAdmissionStatus.PENDING,
+            }:
+                raise ValueDomainError("Value origin review transition is invalid")
+            admission = ValueAdmissionStatus.REJECTED
+
+        reviewed_origin = IdentityOrigin(
+            value.origin.actor,
+            value.origin.input_kind,
+            admission,
+            source_ref=value.origin.source_ref,
+            event_id=value.origin.event_id,
+            context_id=value.origin.context_id,
+            event_sequence=value.origin.event_sequence,
+            confidence=value.origin.confidence,
+        )
+        if reviewed_origin.origin_id != value.origin.origin_id:
+            raise ValueDomainError("origin review changed the provenance identity")
+        updated = replace(value, revision=value.revision + 1, origin=reviewed_origin)
+        record = self._record(
+            value,
+            updated,
+            ValueRevisionOperation.ORIGIN_REVIEW,
+            governance_origin.origin_id,
+            (),
+            evidence,
+        )
+        self._commit_record(updated, record)
+        return ValueMutationResult(
+            status=ValueMutationStatus.APPLIED,
+            value_id=value_id,
+            value=updated,
             revision_record=record,
         )
 

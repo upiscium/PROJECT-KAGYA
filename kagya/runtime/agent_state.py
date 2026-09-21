@@ -560,7 +560,9 @@ class ValueRevisionRecordSnapshot(_StateModel):
     before_digest: str
     after_state_projection: ValueStateSnapshot
     after_digest: str
-    operation: Literal["admission", "update", "freeze", "unfreeze", "rollback"]
+    operation: Literal[
+        "admission", "update", "freeze", "unfreeze", "rollback", "origin_review"
+    ]
     origin_id: str
     evidence_refs: tuple[str, ...]
     event_id: str
@@ -1062,6 +1064,29 @@ def default_agent_state_snapshot(
     )
 
 
+def _value_system_authority(main_loop: KagyaMainLoop) -> ValueSystem | None:
+    """Read the internal Value authority without exposing it as a public port."""
+
+    getter = getattr(main_loop, "_value_system_for_state", None)
+    if callable(getter):
+        value_system = getter()
+    else:
+        value_system = getattr(main_loop, "value_system", None)
+    return value_system if isinstance(value_system, ValueSystem) else None
+
+
+def _replace_value_system_authority(
+    main_loop: KagyaMainLoop, value_system: ValueSystem
+) -> None:
+    """Replace Value authority through the MainLoop state boundary when present."""
+
+    setter = getattr(main_loop, "_replace_value_system_for_state", None)
+    if callable(setter):
+        setter(value_system)
+    else:
+        setattr(main_loop, "value_system", value_system)
+
+
 class AgentStateStore:
     """Load, capture, restore, and atomically publish the R04 snapshot."""
 
@@ -1455,7 +1480,7 @@ class AgentStateStore:
             temporal = getattr(emotion_engine, "temporal_state")
             if not isinstance(temporal, EmotionTemporalState):
                 raise ValueError("Emotion temporal authority is malformed")
-            value_system = getattr(main_loop, "value_system", None)
+            value_system = _value_system_authority(main_loop)
             if not isinstance(value_system, ValueSystem):
                 raise ValueError("Value authority is unavailable")
             value_system.validate()
@@ -1639,7 +1664,7 @@ class AgentStateStore:
             ):
                 raise AgentStateLoadError("AgentState restore requires ContextRegistry")
 
-            current_value_system = getattr(main_loop, "value_system", None)
+            current_value_system = _value_system_authority(main_loop)
             if isinstance(validated, AgentStateSnapshotV5):
                 if not isinstance(current_value_system, ValueSystem):
                     raise AgentStateLoadError(
@@ -1669,7 +1694,7 @@ class AgentStateStore:
                 context_registry.restore_exact(context_state)
             calibration.restore_exact(restored_calibration)
             if value_system_authority is not None:
-                main_loop.value_system = restored_value_system
+                _replace_value_system_authority(main_loop, restored_value_system)
             emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
@@ -1713,7 +1738,7 @@ class AgentStateStore:
                     pass
             if value_system_was_present and previous_value_system is not None:
                 try:
-                    main_loop.value_system = previous_value_system
+                    _replace_value_system_authority(main_loop, previous_value_system)
                 except Exception:
                     pass
             restore_failure = AgentStateLoadError("AgentState restore failed")

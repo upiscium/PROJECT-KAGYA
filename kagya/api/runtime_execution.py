@@ -5,6 +5,7 @@ from typing import TypeVar, overload
 
 from fastapi import HTTPException, status
 
+from kagya.identity import ValueDomainError, ValueNotFound
 from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
@@ -75,6 +76,16 @@ def execute(
         ) from exc
     except AgentRuntimeExecutionError as exc:
         cause = exc.__cause__
+        if isinstance(cause, ValueNotFound):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Value not found",
+            ) from exc
+        if isinstance(cause, ValueDomainError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Value operation is invalid",
+            ) from exc
         if isinstance(cause, ContextNotFound):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

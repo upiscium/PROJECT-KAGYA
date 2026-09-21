@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep
+from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep, values
 from kagya.config import Settings, get_settings
 from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry, SleepCycleManager
@@ -211,6 +211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             nonlocal committed_snapshot, committed_snapshot_hash
             sequence = event.processing_sequence
             assert sequence is not None
+            app.state.main_loop._validate_value_event_commit(event)
             candidate = app.state.agent_state_store.capture(
                 app.state.main_loop, sequence
             )
@@ -231,6 +232,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(evidence, InternalCommitEvidence):
                 raise StateRecoveryError("Internal commit evidence is unavailable")
             app.state.state_recovery.complete_committed_event(event, evidence)
+            app.state.main_loop._publish_committed_value_view()
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
@@ -268,6 +270,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
+            app.state.main_loop.bind_runtime(app.state.agent_runtime)
         except BaseException:
             app.state.event_journal.close()
             raise
@@ -317,9 +320,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         is_context_path = request.url.path == "/api/contexts" or (
             request.url.path.startswith("/api/contexts/")
         )
+        is_values_path = request.url.path == "/api/values" or (
+            request.url.path.startswith("/api/values/")
+        )
         if (
             request.url.path not in {"/api/chat", "/api/chat/debug"}
             and not is_context_path
+            and not is_values_path
         ):
             return await default_validation_exception_handler(request, error)
         return JSONResponse(
@@ -380,6 +387,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(memory.router)
     app.include_router(sleep.router)
     app.include_router(adapters.router)
+    app.include_router(values.router)
 
     return app
 
