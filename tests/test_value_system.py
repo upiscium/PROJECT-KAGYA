@@ -19,6 +19,9 @@ from kagya.identity.value_system import (
     ValueMutationStatus,
     ValueProposal,
     ValueReason,
+    ValueRevisionHistory,
+    ValueRevisionOperation,
+    ValueRevisionRecord,
     ValueSeedDeclaration,
     ValueSelfAdmission,
     ValueScope,
@@ -659,6 +662,7 @@ def test_revision_history_compacts_without_rewriting_chain_or_ledger() -> None:
     history = system.history("value-1")
     assert len(history.records) == 32
     assert history.history_anchor_revision == 1
+    assert history.history_anchor_state_digest == history.records[0].before_digest
     assert history.records[0].from_revision == 1
     assert history.records[0].previous_record_digest == history.history_anchor_digest
     assert len(system.applied_evidence("value-1")) == 34
@@ -688,3 +692,188 @@ def test_system_authorized_value_retains_seed_lineage_during_updates() -> None:
     assert result.value.seed_contract_digest == digest
     assert result.value.strength != system_value.strength
     assert result.value.origin == system_value.origin
+
+
+@pytest.mark.parametrize("actor", [OriginActor.INHERITED, OriginActor.UNKNOWN])
+def test_value_system_retains_inactive_quarantine_values(actor: OriginActor) -> None:
+    value_id = f"quarantine-{actor.value}"
+    quarantine = _value(
+        value_id=value_id,
+        origin=IdentityOrigin(actor, OriginInputKind.LEGACY, ValueAdmissionStatus.UNCERTAIN),
+        evidence_refs=(),
+    )
+    active = _mutable_value()
+    system = ValueSystem(
+        (active, quarantine),
+        conflicts=(ValueConflictDefinition(value_id, "value-1"),),
+    )
+    assert system.get(value_id) == quarantine
+    assert not system.get(value_id).is_active()
+    assert system.conflicts == (ValueConflictDefinition(value_id, "value-1"),)
+    with pytest.raises(ValueDomainError):
+        system.apply_update(_admission(value_id=value_id), _event())
+
+
+def _restorable_system(update_count: int = 2) -> ValueSystem:
+    system = ValueSystem((_mutable_value(),))
+    for index in range(update_count):
+        event_id = f"restore-event-{index}"
+        system.apply_update(
+            _admission(
+                event_id=event_id,
+                event_sequence=index,
+                evidence_ref=f"restore-{index}",
+            ),
+            _event(event_id, index),
+        )
+    return system
+
+
+def test_restore_reconstructs_revision_history_and_exact_ledger_without_replay() -> None:
+    source = _restorable_system()
+    restored = ValueSystem.restore(
+        values=source.value_map,
+        conflicts=source.conflicts,
+        histories=source.histories,
+        evidence_ledgers=source.evidence_ledgers,
+    )
+    assert restored.values == source.values
+    assert restored.histories == source.histories
+    assert restored.evidence_ledgers == source.evidence_ledgers
+    replay = restored.apply_update(
+        _admission(
+            event_id="restore-replay",
+            event_sequence=20,
+            evidence_ref="restore-0",
+        ),
+        _event("restore-replay", 20),
+    )
+    assert replay.status is ValueMutationStatus.IDEMPOTENT
+    fresh = restored.apply_update(
+        _admission(
+            event_id="restore-new",
+            event_sequence=21,
+            evidence_ref="restore-new",
+        ),
+        _event("restore-new", 21),
+    )
+    assert fresh.status is ValueMutationStatus.APPLIED
+
+
+def test_restore_accepts_inactive_values_and_requires_exact_key_sets() -> None:
+    quarantine = _value(
+        value_id="quarantine-1",
+        origin=IdentityOrigin(
+            OriginActor.INHERITED,
+            OriginInputKind.LEGACY,
+            ValueAdmissionStatus.UNCERTAIN,
+        ),
+        evidence_refs=(),
+    )
+    source = _restorable_system()
+    values = {**source.value_map, "quarantine-1": quarantine}
+    histories = {**source.histories, "quarantine-1": ValueRevisionHistory("quarantine-1")}
+    ledgers = {**source.evidence_ledgers, "quarantine-1": ()}
+    restored = ValueSystem.restore(
+        values=values,
+        conflicts=(),
+        histories=histories,
+        evidence_ledgers=ledgers,
+    )
+    assert not restored.get("quarantine-1").is_active()
+    with pytest.raises(ValueDomainError):
+        ValueSystem.restore(
+            values=values,
+            conflicts=(),
+            histories={"value-1": histories["value-1"]},
+            evidence_ledgers=ledgers,
+        )
+
+
+def test_restore_rejects_current_history_and_ledger_inconsistency() -> None:
+    source = _restorable_system()
+    current = source.get("value-1")
+    bad_current = replace(current, strength=current.strength - 0.01)
+    with pytest.raises(ValueDomainError):
+        ValueSystem.restore(
+            values={"value-1": bad_current},
+            conflicts=(),
+            histories=source.histories,
+            evidence_ledgers=source.evidence_ledgers,
+        )
+
+    missing_current_ref = tuple(
+        ref for ref in source.applied_evidence("value-1") if ref != current.evidence_refs[0]
+    )
+    with pytest.raises(ValueDomainError):
+        ValueSystem.restore(
+            values=source.value_map,
+            conflicts=(),
+            histories=source.histories,
+            evidence_ledgers={"value-1": missing_current_ref},
+        )
+
+    long_source = _restorable_system(33)
+    long_current = long_source.get("value-1")
+    long_history = long_source.history("value-1")
+    historical_ref = next(
+        record.evidence_refs[0]
+        for record in long_history.records
+        if record.evidence_refs[0] not in long_current.evidence_refs
+    )
+    missing_historical_ref = tuple(
+        ref for ref in long_source.applied_evidence("value-1") if ref != historical_ref
+    )
+    with pytest.raises(ValueDomainError):
+        ValueSystem.restore(
+            values=long_source.value_map,
+            conflicts=(),
+            histories=long_source.histories,
+            evidence_ledgers={"value-1": missing_historical_ref},
+        )
+    valid = ValueSystem.restore(
+        values=long_source.value_map,
+        conflicts=(),
+        histories=long_source.histories,
+        evidence_ledgers=long_source.evidence_ledgers,
+    )
+    assert historical_ref in valid.applied_evidence("value-1")
+
+
+def test_revision_history_rejects_broken_state_continuity() -> None:
+    source = _restorable_system()
+    first, second = source.history("value-1").records
+    broken = replace(second, before_digest="0" * 64)
+    with pytest.raises(ValueError):
+        ValueRevisionHistory("value-1", records=(first, broken))
+
+
+def test_admission_history_requires_genesis_and_ordinary_history_starts_at_zero() -> None:
+    candidate = _value(evidence_refs=("admission-1",))
+    system = ValueSystem()
+    admission = _admission(
+        reason=ValueMutationReason.SELF_ADMISSION,
+        evidence_ref="admission-1",
+    )
+    result = system.admit_self_value(candidate, admission, _event())
+    assert result.revision_record is not None
+    with pytest.raises(ValueError):
+        replace(result.revision_record, before_digest="0" * 64)
+
+    after = _value(revision=2)
+    ordinary = ValueRevisionRecord(
+        value_id=after.value_id,
+        from_revision=1,
+        to_revision=2,
+        before_digest="0" * 64,
+        after_state_projection=after,
+        after_digest=value_state_digest(after),
+        operation=ValueRevisionOperation.UPDATE,
+        origin_id=after.origin.origin_id,
+        evidence_refs=after.evidence_refs,
+        event_id="event-1",
+        event_sequence=0,
+        recorded_at=_event().recorded_at,
+    )
+    with pytest.raises(ValueError):
+        ValueRevisionHistory("value-1", records=(ordinary,))

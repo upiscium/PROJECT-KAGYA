@@ -586,6 +586,11 @@ class ValueRevisionRecord:
             raise ValueError("record to_revision must match its after-state projection")
         _validate_sha256_digest(self.before_digest, "before_digest")
         _validate_sha256_digest(self.after_digest, "after_digest")
+        if (
+            self.operation is ValueRevisionOperation.ADMISSION
+            and self.before_digest != _genesis_digest(self.value_id)
+        ):
+            raise ValueError("admission records must use their deterministic genesis digest")
         if self.after_digest != value_state_digest(self.after_state_projection):
             raise ValueError("after_digest does not match the after-state projection")
         _validate_sha256_digest(self.origin_id, "origin_id")
@@ -611,18 +616,27 @@ class ValueRevisionHistory:
     value_id: str
     history_anchor_revision: int | None = None
     history_anchor_digest: str | None = None
+    history_anchor_state_digest: str | None = None
     records: tuple[ValueRevisionRecord, ...] = ()
 
     def __post_init__(self) -> None:
         validate_identifier(self.value_id)
-        if (self.history_anchor_revision is None) != (
-            self.history_anchor_digest is None
+        anchor_values = (
+            self.history_anchor_revision,
+            self.history_anchor_digest,
+            self.history_anchor_state_digest,
+        )
+        if any(value is None for value in anchor_values) and not all(
+            value is None for value in anchor_values
         ):
-            raise ValueError("history anchor revision and digest must be paired")
+            raise ValueError("history anchor fields must be all present or all absent")
         if self.history_anchor_revision is not None:
             if type(self.history_anchor_revision) is not int or self.history_anchor_revision < 0:
                 raise TypeError("history_anchor_revision must be a nonnegative exact integer")
             _validate_sha256_digest(self.history_anchor_digest, "history_anchor_digest")
+            _validate_sha256_digest(
+                self.history_anchor_state_digest, "history_anchor_state_digest"
+            )
         if type(self.records) is not tuple:
             raise TypeError("records must be a tuple")
         if len(self.records) > _MAX_REVISION_RECORDS:
@@ -631,6 +645,7 @@ class ValueRevisionHistory:
             raise ValueError("a compacted history must retain at least one record")
 
         expected_previous = self.history_anchor_digest
+        expected_before = self.history_anchor_state_digest
         expected_from = self.history_anchor_revision
         previous_record: ValueRevisionRecord | None = None
         for index, record in enumerate(self.records):
@@ -643,13 +658,22 @@ class ValueRevisionHistory:
                 raise ValueError("revision history has a broken previous-record link")
             if expected_from is not None and record.from_revision != expected_from:
                 raise ValueError("first retained revision does not follow its anchor")
+            if expected_before is not None and record.before_digest != expected_before:
+                raise ValueError("first retained record does not follow its anchor state")
             if previous_record is not None and record.from_revision != previous_record.to_revision:
                 raise ValueError("revision history has a discontinuous revision sequence")
+            if previous_record is not None and record.before_digest != previous_record.after_digest:
+                raise ValueError("revision history has a discontinuous state digest")
+            if previous_record is None and self.history_anchor_revision is None:
+                if record.operation is ValueRevisionOperation.ADMISSION:
+                    if record.before_digest != _genesis_digest(self.value_id):
+                        raise ValueError("admission record does not begin at its genesis digest")
+                elif record.from_revision != 0:
+                    raise ValueError("ordinary history must begin at revision zero")
             expected_previous = record.record_digest
             expected_from = record.to_revision
+            expected_before = record.after_digest
             previous_record = record
-            if index == 0 and self.history_anchor_revision is not None:
-                expected_from = record.to_revision
 
     def validate(self) -> ValueRevisionHistory:
         """Re-run immutable chain validation and return this history."""
@@ -667,15 +691,18 @@ class ValueRevisionHistory:
         records = self.records + (record,)
         anchor_revision = self.history_anchor_revision
         anchor_digest = self.history_anchor_digest
+        anchor_state_digest = self.history_anchor_state_digest
         if len(records) > _MAX_REVISION_RECORDS:
             removed = records[0]
             anchor_revision = removed.to_revision
             anchor_digest = removed.record_digest
+            anchor_state_digest = removed.after_digest
             records = records[1:]
         return ValueRevisionHistory(
             value_id=self.value_id,
             history_anchor_revision=anchor_revision,
             history_anchor_digest=anchor_digest,
+            history_anchor_state_digest=anchor_state_digest,
             records=records,
         )
 
@@ -753,8 +780,6 @@ class ValueSystem:
         for value in value_items:
             if not isinstance(value, ValueState):
                 raise TypeError("values must contain ValueState values")
-            if not value.is_active():
-                raise ValueDomainError("ValueSystem accepts only active Values")
             if value.revision != 0:
                 raise ValueDomainError("initial Values must begin at revision zero")
             if value.value_id in value_map:
@@ -785,6 +810,85 @@ class ValueSystem:
             value_id: tuple(value.evidence_refs)
             for value_id, value in self._values.items()
         }
+        self.validate()
+
+    @classmethod
+    def restore(
+        cls,
+        *,
+        values: Mapping[str, ValueState],
+        conflicts: Iterable[ValueConflictDefinition] = (),
+        histories: Mapping[str, ValueRevisionHistory],
+        evidence_ledgers: Mapping[str, tuple[str, ...]],
+    ) -> ValueSystem:
+        """Restore a complete domain snapshot without I/O or replay."""
+
+        if not isinstance(values, Mapping):
+            raise TypeError("restore values must be a mapping")
+        if not isinstance(histories, Mapping):
+            raise TypeError("restore histories must be a mapping")
+        if not isinstance(evidence_ledgers, Mapping):
+            raise TypeError("restore evidence_ledgers must be a mapping")
+
+        value_map: dict[str, ValueState] = {}
+        for key, value in values.items():
+            validate_identifier(key)
+            if not isinstance(value, ValueState):
+                raise TypeError("restore values must contain ValueState values")
+            if key != value.value_id:
+                raise ValueDomainError("restore Value keys must match Value IDs")
+            value_map[key] = value
+        if len(value_map) > _MAX_AUTHORITATIVE_VALUES:
+            raise ValueDomainError("ValueSystem exceeds the authoritative Value bound")
+
+        if set(value_map) != set(histories) or set(value_map) != set(evidence_ledgers):
+            raise ValueDomainError("restore Value, history, and ledger keys must match exactly")
+
+        history_map: dict[str, ValueRevisionHistory] = {}
+        for key, history in histories.items():
+            validate_identifier(key)
+            if not isinstance(history, ValueRevisionHistory):
+                raise TypeError("restore histories must contain ValueRevisionHistory values")
+            if key != history.value_id:
+                raise ValueDomainError("restore history keys must match Value IDs")
+            history.validate()
+            history_map[key] = history
+
+        ledger_map: dict[str, tuple[str, ...]] = {}
+        for key, ledger in evidence_ledgers.items():
+            validate_identifier(key)
+            if type(ledger) is not tuple:
+                raise TypeError("restore evidence ledgers must contain tuples")
+            if len(ledger) > _MAX_APPLIED_EVIDENCE_REFS:
+                raise ValueDomainError("restore evidence ledger exceeds its bound")
+            checked_ledger = tuple(validate_identifier(ref) for ref in ledger)
+            if checked_ledger != tuple(sorted(set(checked_ledger))):
+                raise ValueDomainError("restore evidence ledgers must be sorted and unique")
+            ledger_map[key] = checked_ledger
+
+        conflict_items = tuple(conflicts)
+        conflict_map: dict[tuple[str, str], ValueConflictDefinition] = {}
+        for conflict in conflict_items:
+            if not isinstance(conflict, ValueConflictDefinition):
+                raise TypeError("conflicts must contain ValueConflictDefinition values")
+            if conflict.left_value_id not in value_map or conflict.right_value_id not in value_map:
+                raise ValueDomainError("conflicts must reference stored Values")
+            pair = (conflict.left_value_id, conflict.right_value_id)
+            if pair in conflict_map:
+                raise ValueDomainError("conflict pairs must be unique")
+            conflict_map[pair] = conflict
+
+        system = cls.__new__(cls)
+        system._values = {value_id: value_map[value_id] for value_id in sorted(value_map)}
+        system._conflicts = tuple(conflict_map[key] for key in sorted(conflict_map))
+        system._histories = {
+            value_id: history_map[value_id] for value_id in sorted(history_map)
+        }
+        system._evidence_ledgers = {
+            value_id: ledger_map[value_id] for value_id in sorted(ledger_map)
+        }
+        system.validate()
+        return system
 
     @property
     def values(self) -> tuple[ValueState, ...]:
@@ -800,11 +904,18 @@ class ValueSystem:
 
     @property
     def histories(self) -> Mapping[str, ValueRevisionHistory]:
-        return MappingProxyType(dict(self._histories))
+        return MappingProxyType(
+            {value_id: self._histories[value_id] for value_id in sorted(self._histories)}
+        )
 
     @property
     def evidence_ledgers(self) -> Mapping[str, tuple[str, ...]]:
-        return MappingProxyType(dict(self._evidence_ledgers))
+        return MappingProxyType(
+            {
+                value_id: self._evidence_ledgers[value_id]
+                for value_id in sorted(self._evidence_ledgers)
+            }
+        )
 
     def get(self, value_id: str) -> ValueState:
         validate_identifier(value_id)
@@ -885,8 +996,9 @@ class ValueSystem:
     def _commit_record(
         self, value: ValueState, record: ValueRevisionRecord
     ) -> None:
+        history = self._histories[value.value_id].append(record)
         self._values[value.value_id] = value
-        self._histories[value.value_id] = self._histories[value.value_id].append(record)
+        self._histories[value.value_id] = history
 
     def admit_self_value(
         self,
@@ -1249,12 +1361,32 @@ class ValueSystem:
         )
 
     def validate(self) -> None:
-        """Validate all retained chains and exact evidence-ledger bounds."""
+        """Validate current state, retained chains, and exact ledger witnesses."""
+
+        value_ids = set(self._values)
+        if len(value_ids) > _MAX_AUTHORITATIVE_VALUES:
+            raise ValueDomainError("ValueSystem exceeds the authoritative Value bound")
+        if value_ids != set(self._histories) or value_ids != set(self._evidence_ledgers):
+            raise ValueDomainError("Value, history, and evidence-ledger keys must match")
+        if tuple(self._values) != tuple(sorted(self._values)):
+            raise ValueDomainError("Value mapping must be canonically sorted")
+        if tuple(self._histories) != tuple(sorted(self._histories)):
+            raise ValueDomainError("history mapping must be canonically sorted")
+        if tuple(self._evidence_ledgers) != tuple(sorted(self._evidence_ledgers)):
+            raise ValueDomainError("evidence-ledger mapping must be canonically sorted")
+
+        for conflict in self._conflicts:
+            if (
+                conflict.left_value_id not in value_ids
+                or conflict.right_value_id not in value_ids
+            ):
+                raise ValueDomainError("conflicts must reference stored Values")
 
         for value_id, value in self._values.items():
-            if value_id != value.value_id or not value.is_active():
-                raise ValueDomainError("ValueSystem contains an invalid authoritative Value")
-            self._histories[value_id].validate()
+            if value_id != value.value_id:
+                raise ValueDomainError("Value mapping key must match Value ID")
+            history = self._histories[value_id]
+            history.validate()
             ledger = self._evidence_ledgers[value_id]
             if len(ledger) > _MAX_APPLIED_EVIDENCE_REFS:
                 raise ValueDomainError("applied evidence ledger exceeds its bound")
@@ -1262,3 +1394,24 @@ class ValueSystem:
                 raise ValueDomainError("applied evidence ledger is not canonical")
             for evidence_ref in ledger:
                 validate_identifier(evidence_ref)
+            if not set(value.evidence_refs) <= set(ledger):
+                raise ValueDomainError("current Value evidence is missing from its ledger")
+
+            if history.records:
+                last = history.last_record
+                assert last is not None
+                if value.revision != last.to_revision:
+                    raise ValueDomainError("current revision does not match retained history")
+                if value != last.after_state_projection:
+                    raise ValueDomainError(
+                        "current Value does not match the last retained state projection"
+                    )
+                if value_state_digest(value) != last.after_digest:
+                    raise ValueDomainError("current Value digest does not match retained history")
+                for record in history.records:
+                    if not set(record.evidence_refs) <= set(ledger):
+                        raise ValueDomainError(
+                            "retained revision evidence is missing from its ledger"
+                        )
+            elif value.revision != 0:
+                raise ValueDomainError("a Value with no history must be at revision zero")
