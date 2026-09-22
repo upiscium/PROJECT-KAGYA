@@ -7,6 +7,7 @@ startup can never replay handlers or recover request payloads.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid5
@@ -112,6 +113,8 @@ class StartupReconciliationCoordinator:
         memory: DualMemorySystem,
         experience_store: ExperienceStore | None = None,
         semantic_store: SemanticStore | None = None,
+        semantic_checkpoint_covers: Callable[[EventJournalTransaction], bool]
+        | None = None,
     ) -> None:
         self.journal = journal
         self.state_recovery = state_recovery
@@ -122,6 +125,7 @@ class StartupReconciliationCoordinator:
         self.semantic_store = semantic_store or SemanticStore.from_memory_root(
             memory.settings.memory.persist_directory
         )
+        self.semantic_checkpoint_covers = semantic_checkpoint_covers
 
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
         """Resolve Path A without replaying an event handler or model call."""
@@ -564,6 +568,15 @@ class StartupReconciliationCoordinator:
         participant_id: str,
         transactions: tuple[EventJournalTransaction, ...],
     ) -> StartupParticipantOutcome:
+        if (
+            participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+            and self.semantic_checkpoint_covers is not None
+        ):
+            transactions = tuple(
+                transaction
+                for transaction in transactions
+                if not self.semantic_checkpoint_covers(transaction)
+            )
         rolled_forward = False
         for transaction in transactions:
             requirement = next(

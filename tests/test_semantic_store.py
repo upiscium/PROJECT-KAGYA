@@ -120,6 +120,28 @@ def test_iter_current_enumerates_only_verified_authority(tmp_path: Path) -> None
     )
 
 
+def test_clean_journal_checkpoint_replaces_atomically(tmp_path: Path) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    store.write_checkpoint(
+        processing_high_water=1,
+        journal_lineage_id="lineage-1",
+        journal_tail_record_id="record-1",
+        journal_tail_record_hash="a" * 64,
+    )
+    store.write_checkpoint(
+        processing_high_water=2,
+        journal_lineage_id="lineage-1",
+        journal_tail_record_id="record-2",
+        journal_tail_record_hash="b" * 64,
+    )
+
+    checkpoint = store.load_checkpoint()
+
+    assert checkpoint is not None
+    assert checkpoint.processing_high_water == 2
+    assert checkpoint.journal_tail_record_id == "record-2"
+
+
 def test_receipt_retirement_is_proof_bound_and_clears_capacity(tmp_path: Path) -> None:
     store = SemanticStore(tmp_path / "semantic")
     transaction_ids = tuple(

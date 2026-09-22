@@ -36,6 +36,7 @@ from kagya.memory.semantic_lifecycle import (
 SEMANTIC_STORE_SCHEMA_VERSION = 2
 SEMANTIC_PENDING_SCHEMA_VERSION = 1
 SEMANTIC_RECEIPT_SCHEMA_VERSION = 1
+SEMANTIC_CHECKPOINT_SCHEMA_VERSION = 1
 SEMANTIC_MAX_RECEIPTS = 1024
 SEMANTIC_MAX_FILE_BYTES = 4 * 1024 * 1024
 SEMANTIC_REVISION_RETENTION = 32
@@ -46,6 +47,7 @@ _TEMP_NAME = re.compile(
     r"\.(?P<target>[A-Za-z0-9_.-]+)\.publish-(?P<token>[0-9a-f-]{36})\.tmp\Z"
 )
 _COMPACTION_NAME = ".compaction.json"
+_CHECKPOINT_NAME = "checkpoint.json"
 
 
 class SemanticStoreError(RuntimeError):
@@ -75,6 +77,16 @@ class SemanticStoredEntry:
     batch_index: int | None = None
     expected_revision: int | None = None
     expected_revision_digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticCheckpoint:
+    """Proof that Semantic authority was verified at a clean Journal boundary."""
+
+    processing_high_water: int
+    journal_lineage_id: str
+    journal_tail_record_id: str
+    journal_tail_record_hash: str
 
 
 def _datetime_value(value: datetime) -> str:
@@ -281,6 +293,10 @@ class SemanticStore:
     def receipts_root(self) -> Path:
         return self.root / "receipts"
 
+    @property
+    def checkpoint_path(self) -> Path:
+        return self.root / _CHECKPOINT_NAME
+
     def record_path(self, semantic_id: str, revision: int) -> Path:
         self._validate_identifier(semantic_id)
         if type(revision) is not int or not 0 <= revision <= SEMANTIC_MAX_REVISION:
@@ -312,6 +328,74 @@ class SemanticStore:
 
     def remove_receipt(self, transaction_id: str) -> None:
         self._remove_file(self.receipt_path(transaction_id), "Semantic receipt")
+
+    def load_checkpoint(self) -> SemanticCheckpoint | None:
+        payload = self._read_json(self.checkpoint_path, missing_ok=True)
+        if payload is None:
+            return None
+        value = _require_keys(
+            payload,
+            {
+                "journal_lineage_id",
+                "journal_tail_record_hash",
+                "journal_tail_record_id",
+                "processing_high_water",
+                "schema_version",
+            },
+        )
+        processing_high_water = value["processing_high_water"]
+        if (
+            value["schema_version"] != SEMANTIC_CHECKPOINT_SCHEMA_VERSION
+            or type(processing_high_water) is not int
+            or processing_high_water < 0
+        ):
+            raise SemanticStoreCorrupt("Semantic checkpoint is invalid")
+        lineage = value["journal_lineage_id"]
+        record_id = value["journal_tail_record_id"]
+        if (
+            not isinstance(lineage, str)
+            or not lineage
+            or not isinstance(record_id, str)
+            or not record_id
+        ):
+            raise SemanticStoreCorrupt("Semantic checkpoint identity is invalid")
+        record_hash = _digest_value(
+            value["journal_tail_record_hash"], "journal_tail_record_hash"
+        )
+        return SemanticCheckpoint(
+            processing_high_water,
+            lineage,
+            record_id,
+            record_hash,
+        )
+
+    def write_checkpoint(
+        self,
+        *,
+        processing_high_water: int,
+        journal_lineage_id: str,
+        journal_tail_record_id: str,
+        journal_tail_record_hash: str,
+    ) -> None:
+        if type(processing_high_water) is not int or processing_high_water < 0:
+            raise ValueError("Semantic checkpoint processing high-water is invalid")
+        if not isinstance(journal_lineage_id, str) or not journal_lineage_id:
+            raise ValueError("Semantic checkpoint Journal lineage is invalid")
+        if not isinstance(journal_tail_record_id, str) or not journal_tail_record_id:
+            raise ValueError("Semantic checkpoint Journal record is invalid")
+        self._validate_digest(journal_tail_record_hash)
+        if self._path_exists(self.checkpoint_path):
+            self.load_checkpoint()
+        self._write_replacing_json(
+            self.checkpoint_path,
+            {
+                "journal_lineage_id": journal_lineage_id,
+                "journal_tail_record_hash": journal_tail_record_hash,
+                "journal_tail_record_id": journal_tail_record_id,
+                "processing_high_water": processing_high_water,
+                "schema_version": SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
+            },
+        )
 
     def prune_receipts(self, safe_transaction_ids: Iterable[str] = ()) -> None:
         """Delete only receipts proven unnecessary by the Journal authority.
@@ -767,7 +851,9 @@ class SemanticStore:
         elif current.anchor_revision is not None:
             raise SemanticStoreCorrupt("Unexpected Semantic compaction anchor")
 
-    def _recover_publication_temps(self, directory: Path) -> None:
+    def _recover_publication_temps(
+        self, directory: Path, *, mutable_targets: frozenset[str] = frozenset()
+    ) -> None:
         try:
             paths = tuple(directory.iterdir())
         except OSError as error:
@@ -785,12 +871,20 @@ class SemanticStore:
             if str(token) != match.group("token"):
                 raise SemanticStoreCorrupt("Semantic temp token is invalid")
             target_name = match.group("target")
-            if target_name != _COMPACTION_NAME and _REVISION_NAME.fullmatch(target_name) is None:
+            if (
+                target_name != _COMPACTION_NAME
+                and target_name != _CHECKPOINT_NAME
+                and _REVISION_NAME.fullmatch(target_name) is None
+            ):
                 raise SemanticStoreCorrupt("Semantic temp target is invalid")
             self._secure_file(temporary)
             target = directory / target_name
             temporary_payload = self._read_json(temporary)
-            if self._path_exists(target) and self._read_json(target) != temporary_payload:
+            if (
+                target_name not in mutable_targets
+                and self._path_exists(target)
+                and self._read_json(target) != temporary_payload
+            ):
                 raise SemanticStoreCorrupt("Semantic temp conflicts with final artifact")
             try:
                 temporary.unlink()
@@ -798,6 +892,60 @@ class SemanticStore:
                 raise SemanticStoreUnavailable("Semantic temp cleanup is unavailable") from error
         if found:
             self._fsync_directory(directory)
+
+    def _write_replacing_json(self, path: Path, payload: dict[str, object]) -> None:
+        encoded = (
+            json.dumps(payload, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+        if len(encoded) > SEMANTIC_MAX_FILE_BYTES:
+            raise SemanticStoreConflict("Semantic checkpoint is too large")
+        self._secure_parent(path.parent, create=True)
+        if self._path_exists(path):
+            self._secure_file(path)
+        self._recover_publication_temps(
+            path.parent, mutable_targets=frozenset({path.name})
+        )
+        parent_fd = self._directory_fd(path.parent)
+        temporary = f".{path.name}.publish-{uuid4()}.tmp"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            with os.fdopen(descriptor, "wb") as target:
+                descriptor = -1
+                target.write(encoded)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(
+                temporary,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary = ""
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise SemanticStoreUnavailable(
+                "Semantic checkpoint publication is unavailable"
+            ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise SemanticStoreUnavailable(
+                        "Semantic checkpoint temporary cleanup is unavailable"
+                    ) from error
+            os.close(parent_fd)
 
     def _recover_compaction(self, directory: Path, semantic_id: str) -> None:
         marker = directory / _COMPACTION_NAME
@@ -1065,11 +1213,13 @@ class SemanticStore:
 __all__ = [
     "SEMANTIC_MAX_FILE_BYTES",
     "SEMANTIC_MAX_RECEIPTS",
+    "SEMANTIC_CHECKPOINT_SCHEMA_VERSION",
     "SEMANTIC_PENDING_SCHEMA_VERSION",
     "SEMANTIC_RECEIPT_SCHEMA_VERSION",
     "SEMANTIC_REVISION_RETENTION",
     "SEMANTIC_STORE_SCHEMA_VERSION",
     "SemanticStoredEntry",
+    "SemanticCheckpoint",
     "SemanticStore",
     "SemanticStoreConflict",
     "SemanticStoreCorrupt",

@@ -132,6 +132,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.memory_system,
                 app.state.experience_store,
                 app.state.semantic_store,
+                semantic_checkpoint_covers=(
+                    app.state.semantic_receipt_retention.checkpoint_covers
+                ),
             )
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True
@@ -168,7 +171,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 if participants_consistent:
                     try:
-                        app.state.semantic_receipt_retention.before_prepare()
+                        app.state.semantic_receipt_retention.after_terminal_completion()
                     except Exception:
                         participants_consistent = False
                         degraded_reason = "semantic_receipt_retention_unavailable"
@@ -284,6 +287,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(evidence, InternalCommitEvidence):
                 raise StateRecoveryError("Internal commit evidence is unavailable")
             app.state.state_recovery.complete_committed_event(event, evidence)
+            app.state.semantic_receipt_retention.after_terminal_completion()
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
