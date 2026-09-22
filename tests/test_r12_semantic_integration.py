@@ -8,7 +8,7 @@ import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem
+from kagya.memory import DualMemorySystem, MemorySemanticParticipant
 from kagya.memory.dual_memory_system import SemanticMemoryFormatError
 from kagya.memory.semantic_store import SemanticStore
 from kagya.memory.semantic_lifecycle import (
@@ -299,3 +299,82 @@ def test_receipt_cleanup_requires_terminal_participant_evidence(tmp_path: Path) 
     retention.before_prepare()  # type: ignore[arg-type]
 
     assert store.load_receipt(transaction_id) is None
+
+
+def test_reconstructible_semantic_receipt_can_retire_after_baseline(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    memory.save_episodic("sleep input", "sleep output", emotion_arousal=0.9)
+    manager = SleepCycleManager(
+        settings, memory, DummyProvider(), AdapterRegistry(settings)
+    )
+    event = _event()
+
+    class Runtime:
+        def current_event(self) -> AgentEvent:
+            return event
+
+    manager.bind_runtime(Runtime())  # type: ignore[arg-type]
+    coordinated = manager.run()
+    assert isinstance(coordinated, CoordinatedResult)
+    participant = coordinated.participants[0]
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    binding = TransactionBinding(
+        transaction_id,
+        event.event_id,
+        event.processing_sequence or 0,
+        participant.participant_id,
+        participant.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+    participant.prepare(binding)
+    participant.finalize(binding)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    assert store.load_receipt(transaction_id) is not None
+    transaction = EventJournalTransaction(
+        transaction_id=transaction_id,
+        event_id=event.event_id,
+        event_type=event.event_type,
+        source=event.source,
+        processing_sequence=event.processing_sequence or 0,
+        kind=TransactionKind.EVENT_MUTATION,
+        required_participants=(
+            ParticipantRequirement(
+                participant_id="memory.semantic",
+                operation_digest=participant.operation_digest,
+                capabilities=(
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+        participant_outcomes=(
+            ("memory.semantic", ParticipantOutcome.FINALIZED),
+        ),
+        terminal_lifecycle=EventLifecycle.TRANSACTION_COMPLETED,
+    )
+    journal = SimpleNamespace(
+        inspect=lambda: SimpleNamespace(
+            completed_transactions=(transaction,),
+            reconciled_transactions=(),
+            baselines=(SimpleNamespace(processing_high_water=0),),
+        )
+    )
+
+    SemanticReceiptRetentionCoordinator(journal, store).before_prepare()  # type: ignore[arg-type]
+
+    assert store.load_receipt(transaction_id) is None
+    reconstructed = MemorySemanticParticipant.from_pending(
+        memory,
+        store,
+        transaction_id,
+        participant.participant_id,
+        participant.operation_digest,
+        event_id=event.event_id,
+        processing_sequence=event.processing_sequence,
+    )
+    assert reconstructed.operation == participant.operation

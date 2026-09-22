@@ -33,7 +33,7 @@ from kagya.memory.semantic_lifecycle import (
 )
 
 
-SEMANTIC_STORE_SCHEMA_VERSION = 1
+SEMANTIC_STORE_SCHEMA_VERSION = 2
 SEMANTIC_PENDING_SCHEMA_VERSION = 1
 SEMANTIC_RECEIPT_SCHEMA_VERSION = 1
 SEMANTIC_MAX_RECEIPTS = 1024
@@ -72,6 +72,9 @@ class SemanticStoredEntry:
     operation_digest: str
     anchor_revision: int | None = None
     anchor_revision_digest: str | None = None
+    batch_index: int | None = None
+    expected_revision: int | None = None
+    expected_revision_digest: str | None = None
 
 
 def _datetime_value(value: datetime) -> str:
@@ -402,6 +405,48 @@ class SemanticStore:
             entries.append(current)
         return tuple(sorted(entries, key=lambda entry: entry.revision.semantic_id))
 
+    def iter_entries(self) -> tuple[SemanticStoredEntry, ...]:
+        """Return every retained, verified revision in deterministic order."""
+
+        if not self._path_exists(self.records_root):
+            return ()
+        self._secure_parent(self.records_root, create=False)
+        try:
+            paths = tuple(self.records_root.iterdir())
+        except OSError as error:
+            raise SemanticStoreUnavailable("Semantic records are unavailable") from error
+        entries: list[SemanticStoredEntry] = []
+        for path in paths:
+            try:
+                status = path.lstat()
+            except OSError as error:
+                raise SemanticStoreUnavailable(
+                    "Semantic record identity is unavailable"
+                ) from error
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or status.st_uid != os.geteuid()
+                or stat.S_IMODE(status.st_mode) != 0o700
+            ):
+                raise SemanticStoreCorrupt("Semantic record directory is unsafe")
+            try:
+                self._validate_identifier(path.name)
+            except ValueError:
+                raise SemanticStoreCorrupt("Semantic record identity is invalid") from None
+            self._secure_parent(path, create=False)
+            self._recover_publication_temps(path)
+            self._recover_compaction(path, path.name)
+            entries.extend(self._load_entries(path, path.name).values())
+        return tuple(
+            sorted(
+                entries,
+                key=lambda entry: (
+                    entry.revision.semantic_id,
+                    entry.revision.revision,
+                ),
+            )
+        )
+
     def load_current(self, semantic_id: str) -> SemanticStoredEntry | None:
         self._validate_identifier(semantic_id)
         directory = self.records_root / semantic_id
@@ -450,11 +495,19 @@ class SemanticStore:
         return self._entry_from_payload(payload, semantic_id, revision)
 
     def publish_create(
-        self, revision: SemanticRevision, operation_digest: str
+        self,
+        revision: SemanticRevision,
+        operation_digest: str,
+        *,
+        batch_index: int | None = None,
     ) -> SemanticStoredEntry:
         if revision.revision != 0:
             raise SemanticStoreConflict("Semantic create must publish revision zero")
-        entry = SemanticStoredEntry(revision, self._validate_digest(operation_digest))
+        entry = SemanticStoredEntry(
+            revision,
+            self._validate_digest(operation_digest),
+            batch_index=batch_index,
+        )
         self._publish_entry(entry)
         return entry
 
@@ -465,6 +518,7 @@ class SemanticStore:
         *,
         expected_revision: int,
         expected_digest: str,
+        batch_index: int | None = None,
     ) -> SemanticStoredEntry:
         current = self.load_current(revision.semantic_id)
         if current is None:
@@ -491,6 +545,9 @@ class SemanticStore:
             self._validate_digest(operation_digest),
             anchor_revision,
             anchor_digest,
+            batch_index,
+            expected_revision,
+            expected_digest,
         )
         self._publish_entry(entry)
         return entry
@@ -520,8 +577,11 @@ class SemanticStore:
         payload: dict[str, object] = {
             "anchor_revision": entry.anchor_revision,
             "anchor_revision_digest": entry.anchor_revision_digest,
+            "batch_index": entry.batch_index,
             "operation_digest": entry.operation_digest,
             "revision": semantic_revision_to_dict(revision),
+            "expected_revision": entry.expected_revision,
+            "expected_revision_digest": entry.expected_revision_digest,
             "revision_digest": revision.revision_digest,
             "schema_version": SEMANTIC_STORE_SCHEMA_VERSION,
             "semantic_id": revision.semantic_id,
@@ -596,20 +656,27 @@ class SemanticStore:
     def _entry_from_payload(
         self, payload: object, semantic_id: str, revision: int
     ) -> SemanticStoredEntry:
-        value = _require_keys(
-            payload,
-            {
-                "anchor_revision",
-                "anchor_revision_digest",
-                "operation_digest",
-                "revision",
-                "revision_digest",
-                "schema_version",
-                "semantic_id",
-            },
-        )
+        if not isinstance(payload, dict):
+            raise SemanticStoreCorrupt("Semantic stored entry is invalid")
+        legacy_keys = {
+            "anchor_revision",
+            "anchor_revision_digest",
+            "operation_digest",
+            "revision",
+            "revision_digest",
+            "schema_version",
+            "semantic_id",
+        }
+        current_keys = legacy_keys | {
+            "batch_index",
+            "expected_revision",
+            "expected_revision_digest",
+        }
+        if set(payload) not in (legacy_keys, current_keys):
+            raise SemanticStoreCorrupt("Semantic stored entry shape is invalid")
+        value = payload
         if (
-            value["schema_version"] != SEMANTIC_STORE_SCHEMA_VERSION
+            value["schema_version"] not in {1, SEMANTIC_STORE_SCHEMA_VERSION}
             or value["semantic_id"] != semantic_id
         ):
             raise SemanticStoreCorrupt("Semantic store schema is unsupported")
@@ -629,12 +696,46 @@ class SemanticStore:
             _digest_value(anchor_digest, "anchor_revision_digest")
         elif anchor_digest is not None:
             raise SemanticStoreCorrupt("Semantic anchor digest is unexpected")
+        batch_index = value.get("batch_index")
+        expected_revision = value.get("expected_revision")
+        expected_revision_digest = value.get("expected_revision_digest")
+        if batch_index is not None and (
+            type(batch_index) is not int or not 0 <= batch_index < 128
+        ):
+            raise SemanticStoreCorrupt("Semantic batch index is invalid")
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise SemanticStoreCorrupt("Semantic expected revision is invalid")
+        if expected_revision_digest is not None:
+            _digest_value(expected_revision_digest, "expected_revision_digest")
+        if record.revision == 0 and (
+            expected_revision is not None or expected_revision_digest is not None
+        ):
+            raise SemanticStoreCorrupt("Genesis Semantic expected revision is invalid")
+        if record.revision > 0 and (
+            expected_revision is not None and expected_revision != record.revision - 1
+        ):
+            raise SemanticStoreCorrupt("Semantic expected revision is inconsistent")
+        if record.revision > 0 and (
+            expected_revision_digest is not None
+            and expected_revision_digest != record.previous_revision_digest
+        ):
+            raise SemanticStoreCorrupt("Semantic expected predecessor is inconsistent")
         if revision >= SEMANTIC_REVISION_RETENTION + 1:
             if anchor_revision != revision - (SEMANTIC_REVISION_RETENTION + 1):
                 raise SemanticStoreCorrupt("Semantic anchor revision is inconsistent")
         elif anchor_revision is not None:
             raise SemanticStoreCorrupt("Unexpected Semantic anchor evidence")
-        return SemanticStoredEntry(record, operation_digest, anchor_revision, anchor_digest)
+        return SemanticStoredEntry(
+            record,
+            operation_digest,
+            anchor_revision,
+            anchor_digest,
+            batch_index,
+            expected_revision,
+            expected_revision_digest,
+        )
 
     def _validate_revision_window(self, entries: dict[int, SemanticStoredEntry]) -> None:
         if not entries:

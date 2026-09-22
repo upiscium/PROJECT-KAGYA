@@ -156,6 +156,18 @@ def test_prepare_is_non_authoritative_and_finalize_is_idempotent(tmp_path: Path)
     )
     assert recovered.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
 
+    participant.store.remove_receipt(binding.transaction_id)
+    reconstructed = MemorySemanticParticipant.from_pending(
+        memory,
+        participant.store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=binding.event_id,
+        processing_sequence=binding.processing_sequence,
+    )
+    assert reconstructed.operation == participant.operation
+
 
 def test_pre_internal_abort_removes_pending_without_publication(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings(tmp_path))

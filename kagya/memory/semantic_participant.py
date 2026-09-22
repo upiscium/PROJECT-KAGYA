@@ -308,18 +308,118 @@ class MemorySemanticParticipant:
         receipt = cls._load_receipt(store, transaction_id)
         payload = pending or receipt
         if payload is None:
-            raise UnsupportedParticipantReconciliationError(
-                "Semantic operation evidence is absent"
+            if event_id is None or processing_sequence is None:
+                raise UnsupportedParticipantReconciliationError(
+                    "Semantic operation evidence is absent"
+                )
+            operation = cls.operation_from_authority(
+                store,
+                transaction_id,
+                event_id,
+                processing_sequence,
+                operation_digest,
             )
-        operation = cls._operation_from_evidence(
-            payload, transaction_id, participant_id, operation_digest
-        )
+        else:
+            operation = cls._operation_from_evidence(
+                payload, transaction_id, participant_id, operation_digest
+            )
         participant = cls(memory, store, operation)
         if event_id is not None or processing_sequence is not None:
             if event_id is None or processing_sequence is None:
                 raise ParticipantDivergedError("Semantic event binding is incomplete")
             participant._validate_event_identity(event_id, processing_sequence)
         return participant
+
+    @classmethod
+    def operation_from_authority(
+        cls,
+        store: SemanticStore,
+        transaction_id: str,
+        event_id: str,
+        processing_sequence: int,
+        operation_digest: str,
+    ) -> SemanticBatchOperation:
+        """Reconstruct a batch from retained immutable Semantic revisions."""
+
+        try:
+            entries = store.iter_entries()
+        except (SemanticStoreCorrupt, SemanticStoreConflict) as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except SemanticStoreUnavailable as error:
+            raise ParticipantUnavailableError(str(error)) from None
+        candidates = tuple(
+            entry
+            for entry in entries
+            if entry.operation_digest == operation_digest
+            and entry.revision.event_id == event_id
+            and entry.revision.event_sequence == processing_sequence
+        )
+        if not candidates:
+            raise UnsupportedParticipantReconciliationError(
+                "Semantic operation evidence is absent"
+            )
+        reconstructed: list[SemanticBatchEntry] = []
+        used_indices: set[int] = set()
+        for entry in candidates:
+            batch_index = entry.batch_index
+            if batch_index is None and entry.revision.revision == 0:
+                batch_index = next(
+                    (
+                        index
+                        for index in range(SEMANTIC_MAX_BATCH_ENTRIES)
+                        if semantic_id_for_batch_entry(transaction_id, index)
+                        == entry.revision.semantic_id
+                    ),
+                    None,
+                )
+            if batch_index is None or batch_index in used_indices:
+                raise UnsupportedParticipantReconciliationError(
+                    "Semantic batch index evidence is absent"
+                )
+            used_indices.add(batch_index)
+            if entry.revision.revision == 0:
+                try:
+                    mutation: SemanticMutation = SemanticCreateIntent(entry.revision)
+                except (TypeError, ValueError):
+                    raise ParticipantDivergedError(
+                        "Semantic authority create evidence is invalid"
+                    ) from None
+            else:
+                expected_revision = entry.expected_revision
+                expected_digest = entry.expected_revision_digest
+                if expected_revision is None:
+                    expected_revision = entry.revision.revision - 1
+                if expected_digest is None:
+                    expected_digest = entry.revision.previous_revision_digest
+                if expected_digest is None:
+                    raise ParticipantDivergedError(
+                        "Semantic authority predecessor evidence is absent"
+                    )
+                try:
+                    mutation = SemanticRevisionIntent(
+                        entry.revision,
+                        expected_revision,
+                        expected_digest,
+                    )
+                except (TypeError, ValueError):
+                    raise ParticipantDivergedError(
+                        "Semantic authority revision evidence is invalid"
+                    ) from None
+            reconstructed.append(SemanticBatchEntry(batch_index, mutation))
+        try:
+            operation = SemanticBatchOperation(
+                transaction_id,
+                tuple(sorted(reconstructed, key=lambda item: item.batch_index)),
+            )
+        except (TypeError, ValueError):
+            raise UnsupportedParticipantReconciliationError(
+                "Semantic authority batch evidence is incomplete"
+            ) from None
+        if semantic_batch_operation_digest(operation) != operation_digest:
+            raise ParticipantDivergedError(
+                "Semantic authority operation digest conflicts"
+            )
+        return operation
 
     @staticmethod
     def _load_pending(
@@ -621,13 +721,18 @@ class MemorySemanticParticipant:
         mutation = entry.mutation
         try:
             if isinstance(mutation, SemanticCreateIntent):
-                self.store.publish_create(mutation.revision, self.operation_digest)
+                self.store.publish_create(
+                    mutation.revision,
+                    self.operation_digest,
+                    batch_index=entry.batch_index,
+                )
             else:
                 self.store.publish_revision(
                     mutation.revision,
                     self.operation_digest,
                     expected_revision=mutation.expected_revision,
                     expected_digest=mutation.expected_revision_digest,
+                    batch_index=entry.batch_index,
                 )
         except (SemanticStoreConflict, SemanticStoreCorrupt) as error:
             raise ParticipantDivergedError(str(error)) from None
