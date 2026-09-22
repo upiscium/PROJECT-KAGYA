@@ -237,7 +237,9 @@ def test_terminal_startup_reconciles_missing_projection_from_authority(
     )
     journal = SimpleNamespace(
         inspect=lambda: SimpleNamespace(
-            completed_transactions=(transaction,), reconciled_transactions=()
+            completed_transactions=(transaction,),
+            reconciled_transactions=(),
+            baselines=(SimpleNamespace(processing_high_water=1),),
         )
     )
     coordinator = StartupReconciliationCoordinator(
@@ -279,10 +281,21 @@ def test_receipt_cleanup_requires_terminal_participant_evidence(tmp_path: Path) 
     )
     journal = SimpleNamespace(
         inspect=lambda: SimpleNamespace(
-            completed_transactions=(transaction,), reconciled_transactions=()
+            completed_transactions=(transaction,),
+            reconciled_transactions=(),
+            baselines=(SimpleNamespace(processing_high_water=0),),
         )
     )
 
-    SemanticReceiptRetentionCoordinator(journal, store).before_prepare()  # type: ignore[arg-type]
+    retention = SemanticReceiptRetentionCoordinator(journal, store)
+    retention.before_prepare()  # type: ignore[arg-type]
+    assert store.load_receipt(transaction_id) is not None
+
+    journal.inspect = lambda: SimpleNamespace(
+        completed_transactions=(transaction,),
+        reconciled_transactions=(),
+        baselines=(SimpleNamespace(processing_high_water=1),),
+    )
+    retention.before_prepare()  # type: ignore[arg-type]
 
     assert store.load_receipt(transaction_id) is None

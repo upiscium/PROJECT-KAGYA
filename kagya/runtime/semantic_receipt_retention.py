@@ -24,8 +24,18 @@ class SemanticReceiptRetentionCoordinator:
             *inspection.completed_transactions,
             *inspection.reconciled_transactions,
         )
+        latest_baseline = inspection.baselines[-1] if inspection.baselines else None
         proofs: dict[str, str] = {}
         for transaction in transactions:
+            if (
+                latest_baseline is None
+                or transaction.processing_sequence > latest_baseline.processing_high_water
+            ):
+                # A true rollback may still revisit every transaction after the
+                # latest clean participant baseline.  Those receipts remain
+                # the Memory-owned reconstruction evidence until a later
+                # baseline epoch makes them unreachable.
+                continue
             if not any(
                 participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
                 for participant_id, _outcome in transaction.participant_outcomes
