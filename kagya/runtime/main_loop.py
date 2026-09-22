@@ -43,6 +43,9 @@ from kagya.experience import (
     ExperienceMeasurementEvidence,
     ExperienceRecord,
     ExperienceLifecycle,
+    ExperienceRevisionOperation,
+    ExperienceRevisionReason,
+    ExperienceRevisionRecord,
     calculate_subjective_salience,
 )
 from kagya.memory.experience_store import ExperienceStore
@@ -702,6 +705,20 @@ class KagyaMainLoop:
                     post_appraisal_emotion,
                 ),
                 created_at=event.requested_at,
+                revision_history=(
+                    ExperienceRevisionRecord(
+                        experience_id=experience_id_for_event(
+                            event.event_id, event_sequence
+                        ),
+                        revision=0,
+                        operation=ExperienceRevisionOperation.CREATE,
+                        reason=ExperienceRevisionReason.CREATION,
+                        created_at=event.requested_at,
+                        event_id=event.event_id,
+                        event_sequence=event_sequence,
+                        evidence_refs=(event.event_id,),
+                    ),
+                ),
             )
             experience_participant = MemoryExperienceParticipant(
                 self.memory_system,

@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import stat
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from kagya.experience import (
     EXPERIENCE_MAX_REVISION,
@@ -32,11 +32,17 @@ from kagya.experience import (
 from kagya.identifiers import validate_identifier
 
 
-EXPERIENCE_STORE_SCHEMA_VERSION = 1
+EXPERIENCE_STORE_SCHEMA_VERSION = 2
 EXPERIENCE_PENDING_SCHEMA_VERSION = 1
+EXPERIENCE_RECEIPT_SCHEMA_VERSION = 1
+EXPERIENCE_MAX_RECEIPTS = 1024
 EXPERIENCE_MAX_FILE_BYTES = 4 * 1024 * 1024
 _REVISION_NAME = re.compile(r"(?:0|[1-9][0-9]*)\.json\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_TEMP_NAME = re.compile(
+    r"\.(?P<target>[A-Za-z0-9_.-]+)\.publish-(?P<token>[0-9a-f-]{36})\.tmp\Z"
+)
+_COMPACTION_NAME = ".compaction.json"
 
 
 class ExperienceStoreError(RuntimeError):
@@ -62,6 +68,10 @@ class ExperienceStoredEntry:
         "record",
         "operation_digest",
         "source_episode_operation_digest",
+        "revision_evidence",
+        "previous_record_digest",
+        "anchor_revision",
+        "anchor_record_digest",
     )
 
     def __init__(
@@ -69,10 +79,18 @@ class ExperienceStoredEntry:
         record: ExperienceRecord,
         operation_digest: str,
         source_episode_operation_digest: str,
+        revision_evidence: ExperienceRevisionRecord | None = None,
+        previous_record_digest: str | None = None,
+        anchor_revision: int | None = None,
+        anchor_record_digest: str | None = None,
     ) -> None:
         self.record = record
         self.operation_digest = operation_digest
         self.source_episode_operation_digest = source_episode_operation_digest
+        self.revision_evidence = revision_evidence
+        self.previous_record_digest = previous_record_digest
+        self.anchor_revision = anchor_revision
+        self.anchor_record_digest = anchor_record_digest
 
 
 def _datetime_value(value: datetime) -> str:
@@ -216,6 +234,7 @@ def experience_record_to_dict(record: ExperienceRecord) -> dict[str, object]:
         "emotion_update_reasons": [item.value for item in record.emotion_update_reasons],
         "experience_id": record.experience_id,
         "history_anchor_digest": record.history_anchor_digest,
+        "history_anchor_revision": record.history_anchor_revision,
         "lifecycle": record.lifecycle.value,
         "measurement": {
             "calibrated_novelty": None
@@ -258,6 +277,7 @@ def experience_record_from_dict(value: object) -> ExperienceRecord:
             "emotion_update_reasons",
             "experience_id",
             "history_anchor_digest",
+            "history_anchor_revision",
             "lifecycle",
             "measurement",
             "post_appraisal_emotion",
@@ -401,6 +421,7 @@ def experience_record_from_dict(value: object) -> ExperienceRecord:
                 _revision_from_dict(item) for item in payload["revision_history"]
             ),
             history_anchor_digest=payload["history_anchor_digest"],
+            history_anchor_revision=payload["history_anchor_revision"],
         )
     except (TypeError, ValueError, KeyError, ExperienceStoreCorrupt):
         raise ExperienceStoreCorrupt("Experience record is invalid") from None
@@ -428,6 +449,14 @@ class ExperienceStore:
     def pending_path(self, transaction_id: str) -> Path:
         self._validate_uuid(transaction_id)
         return self.pending_root / f"{transaction_id}.json"
+
+    @property
+    def receipts_root(self) -> Path:
+        return self.root / "receipts"
+
+    def receipt_path(self, transaction_id: str) -> Path:
+        self._validate_uuid(transaction_id)
+        return self.receipts_root / f"{transaction_id}.json"
 
     def record_path(self, experience_id: str, revision: int) -> Path:
         self._validate_identifier(experience_id)
@@ -459,34 +488,322 @@ class ExperienceStore:
             if directory_fd >= 0:
                 os.close(directory_fd)
 
+    def load_receipt(self, transaction_id: str) -> dict[str, object] | None:
+        """Load immutable Memory-owned operation evidence retained after commit."""
+
+        return self._read_json(self.receipt_path(transaction_id), missing_ok=True)
+
+    def write_receipt(self, transaction_id: str, payload: dict[str, object]) -> None:
+        """Durably retain a bounded operation receipt before publication."""
+
+        path = self.receipt_path(transaction_id)
+        self._write_immutable_json(path, payload)
+
+    def remove_receipt(self, transaction_id: str) -> None:
+        path = self.receipt_path(transaction_id)
+        if not self._path_exists(self.receipts_root):
+            return
+        directory_fd = -1
+        try:
+            self._secure_parent(self.receipts_root, create=False)
+            directory_fd = self._directory_fd(self.receipts_root)
+            os.unlink(path.name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ExperienceStoreUnavailable("Experience receipt storage is unavailable") from error
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def prune_receipts(self, protected_transaction_id: str | None = None) -> None:
+        """Bound receipts while retaining only evidence of committed operations."""
+
+        if not self._path_exists(self.receipts_root):
+            return
+        self._secure_parent(self.receipts_root, create=False)
+        try:
+            paths = tuple(self.receipts_root.iterdir())
+        except OSError as error:
+            raise ExperienceStoreUnavailable("Experience receipts are unavailable") from error
+        receipts: list[tuple[str, Path]] = []
+        for path in paths:
+            if path.suffix != ".json" or _REVISION_NAME.fullmatch(path.name) is not None:
+                # Receipt filenames are UUIDs, not revision numbers.  Any other
+                # directory entry is an untrusted artifact.
+                if path.name != _COMPACTION_NAME:
+                    raise ExperienceStoreCorrupt("Experience receipt file name is invalid")
+                raise ExperienceStoreCorrupt("Experience receipt directory is invalid")
+            transaction_id = path.stem
+            try:
+                parsed = UUID(transaction_id)
+            except (TypeError, ValueError):
+                raise ExperienceStoreCorrupt("Experience receipt file name is invalid") from None
+            if str(parsed) != transaction_id:
+                raise ExperienceStoreCorrupt("Experience receipt file name is invalid")
+            self._secure_file(path)
+            receipts.append((transaction_id, path))
+        if len(receipts) <= EXPERIENCE_MAX_RECEIPTS:
+            return
+        for transaction_id, path in sorted(receipts):
+            if len(receipts) <= EXPERIENCE_MAX_RECEIPTS:
+                break
+            if transaction_id == protected_transaction_id:
+                continue
+            if self._receipt_has_pending(transaction_id):
+                continue
+            if self._receipt_is_committed(path):
+                self._unlink_receipt(path)
+            else:
+                # A receipt with neither a pending artifact nor a matching
+                # current record is an aborted/stale preparation artifact.
+                self._unlink_receipt(path)
+            receipts = [item for item in receipts if item[0] != transaction_id]
+
+    def _receipt_has_pending(self, transaction_id: str) -> bool:
+        pending = self.pending_path(transaction_id)
+        if not self._path_exists(pending):
+            return False
+        self._read_json(pending)
+        return True
+
+    def _receipt_is_committed(self, path: Path) -> bool:
+        payload = self._read_json(path)
+        value = _require_keys(
+            payload,
+            {
+                "operation",
+                "operation_digest",
+                "participant_id",
+                "schema_version",
+                "transaction_id",
+            },
+        )
+        if value["schema_version"] != EXPERIENCE_RECEIPT_SCHEMA_VERSION:
+            raise ExperienceStoreCorrupt("Experience receipt schema is unsupported")
+        operation = value["operation"]
+        if not isinstance(operation, dict) or not isinstance(operation.get("record"), dict):
+            raise ExperienceStoreCorrupt("Experience receipt operation is invalid")
+        record = experience_record_from_dict(operation["record"])
+        current = self.load_revision(record.experience_id, record.revision)
+        return bool(
+            current is not None
+            and current.record == record
+            and current.operation_digest == value["operation_digest"]
+            and operation.get("source_episode_operation_digest")
+            == current.source_episode_operation_digest
+        )
+
+    def _unlink_receipt(self, path: Path) -> None:
+        self._secure_file(path)
+        try:
+            path.unlink()
+        except OSError as error:
+            raise ExperienceStoreUnavailable("Experience receipt cleanup is unavailable") from error
+        self._fsync_directory(path.parent)
+
     def load_current(self, experience_id: str) -> ExperienceStoredEntry | None:
         self._validate_identifier(experience_id)
         directory = self.records_root / experience_id
         if not self._path_exists(directory):
             return None
         self._secure_parent(directory, create=False)
-        paths: list[tuple[int, Path]] = []
+        self._recover_publication_temps(directory)
+        self._recover_compaction(directory, experience_id)
+        entries = self._load_entries(directory, experience_id)
+        if not entries:
+            raise ExperienceStoreCorrupt("Experience record directory is empty")
+        self._validate_revision_window(entries)
+        return entries[max(entries)]
+
+    def _load_entries(
+        self, directory: Path, experience_id: str
+    ) -> dict[int, ExperienceStoredEntry]:
         try:
-            entries = tuple(directory.iterdir())
+            paths = tuple(directory.iterdir())
         except OSError as error:
             raise ExperienceStoreUnavailable("Experience records are unavailable") from error
-        for path in entries:
+        result: dict[int, ExperienceStoredEntry] = {}
+        for path in paths:
+            if path.name == _COMPACTION_NAME:
+                continue
+            if _TEMP_NAME.fullmatch(path.name) is not None:
+                raise ExperienceStoreCorrupt("Unreconciled Experience publication temp remains")
             if path.suffix != ".json" or _REVISION_NAME.fullmatch(path.name) is None:
                 raise ExperienceStoreCorrupt("Experience revision file name is invalid")
             try:
                 revision = int(path.stem)
             except ValueError:
                 raise ExperienceStoreCorrupt("Experience revision file name is invalid") from None
+            if revision in result:
+                raise ExperienceStoreCorrupt("Duplicate Experience revision artifact")
             payload = self._read_json(path)
-            entry = self._entry_from_payload(payload, experience_id, revision)
-            paths.append((revision, path))
-            del entry
-        if not paths:
-            raise ExperienceStoreCorrupt("Experience record directory is empty")
-        current_revision = max(revision for revision, _path in paths)
+            result[revision] = self._entry_from_payload(payload, experience_id, revision)
+        return result
+
+    def _validate_revision_window(
+        self, entries: dict[int, ExperienceStoredEntry]
+    ) -> None:
+        if not entries:
+            return
+        current_revision = max(entries)
+        actual = set(entries)
+        if current_revision < 32:
+            expected = set(range(current_revision + 1))
+        else:
+            floor = current_revision - 32
+            expected = set(range(floor, current_revision + 1))
+            full = set(range(current_revision + 1))
+            previous_window = set(range(max(0, floor - 1), current_revision + 1))
+            if actual not in (expected, full, previous_window):
+                raise ExperienceStoreCorrupt("Experience revision window is incomplete")
+        if current_revision < 32 and actual != expected:
+            raise ExperienceStoreCorrupt("Experience revision window is incomplete")
+        for revision, entry in entries.items():
+            evidence = entry.revision_evidence
+            if evidence is None or evidence != entry.record.revision_history[-1]:
+                raise ExperienceStoreCorrupt("Experience operation evidence is inconsistent")
+            if revision == 0:
+                if entry.previous_record_digest is not None:
+                    raise ExperienceStoreCorrupt("Genesis artifact has a prior record")
+                continue
+            previous = entries.get(revision - 1)
+            if previous is not None:
+                if entry.previous_record_digest != experience_record_digest(previous.record):
+                    raise ExperienceStoreCorrupt("Experience record chain is broken")
+            elif _DIGEST.fullmatch(entry.previous_record_digest or "") is None:
+                raise ExperienceStoreCorrupt("Compacted Experience predecessor is invalid")
+        current = entries[current_revision]
+        if current_revision >= 32:
+            floor = current_revision - 32
+            if current.record.history_anchor_revision != floor:
+                raise ExperienceStoreCorrupt("Experience history anchor revision is invalid")
+            if current.anchor_revision != floor:
+                raise ExperienceStoreCorrupt("Experience artifact anchor revision is invalid")
+            anchor = entries[floor]
+            if current.anchor_record_digest != experience_record_digest(anchor.record):
+                raise ExperienceStoreCorrupt("Experience artifact anchor is invalid")
+            if (
+                anchor.revision_evidence is None
+                or current.record.history_anchor_digest
+                != anchor.revision_evidence.record_digest
+            ):
+                raise ExperienceStoreCorrupt("Experience evidence anchor is invalid")
+        elif any(entry.anchor_revision is not None for entry in entries.values()):
+            raise ExperienceStoreCorrupt("Unexpected Experience history anchor")
+
+    def _recover_publication_temps(self, directory: Path) -> None:
+        try:
+            paths = tuple(directory.iterdir())
+        except OSError as error:
+            raise ExperienceStoreUnavailable("Experience records are unavailable") from error
+        for temporary in paths:
+            match = _TEMP_NAME.fullmatch(temporary.name)
+            if match is None:
+                continue
+            target_name = match.group("target")
+            token = match.group("token")
+            try:
+                parsed_token = UUID(token)
+            except (TypeError, ValueError):
+                raise ExperienceStoreCorrupt("Experience publication temp token is invalid") from None
+            if str(parsed_token) != token:
+                raise ExperienceStoreCorrupt("Experience publication temp token is invalid")
+            if target_name != _COMPACTION_NAME and _REVISION_NAME.fullmatch(target_name) is None:
+                raise ExperienceStoreCorrupt("Experience publication temp target is invalid")
+            self._secure_file(temporary)
+            target = directory / target_name
+            temporary_payload = self._read_json(temporary)
+            if self._path_exists(target):
+                target_payload = self._read_json(target)
+                if target_payload != temporary_payload:
+                    raise ExperienceStoreCorrupt(
+                        "Experience publication temp conflicts with its final artifact"
+                    )
+            try:
+                temporary.unlink()
+            except OSError as error:
+                raise ExperienceStoreUnavailable(
+                    "Experience publication temp cleanup is unavailable"
+                ) from error
+        if any(_TEMP_NAME.fullmatch(path.name) is not None for path in paths):
+            self._fsync_directory(directory)
+
+    def _recover_compaction(self, directory: Path, experience_id: str) -> None:
+        marker = directory / _COMPACTION_NAME
+        if not self._path_exists(marker):
+            return
+        payload = self._read_json(marker)
+        value = _require_keys(
+            payload,
+            {
+                "anchor_digest",
+                "anchor_record_digest",
+                "anchor_revision",
+                "current_record_digest",
+                "current_revision",
+                "delete_revisions",
+                "experience_id",
+                "floor",
+                "schema_version",
+            },
+        )
+        if value["schema_version"] != 1 or value["experience_id"] != experience_id:
+            raise ExperienceStoreCorrupt("Experience compaction marker is unsupported")
+        try:
+            current_revision = value["current_revision"]
+            floor = value["floor"]
+            anchor_revision = value["anchor_revision"]
+            delete_revisions = value["delete_revisions"]
+            if (
+                type(current_revision) is not int
+                or type(floor) is not int
+                or type(anchor_revision) is not int
+                or type(delete_revisions) is not list
+                or delete_revisions != list(range(floor))
+                or floor != current_revision - 32
+                or anchor_revision != floor
+            ):
+                raise ValueError
+            anchor_digest = _digest_value(value["anchor_digest"], "anchor_digest")
+            anchor_record_digest = _digest_value(
+                value["anchor_record_digest"], "anchor_record_digest"
+            )
+            current_record_digest = _digest_value(
+                value["current_record_digest"], "current_record_digest"
+            )
+        except (TypeError, ValueError, ExperienceStoreCorrupt):
+            raise ExperienceStoreCorrupt("Experience compaction marker is invalid") from None
         current_path = directory / f"{current_revision}.json"
         current_payload = self._read_json(current_path)
-        return self._entry_from_payload(current_payload, experience_id, current_revision)
+        current = self._entry_from_payload(current_payload, experience_id, current_revision)
+        if (
+            experience_record_digest(current.record) != current_record_digest
+            or current.record.history_anchor_revision != anchor_revision
+            or current.record.history_anchor_digest != anchor_digest
+            or current.anchor_record_digest != anchor_record_digest
+        ):
+            raise ExperienceStoreCorrupt("Experience compaction marker conflicts")
+        for revision in delete_revisions:
+            path = directory / f"{revision}.json"
+            try:
+                self._secure_file(path)
+            except FileNotFoundError:
+                continue
+            try:
+                path.unlink()
+            except OSError as error:
+                raise ExperienceStoreUnavailable(
+                    "Experience history compaction is unavailable"
+                ) from error
+        try:
+            marker.unlink()
+        except OSError as error:
+            raise ExperienceStoreUnavailable(
+                "Experience compaction marker cleanup is unavailable"
+            ) from error
+        self._fsync_directory(directory)
 
     def publish_create(
         self,
@@ -497,7 +814,10 @@ class ExperienceStore:
         if record.revision != 0:
             raise ExperienceStoreConflict("Experience create must publish revision zero")
         entry = ExperienceStoredEntry(
-            record, operation_digest, source_episode_operation_digest
+            record,
+            operation_digest,
+            source_episode_operation_digest,
+            revision_evidence=record.revision_history[-1],
         )
         self._publish_entry(entry)
         return entry
@@ -521,11 +841,49 @@ class ExperienceStore:
             raise ExperienceStoreConflict("Experience revision target is stale")
         if record.revision != expected_revision + 1:
             raise ExperienceStoreConflict("Experience revision is not the next revision")
+        anchor_revision = None
+        anchor_record_digest = None
+        if record.revision >= 32:
+            anchor_revision = record.revision - 32
+            if record.history_anchor_revision != anchor_revision:
+                raise ExperienceStoreConflict("Experience history anchor is inconsistent")
+            anchor_entry = self._load_revision_entry(record.experience_id, anchor_revision)
+            if anchor_entry is None:
+                raise ExperienceStoreUnavailable("Experience history anchor is absent")
+            anchor_record_digest = experience_record_digest(anchor_entry.record)
         entry = ExperienceStoredEntry(
-            record, operation_digest, source_episode_operation_digest
+            record,
+            operation_digest,
+            source_episode_operation_digest,
+            revision_evidence=record.revision_history[-1],
+            previous_record_digest=experience_record_digest(current.record),
+            anchor_revision=anchor_revision,
+            anchor_record_digest=anchor_record_digest,
         )
         self._publish_entry(entry)
         return entry
+
+    def _load_revision_entry(
+        self, experience_id: str, revision: int
+    ) -> ExperienceStoredEntry | None:
+        path = self.record_path(experience_id, revision)
+        payload = self._read_json(path, missing_ok=True)
+        if payload is None:
+            return None
+        return self._entry_from_payload(payload, experience_id, revision)
+
+    def load_revision(
+        self, experience_id: str, revision: int
+    ) -> ExperienceStoredEntry | None:
+        """Load one immutable revision for historical transaction recovery."""
+
+        self._validate_identifier(experience_id)
+        if type(revision) is not int or not 0 <= revision <= EXPERIENCE_MAX_REVISION:
+            raise ValueError("Experience revision is invalid")
+        current = self.load_current(experience_id)
+        if current is None or revision > current.record.revision:
+            return None
+        return self._load_revision_entry(experience_id, revision)
 
     def reconcile_prune(self, experience_id: str) -> None:
         """Finish an interrupted safe compaction without changing authority."""
@@ -539,12 +897,33 @@ class ExperienceStore:
             entry.source_episode_operation_digest
         ) is None:
             raise ExperienceStoreConflict("Experience operation digest is invalid")
+        if entry.revision_evidence is None:
+            raise ExperienceStoreConflict("Experience revision evidence is missing")
+        if entry.revision_evidence != entry.record.revision_history[-1]:
+            raise ExperienceStoreConflict("Experience revision evidence is inconsistent")
+        if entry.record.revision == 0:
+            if entry.previous_record_digest is not None or entry.anchor_revision is not None:
+                raise ExperienceStoreConflict("Genesis artifact has predecessor evidence")
+        elif _DIGEST.fullmatch(entry.previous_record_digest or "") is None:
+            raise ExperienceStoreConflict("Experience predecessor evidence is missing")
+        if entry.record.revision >= 32:
+            if (
+                entry.anchor_revision != entry.record.history_anchor_revision
+                or _DIGEST.fullmatch(entry.anchor_record_digest or "") is None
+            ):
+                raise ExperienceStoreConflict("Experience anchor evidence is missing")
+        elif entry.anchor_revision is not None or entry.anchor_record_digest is not None:
+            raise ExperienceStoreConflict("Unexpected Experience anchor evidence")
         path = self.record_path(entry.record.experience_id, entry.record.revision)
-        payload = {
+        payload: dict[str, object] = {
+            "anchor_record_digest": entry.anchor_record_digest,
+            "anchor_revision": entry.anchor_revision,
             "experience_id": entry.record.experience_id,
             "operation_digest": entry.operation_digest,
+            "previous_record_digest": entry.previous_record_digest,
             "record": experience_record_to_dict(entry.record),
             "record_digest": experience_record_digest(entry.record),
+            "revision_evidence": _revision_to_dict(entry.revision_evidence),
             "schema_version": EXPERIENCE_STORE_SCHEMA_VERSION,
             "source_episode_operation_digest": entry.source_episode_operation_digest,
         }
@@ -552,27 +931,32 @@ class ExperienceStore:
         self._prune(entry.record.experience_id, entry.record.revision)
 
     def _prune(self, experience_id: str, current_revision: int) -> None:
+        directory = self.records_root / experience_id
+        self._secure_parent(directory, create=False)
+        self._recover_publication_temps(directory)
+        self._recover_compaction(directory, experience_id)
+        entries = self._load_entries(directory, experience_id)
+        if not entries or max(entries) != current_revision:
+            raise ExperienceStoreUnavailable("Experience publication is not current")
+        self._validate_revision_window(entries)
         if current_revision <= 32:
             return
-        current = self.load_current(experience_id)
-        if current is None or current.record.revision != current_revision:
-            raise ExperienceStoreUnavailable("Experience publication is not current")
-        if current.record.history_anchor_digest is None or not current.record.revision_history:
-            raise ExperienceStoreConflict("Experience history anchor is missing")
-        directory = self.records_root / experience_id
+        current = entries[current_revision]
         floor = current_revision - 32
-        for path in tuple(directory.iterdir()):
-            if path.suffix != ".json" or _REVISION_NAME.fullmatch(path.name) is None:
-                raise ExperienceStoreCorrupt("Experience revision file name is invalid")
-            if int(path.stem) < floor:
-                self._secure_file(path)
-                try:
-                    path.unlink()
-                except OSError as error:
-                    raise ExperienceStoreUnavailable(
-                        "Experience history compaction is unavailable"
-                    ) from error
-        self._fsync_directory(directory)
+        marker_payload: dict[str, object] = {
+            "anchor_digest": current.record.history_anchor_digest,
+            "anchor_record_digest": current.anchor_record_digest,
+            "anchor_revision": current.anchor_revision,
+            "current_record_digest": experience_record_digest(current.record),
+            "current_revision": current_revision,
+            "delete_revisions": list(range(floor)),
+            "experience_id": experience_id,
+            "floor": floor,
+            "schema_version": 1,
+        }
+        marker = directory / _COMPACTION_NAME
+        self._write_immutable_json(marker, marker_payload)
+        self._recover_compaction(directory, experience_id)
 
     def _entry_from_payload(
         self, payload: object, experience_id: str, revision: int
@@ -580,10 +964,14 @@ class ExperienceStore:
         value = _require_keys(
             payload,
             {
+                "anchor_record_digest",
+                "anchor_revision",
                 "experience_id",
                 "operation_digest",
+                "previous_record_digest",
                 "record",
                 "record_digest",
+                "revision_evidence",
                 "schema_version",
                 "source_episode_operation_digest",
             },
@@ -606,7 +994,29 @@ class ExperienceStore:
         ):
             raise ExperienceStoreCorrupt("Experience record digest is inconsistent")
         _digest_value(value["record_digest"], "record_digest")
-        return ExperienceStoredEntry(record, operation_digest, source_digest)
+        anchor_revision = value["anchor_revision"]
+        if anchor_revision is not None and (
+            type(anchor_revision) is not int or anchor_revision < 0
+        ):
+            raise ExperienceStoreCorrupt("Experience anchor revision is invalid")
+        anchor_record_digest = value["anchor_record_digest"]
+        if anchor_record_digest is not None:
+            _digest_value(anchor_record_digest, "anchor_record_digest")
+        previous_record_digest = value["previous_record_digest"]
+        if previous_record_digest is not None:
+            _digest_value(previous_record_digest, "previous_record_digest")
+        revision_evidence = _revision_from_dict(value["revision_evidence"])
+        if revision_evidence != record.revision_history[-1]:
+            raise ExperienceStoreCorrupt("Experience operation evidence is inconsistent")
+        return ExperienceStoredEntry(
+            record,
+            operation_digest,
+            source_digest,
+            revision_evidence=revision_evidence,
+            previous_record_digest=previous_record_digest,
+            anchor_revision=anchor_revision,
+            anchor_record_digest=anchor_record_digest,
+        )
 
     def _write_immutable_json(self, path: Path, payload: dict[str, object]) -> None:
         encoded = (
@@ -616,13 +1026,15 @@ class ExperienceStore:
         if len(encoded) > EXPERIENCE_MAX_FILE_BYTES:
             raise ExperienceStoreConflict("Experience artifact is too large")
         self._secure_parent(path.parent, create=True)
+        self._recover_publication_temps(path.parent)
         existing = self._read_json(path, missing_ok=True)
         if existing is not None:
             if existing != payload:
                 raise ExperienceStoreConflict("Experience artifact conflicts")
             return
         parent_fd = self._directory_fd(path.parent)
-        temporary = f".tmp-{path.name}-{os.getpid()}"
+        temporary = f".{path.name}.publish-{uuid4()}.tmp"
+        linked = False
         descriptor = -1
         try:
             descriptor = os.open(
@@ -643,6 +1055,7 @@ class ExperienceStore:
                 dst_dir_fd=parent_fd,
                 follow_symlinks=False,
             )
+            linked = True
             os.unlink(temporary, dir_fd=parent_fd)
             temporary = ""
             os.fsync(parent_fd)
@@ -655,11 +1068,13 @@ class ExperienceStore:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-            if temporary:
+            if temporary and not linked:
                 try:
                     os.unlink(temporary, dir_fd=parent_fd)
                 except OSError:
-                    pass
+                    raise ExperienceStoreUnavailable(
+                        "Experience temporary cleanup is unavailable"
+                    )
             os.close(parent_fd)
 
     def _read_json(self, path: Path, *, missing_ok: bool = False) -> dict[str, object] | None:

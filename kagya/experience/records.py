@@ -42,6 +42,7 @@ class ExperienceLifecycle(str, Enum):
 
 
 class ExperienceRevisionOperation(str, Enum):
+    CREATE = "create"
     REASSESS = "reassess"
     CORRECT = "correct"
     SUPERSEDE = "supersede"
@@ -49,6 +50,7 @@ class ExperienceRevisionOperation(str, Enum):
 
 
 class ExperienceRevisionReason(str, Enum):
+    CREATION = "creation"
     REASSESSMENT = "reassessment"
     CORRECTION = "correction"
     SUPERSESSION = "supersession"
@@ -87,6 +89,7 @@ ExperienceLossInvalidReason = ExperienceMeasurementInvalidReason
 ExperienceEmotionReasonCode = ExperienceEmotionUpdateReasonCode
 
 _EXPERIENCE_REVISION_COMPATIBILITY = {
+    (ExperienceRevisionOperation.CREATE, ExperienceRevisionReason.CREATION),
     (ExperienceRevisionOperation.REASSESS, ExperienceRevisionReason.REASSESSMENT),
     (ExperienceRevisionOperation.CORRECT, ExperienceRevisionReason.CORRECTION),
     (ExperienceRevisionOperation.SUPERSEDE, ExperienceRevisionReason.SUPERSESSION),
@@ -518,6 +521,10 @@ class ExperienceRevisionRecord:
         _enum(self.reason, ExperienceRevisionReason, "reason")
         if (self.operation, self.reason) not in _EXPERIENCE_REVISION_COMPATIBILITY:
             raise ValueError("Experience revision operation and reason are incompatible")
+        if self.revision == 0 and self.operation is not ExperienceRevisionOperation.CREATE:
+            raise ValueError("revision zero must be the Experience creation")
+        if self.revision > 0 and self.operation is ExperienceRevisionOperation.CREATE:
+            raise ValueError("non-genesis revisions cannot create an Experience")
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "created_at"))
         object.__setattr__(
             self,
@@ -609,6 +616,7 @@ def _record_fields(record: ExperienceRecord) -> dict[str, object]:
         ],
         "experience_id": record.experience_id,
         "history_anchor_digest": record.history_anchor_digest,
+        "history_anchor_revision": record.history_anchor_revision,
         "lifecycle": record.lifecycle.value,
         "measurement": {
             "calibrated_novelty": None
@@ -670,6 +678,7 @@ class ExperienceRecord:
     superseded_by_id: str | None = None
     revision_history: tuple[ExperienceRevisionRecord, ...] = ()
     history_anchor_digest: str | None = None
+    history_anchor_revision: int | None = None
 
     def __post_init__(self) -> None:
         validate_identifier(self.experience_id)
@@ -681,6 +690,8 @@ class ExperienceRecord:
             maximum=EXPERIENCE_MAX_REVISION,
         )
         _enum(self.lifecycle, ExperienceLifecycle, "lifecycle")
+        if self.revision == 0 and self.lifecycle is not ExperienceLifecycle.ACTIVE:
+            raise ValueError("revision zero must be active")
         validate_identifier(self.source_event_id)
         _positive_int(
             self.source_event_sequence,
@@ -729,18 +740,29 @@ class ExperienceRecord:
         if self.lifecycle is ExperienceLifecycle.SUPERSEDED:
             if self.superseded_by_id is None:
                 raise ValueError("superseded Experiences require superseded_by_id")
+            if self.superseded_by_id == self.experience_id:
+                raise ValueError("an Experience cannot supersede itself")
         elif self.superseded_by_id is not None:
             raise ValueError("only superseded Experiences may name a successor")
         if type(self.revision_history) is not tuple:
             raise TypeError("revision_history must be a tuple")
         if len(self.revision_history) > EXPERIENCE_MAX_REVISIONS:
             raise ValueError("Experience revision history exceeds its bound")
-        if self.revision == 0 and self.revision_history:
-            raise ValueError("revision zero cannot retain prior revisions")
-        if self.revision == 0 and self.history_anchor_digest is not None:
-            raise ValueError("revision zero cannot retain a history anchor")
-        if self.revision > 0 and not self.revision_history and self.history_anchor_digest is None:
-            raise ValueError("nonzero revision requires history or an anchor")
+        if self.revision == 0:
+            if len(self.revision_history) != 1:
+                raise ValueError("revision zero requires its creation evidence")
+            if self.history_anchor_digest is not None or self.history_anchor_revision is not None:
+                raise ValueError("revision zero cannot retain a history anchor")
+        elif not self.revision_history:
+            raise ValueError("nonzero revision requires retained revision evidence")
+        if (self.history_anchor_digest is None) != (self.history_anchor_revision is None):
+            raise ValueError("history anchor digest and revision must be paired")
+        if self.history_anchor_revision is not None:
+            expected_anchor = self.revision - EXPERIENCE_MAX_REVISIONS
+            if expected_anchor < 0 or self.history_anchor_revision != expected_anchor:
+                raise ValueError("history anchor revision is not the retention predecessor")
+        elif self.revision >= EXPERIENCE_MAX_REVISIONS:
+            raise ValueError("retained revision history requires its anchor")
         previous: ExperienceRevisionRecord | None = None
         for item in self.revision_history:
             if not isinstance(item, ExperienceRevisionRecord):
@@ -762,7 +784,22 @@ class ExperienceRecord:
             if item.revision > self.revision:
                 raise ValueError("Experience revision history contains a future revision")
             previous = item
-        if previous is not None and previous.revision != self.revision - 1:
+        expected_first = 0 if self.history_anchor_revision is None else self.history_anchor_revision + 1
+        if self.revision == 0:
+            genesis = self.revision_history[0]
+            if (
+                genesis.revision != 0
+                or genesis.operation is not ExperienceRevisionOperation.CREATE
+                or genesis.reason is not ExperienceRevisionReason.CREATION
+                or genesis.event_id != self.source_event_id
+                or genesis.event_sequence != self.source_event_sequence
+                or genesis.created_at != self.created_at
+                or self.source_event_id not in genesis.evidence_refs
+            ):
+                raise ValueError("creation evidence is not bound to the Experience source")
+        elif self.revision_history[0].revision != expected_first:
+            raise ValueError("Experience revision history starts outside its retained window")
+        if self.revision > 0 and previous is not None and previous.revision != self.revision:
             raise ValueError("Experience revision history does not reach the current revision")
         if self.history_anchor_digest is not None:
             _digest(self.history_anchor_digest, "history_anchor_digest")

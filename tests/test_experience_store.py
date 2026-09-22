@@ -1,6 +1,7 @@
 """Durability and privacy tests for the Memory-owned Experience store."""
 
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from kagya.memory.experience_store import (
     ExperienceStore,
     ExperienceStoreConflict,
     ExperienceStoreCorrupt,
+    ExperienceStoreUnavailable,
     experience_record_from_dict,
     experience_record_to_dict,
 )
@@ -40,7 +42,21 @@ def _record(
     revision: int = 0,
     history=(),
     anchor: str | None = None,
+    anchor_revision: int | None = None,
 ) -> ExperienceRecord:
+    if not history:
+        history = (
+            ExperienceRevisionRecord(
+                experience_id,
+                0,
+                ExperienceRevisionOperation.CREATE,
+                ExperienceRevisionReason.CREATION,
+                CREATED_AT,
+                event_id="event:1",
+                event_sequence=1,
+                evidence_refs=("event:1",),
+            ),
+        )
     measurement = ExperienceMeasurementEvidence(
         MODEL_KEY, True, calibrated_novelty=0.25
     )
@@ -69,7 +85,50 @@ def _record(
         created_at=CREATED_AT,
         revision_history=history,
         history_anchor_digest=anchor,
+        history_anchor_revision=anchor_revision,
     )
+
+
+def _revision_series(experience_id: str, highest: int) -> list[ExperienceRecord]:
+    evidence: list[ExperienceRevisionRecord] = []
+    records: list[ExperienceRecord] = []
+    for revision in range(highest + 1):
+        current_evidence = ExperienceRevisionRecord(
+            experience_id,
+            revision,
+            ExperienceRevisionOperation.CREATE
+            if revision == 0
+            else ExperienceRevisionOperation.CORRECT,
+            ExperienceRevisionReason.CREATION
+            if revision == 0
+            else ExperienceRevisionReason.CORRECTION,
+            CREATED_AT,
+            event_id=f"event:{revision + 1}",
+            event_sequence=revision + 1,
+            evidence_refs=(f"event:{revision + 1}",),
+            previous_revision_digest=(
+                None if revision == 0 else evidence[-1].record_digest
+            ),
+        )
+        evidence.append(current_evidence)
+        if revision >= 32:
+            anchor_revision = revision - 32
+            history = tuple(evidence[anchor_revision + 1 :])
+            anchor_digest = evidence[anchor_revision].record_digest
+        else:
+            anchor_revision = None
+            history = tuple(evidence)
+            anchor_digest = None
+        records.append(
+            _record(
+                experience_id=experience_id,
+                revision=revision,
+                history=history,
+                anchor=anchor_digest,
+                anchor_revision=anchor_revision,
+            )
+        )
+    return records
 
 
 def test_experience_record_round_trip_is_exact_and_reference_first() -> None:
@@ -146,14 +205,25 @@ def test_revision_publication_keeps_prior_bytes_and_rejects_stale_target(
     genesis = ExperienceRevisionRecord(
         initial.experience_id,
         0,
-        ExperienceRevisionOperation.REASSESS,
-        ExperienceRevisionReason.REASSESSMENT,
+        ExperienceRevisionOperation.CREATE,
+        ExperienceRevisionReason.CREATION,
         CREATED_AT,
         event_id="event:1",
         event_sequence=1,
-        evidence_refs=("evidence:0",),
+        evidence_refs=("event:1",),
     )
-    revised = _record(revision=1, history=(genesis,))
+    revision = ExperienceRevisionRecord(
+        initial.experience_id,
+        1,
+        ExperienceRevisionOperation.CORRECT,
+        ExperienceRevisionReason.CORRECTION,
+        CREATED_AT,
+        event_id="event:2",
+        event_sequence=2,
+        evidence_refs=("event:2",),
+        previous_revision_digest=genesis.record_digest,
+    )
+    revised = _record(revision=1, history=(genesis, revision))
     store.publish_revision(
         revised,
         "3" * 64,
@@ -174,3 +244,102 @@ def test_revision_publication_keeps_prior_bytes_and_rejects_stale_target(
             expected_revision=0,
             expected_digest=experience_record_digest(initial),
         )
+
+
+def test_publication_temp_is_typed_and_recovers_without_replacing_final(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    record = _record()
+    failed = False
+    original_unlink = os.unlink
+
+    def fail_temp_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if not failed and isinstance(path, str) and ".publish-" in path:
+            failed = True
+            raise OSError("injected publication cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", fail_temp_unlink)
+    with pytest.raises(ExperienceStoreUnavailable):
+        store.publish_create(record, OPERATION_DIGEST, SOURCE_DIGEST)
+    path = store.record_path(record.experience_id, 0)
+    final_bytes = path.read_bytes()
+    assert any(".publish-" in item.name for item in path.parent.iterdir())
+    monkeypatch.undo()
+
+    current = store.load_current(record.experience_id)
+    assert current is not None and current.record == record
+    assert path.read_bytes() == final_bytes
+    assert not any(".publish-" in item.name for item in path.parent.iterdir())
+
+    unknown = path.parent / ".tmp-unknown"
+    unknown.write_bytes(b"not a recognized publication artifact")
+    unknown.chmod(0o600)
+    with pytest.raises(ExperienceStoreCorrupt):
+        store.load_current(record.experience_id)
+
+
+def test_retention_is_exact_anchored_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    records = _revision_series("experience:retention", 34)
+    store.publish_create(records[0], OPERATION_DIGEST, SOURCE_DIGEST)
+    for revision in range(1, len(records)):
+        if revision == 33:
+            original_unlink = Path.unlink
+            failed = False
+
+            def fail_first_prune_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                nonlocal failed
+                if path.name == "0.json" and not failed:
+                    failed = True
+                    raise OSError("injected compaction failure")
+                original_unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", fail_first_prune_unlink)
+            with pytest.raises(ExperienceStoreUnavailable):
+                store.publish_revision(
+                    records[revision],
+                    f"{revision + 2:064x}",
+                    SOURCE_DIGEST,
+                    expected_revision=revision - 1,
+                    expected_digest=experience_record_digest(records[revision - 1]),
+                )
+            monkeypatch.undo()
+            assert (store.records_root / "experience:retention" / ".compaction.json").exists()
+            assert store.load_current("experience:retention") is not None
+        else:
+            store.publish_revision(
+                records[revision],
+                f"{revision + 2:064x}",
+                SOURCE_DIGEST,
+                expected_revision=revision - 1,
+                expected_digest=experience_record_digest(records[revision - 1]),
+            )
+
+    current = store.load_current(records[-1].experience_id)
+    assert current is not None
+    assert current.record == records[-1]
+    assert current.record.history_anchor_revision == 2
+    assert current.record.revision_history[0].revision == 3
+    revisions = {
+        int(path.stem)
+        for path in (store.records_root / records[-1].experience_id).iterdir()
+        if path.suffix == ".json" and path.stem.isdigit()
+    }
+    assert revisions == set(range(2, 35))
+    retained_bytes = store.record_path(records[-1].experience_id, 3).read_bytes()
+    store.reconcile_prune(records[-1].experience_id)
+    assert store.record_path(records[-1].experience_id, 3).read_bytes() == retained_bytes
+    assert {
+        int(path.stem)
+        for path in (store.records_root / records[-1].experience_id).iterdir()
+        if path.suffix == ".json" and path.stem.isdigit()
+    } == revisions
+
+    store.record_path(records[-1].experience_id, 10).unlink()
+    with pytest.raises(ExperienceStoreCorrupt):
+        store.load_current(records[-1].experience_id)

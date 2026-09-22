@@ -29,6 +29,7 @@ from kagya.memory.episodic_participant import (
 )
 from kagya.memory.experience_store import (
     EXPERIENCE_PENDING_SCHEMA_VERSION,
+    EXPERIENCE_RECEIPT_SCHEMA_VERSION,
     ExperienceStore,
     ExperienceStoreConflict,
     ExperienceStoreCorrupt,
@@ -150,11 +151,21 @@ class ExperienceRevisionIntent:
         if _DIGEST.fullmatch(self.source_episode_operation_digest) is None:
             raise ValueError("Source episode operation digest is invalid")
         if (
-            not self.record.revision_history
+            len(self.record.revision_history) < 2
             or self.revision_record.previous_revision_digest
-            != self.record.revision_history[-1].record_digest
+            != self.record.revision_history[-2].record_digest
         ):
             raise ValueError("Experience revision evidence is not linked to history")
+        if self.record.revision_history[-1] != self.revision_record:
+            raise ValueError("Experience revision evidence is not the committed revision")
+        expected_lifecycle = {
+            ExperienceRevisionOperation.REASSESS: ExperienceLifecycle.ACTIVE,
+            ExperienceRevisionOperation.CORRECT: ExperienceLifecycle.ACTIVE,
+            ExperienceRevisionOperation.SUPERSEDE: ExperienceLifecycle.SUPERSEDED,
+            ExperienceRevisionOperation.RETRACT: ExperienceLifecycle.RETRACTED,
+        }[self.revision_record.operation]
+        if self.record.lifecycle is not expected_lifecycle:
+            raise ValueError("Experience revision lifecycle does not match its operation")
 
     def canonical_dict(self) -> dict[str, object]:
         return {
@@ -297,9 +308,27 @@ class MemoryExperienceParticipant:
             if current is not None:
                 if isinstance(participant.operation, ExperienceRevisionIntent):
                     if not participant._operation_matches_current(current):
-                        participant._validate_revision_target(current)
+                        if current.record.revision == participant.operation.expected_revision:
+                            participant._validate_revision_target(current)
+                        else:
+                            participant._validate_committed_artifact()
                 else:
-                    participant._ensure_current_matches(current)
+                    if current.record.revision == 0:
+                        participant._ensure_current_matches(current)
+                    else:
+                        participant._validate_committed_artifact()
+            return participant
+        receipt = cls._load_receipt(store, transaction_id)
+        if receipt is not None:
+            operation = cls._operation_from_receipt(
+                receipt, transaction_id, participant_id, operation_digest
+            )
+            participant = cls(memory, store, operation)
+            if event_id is not None and processing_sequence is not None:
+                participant._validate_record_identity(
+                    transaction_id, event_id, processing_sequence
+                )
+            participant._validate_committed_artifact()
             return participant
         if event_id is None or processing_sequence is None:
             raise UnsupportedParticipantReconciliationError(
@@ -344,6 +373,17 @@ class MemoryExperienceParticipant:
             raise ParticipantUnavailableError(str(error)) from None
 
     @staticmethod
+    def _load_receipt(
+        store: ExperienceStore, transaction_id: str
+    ) -> dict[str, object] | None:
+        try:
+            return store.load_receipt(transaction_id)
+        except ExperienceStoreCorrupt as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreError as error:
+            raise ParticipantUnavailableError(str(error)) from None
+
+    @staticmethod
     def _operation_from_pending_payload(
         payload: dict[str, object],
         transaction_id: str,
@@ -370,6 +410,33 @@ class MemoryExperienceParticipant:
             raise ParticipantDivergedError("Experience pending digest conflicts")
         return operation
 
+    @staticmethod
+    def _operation_from_receipt(
+        payload: dict[str, object],
+        transaction_id: str,
+        participant_id: str,
+        operation_digest: str,
+    ) -> ExperienceOperation:
+        expected = {
+            "operation",
+            "operation_digest",
+            "participant_id",
+            "schema_version",
+            "transaction_id",
+        }
+        if (
+            set(payload) != expected
+            or payload["schema_version"] != EXPERIENCE_RECEIPT_SCHEMA_VERSION
+            or payload["transaction_id"] != transaction_id
+            or payload["participant_id"] != participant_id
+            or payload["operation_digest"] != operation_digest
+        ):
+            raise ParticipantDivergedError("Experience receipt conflicts")
+        operation = _operation_from_dict(payload["operation"])
+        if experience_operation_digest(operation) != operation_digest:
+            raise ParticipantDivergedError("Experience receipt digest conflicts")
+        return operation
+
     def prepare(self, binding: TransactionBinding) -> None:
         self._validate_binding(binding)
         self._validate_record_identity(binding.transaction_id, binding.event_id, binding.processing_sequence)
@@ -377,13 +444,20 @@ class MemoryExperienceParticipant:
         expected = self._artifact(binding)
         try:
             current = self._current_entry()
+            self._ensure_receipt(binding)
             if current is not None:
                 if self._operation_matches_current(current):
                     pass
                 elif isinstance(self.operation, ExperienceRevisionIntent):
-                    self._validate_revision_target(current)
+                    if current.record.revision == self.operation.expected_revision:
+                        self._validate_revision_target(current)
+                    else:
+                        self._validate_committed_artifact()
                 else:
-                    self._ensure_current_matches(current)
+                    if current.record.revision == 0:
+                        self._ensure_current_matches(current)
+                    else:
+                        self._validate_committed_artifact()
                 pending = self.store.load_pending(binding.transaction_id)
                 if pending is not None and pending != expected:
                     raise ParticipantDivergedError("Experience pending artifact conflicts")
@@ -421,9 +495,20 @@ class MemoryExperienceParticipant:
             raise ParticipantDivergedError("Experience transaction binding is invalid")
         try:
             pending = store.load_pending(binding.transaction_id)
-            current = store.load_current(
-                experience_id_for_event(binding.event_id, binding.processing_sequence)
-            )
+            receipt = cls._load_receipt(store, binding.transaction_id)
+            current = None
+            if receipt is not None:
+                operation = cls._operation_from_receipt(
+                    receipt,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+                current = store.load_current(operation.record.experience_id)
+            else:
+                current = store.load_current(
+                    experience_id_for_event(binding.event_id, binding.processing_sequence)
+                )
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
@@ -431,6 +516,13 @@ class MemoryExperienceParticipant:
         if current is not None and pending is None:
             raise ParticipantDivergedError("Committed Experience cannot be aborted")
         if pending is None:
+            if receipt is not None:
+                try:
+                    store.remove_receipt(binding.transaction_id)
+                except ExperienceStoreCorrupt as error:
+                    raise ParticipantDivergedError(str(error)) from None
+                except ExperienceStoreError as error:
+                    raise ParticipantUnavailableError(str(error)) from None
             return AbortOutcome.ALREADY_ABSENT
         participant = cls.from_pending(
             memory,
@@ -459,17 +551,40 @@ class MemoryExperienceParticipant:
             if self._operation_matches_current(current):
                 if pending is not None and pending != expected:
                     raise ParticipantDivergedError("Experience pending artifact conflicts")
+                self._ensure_receipt(binding)
                 self._reconcile_prune()
                 if pending is not None:
                     self._remove_pending(binding.transaction_id)
+                self._prune_receipts(binding.transaction_id)
                 return ParticipantOutcome.ALREADY_CONSISTENT
             if not isinstance(self.operation, ExperienceRevisionIntent):
-                self._ensure_current_matches(current)
-            self._validate_revision_target(current)
+                if current.record.revision == 0:
+                    self._ensure_current_matches(current)
+                else:
+                    self._validate_committed_artifact()
+                    if pending is not None and pending != expected:
+                        raise ParticipantDivergedError("Experience pending artifact conflicts")
+                    self._reconcile_prune()
+                    if pending is not None:
+                        self._remove_pending(binding.transaction_id)
+                    self._prune_receipts(binding.transaction_id)
+                    return ParticipantOutcome.ALREADY_CONSISTENT
+            elif current.record.revision == self.operation.expected_revision:
+                self._validate_revision_target(current)
+            else:
+                self._validate_committed_artifact()
+                if pending is not None and pending != expected:
+                    raise ParticipantDivergedError("Experience pending artifact conflicts")
+                self._reconcile_prune()
+                if pending is not None:
+                    self._remove_pending(binding.transaction_id)
+                self._prune_receipts(binding.transaction_id)
+                return ParticipantOutcome.ALREADY_CONSISTENT
         if pending != expected:
             if pending is None:
                 raise ParticipantUnavailableError("Experience pending artifact is absent")
             raise ParticipantDivergedError("Experience pending artifact conflicts")
+        self._ensure_receipt(binding)
         try:
             if isinstance(self.operation, ExperienceCreateIntent):
                 self.store.publish_create(
@@ -490,6 +605,7 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
         self._remove_pending(binding.transaction_id)
+        self._prune_receipts(binding.transaction_id)
         return ParticipantOutcome.FINALIZED
 
     def abort(self, binding: TransactionBinding) -> AbortOutcome:
@@ -507,12 +623,18 @@ class MemoryExperienceParticipant:
                 raise ParticipantDivergedError("Committed Experience cannot be aborted")
             if self._operation_matches_current(current):
                 raise ParticipantDivergedError("Committed Experience cannot be aborted")
-            self._validate_revision_target(current)
+            if current.record.revision == self.operation.expected_revision:
+                self._validate_revision_target(current)
+            else:
+                self._validate_committed_artifact()
+                raise ParticipantDivergedError("Committed Experience cannot be aborted")
         if pending is None:
+            self._remove_receipt(binding.transaction_id)
             return AbortOutcome.ALREADY_ABSENT
         if pending != self._artifact(binding):
             raise ParticipantDivergedError("Experience pending artifact conflicts")
         self._remove_pending(binding.transaction_id)
+        self._remove_receipt(binding.transaction_id)
         return AbortOutcome.ABORTED
 
     def inspect_reconciliation(self, binding: TransactionBinding) -> StartupParticipantOutcome:
@@ -528,9 +650,15 @@ class MemoryExperienceParticipant:
         if current is not None:
             if isinstance(self.operation, ExperienceRevisionIntent):
                 if not self._operation_matches_current(current):
-                    self._validate_revision_target(current)
+                    if current.record.revision == self.operation.expected_revision:
+                        self._validate_revision_target(current)
+                    else:
+                        self._validate_committed_artifact()
             else:
-                self._ensure_current_matches(current)
+                if current.record.revision == 0:
+                    self._ensure_current_matches(current)
+                else:
+                    self._validate_committed_artifact()
             if pending is not None and pending != self._artifact(binding):
                 raise ParticipantDivergedError("Experience pending artifact conflicts")
             return StartupParticipantOutcome.VERIFIED_CONSISTENT
@@ -549,6 +677,7 @@ class MemoryExperienceParticipant:
             self._reconcile_prune()
             if pending is not None:
                 self._remove_pending(binding.transaction_id)
+            self._prune_receipts(binding.transaction_id)
             return outcome
         self.finalize(binding)
         return StartupParticipantOutcome.ROLLED_FORWARD
@@ -649,6 +778,29 @@ class MemoryExperienceParticipant:
             "transaction_id": binding.transaction_id,
         }
 
+    def _ensure_receipt(self, binding: TransactionBinding) -> None:
+        expected = {
+            "operation": self.operation.canonical_dict(),
+            "operation_digest": self.operation_digest,
+            "participant_id": self.participant_id,
+            "schema_version": EXPERIENCE_RECEIPT_SCHEMA_VERSION,
+            "transaction_id": binding.transaction_id,
+        }
+        try:
+            existing = self.store.load_receipt(binding.transaction_id)
+            if existing is not None and existing != expected:
+                raise ParticipantDivergedError("Experience receipt conflicts")
+            if existing is None:
+                self.store.write_receipt(binding.transaction_id, expected)
+        except ParticipantDivergedError:
+            raise
+        except ExperienceStoreCorrupt as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreConflict as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreError as error:
+            raise ParticipantUnavailableError(str(error)) from None
+
     def _current_entry(self) -> ExperienceStoredEntry | None:
         try:
             return self.store.load_current(self.operation.record.experience_id)
@@ -667,12 +819,33 @@ class MemoryExperienceParticipant:
             raise ParticipantDivergedError("Committed Experience conflicts")
 
     def _operation_matches_current(self, current: ExperienceStoredEntry) -> bool:
+        return self._operation_matches_entry(current)
+
+    def _operation_matches_entry(self, entry: ExperienceStoredEntry) -> bool:
         return (
-            current.record == self.operation.record
-            and current.operation_digest == self.operation_digest
-            and current.source_episode_operation_digest
+            entry.record == self.operation.record
+            and entry.operation_digest == self.operation_digest
+            and entry.source_episode_operation_digest
             == self.operation.source_episode_operation_digest
         )
+
+    def _validate_committed_artifact(self) -> ExperienceStoredEntry:
+        try:
+            entry = self.store.load_revision(
+                self.operation.record.experience_id,
+                self.operation.record.revision,
+            )
+        except ExperienceStoreCorrupt as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreError as error:
+            raise ParticipantUnavailableError(str(error)) from None
+        if entry is None:
+            raise UnsupportedParticipantReconciliationError(
+                "Committed Experience revision artifact is absent"
+            )
+        if not self._operation_matches_entry(entry):
+            raise ParticipantDivergedError("Committed Experience revision conflicts")
+        return entry
 
     def _validate_revision_target(self, current: ExperienceStoredEntry) -> None:
         if not isinstance(self.operation, ExperienceRevisionIntent):
@@ -683,10 +856,40 @@ class MemoryExperienceParticipant:
             != self.operation.expected_record_digest
         ):
             raise ParticipantDivergedError("Experience revision target is stale")
+        if current.record.lifecycle is not ExperienceLifecycle.ACTIVE:
+            raise ParticipantDivergedError("Only active Experiences may be revised")
+        revised = self.operation.record
+        if (
+            revised.experience_id != current.record.experience_id
+            or revised.source_event_id != current.record.source_event_id
+            or revised.source_event_sequence != current.record.source_event_sequence
+            or revised.source_episode_id != current.record.source_episode_id
+            or revised.context_id != current.record.context_id
+            or revised.created_at != current.record.created_at
+            or self.operation.source_episode_operation_digest
+            != current.source_episode_operation_digest
+        ):
+            raise ParticipantDivergedError("Experience source lineage conflicts")
 
     def _remove_pending(self, transaction_id: str) -> None:
         try:
             self.store.remove_pending(transaction_id)
+        except ExperienceStoreCorrupt as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreError as error:
+            raise ParticipantUnavailableError(str(error)) from None
+
+    def _remove_receipt(self, transaction_id: str) -> None:
+        try:
+            self.store.remove_receipt(transaction_id)
+        except ExperienceStoreCorrupt as error:
+            raise ParticipantDivergedError(str(error)) from None
+        except ExperienceStoreError as error:
+            raise ParticipantUnavailableError(str(error)) from None
+
+    def _prune_receipts(self, protected_transaction_id: str) -> None:
+        try:
+            self.store.prune_receipts(protected_transaction_id)
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:

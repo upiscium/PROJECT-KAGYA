@@ -91,6 +91,16 @@ def test_experience_record_is_immutable_bounded_and_rejects_raw_content_fields()
     measurement = ExperienceMeasurementEvidence(MODEL_KEY, True, calibrated_novelty=0.25)
     pre = ExperienceEmotionProjection(0.0, 0.0)
     post = ExperienceEmotionProjection(0.5, 0.25)
+    genesis = ExperienceRevisionRecord(
+        "experience:1",
+        0,
+        ExperienceRevisionOperation.CREATE,
+        ExperienceRevisionReason.CREATION,
+        CREATED_AT,
+        event_id="event:1",
+        event_sequence=1,
+        evidence_refs=("event:1",),
+    )
     record = ExperienceRecord(
         experience_id="experience:1",
         revision=0,
@@ -112,6 +122,7 @@ def test_experience_record_is_immutable_bounded_and_rejects_raw_content_fields()
         emotion_update_reasons=(ExperienceEmotionUpdateReasonCode.APPRAISAL_APPLIED,),
         subjective_salience=0.25,
         created_at=CREATED_AT,
+        revision_history=(genesis,),
     )
     assert record.subjective_salience == 0.25
     with pytest.raises(AttributeError):
@@ -129,7 +140,7 @@ def test_experience_record_is_immutable_bounded_and_rejects_raw_content_fields()
     with pytest.raises(ValueError):
         replace(record, source_event_sequence=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
-        replace(record, revision=1)
+        replace(record, revision=1, revision_history=())
     with pytest.raises(ValueError):
         replace(record, history_anchor_digest="0" * 64)
     with pytest.raises(ValueError):
@@ -186,8 +197,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
     genesis = ExperienceRevisionRecord(
         "experience:1",
         0,
-        ExperienceRevisionOperation.REASSESS,
-        ExperienceRevisionReason.REASSESSMENT,
+        ExperienceRevisionOperation.CREATE,
+        ExperienceRevisionReason.CREATION,
         CREATED_AT,
         evidence_refs=("evidence:0",),
         event_id="event:1",
@@ -210,8 +221,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
         ExperienceRevisionRecord(
             "experience:1",
             0,
-            ExperienceRevisionOperation.REASSESS,
-            ExperienceRevisionReason.REASSESSMENT,
+            ExperienceRevisionOperation.CREATE,
+            ExperienceRevisionReason.CREATION,
             CREATED_AT,
             event_id="event:1",
             event_sequence=1,
@@ -220,8 +231,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
         ExperienceRevisionRecord(
             "experience:1",
             0,
-            ExperienceRevisionOperation.REASSESS,
-            ExperienceRevisionReason.REASSESSMENT,
+            ExperienceRevisionOperation.CREATE,
+            ExperienceRevisionReason.CREATION,
             CREATED_AT,
             evidence_refs=("evidence:0",),
             event_id="event:1",
@@ -231,8 +242,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
         ExperienceRevisionRecord(
             "experience:1",
             0,
-            ExperienceRevisionOperation.REASSESS,
-            ExperienceRevisionReason.REASSESSMENT,
+            ExperienceRevisionOperation.CREATE,
+            ExperienceRevisionReason.CREATION,
             CREATED_AT,
             evidence_refs=("evidence:0",),
             event_id="event:1",

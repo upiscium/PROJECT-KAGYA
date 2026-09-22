@@ -109,6 +109,16 @@ def _setup(tmp_path: Path):
     )
     pre = ExperienceEmotionProjection(0.0, 0.0)
     post = ExperienceEmotionProjection(0.5, 0.25)
+    genesis = ExperienceRevisionRecord(
+        experience_id_for_event(EVENT_ID, 1),
+        0,
+        ExperienceRevisionOperation.CREATE,
+        ExperienceRevisionReason.CREATION,
+        NOW,
+        EVENT_ID,
+        1,
+        evidence_refs=(EVENT_ID,),
+    )
     record = ExperienceRecord(
         experience_id=experience_id_for_event(EVENT_ID, 1),
         revision=0,
@@ -130,6 +140,7 @@ def _setup(tmp_path: Path):
         emotion_update_reasons=(ExperienceEmotionUpdateReasonCode.APPRAISAL_APPLIED,),
         subjective_salience=0.25,
         created_at=NOW,
+        revision_history=(genesis,),
     )
     participant = MemoryExperienceParticipant(
         memory,
@@ -163,6 +174,10 @@ def test_prepare_is_pending_only_and_finalize_requires_committed_episode(
     current = store.load_current(participant.operation.record.experience_id)
     assert current is not None
     assert current.record.source_episode_id == episode.episode_id(binding.transaction_id)
+    receipt = store.load_receipt(binding.transaction_id)
+    assert receipt is not None
+    assert receipt["operation_digest"] == participant.operation_digest
+    assert "user_input" not in str(receipt)
     assert participant.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
     assert store.load_pending(binding.transaction_id) is None
 
@@ -175,6 +190,7 @@ def test_abort_removes_only_pending_and_restart_reuses_committed_identity(
     participant.prepare(binding)
     assert participant.abort(binding).value == "aborted"
     assert store.load_current(participant.operation.record.experience_id) is None
+    assert store.load_receipt(binding.transaction_id) is None
     assert participant.abort(binding).value == "already_absent"
 
     participant.prepare(binding)
@@ -205,17 +221,12 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
     genesis = ExperienceRevisionRecord(
         initial.experience_id,
         0,
-        ExperienceRevisionOperation.REASSESS,
-        ExperienceRevisionReason.REASSESSMENT,
+        ExperienceRevisionOperation.CREATE,
+        ExperienceRevisionReason.CREATION,
         NOW,
         EVENT_ID,
         1,
-        evidence_refs=("evidence:0",),
-    )
-    revised = replace(
-        initial,
-        revision=1,
-        revision_history=(genesis,),
+        evidence_refs=(EVENT_ID,),
     )
     revision_record = ExperienceRevisionRecord(
         initial.experience_id,
@@ -228,6 +239,19 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
         evidence_refs=("evidence:1",),
         previous_revision_digest=genesis.record_digest,
     )
+    revised = replace(
+        initial,
+        revision=1,
+        revision_history=(genesis, revision_record),
+    )
+    with pytest.raises(ValueError):
+        ExperienceRevisionIntent(
+            replace(revised, lifecycle=ExperienceLifecycle.RETRACTED),
+            revision_record,
+            expected_revision=0,
+            expected_record_digest=experience_record_digest(initial),
+            source_episode_operation_digest=participant.operation.source_episode_operation_digest,
+        )
     revision = MemoryExperienceParticipant(
         memory,
         store,
@@ -285,5 +309,61 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
     current = store.load_current(initial.experience_id)
     assert current is not None
     assert current.record == revised
+    receipt = store.load_receipt(revision_transaction_id)
+    assert receipt is not None
+    assert receipt["operation_digest"] == revision.operation_digest
+    restarted_after_commit = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        revision_transaction_id,
+        revision_binding.participant_id,
+        revision_binding.operation_digest,
+        event_id=REVISION_EVENT_ID,
+        processing_sequence=2,
+    )
+    assert restarted_after_commit.finalize(revision_binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    revision_two_record = ExperienceRevisionRecord(
+        initial.experience_id,
+        2,
+        ExperienceRevisionOperation.REASSESS,
+        ExperienceRevisionReason.REASSESSMENT,
+        NOW,
+        "event:3",
+        3,
+        evidence_refs=("event:3",),
+        previous_revision_digest=revision_record.record_digest,
+    )
+    revised_twice = replace(
+        revised,
+        revision=2,
+        revision_history=(genesis, revision_record, revision_two_record),
+    )
+    store.publish_revision(
+        revised_twice,
+        "4" * 64,
+        participant.operation.source_episode_operation_digest,
+        expected_revision=1,
+        expected_digest=experience_record_digest(revised),
+    )
+    historical = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        revision_transaction_id,
+        revision_binding.participant_id,
+        revision_binding.operation_digest,
+        event_id=REVISION_EVENT_ID,
+        processing_sequence=2,
+    )
+    assert historical.finalize(revision_binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    historical_create = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=EVENT_ID,
+        processing_sequence=1,
+    )
+    assert historical_create.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
     with pytest.raises(ParticipantDivergedError):
         rebuilt.abort(revision_binding)
