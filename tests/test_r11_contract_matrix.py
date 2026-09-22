@@ -73,6 +73,8 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
         "tests/test_bootstrap_config.py::test_value_seed_ids_must_be_unique; "
         "tests/test_value_system.py::test_scalar_bounds_are_strict; "
         "tests/test_value_system.py::test_revision_requires_a_nonnegative_exact_integer; "
+        "tests/test_value_system.py::test_authoritative_value_ids_are_unique; "
+        "tests/test_value_system.py::test_revision_history_rejects_duplicate_and_non_monotonic_sequences; "
         "tests/test_value_system.py::test_refs_conflicts_and_non_authoritative_types; "
         "tests/test_value_system.py::test_restore_rejects_current_history_and_ledger_inconsistency; "
         "tests/test_value_system.py::test_restore_rejects_surplus_ledger_ref_with_exact_digest_witness; "

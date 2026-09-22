@@ -355,6 +355,35 @@ def test_revision_requires_a_nonnegative_exact_integer(revision: object) -> None
     assert _value(revision=0).revision == 0
 
 
+def test_authoritative_value_ids_are_unique() -> None:
+    with pytest.raises(ValueDomainError, match="Value IDs must be unique"):
+        ValueSystem((_value(), _value(name="different name")))
+
+
+def test_revision_history_rejects_duplicate_and_non_monotonic_sequences() -> None:
+    source = _restorable_system()
+    first, second = source.history("value-1").records
+
+    with pytest.raises(ValueError, match="previous-record link"):
+        ValueRevisionHistory("value-1", records=(first, first))
+
+    non_monotonic_state = replace(
+        second.after_state_projection,
+        revision=first.to_revision,
+    )
+    non_monotonic = replace(
+        second,
+        from_revision=first.from_revision,
+        to_revision=first.to_revision,
+        before_digest=first.before_digest,
+        after_state_projection=non_monotonic_state,
+        after_digest=value_state_digest(non_monotonic_state),
+        previous_record_digest=first.record_digest,
+    )
+    with pytest.raises(ValueError, match="revision"):
+        ValueRevisionHistory("value-1", records=(first, non_monotonic))
+
+
 @pytest.mark.parametrize("polarity", [True, 0, 1.0, "1"])
 def test_polarity_requires_exactly_negative_or_positive_one(polarity: object) -> None:
     with pytest.raises((TypeError, ValueError)):
