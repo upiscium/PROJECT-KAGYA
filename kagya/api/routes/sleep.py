@@ -25,9 +25,11 @@ def run_sleep(
     manager: SleepCycleManager = Depends(get_sleep_cycle_manager),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> SleepRunResponse:
-    result = cast(SleepCycleResult, execute(
-        runtime, AgentEventType.SLEEP, AgentEventSource.API_SLEEP_RUN, manager.run
-    ))
+    result = cast(
+        SleepCycleResult,
+        execute(runtime, AgentEventType.SLEEP, AgentEventSource.API_SLEEP_RUN, manager.run),
+    )
+    result = manager.complete_post_commit(result)
     return SleepRunResponse(
         selected_episode_ids=result.selected_episode_ids,
         semantic_memory_ids=result.semantic_memory_ids,

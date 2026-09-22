@@ -7,6 +7,7 @@ nothing about Chroma, prompts, model providers, or runtime state.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -309,8 +310,20 @@ class SemanticStore:
     def remove_receipt(self, transaction_id: str) -> None:
         self._remove_file(self.receipt_path(transaction_id), "Semantic receipt")
 
-    def prune_receipts(self, protected_transaction_id: str | None = None) -> None:
-        """Bound receipt retention without deleting protected/in-flight evidence."""
+    def prune_receipts(self, safe_transaction_ids: Iterable[str] = ()) -> None:
+        """Delete only receipts proven unnecessary by the Journal authority.
+
+        The Semantic store cannot determine whether a transaction may still be
+        recovered.  Callers therefore provide the transaction IDs for which a
+        durable participant outcome has already been recorded by EventJournal.
+        Every other receipt remains protected.  If the protected set is still
+        over the bound, the store fails closed rather than guessing which
+        recovery evidence may be discarded.
+        """
+
+        safe_transaction_ids = frozenset(safe_transaction_ids)
+        for transaction_id in safe_transaction_ids:
+            self._validate_uuid(transaction_id)
 
         if not self._path_exists(self.receipts_root):
             return
@@ -327,10 +340,67 @@ class SemanticStore:
             self._validate_uuid(transaction_id)
             self._secure_file(path)
             receipts.append((transaction_id, path))
-        if len(receipts) <= SEMANTIC_MAX_RECEIPTS:
-            return
-        del protected_transaction_id
-        raise SemanticStoreUnavailable("Semantic receipt retention is exhausted")
+        retired = tuple(
+            (transaction_id, path)
+            for transaction_id, path in receipts
+            if transaction_id in safe_transaction_ids
+        )
+        if retired:
+            directory_fd = self._directory_fd(self.receipts_root)
+            try:
+                for _transaction_id, path in retired:
+                    try:
+                        os.unlink(path.name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        continue
+                os.fsync(directory_fd)
+            except OSError as error:
+                raise SemanticStoreUnavailable(
+                    "Semantic receipt retirement is unavailable"
+                ) from error
+            finally:
+                os.close(directory_fd)
+        remaining = len(receipts) - len(retired)
+        if remaining > SEMANTIC_MAX_RECEIPTS:
+            raise SemanticStoreUnavailable("Semantic receipt retention is exhausted")
+
+    def iter_current(self) -> tuple[SemanticStoredEntry, ...]:
+        """Return every verified current Semantic authority entry.
+
+        This enumeration is intentionally rooted in the private authority
+        filesystem.  DB2 is never used to discover Semantic identities.
+        """
+
+        if not self._path_exists(self.records_root):
+            return ()
+        self._secure_parent(self.records_root, create=False)
+        try:
+            paths = tuple(self.records_root.iterdir())
+        except OSError as error:
+            raise SemanticStoreUnavailable("Semantic records are unavailable") from error
+        entries: list[SemanticStoredEntry] = []
+        for path in paths:
+            try:
+                status = path.lstat()
+            except OSError as error:
+                raise SemanticStoreUnavailable(
+                    "Semantic record identity is unavailable"
+                ) from error
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or status.st_uid != os.geteuid()
+                or stat.S_IMODE(status.st_mode) != 0o700
+            ):
+                raise SemanticStoreCorrupt("Semantic record directory is unsafe")
+            try:
+                self._validate_identifier(path.name)
+            except ValueError:
+                raise SemanticStoreCorrupt("Semantic record identity is invalid") from None
+            current = self.load_current(path.name)
+            if current is None:
+                raise SemanticStoreCorrupt("Semantic record authority is absent")
+            entries.append(current)
+        return tuple(sorted(entries, key=lambda entry: entry.revision.semantic_id))
 
     def load_current(self, semantic_id: str) -> SemanticStoredEntry | None:
         self._validate_identifier(semantic_id)

@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,13 @@ from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
 from kagya.memory.dual_memory_system import SemanticMemoryFormatError
 from kagya.memory.semantic_store import SemanticStore
+from kagya.memory.semantic_lifecycle import (
+    SemanticLifecycle,
+    SemanticRevision,
+    SemanticRevisionOperation,
+    SemanticRevisionReason,
+    semantic_content_digest,
+)
 from kagya.models import DummyProvider
 from kagya.runtime import (
     AgentEvent,
@@ -20,6 +28,17 @@ from kagya.runtime import (
     TransactionCoordinator,
     TransactionKind,
 )
+from kagya.runtime.event_journal import (
+    EventLifecycle,
+    EventJournalTransaction,
+    ParticipantCapability,
+    ParticipantOutcome,
+    ParticipantRequirement,
+)
+from kagya.runtime.semantic_receipt_retention import (
+    SemanticReceiptRetentionCoordinator,
+)
+from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -165,3 +184,105 @@ def test_sleep_persists_visible_semantic_only_and_never_reruns_model(
     assert PRIVATE_SENTINEL not in db2
     assert PRIVATE_SENTINEL not in current.revision.semantic_content
     assert "Extract one concise semantic memory" not in receipt
+
+
+def test_terminal_startup_reconciles_missing_projection_from_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    event = _event()
+    semantic_id = "semantic-startup-repair"
+    revision = SemanticRevision(
+        semantic_id=semantic_id,
+        revision=0,
+        semantic_content="authoritative startup semantic",
+        content_digest=semantic_content_digest("authoritative startup semantic"),
+        created_at=event.requested_at,
+        lifecycle=SemanticLifecycle.ACTIVE,
+        source_edges=(),
+        operation=SemanticRevisionOperation.CREATE,
+        reason=SemanticRevisionReason.CREATION,
+        event_id=event.event_id,
+        event_sequence=event.processing_sequence or 0,
+    )
+    operation_digest = "a" * 64
+    store.publish_create(revision, operation_digest)
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    transaction = EventJournalTransaction(
+        transaction_id=transaction_id,
+        event_id=event.event_id,
+        event_type=event.event_type,
+        source=event.source,
+        processing_sequence=event.processing_sequence or 0,
+        kind=TransactionKind.EVENT_MUTATION,
+        required_participants=(
+            ParticipantRequirement(
+                participant_id="memory.semantic",
+                operation_digest=operation_digest,
+                capabilities=(
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.INSPECT_RECONCILE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+        participant_outcomes=(
+            ("memory.semantic", ParticipantOutcome.FINALIZED),
+        ),
+        terminal_lifecycle=EventLifecycle.TRANSACTION_COMPLETED,
+    )
+    journal = SimpleNamespace(
+        inspect=lambda: SimpleNamespace(
+            completed_transactions=(transaction,), reconciled_transactions=()
+        )
+    )
+    coordinator = StartupReconciliationCoordinator(
+        journal, object(), memory, semantic_store=store  # type: ignore[arg-type]
+    )
+
+    assert coordinator.reconcile_terminal_semantic_projections() == (True, None)
+    assert memory.get_committed_semantic(semantic_id) is not None
+
+
+def test_receipt_cleanup_requires_terminal_participant_evidence(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    transaction_id = "55555555-5555-4555-8555-555555555555"
+    operation_digest = "b" * 64
+    store.write_receipt(
+        transaction_id,
+        {"transaction_id": transaction_id, "operation_digest": operation_digest},
+    )
+    event = _event()
+    transaction = EventJournalTransaction(
+        transaction_id=transaction_id,
+        event_id=event.event_id,
+        event_type=event.event_type,
+        source=event.source,
+        processing_sequence=event.processing_sequence or 0,
+        kind=TransactionKind.EVENT_MUTATION,
+        required_participants=(
+            ParticipantRequirement(
+                participant_id="memory.semantic",
+                operation_digest=operation_digest,
+                capabilities=(
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+        participant_outcomes=(("memory.semantic", ParticipantOutcome.FINALIZED),),
+    )
+    journal = SimpleNamespace(
+        inspect=lambda: SimpleNamespace(
+            completed_transactions=(transaction,), reconciled_transactions=()
+        )
+    )
+
+    SemanticReceiptRetentionCoordinator(journal, store).before_prepare()  # type: ignore[arg-type]
+
+    assert store.load_receipt(transaction_id) is None

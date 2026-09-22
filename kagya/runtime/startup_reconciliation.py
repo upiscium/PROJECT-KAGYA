@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid5
 
-from kagya.memory.dual_memory_system import DualMemorySystem
+from kagya.memory.dual_memory_system import (
+    DualMemorySystem,
+    SemanticMemoryFormatError,
+    SemanticMemoryReadError,
+    SemanticProjectionStatus,
+)
 from kagya.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     MemoryEpisodicParticipant,
@@ -25,7 +30,7 @@ from kagya.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
     MemorySemanticParticipant,
 )
-from kagya.memory.semantic_store import SemanticStore
+from kagya.memory.semantic_store import SemanticStore, SemanticStoreError
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -142,6 +147,64 @@ class StartupReconciliationCoordinator:
                 UnsupportedParticipantReconciliationError,
             ):
                 return False, "external_participant_reconciliation_required"
+        return True, None
+
+    def reconcile_terminal_semantic_projections(self) -> tuple[bool, str | None]:
+        """Reconcile DB2 only from terminal, Journal-proven Semantic authority."""
+
+        try:
+            entries = self.semantic_store.iter_current()
+            inspection = self.journal.inspect()
+        except SemanticStoreError:
+            return False, "semantic_authority_unavailable"
+
+        terminal_transactions = (
+            *inspection.completed_transactions,
+            *inspection.reconciled_transactions,
+        )
+        for entry in entries:
+            matching = []
+            for transaction in terminal_transactions:
+                if (
+                    transaction.event_id != entry.revision.event_id
+                    or transaction.processing_sequence != entry.revision.event_sequence
+                ):
+                    continue
+                requirement = next(
+                    (
+                        item
+                        for item in transaction.required_participants
+                        if item.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+                    ),
+                    None,
+                )
+                if requirement is None or requirement.operation_digest != entry.operation_digest:
+                    continue
+                if not any(
+                    participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+                    for participant_id, _outcome in transaction.participant_outcomes
+                ):
+                    continue
+                matching.append(transaction)
+            if len(matching) != 1:
+                return False, "semantic_terminal_proof_unavailable"
+            try:
+                inspection_result = self.memory.inspect_semantic_projection(
+                    entry.revision.semantic_id, entry.revision, self.semantic_store
+                )
+                if inspection_result.status is SemanticProjectionStatus.DIVERGENT:
+                    return False, "semantic_projection_diverged"
+                if inspection_result.status in {
+                    SemanticProjectionStatus.MISSING,
+                    SemanticProjectionStatus.REPAIRABLE_STALE,
+                }:
+                    self.memory.project_semantic_revision(
+                        entry.revision, self.semantic_store
+                    )
+            except SemanticMemoryFormatError:
+                return False, "semantic_projection_diverged"
+            except SemanticMemoryReadError:
+                return False, "semantic_projection_unavailable"
         return True, None
 
     def ensure_adoption_baseline(

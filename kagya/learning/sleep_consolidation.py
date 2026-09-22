@@ -1,6 +1,7 @@
 """Sleep-time consolidation and learning cycle."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from threading import RLock
 
 from kagya.config import Settings
 from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry
@@ -75,6 +76,7 @@ class SleepCycleManager:
             memory_system.settings.memory.persist_directory
         )
         self._runtime: AgentRuntime | None = None
+        self._learning_lock = RLock()
 
     def bind_runtime(self, runtime: AgentRuntime) -> None:
         if self._runtime is not None and self._runtime is not runtime:
@@ -91,16 +93,6 @@ class SleepCycleManager:
         if len(episodes) > 128:
             raise ValueError("Semantic batch exceeds its bounded entry limit")
         semantic_plan = self._generate_semantic_memories(episodes, event)
-        self.dream_dataset_generator.generate(episodes, self.settings.sleep.dream_dataset_path)
-        training_result = self.qlora_trainer.train(self.settings.sleep.dream_dataset_path)
-        adapter_entry = self.adapter_registry.register_candidate(
-            adapter_id=training_result.adapter_id,
-            adapter_path=training_result.adapter_path,
-            dataset_path=training_result.dataset_path,
-            dataset_hash=training_result.dataset_hash,
-            base_model=self.settings.model.primary_id,
-            notes="registered by sleep cycle dry-run" if training_result.dry_run else "registered by sleep cycle",
-        )
         result = SleepCycleResult(
             selected_episode_ids=[episode.id for episode in episodes],
             semantic_memory_ids=[
@@ -109,14 +101,59 @@ class SleepCycleManager:
                 )
                 for entry in semantic_plan.operation.entries
             ],
-            dream_dataset_path=str(self.settings.sleep.dream_dataset_path),
-            training_result=training_result,
-            adapter_entry=adapter_entry,
+            dream_dataset_path=None,
+            training_result=None,
+            adapter_entry=None,
         )
         return CoordinatedResult(
             TransactionBoundValue(lambda _transaction_id: result),
             (semantic_plan,),
         )
+
+    def complete_post_commit(self, result: SleepCycleResult) -> SleepCycleResult:
+        """Run non-transactional learning only after Semantic commit succeeds.
+
+        Semantic publication is the durable transaction authority.  Dataset
+        generation, training, and candidate registration are deliberately a
+        serialized follow-up workflow because their files are not rollbackable
+        transaction participants.
+        """
+
+        if not result.selected_episode_ids:
+            return result
+        if result.training_result is not None or result.adapter_entry is not None:
+            return result
+        with self._learning_lock:
+            episodes: list[EpisodicMemoryRecord] = []
+            for episode_id in result.selected_episode_ids:
+                committed = self.memory_system.get_committed_episodic(episode_id)
+                if committed is None:
+                    raise RuntimeError("Selected Sleep episode is no longer authoritative")
+                episodes.append(committed.record)
+            self.dream_dataset_generator.generate(
+                episodes, self.settings.sleep.dream_dataset_path
+            )
+            training_result = self.qlora_trainer.train(
+                self.settings.sleep.dream_dataset_path
+            )
+            adapter_entry = self.adapter_registry.register_candidate(
+                adapter_id=training_result.adapter_id,
+                adapter_path=training_result.adapter_path,
+                dataset_path=training_result.dataset_path,
+                dataset_hash=training_result.dataset_hash,
+                base_model=self.settings.model.primary_id,
+                notes=(
+                    "registered by sleep cycle dry-run"
+                    if training_result.dry_run
+                    else "registered by sleep cycle"
+                ),
+            )
+            return replace(
+                result,
+                dream_dataset_path=str(self.settings.sleep.dream_dataset_path),
+                training_result=training_result,
+                adapter_entry=adapter_entry,
+            )
 
     def select_high_emotion_episodes(self) -> list[EpisodicMemoryRecord]:
         episodes = self.memory_system._get_unarchived_episodic_records()

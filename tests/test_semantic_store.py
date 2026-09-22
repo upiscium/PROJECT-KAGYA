@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -12,8 +13,10 @@ from kagya.memory.semantic_lifecycle import (
     semantic_content_digest,
 )
 from kagya.memory.semantic_store import (
+    SEMANTIC_MAX_RECEIPTS,
     SemanticStore,
     SemanticStoreCorrupt,
+    SemanticStoreUnavailable,
     semantic_revision_from_dict,
     semantic_revision_to_dict,
 )
@@ -100,3 +103,35 @@ def test_store_rejects_unknown_revision_artifact(tmp_path: Path) -> None:
 
     with pytest.raises(SemanticStoreCorrupt):
         store.load_current(revision.semantic_id)
+
+
+def test_iter_current_enumerates_only_verified_authority(tmp_path: Path) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    first = _revision("semantic:first", 0)
+    second = _revision("semantic:second", 0)
+    store.publish_create(first, "a" * 64)
+    store.publish_create(second, "b" * 64)
+
+    entries = store.iter_current()
+
+    assert tuple(entry.revision.semantic_id for entry in entries) == (
+        "semantic:first",
+        "semantic:second",
+    )
+
+
+def test_receipt_retirement_is_proof_bound_and_clears_capacity(tmp_path: Path) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    transaction_ids = tuple(
+        str(uuid5(NAMESPACE_URL, f"receipt-{index}"))
+        for index in range(SEMANTIC_MAX_RECEIPTS + 1)
+    )
+    for transaction_id in transaction_ids:
+        store.write_receipt(transaction_id, {"transaction_id": transaction_id})
+
+    with pytest.raises(SemanticStoreUnavailable):
+        store.prune_receipts()
+
+    store.prune_receipts(transaction_ids)
+
+    assert tuple(store.receipts_root.iterdir()) == ()

@@ -168,6 +168,12 @@ def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> Non
     result_value = result.value.materialize(transaction_id)
     assert len(result_value.selected_episode_ids) == 1
     assert len(result_value.semantic_memory_ids) == 1
+    assert result_value.training_result is None
+    assert result_value.adapter_entry is None
+    assert not settings.sleep.dream_dataset_path.exists()
+    assert registry.list() == []
+
+    result_value = manager.complete_post_commit(result_value)
     assert result_value.training_result is not None
     assert result_value.adapter_entry is not None
     assert result_value.adapter_entry.status == AdapterStatus.CANDIDATE

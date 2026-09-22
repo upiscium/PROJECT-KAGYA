@@ -456,7 +456,6 @@ class MemorySemanticParticipant:
         for entry in self.operation.entries:
             self._project_entry(entry)
         self._remove_pending(binding.transaction_id)
-        self._prune_receipts(binding.transaction_id)
         return (
             ParticipantOutcome.ALREADY_CONSISTENT
             if already_consistent
@@ -686,15 +685,6 @@ class MemorySemanticParticipant:
             raise ParticipantDivergedError(str(error)) from None
         except SemanticStoreUnavailable as error:
             raise ParticipantUnavailableError(str(error)) from None
-
-    def _prune_receipts(self, transaction_id: str) -> None:
-        try:
-            self.store.prune_receipts(transaction_id)
-        except (SemanticStoreCorrupt, SemanticStoreConflict) as error:
-            raise ParticipantDivergedError(str(error)) from None
-        except SemanticStoreUnavailable as error:
-            raise ParticipantUnavailableError(str(error)) from None
-
 
 __all__ = [
     "MEMORY_SEMANTIC_PARTICIPANT_ID",
