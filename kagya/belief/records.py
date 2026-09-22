@@ -118,6 +118,12 @@ def _bounded_int(value: object, name: str, *, maximum: int) -> int:
     return value
 
 
+def _positive_int(value: object, name: str, *, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be a positive bounded exact integer")
+    return value
+
+
 def _fraction(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a finite number")
@@ -343,7 +349,7 @@ class BeliefSubjectAdmission:
         object.__setattr__(
             self,
             "event_sequence",
-            _bounded_int(
+            _positive_int(
                 self.event_sequence,
                 "event_sequence",
                 maximum=BELIEF_MAX_EVENT_SEQUENCE,
@@ -425,6 +431,8 @@ def build_conflict_candidate(
 ) -> BeliefConflictCandidate | None:
     if not isinstance(left, BeliefProposition) or not isinstance(right, BeliefProposition):
         raise TypeError("conflict candidates require BeliefProposition values")
+    if left.proposition_digest == right.proposition_digest:
+        return None
     left_contexts = _context_scope(left_context_scope, "left_context_scope")
     right_contexts = _context_scope(right_context_scope, "right_context_scope")
     if not all(
@@ -492,6 +500,10 @@ class BeliefRevisionRecord:
         _enum(self.operation, BeliefRevisionOperation, "operation")
         _enum(self.reason, BeliefRevisionReason, "reason")
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "created_at"))
+        if self.revision == 0 and self.previous_revision_digest is not None:
+            raise ValueError("genesis revision cannot have a previous digest")
+        if self.revision > 0 and self.previous_revision_digest is None:
+            raise ValueError("non-genesis revision requires a previous digest")
         if self.previous_revision_digest is not None:
             _digest(self.previous_revision_digest, "previous_revision_digest")
         object.__setattr__(self, "record_digest", recompute_revision_digest(self))
@@ -568,11 +580,14 @@ class BeliefRecord:
             if self.valid_until < self.valid_from:
                 raise ValueError("valid_until cannot precede valid_from")
         object.__setattr__(self, "evidence", canonicalize_evidence(self.evidence))
+        evidence_refs = tuple(item.evidence_ref for item in self.evidence)
         if self.subject_admission is not None:
             if not isinstance(self.subject_admission, BeliefSubjectAdmission):
                 raise TypeError("subject_admission must be BeliefSubjectAdmission")
             if self.subject_admission.proposition_digest != self.proposition.proposition_digest:
                 raise ValueError("subject_admission proposition mismatch")
+            if evidence_refs != self.subject_admission.evidence_refs:
+                raise ValueError("subject admission evidence does not match record evidence")
         if self.lifecycle is BeliefLifecycle.ADOPTED and self.subject_admission is None:
             raise ValueError("adopted Beliefs require subject admission")
         object.__setattr__(
@@ -585,6 +600,13 @@ class BeliefRecord:
             "superseded_by_id",
             _optional_identifier(self.superseded_by_id, "superseded_by_id"),
         )
+        if self.supersedes_id == self.belief_id or self.superseded_by_id == self.belief_id:
+            raise ValueError("a Belief cannot supersede itself")
+        if self.lifecycle is BeliefLifecycle.SUPERSEDED:
+            if self.superseded_by_id is None:
+                raise ValueError("superseded Beliefs require superseded_by_id")
+        elif self.superseded_by_id is not None:
+            raise ValueError("only superseded Beliefs may name a successor")
         object.__setattr__(
             self,
             "revision",
@@ -596,6 +618,8 @@ class BeliefRecord:
             raise ValueError("revision_history exceeds its bound")
         if self.revision == 0 and self.revision_history:
             raise ValueError("revision zero cannot retain prior revisions")
+        if self.revision == 0 and self.history_anchor_digest is not None:
+            raise ValueError("revision zero cannot retain a history anchor")
         if self.revision > 0 and not self.revision_history and self.history_anchor_digest is None:
             raise ValueError("nonzero revision requires history or an anchor")
         previous: BeliefRevisionRecord | None = None
@@ -683,6 +707,13 @@ def _record_fields(record: BeliefRecord) -> dict[str, object]:
         "history_anchor_digest": record.history_anchor_digest,
         "lifecycle": record.lifecycle.value,
         "proposition_digest": record.proposition.proposition_digest,
+        "structured_projection": None
+        if record.proposition.structured_projection is None
+        else {
+            "object": record.proposition.object,
+            "predicate": record.proposition.predicate,
+            "subject": record.proposition.subject,
+        },
         "revision": record.revision,
         "revision_history": [item.record_digest for item in record.revision_history],
         "schema_version": record.schema_version,

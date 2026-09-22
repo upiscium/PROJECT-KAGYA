@@ -12,8 +12,12 @@ from kagya.belief import (
     BeliefLifecycle,
     BeliefProposition,
     BeliefRecord,
+    BeliefRevisionOperation,
+    BeliefRevisionReason,
+    BeliefRevisionRecord,
     BeliefSubjectAdmission,
     EpistemicStatus,
+    belief_record_digest,
     build_conflict_candidate,
     is_conflict_candidate,
 )
@@ -46,6 +50,13 @@ def test_structured_projection_is_optional_and_not_identity() -> None:
         BeliefProposition("partial", subject="Alice")
     with pytest.raises(ValueError):
         BeliefProposition("component", "a", "p", "x" * 257)
+
+
+def test_same_identity_with_different_projection_is_not_a_conflict() -> None:
+    left = BeliefProposition("same", "Alice", "likes", "tea")
+    right = BeliefProposition("same", "Alice", "likes", "coffee")
+    assert left.proposition_digest == right.proposition_digest
+    assert build_conflict_candidate(left, right) is None
 
 
 def test_conflict_candidate_is_a_pure_hint_only() -> None:
@@ -81,6 +92,22 @@ def test_admission_is_reference_only_and_has_stable_digest() -> None:
             3,
             AdmissionReason.SUBJECT_ENDORSEMENT,
         )
+    with pytest.raises(ValueError):
+        BeliefSubjectAdmission(
+            proposition.proposition_digest,
+            ("event:1",),
+            "event:2",
+            0,
+            AdmissionReason.SUBJECT_ENDORSEMENT,
+        )
+    with pytest.raises(ValueError):
+        BeliefSubjectAdmission(
+            proposition.proposition_digest,
+            ("event:1",),
+            "event:2",
+            True,  # type: ignore[arg-type]
+            AdmissionReason.SUBJECT_ENDORSEMENT,
+        )
 
 
 def test_external_evidence_does_not_adopt_a_belief() -> None:
@@ -112,10 +139,54 @@ def test_adopted_uncertain_is_valid_but_not_ordinary_active() -> None:
         BeliefLifecycle.ADOPTED,
         EpistemicStatus.UNCERTAIN,
         0.5,
+        evidence=(BeliefEvidence("event:1", BeliefEvidenceType.EXPERIENCE),),
         subject_admission=admission,
     )
     assert not record.is_active
     assert not record.is_ordinary_active()
+
+
+def test_adopted_admission_evidence_must_exactly_match_record_evidence() -> None:
+    proposition = BeliefProposition("claim")
+    admission = BeliefSubjectAdmission(
+        proposition.proposition_digest,
+        ("event:1",),
+        "event:2",
+        3,
+        AdmissionReason.SUBJECT_ENDORSEMENT,
+    )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.ADOPTED,
+            EpistemicStatus.PROBABLE,
+            0.5,
+            subject_admission=admission,
+        )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.ADOPTED,
+            EpistemicStatus.PROBABLE,
+            0.5,
+            evidence=(
+                BeliefEvidence("event:1", BeliefEvidenceType.EXPERIENCE),
+                BeliefEvidence("event:3", BeliefEvidenceType.EXPERIENCE),
+            ),
+            subject_admission=admission,
+        )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.ADOPTED,
+            EpistemicStatus.PROBABLE,
+            0.5,
+            evidence=(BeliefEvidence("event:3", BeliefEvidenceType.EXPERIENCE),),
+            subject_admission=admission,
+        )
 
 
 def test_ordinary_active_projection_is_bounded_and_pure() -> None:
@@ -175,3 +246,99 @@ def test_ordinary_active_projection_is_bounded_and_pure() -> None:
         replace(proposed, revision=2**31)
     with pytest.raises(ValueError):
         replace(proposed, revision=1)
+    with pytest.raises(ValueError):
+        replace(proposed, history_anchor_digest="0" * 64)
+
+
+def test_revision_records_and_genesis_anchors_are_strict() -> None:
+    genesis = BeliefRevisionRecord(
+        "belief:1",
+        0,
+        BeliefRevisionOperation.CREATE,
+        BeliefRevisionReason.CREATION,
+        NOW,
+    )
+    with pytest.raises(ValueError):
+        BeliefRevisionRecord(
+            "belief:1",
+            0,
+            BeliefRevisionOperation.CREATE,
+            BeliefRevisionReason.CREATION,
+            NOW,
+            previous_revision_digest="0" * 64,
+        )
+    with pytest.raises(ValueError):
+        BeliefRevisionRecord(
+            "belief:1",
+            1,
+            BeliefRevisionOperation.CORRECT,
+            BeliefRevisionReason.CORRECTION,
+            NOW,
+        )
+    corrected = BeliefRevisionRecord(
+        "belief:1",
+        1,
+        BeliefRevisionOperation.CORRECT,
+        BeliefRevisionReason.CORRECTION,
+        NOW,
+        previous_revision_digest=genesis.record_digest,
+    )
+    assert corrected.previous_revision_digest == genesis.record_digest
+
+
+def test_supersession_references_obey_local_lifecycle_invariants() -> None:
+    proposition = BeliefProposition("claim")
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.SUPERSEDED,
+            EpistemicStatus.PROBABLE,
+            0.5,
+        )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.PROPOSED,
+            EpistemicStatus.UNKNOWN,
+            0.5,
+            superseded_by_id="belief:2",
+        )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.SUPERSEDED,
+            EpistemicStatus.PROBABLE,
+            0.5,
+            superseded_by_id="belief:1",
+        )
+    with pytest.raises(ValueError):
+        BeliefRecord(
+            "belief:1",
+            proposition,
+            BeliefLifecycle.PROPOSED,
+            EpistemicStatus.UNKNOWN,
+            0.5,
+            supersedes_id="belief:1",
+        )
+
+
+def test_whole_record_digest_binds_projection_but_not_proposition_identity() -> None:
+    plain = BeliefRecord(
+        "belief:1",
+        BeliefProposition("same"),
+        BeliefLifecycle.PROPOSED,
+        EpistemicStatus.UNKNOWN,
+        0.5,
+    )
+    projected = BeliefRecord(
+        "belief:1",
+        BeliefProposition("same", "Alice", "likes", "tea"),
+        BeliefLifecycle.PROPOSED,
+        EpistemicStatus.UNKNOWN,
+        0.5,
+    )
+    assert plain.proposition.proposition_digest == projected.proposition.proposition_digest
+    assert belief_record_digest(plain) != belief_record_digest(projected)

@@ -5,10 +5,13 @@ from datetime import UTC, datetime
 import pytest
 
 from kagya.memory.semantic_lifecycle import (
+    SEMANTIC_MAX_EVENT_SEQUENCE,
     SEMANTIC_MAX_SOURCE_EDGES,
     SemanticLifecycle,
     SemanticProvenanceClass,
     SemanticRevision,
+    SemanticRevisionOperation,
+    SemanticRevisionReason,
     SemanticSourceEdge,
     SemanticSourceKind,
     SemanticSourceStatus,
@@ -26,10 +29,13 @@ def edge(
     source_id: str,
     context_id: str | None,
     status: SemanticSourceStatus = SemanticSourceStatus.AVAILABLE,
+    kind: SemanticSourceKind = SemanticSourceKind.EPISODIC,
+    source_revision: int | None = None,
 ) -> SemanticSourceEdge:
     return SemanticSourceEdge(
-        source_kind=SemanticSourceKind.EPISODIC,
+        source_kind=kind,
         source_id=source_id,
+        source_revision=source_revision,
         captured_context_id=context_id,
         source_status=status,
     )
@@ -81,6 +87,25 @@ def test_source_edges_are_canonical_and_conflicting_duplicates_fail() -> None:
                 for index in range(SEMANTIC_MAX_SOURCE_EDGES + 1)
             ),
         )
+
+
+def test_source_kind_requires_the_matching_source_revision_shape() -> None:
+    with pytest.raises(ValueError):
+        edge("semantic:source", "context:x", kind=SemanticSourceKind.SEMANTIC)
+    with pytest.raises(ValueError):
+        edge(
+            "episode:source",
+            "context:x",
+            kind=SemanticSourceKind.EPISODIC,
+            source_revision=1,
+        )
+    semantic = edge(
+        "semantic:source",
+        "context:x",
+        kind=SemanticSourceKind.SEMANTIC,
+        source_revision=1,
+    )
+    assert semantic.source_revision == 1
 
 
 @pytest.mark.parametrize(
@@ -136,6 +161,13 @@ def test_provenance_classification_preserves_source_count(
 def test_revision_digest_is_order_independent_and_immutable() -> None:
     first = edge("episode:a", "context:x")
     second = edge("episode:b", "context:y")
+    genesis = SemanticRevision(
+        "semantic:1",
+        0,
+        "fact",
+        semantic_content_digest("fact"),
+        CREATED_AT,
+    )
     left = SemanticRevision(
         "semantic:1",
         1,
@@ -144,6 +176,9 @@ def test_revision_digest_is_order_independent_and_immutable() -> None:
         CREATED_AT,
         source_edges=(first, second),
         lifecycle=SemanticLifecycle.ACTIVE,
+        operation=SemanticRevisionOperation.CORRECT,
+        reason=SemanticRevisionReason.CORRECTION,
+        previous_revision_digest=genesis.revision_digest,
     )
     right = SemanticRevision(
         "semantic:1",
@@ -153,6 +188,9 @@ def test_revision_digest_is_order_independent_and_immutable() -> None:
         CREATED_AT,
         source_edges=(second, first),
         lifecycle=SemanticLifecycle.ACTIVE,
+        operation=SemanticRevisionOperation.CORRECT,
+        reason=SemanticRevisionReason.CORRECTION,
+        previous_revision_digest=genesis.revision_digest,
     )
     assert left.revision_digest == right.revision_digest
     assert validate_revision_digest(left) == left.revision_digest
@@ -162,3 +200,95 @@ def test_revision_digest_is_order_independent_and_immutable() -> None:
         SemanticRevision("semantic:1", 0, "fact", "0" * 64, CREATED_AT)
     with pytest.raises(ValueError):
         SemanticRevision("semantic:1", 2**31, "fact", semantic_content_digest("fact"), CREATED_AT)
+
+
+def test_revision_chain_event_binding_and_compatibility_are_strict() -> None:
+    genesis = SemanticRevision(
+        "semantic:1",
+        0,
+        "fact",
+        semantic_content_digest("fact"),
+        CREATED_AT,
+    )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            0,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            previous_revision_digest="0" * 64,
+        )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            1,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            operation=SemanticRevisionOperation.CORRECT,
+            reason=SemanticRevisionReason.CORRECTION,
+        )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            1,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            operation=SemanticRevisionOperation.CORRECT,
+            reason=SemanticRevisionReason.CORRECTION,
+            previous_revision_digest=genesis.revision_digest,
+            event_id="event:1",
+        )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            1,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            operation=SemanticRevisionOperation.CORRECT,
+            reason=SemanticRevisionReason.CORRECTION,
+            previous_revision_digest=genesis.revision_digest,
+            event_id="event:1",
+            event_sequence=0,
+        )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            1,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            operation=SemanticRevisionOperation.CORRECT,
+            reason=SemanticRevisionReason.CORRECTION,
+            previous_revision_digest=genesis.revision_digest,
+            event_id="event:1",
+            event_sequence=SEMANTIC_MAX_EVENT_SEQUENCE + 1,
+        )
+    with pytest.raises(ValueError):
+        SemanticRevision(
+            "semantic:1",
+            1,
+            "fact",
+            semantic_content_digest("fact"),
+            CREATED_AT,
+            lifecycle=SemanticLifecycle.RETRACTED,
+            operation=SemanticRevisionOperation.CORRECT,
+            reason=SemanticRevisionReason.CORRECTION,
+            previous_revision_digest=genesis.revision_digest,
+        )
+    corrected = SemanticRevision(
+        "semantic:1",
+        1,
+        "fact",
+        semantic_content_digest("fact"),
+        CREATED_AT,
+        operation=SemanticRevisionOperation.CORRECT,
+        reason=SemanticRevisionReason.CORRECTION,
+        previous_revision_digest=genesis.revision_digest,
+        event_id="event:1",
+        event_sequence=1,
+    )
+    assert corrected.event_id == "event:1"

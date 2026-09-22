@@ -77,10 +77,44 @@ SEMANTIC_SCHEMA_VERSION: Final = 1
 SEMANTIC_MAX_CONTENT_CODEPOINTS: Final = 16_384
 SEMANTIC_MAX_SOURCE_EDGES: Final = 64
 SEMANTIC_MAX_REVISION: Final = 2**31 - 1
+SEMANTIC_MAX_EVENT_SEQUENCE: Final = 2**63 - 1
 
 SEMANTIC_CONTENT_DOMAIN: Final = b"PROJECT-KAGYA:R12:SEMANTIC-CONTENT:V1\0"
 SEMANTIC_PROVENANCE_DOMAIN: Final = b"PROJECT-KAGYA:R12:SEMANTIC-PROVENANCE:V1\0"
 SEMANTIC_REVISION_DOMAIN: Final = b"PROJECT-KAGYA:R12:SEMANTIC-REVISION:V1\0"
+
+_SEMANTIC_REVISION_COMPATIBILITY = {
+    (
+        SemanticRevisionOperation.CREATE,
+        SemanticRevisionReason.CREATION,
+        SemanticLifecycle.ACTIVE,
+    ),
+    (
+        SemanticRevisionOperation.CORRECT,
+        SemanticRevisionReason.CORRECTION,
+        SemanticLifecycle.ACTIVE,
+    ),
+    (
+        SemanticRevisionOperation.SUPERSEDE,
+        SemanticRevisionReason.SUPERSESSION,
+        SemanticLifecycle.SUPERSEDED,
+    ),
+    (
+        SemanticRevisionOperation.RETRACT,
+        SemanticRevisionReason.RETRACTION,
+        SemanticLifecycle.RETRACTED,
+    ),
+    (
+        SemanticRevisionOperation.QUARANTINE,
+        SemanticRevisionReason.QUARANTINE,
+        SemanticLifecycle.QUARANTINED,
+    ),
+    (
+        SemanticRevisionOperation.ARCHIVE,
+        SemanticRevisionReason.ARCHIVAL,
+        SemanticLifecycle.ARCHIVED,
+    ),
+}
 
 
 def _enum(value: object, enum_type: type[Enum], name: str) -> Enum:
@@ -92,6 +126,12 @@ def _enum(value: object, enum_type: type[Enum], name: str) -> Enum:
 def _nonnegative_int(value: object, name: str, *, maximum: int) -> int:
     if type(value) is not int or not 0 <= value <= maximum:
         raise ValueError(f"{name} must be a bounded non-negative exact integer")
+    return value
+
+
+def _positive_int(value: object, name: str, *, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be a positive bounded exact integer")
     return value
 
 
@@ -167,6 +207,10 @@ class SemanticSourceEdge:
     def __post_init__(self) -> None:
         _enum(self.source_kind, SemanticSourceKind, "source_kind")
         object.__setattr__(self, "source_id", validate_identifier(self.source_id))
+        if self.source_kind is SemanticSourceKind.EPISODIC and self.source_revision is not None:
+            raise ValueError("episodic source edges cannot carry source_revision")
+        if self.source_kind is SemanticSourceKind.SEMANTIC and self.source_revision is None:
+            raise ValueError("semantic source edges require source_revision")
         if self.source_revision is not None:
             object.__setattr__(
                 self,
@@ -383,6 +427,17 @@ class SemanticRevision:
         _enum(self.lifecycle, SemanticLifecycle, "lifecycle")
         _enum(self.operation, SemanticRevisionOperation, "operation")
         _enum(self.reason, SemanticRevisionReason, "reason")
+        if (self.operation, self.reason, self.lifecycle) not in _SEMANTIC_REVISION_COMPATIBILITY:
+            raise ValueError("semantic operation, reason, and lifecycle are incompatible")
+        if self.revision == 0:
+            if self.previous_revision_digest is not None:
+                raise ValueError("genesis revision cannot have a previous digest")
+            if self.operation is not SemanticRevisionOperation.CREATE:
+                raise ValueError("genesis revision must be a creation")
+        elif self.previous_revision_digest is None:
+            raise ValueError("non-genesis revision requires a previous digest")
+        if self.operation is SemanticRevisionOperation.CREATE and self.revision != 0:
+            raise ValueError("creation is only valid for the genesis revision")
         edges = canonicalize_source_edges(self.source_edges)
         object.__setattr__(self, "source_edges", edges)
         provenance = provenance_for_edges(edges)
@@ -395,15 +450,17 @@ class SemanticRevision:
         object.__setattr__(self, "provenance", provenance)
         if self.previous_revision_digest is not None:
             _digest(self.previous_revision_digest, "previous_revision_digest")
+        if (self.event_id is None) != (self.event_sequence is None):
+            raise ValueError("event_id and event_sequence must be supplied together")
         object.__setattr__(self, "event_id", _optional_identifier(self.event_id, "event_id"))
         if self.event_sequence is not None:
             object.__setattr__(
                 self,
                 "event_sequence",
-                _nonnegative_int(
+                _positive_int(
                     self.event_sequence,
                     "event_sequence",
-                    maximum=SEMANTIC_MAX_REVISION,
+                    maximum=SEMANTIC_MAX_EVENT_SEQUENCE,
                 ),
             )
         object.__setattr__(self, "revision_digest", recompute_revision_digest(self))
@@ -474,6 +531,7 @@ SemanticMemoryRevision = SemanticRevision
 __all__ = [
     "SEMANTIC_CONTENT_DOMAIN",
     "SEMANTIC_MAX_CONTENT_CODEPOINTS",
+    "SEMANTIC_MAX_EVENT_SEQUENCE",
     "SEMANTIC_MAX_REVISION",
     "SEMANTIC_MAX_SOURCE_EDGES",
     "SEMANTIC_PROVENANCE_DOMAIN",

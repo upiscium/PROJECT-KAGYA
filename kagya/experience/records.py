@@ -16,17 +16,9 @@ import math
 import re
 from typing import Final
 
-from kagya.body import (
-    ArousalContributions,
-    EmotionState,
-    EmotionUpdate,
-    EmotionUpdateReasonCode,
-    ValenceContributions,
-)
+from kagya.body import EmotionState, EmotionUpdate
 from kagya.cognition import (
-    AppraisalReasonCode,
     AppraisalResult,
-    LossInvalidReason,
     LossMeasurement,
 )
 from kagya.identifiers import validate_identifier
@@ -37,6 +29,7 @@ EXPERIENCE_SALIENCE_VERSION: Final = 1
 EXPERIENCE_MAX_REVISIONS: Final = 32
 EXPERIENCE_MAX_REVISION: Final = 2**31 - 1
 EXPERIENCE_MAX_EVENT_SEQUENCE: Final = 2**63 - 1
+EXPERIENCE_MAX_REVISION_EVIDENCE: Final = 32
 _EXPERIENCE_DOMAIN: Final = b"PROJECT-KAGYA:R12:EXPERIENCE:V1\0"
 _EXPERIENCE_REVISION_DOMAIN: Final = b"PROJECT-KAGYA:R12:EXPERIENCE-REVISION:V1\0"
 _MODEL_KEY_PATTERN: Final = re.compile(r"model\.[0-9a-f]{64}\Z")
@@ -60,6 +53,38 @@ class ExperienceRevisionReason(str, Enum):
     CORRECTION = "correction"
     SUPERSESSION = "supersession"
     RETRACTION = "retraction"
+
+
+class ExperienceMeasurementInvalidReason(str, Enum):
+    """Frozen R10 measurement-invalid vocabulary stored by Experience V1."""
+
+    EMPTY_TARGET = "empty_target"
+    PROVIDER_ERROR = "provider_error"
+    NON_FINITE_LOSS = "non_finite_loss"
+
+
+class ExperienceAppraisalReasonCode(str, Enum):
+    """Frozen R10 appraisal-reason vocabulary stored by Experience V1."""
+
+    NOVELTY_MEASURED = "novelty_measured"
+    NOVELTY_INVALID = "novelty_invalid"
+    GOAL_PROGRESS = "goal_progress"
+    GOAL_SETBACK = "goal_setback"
+    THREAT = "threat"
+
+
+class ExperienceEmotionUpdateReasonCode(str, Enum):
+    """Frozen R10 emotion-update vocabulary stored by Experience V1."""
+
+    APPRAISAL_APPLIED = "appraisal_applied"
+    NOVELTY_OMITTED = "novelty_omitted"
+    TIME_RECOVERY = "time_recovery"
+    TIMELINE_INITIALIZED = "timeline_initialized"
+    NO_MATERIAL_APPRAISAL = "no_material_appraisal"
+
+
+ExperienceLossInvalidReason = ExperienceMeasurementInvalidReason
+ExperienceEmotionReasonCode = ExperienceEmotionUpdateReasonCode
 
 
 def _enum(value: object, enum_type: type[Enum], name: str) -> Enum:
@@ -97,6 +122,23 @@ def _optional_identifier(value: object, name: str) -> str | None:
         return validate_identifier(value)
     except (TypeError, ValueError) as error:
         raise type(error)(f"{name} must be a valid identifier") from error
+
+
+def _canonical_references(value: object, name: str) -> tuple[str, ...]:
+    if type(value) is not tuple or not value:
+        raise ValueError(f"{name} must be a non-empty tuple")
+    if len(value) > EXPERIENCE_MAX_REVISION_EVIDENCE:
+        raise ValueError(f"{name} exceeds its bound")
+    references = tuple(validate_identifier(item) for item in value)
+    if references != tuple(sorted(set(references))):
+        raise ValueError(f"{name} must be sorted and unique")
+    return references
+
+
+def _positive_int(value: object, name: str, *, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be a positive bounded exact integer")
+    return value
 
 
 def _utc_datetime(value: object, name: str) -> datetime:
@@ -157,7 +199,7 @@ class ExperienceMeasurementEvidence:
 
     model_key: str
     valid: bool
-    invalid_reason: LossInvalidReason | None = None
+    invalid_reason: ExperienceMeasurementInvalidReason | None = None
     calibrated_novelty: float | None = None
 
     def __post_init__(self) -> None:
@@ -175,8 +217,8 @@ class ExperienceMeasurementEvidence:
             )
             object.__setattr__(self, "calibrated_novelty", novelty)
         else:
-            if type(self.invalid_reason) is not LossInvalidReason:
-                raise ValueError("invalid evidence requires a closed invalid reason")
+            if type(self.invalid_reason) is not ExperienceMeasurementInvalidReason:
+                raise TypeError("invalid evidence requires a closed invalid reason")
             if self.calibrated_novelty is not None:
                 raise ValueError("invalid evidence cannot carry novelty")
 
@@ -184,10 +226,18 @@ class ExperienceMeasurementEvidence:
     def from_loss_measurement(cls, measurement: LossMeasurement) -> ExperienceMeasurementEvidence:
         if not isinstance(measurement, LossMeasurement):
             raise TypeError("measurement must be LossMeasurement")
+        invalid_reason = None
+        if measurement.invalid_reason is not None:
+            try:
+                invalid_reason = ExperienceMeasurementInvalidReason(
+                    measurement.invalid_reason.value
+                )
+            except (AttributeError, ValueError) as error:
+                raise ValueError("unsupported R10 measurement invalid reason") from error
         return cls(
             model_key=measurement.model_key,
             valid=measurement.valid,
-            invalid_reason=measurement.invalid_reason,
+            invalid_reason=invalid_reason,
             calibrated_novelty=measurement.calibrated_novelty,
         )
 
@@ -206,7 +256,7 @@ class ExperienceAppraisalEvidence:
     certainty: float | None = None
     social_relevance: float | None = None
     effort_cost: float | None = None
-    reason_codes: tuple[AppraisalReasonCode, ...] = ()
+    reason_codes: tuple[ExperienceAppraisalReasonCode, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.novelty_valid) is not bool:
@@ -217,17 +267,6 @@ class ExperienceAppraisalEvidence:
         if self.novelty_valid != (novelty is not None):
             raise ValueError("novelty and novelty_valid disagree")
         object.__setattr__(self, "novelty", novelty)
-        signals = AppraisalResult(
-            novelty=novelty,
-            novelty_valid=self.novelty_valid,
-            goal_progress=self.goal_progress,
-            threat=self.threat,
-            controllability=self.controllability,
-            certainty=self.certainty,
-            social_relevance=self.social_relevance,
-            effort_cost=self.effort_cost,
-            reasons=self.reason_codes,
-        )
         for name in (
             "goal_progress",
             "threat",
@@ -236,17 +275,29 @@ class ExperienceAppraisalEvidence:
             "social_relevance",
             "effort_cost",
         ):
-            object.__setattr__(self, name, getattr(signals, name))
-        _reasons(self.reason_codes, AppraisalReasonCode, "reason_codes")
+            lower, upper = (-1.0, 1.0) if name == "goal_progress" else (0.0, 1.0)
+            value = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                None if value is None else _finite(value, name, lower=lower, upper=upper),
+            )
+        _reasons(self.reason_codes, ExperienceAppraisalReasonCode, "reason_codes")
 
     @property
-    def reasons(self) -> tuple[AppraisalReasonCode, ...]:
+    def reasons(self) -> tuple[ExperienceAppraisalReasonCode, ...]:
         return self.reason_codes
 
     @classmethod
     def from_result(cls, result: AppraisalResult) -> ExperienceAppraisalEvidence:
         if not isinstance(result, AppraisalResult):
             raise TypeError("result must be AppraisalResult")
+        try:
+            reason_codes = tuple(
+                ExperienceAppraisalReasonCode(reason.value) for reason in result.reasons
+            )
+        except (AttributeError, ValueError) as error:
+            raise ValueError("unsupported R10 appraisal reason") from error
         return cls(
             novelty=result.novelty,
             novelty_valid=result.novelty_valid,
@@ -256,7 +307,7 @@ class ExperienceAppraisalEvidence:
             certainty=result.certainty,
             social_relevance=result.social_relevance,
             effort_cost=result.effort_cost,
-            reason_codes=result.reasons,
+            reason_codes=reason_codes,
         )
 
 
@@ -283,35 +334,102 @@ class ExperienceEmotionProjection:
 
 
 @dataclass(frozen=True, slots=True)
-class ExperienceEmotionContributions:
-    """Typed R10 contribution vectors with their existing bounds."""
+class ExperienceValenceContributions:
+    """Frozen R10 V1 valence contribution projection."""
 
-    valence_contributions: ValenceContributions = field(
-        default_factory=ValenceContributions
+    goal_progress: float = 0.0
+    threat: float = 0.0
+    effort_cost: float = 0.0
+    controllability: float = 0.0
+
+    def __post_init__(self) -> None:
+        bounds = {
+            "goal_progress": (-0.7, 0.7),
+            "threat": (-0.8, 0.0),
+            "effort_cost": (-0.3, 0.0),
+            "controllability": (-0.1, 0.1),
+        }
+        for name, (lower, upper) in bounds.items():
+            object.__setattr__(
+                self,
+                name,
+                _finite(getattr(self, name), name, lower=lower, upper=upper),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceArousalContributions:
+    """Frozen R10 V1 arousal contribution projection."""
+
+    novelty: float = 0.0
+    threat: float = 0.0
+    effort_cost: float = 0.0
+    social_relevance: float = 0.0
+    uncertainty: float = 0.0
+    low_controllability: float = 0.0
+
+    def __post_init__(self) -> None:
+        bounds = {
+            "novelty": (0.0, 0.6),
+            "threat": (0.0, 0.7),
+            "effort_cost": (0.0, 0.3),
+            "social_relevance": (0.0, 0.2),
+            "uncertainty": (0.0, 0.2),
+            "low_controllability": (0.0, 0.2),
+        }
+        for name, (lower, upper) in bounds.items():
+            object.__setattr__(
+                self,
+                name,
+                _finite(getattr(self, name), name, lower=lower, upper=upper),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceEmotionContributions:
+    """R12-owned contribution vectors frozen from the current R10 contract."""
+
+    valence_contributions: ExperienceValenceContributions = field(
+        default_factory=ExperienceValenceContributions
     )
-    arousal_contributions: ArousalContributions = field(
-        default_factory=ArousalContributions
+    arousal_contributions: ExperienceArousalContributions = field(
+        default_factory=ExperienceArousalContributions
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.valence_contributions, ValenceContributions):
-            raise TypeError("valence_contributions must be ValenceContributions")
-        if not isinstance(self.arousal_contributions, ArousalContributions):
-            raise TypeError("arousal_contributions must be ArousalContributions")
+        if not isinstance(self.valence_contributions, ExperienceValenceContributions):
+            raise TypeError("valence_contributions must be ExperienceValenceContributions")
+        if not isinstance(self.arousal_contributions, ExperienceArousalContributions):
+            raise TypeError("arousal_contributions must be ExperienceArousalContributions")
 
     @property
-    def valence(self) -> ValenceContributions:
+    def valence(self) -> ExperienceValenceContributions:
         return self.valence_contributions
 
     @property
-    def arousal(self) -> ArousalContributions:
+    def arousal(self) -> ExperienceArousalContributions:
         return self.arousal_contributions
 
     @classmethod
     def from_update(cls, update: EmotionUpdate) -> ExperienceEmotionContributions:
         if not isinstance(update, EmotionUpdate):
             raise TypeError("update must be EmotionUpdate")
-        return cls(update.valence_contributions, update.arousal_contributions)
+        return cls(
+            ExperienceValenceContributions(
+                goal_progress=update.valence_contributions.goal_progress,
+                threat=update.valence_contributions.threat,
+                effort_cost=update.valence_contributions.effort_cost,
+                controllability=update.valence_contributions.controllability,
+            ),
+            ExperienceArousalContributions(
+                novelty=update.arousal_contributions.novelty,
+                threat=update.arousal_contributions.threat,
+                effort_cost=update.arousal_contributions.effort_cost,
+                social_relevance=update.arousal_contributions.social_relevance,
+                uncertainty=update.arousal_contributions.uncertainty,
+                low_controllability=update.arousal_contributions.low_controllability,
+            ),
+        )
 
 
 def calculate_subjective_salience(
@@ -348,6 +466,9 @@ subjective_salience = calculate_subjective_salience
 def _revision_fields(record: ExperienceRevisionRecord) -> dict[str, object]:
     return {
         "created_at": _datetime_value(record.created_at),
+        "event_id": record.event_id,
+        "event_sequence": record.event_sequence,
+        "evidence_refs": list(record.evidence_refs),
         "experience_id": record.experience_id,
         "operation": record.operation.value,
         "previous_revision_digest": record.previous_revision_digest,
@@ -373,7 +494,10 @@ class ExperienceRevisionRecord:
     operation: ExperienceRevisionOperation
     reason: ExperienceRevisionReason
     created_at: datetime
+    evidence_refs: tuple[str, ...] = ()
     previous_revision_digest: str | None = None
+    event_id: str | None = None
+    event_sequence: int | None = None
     record_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -386,15 +510,37 @@ class ExperienceRevisionRecord:
         _enum(self.operation, ExperienceRevisionOperation, "operation")
         _enum(self.reason, ExperienceRevisionReason, "reason")
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "created_at"))
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _canonical_references(self.evidence_refs, "evidence_refs"),
+        )
+        if (self.event_id is None) != (self.event_sequence is None):
+            raise ValueError("event_id and event_sequence must be supplied together")
+        object.__setattr__(self, "event_id", _optional_identifier(self.event_id, "event_id"))
+        if self.event_sequence is not None:
+            object.__setattr__(
+                self,
+                "event_sequence",
+                _positive_int(
+                    self.event_sequence,
+                    "event_sequence",
+                    maximum=EXPERIENCE_MAX_EVENT_SEQUENCE,
+                ),
+            )
+        if self.revision == 0 and self.previous_revision_digest is not None:
+            raise ValueError("genesis revision cannot have a previous digest")
+        if self.revision > 0 and self.previous_revision_digest is None:
+            raise ValueError("non-genesis revision requires a previous digest")
         if self.previous_revision_digest is not None:
             _digest(self.previous_revision_digest, "previous_revision_digest")
         object.__setattr__(self, "record_digest", experience_revision_digest(self))
 
 
 def _emotion_reasons(
-    value: tuple[EmotionUpdateReasonCode, ...], name: str
-) -> tuple[EmotionUpdateReasonCode, ...]:
-    result = _reasons(value, EmotionUpdateReasonCode, name)
+    value: tuple[ExperienceEmotionUpdateReasonCode, ...], name: str
+) -> tuple[ExperienceEmotionUpdateReasonCode, ...]:
+    result = _reasons(value, ExperienceEmotionUpdateReasonCode, name)
     return result  # type: ignore[return-value]
 
 
@@ -504,14 +650,14 @@ class ExperienceRecord:
     source_event_id: str
     source_event_sequence: int
     source_episode_id: str
-    context_id: str | None
+    context_id: str
     measurement: ExperienceMeasurementEvidence
     appraisal: ExperienceAppraisalEvidence
     pre_appraisal_emotion: ExperienceEmotionProjection
-    temporal_update_reasons: tuple[EmotionUpdateReasonCode, ...]
+    temporal_update_reasons: tuple[ExperienceEmotionUpdateReasonCode, ...]
     post_appraisal_emotion: ExperienceEmotionProjection
     emotion_contributions: ExperienceEmotionContributions
-    emotion_update_reasons: tuple[EmotionUpdateReasonCode, ...]
+    emotion_update_reasons: tuple[ExperienceEmotionUpdateReasonCode, ...]
     subjective_salience: float
     created_at: datetime
     schema_version: int = EXPERIENCE_SCHEMA_VERSION
@@ -536,9 +682,7 @@ class ExperienceRecord:
             maximum=EXPERIENCE_MAX_EVENT_SEQUENCE,
         )
         validate_identifier(self.source_episode_id)
-        object.__setattr__(
-            self, "context_id", _optional_identifier(self.context_id, "context_id")
-        )
+        object.__setattr__(self, "context_id", validate_identifier(self.context_id))
         for name, expected in (
             ("measurement", ExperienceMeasurementEvidence),
             ("appraisal", ExperienceAppraisalEvidence),
@@ -587,6 +731,8 @@ class ExperienceRecord:
             raise ValueError("Experience revision history exceeds its bound")
         if self.revision == 0 and self.revision_history:
             raise ValueError("revision zero cannot retain prior revisions")
+        if self.revision == 0 and self.history_anchor_digest is not None:
+            raise ValueError("revision zero cannot retain a history anchor")
         if self.revision > 0 and not self.revision_history and self.history_anchor_digest is None:
             raise ValueError("nonzero revision requires history or an anchor")
         previous: ExperienceRevisionRecord | None = None
