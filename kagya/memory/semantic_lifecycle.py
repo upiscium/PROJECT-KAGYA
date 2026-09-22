@@ -281,6 +281,52 @@ def canonicalize_source_edges(
 canonical_source_edges = canonicalize_source_edges
 
 
+def _provenance_summary(
+    edges: tuple[SemanticSourceEdge, ...],
+) -> tuple[SemanticProvenanceClass, int, tuple[str, ...], int, int]:
+    known_contexts = tuple(
+        sorted(
+            {
+                edge.captured_context_id
+                for edge in edges
+                if edge.source_status is SemanticSourceStatus.AVAILABLE
+                and edge.captured_context_id is not None
+            }
+        )
+    )
+    unknown_count = sum(
+        edge.source_status is not SemanticSourceStatus.AVAILABLE
+        or edge.captured_context_id is None
+        for edge in edges
+    )
+    incomplete_count = sum(
+        edge.source_status
+        in {
+            SemanticSourceStatus.MISSING,
+            SemanticSourceStatus.RETRACTED,
+            SemanticSourceStatus.SUPERSEDED,
+        }
+        for edge in edges
+    )
+    if not edges:
+        classification = SemanticProvenanceClass.UNKNOWN
+    elif incomplete_count or (known_contexts and unknown_count):
+        classification = SemanticProvenanceClass.INCOMPLETE
+    elif not known_contexts:
+        classification = SemanticProvenanceClass.UNKNOWN
+    elif len(known_contexts) == 1:
+        classification = SemanticProvenanceClass.SINGLE_CONTEXT
+    else:
+        classification = SemanticProvenanceClass.MULTI_CONTEXT
+    return (
+        classification,
+        len(edges),
+        known_contexts,
+        unknown_count,
+        incomplete_count,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticProvenance:
     """Bounded classification evidence retained beside a source-edge set."""
@@ -290,31 +336,23 @@ class SemanticProvenance:
     known_context_ids: tuple[str, ...] = ()
     unknown_source_count: int = 0
     incomplete_source_count: int = 0
+    source_edges: tuple[SemanticSourceEdge, ...] = ()
     digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         _enum(self.classification, SemanticProvenanceClass, "classification")
-        _nonnegative_int(
+        edges = canonicalize_source_edges(self.source_edges)
+        expected = _provenance_summary(edges)
+        actual = (
+            self.classification,
             self.source_count,
-            "source_count",
-            maximum=SEMANTIC_MAX_SOURCE_EDGES,
+            self.known_context_ids,
+            self.unknown_source_count,
+            self.incomplete_source_count,
         )
-        if type(self.known_context_ids) is not tuple:
-            raise TypeError("known_context_ids must be a tuple")
-        contexts = tuple(validate_identifier(value) for value in self.known_context_ids)
-        if contexts != tuple(sorted(set(contexts))):
-            raise ValueError("known_context_ids must be sorted and unique")
-        object.__setattr__(self, "known_context_ids", contexts)
-        for name in ("unknown_source_count", "incomplete_source_count"):
-            _nonnegative_int(
-                getattr(self, name),
-                name,
-                maximum=SEMANTIC_MAX_SOURCE_EDGES,
-            )
-        if self.unknown_source_count > self.source_count:
-            raise ValueError("unknown_source_count exceeds source_count")
-        if self.incomplete_source_count > self.source_count:
-            raise ValueError("incomplete_source_count exceeds source_count")
+        if actual != expected:
+            raise ValueError("provenance summary does not match source_edges")
+        object.__setattr__(self, "source_edges", edges)
         object.__setattr__(self, "digest", provenance_digest(self))
 
 
@@ -327,6 +365,16 @@ def canonical_provenance_payload(provenance: SemanticProvenance) -> bytes:
             "incomplete_source_count": provenance.incomplete_source_count,
             "known_context_ids": list(provenance.known_context_ids),
             "source_count": provenance.source_count,
+            "source_edges": [
+                {
+                    "captured_context_id": edge.captured_context_id,
+                    "source_id": edge.source_id,
+                    "source_kind": edge.source_kind.value,
+                    "source_revision": edge.source_revision,
+                    "source_status": edge.source_status.value,
+                }
+                for edge in provenance.source_edges
+            ],
             "unknown_source_count": provenance.unknown_source_count,
         }
     )
@@ -340,46 +388,20 @@ def provenance_for_edges(
     edges: tuple[SemanticSourceEdge, ...],
 ) -> SemanticProvenance:
     canonical = canonicalize_source_edges(edges)
-    known_contexts = tuple(
-        sorted(
-            {
-                edge.captured_context_id
-                for edge in canonical
-                if edge.source_status is SemanticSourceStatus.AVAILABLE
-                and edge.captured_context_id is not None
-            }
-        )
-    )
-    unknown_count = sum(
-        edge.source_status is not SemanticSourceStatus.AVAILABLE
-        or edge.captured_context_id is None
-        for edge in canonical
-    )
-    incomplete_count = sum(
-        edge.source_status
-        in {
-            SemanticSourceStatus.MISSING,
-            SemanticSourceStatus.RETRACTED,
-            SemanticSourceStatus.SUPERSEDED,
-        }
-        for edge in canonical
-    )
-    if not canonical:
-        classification = SemanticProvenanceClass.UNKNOWN
-    elif incomplete_count or (known_contexts and unknown_count):
-        classification = SemanticProvenanceClass.INCOMPLETE
-    elif not known_contexts:
-        classification = SemanticProvenanceClass.UNKNOWN
-    elif len(known_contexts) == 1:
-        classification = SemanticProvenanceClass.SINGLE_CONTEXT
-    else:
-        classification = SemanticProvenanceClass.MULTI_CONTEXT
+    (
+        classification,
+        source_count,
+        known_contexts,
+        unknown_count,
+        incomplete_count,
+    ) = _provenance_summary(canonical)
     return SemanticProvenance(
         classification=classification,
-        source_count=len(canonical),
+        source_count=source_count,
         known_context_ids=known_contexts,
         unknown_source_count=unknown_count,
         incomplete_source_count=incomplete_count,
+        source_edges=canonical,
     )
 
 

@@ -125,6 +125,10 @@ def test_experience_record_is_immutable_bounded_and_rejects_raw_content_fields()
     with pytest.raises(ValueError):
         replace(record, source_event_sequence=2**63)
     with pytest.raises(ValueError):
+        replace(record, source_event_sequence=0)
+    with pytest.raises(ValueError):
+        replace(record, source_event_sequence=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
         replace(record, revision=1)
     with pytest.raises(ValueError):
         replace(record, history_anchor_digest="0" * 64)
@@ -209,6 +213,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
             ExperienceRevisionOperation.REASSESS,
             ExperienceRevisionReason.REASSESSMENT,
             CREATED_AT,
+            event_id="event:1",
+            event_sequence=1,
         )
     with pytest.raises(ValueError):
         ExperienceRevisionRecord(
@@ -219,6 +225,7 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
             CREATED_AT,
             evidence_refs=("evidence:0",),
             event_id="event:1",
+            event_sequence=None,  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError):
         ExperienceRevisionRecord(
@@ -239,6 +246,8 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
             ExperienceRevisionReason.CORRECTION,
             CREATED_AT,
             evidence_refs=("evidence:1",),
+            event_id="event:2",
+            event_sequence=2,
         )
     with pytest.raises(ValueError):
         ExperienceRevisionRecord(
@@ -251,4 +260,28 @@ def test_experience_revision_evidence_and_event_binding_are_strict() -> None:
             previous_revision_digest=genesis.record_digest,
             event_id="event:2",
             event_sequence=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises((TypeError, ValueError)):
+        ExperienceRevisionRecord(
+            "experience:1",
+            1,
+            ExperienceRevisionOperation.CORRECT,
+            ExperienceRevisionReason.CORRECTION,
+            CREATED_AT,
+            evidence_refs=("evidence:1",),
+            previous_revision_digest=genesis.record_digest,
+            event_id=None,  # type: ignore[arg-type]
+            event_sequence=None,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError):
+        ExperienceRevisionRecord(
+            "experience:1",
+            1,
+            ExperienceRevisionOperation.CORRECT,
+            ExperienceRevisionReason.REASSESSMENT,
+            CREATED_AT,
+            evidence_refs=("evidence:1",),
+            previous_revision_digest=genesis.record_digest,
+            event_id="event:2",
+            event_sequence=2,
         )

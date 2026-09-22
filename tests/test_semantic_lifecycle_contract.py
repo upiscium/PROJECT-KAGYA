@@ -19,6 +19,7 @@ from kagya.memory.semantic_lifecycle import (
     normalize_semantic_content,
     semantic_content_digest,
     validate_revision_digest,
+    provenance_for_edges,
 )
 
 
@@ -156,6 +157,64 @@ def test_provenance_classification_preserves_source_count(
     )
     assert revision.provenance.source_count == source_count
     assert revision.provenance_class is expected
+
+
+def test_provenance_digest_binds_the_canonical_source_graph() -> None:
+    first = edge("episode:a", "context:x")
+    second = edge("episode:b", "context:x")
+    base = provenance_for_edges((first,))
+    canonical = provenance_for_edges((first, second))
+    reordered_duplicate = provenance_for_edges((second, first, first))
+    assert canonical.digest == reordered_duplicate.digest
+    assert canonical.source_edges == (first, second)
+
+    assert base.digest != provenance_for_edges(
+        (edge("episode:other", "context:x"),)
+    ).digest
+    assert base.digest != provenance_for_edges(
+        (edge("episode:a", "context:y"),)
+    ).digest
+
+    semantic_revision_one = edge(
+        "source:semantic",
+        "context:x",
+        kind=SemanticSourceKind.SEMANTIC,
+        source_revision=1,
+    )
+    semantic_revision_two = edge(
+        "source:semantic",
+        "context:x",
+        kind=SemanticSourceKind.SEMANTIC,
+        source_revision=2,
+    )
+    assert provenance_for_edges((semantic_revision_one,)).digest != provenance_for_edges(
+        (semantic_revision_two,)
+    ).digest
+
+    missing = edge(
+        "episode:status",
+        None,
+        status=SemanticSourceStatus.MISSING,
+    )
+    retracted = edge(
+        "episode:status",
+        None,
+        status=SemanticSourceStatus.RETRACTED,
+    )
+    assert provenance_for_edges((missing,)).digest != provenance_for_edges(
+        (retracted,)
+    ).digest
+
+    episodic = edge("source:kind", "context:x")
+    semantic = edge(
+        "source:kind",
+        "context:x",
+        kind=SemanticSourceKind.SEMANTIC,
+        source_revision=1,
+    )
+    assert provenance_for_edges((episodic,)).digest != provenance_for_edges(
+        (semantic,)
+    ).digest
 
 
 def test_revision_digest_is_order_independent_and_immutable() -> None:

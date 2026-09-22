@@ -86,6 +86,13 @@ class ExperienceEmotionUpdateReasonCode(str, Enum):
 ExperienceLossInvalidReason = ExperienceMeasurementInvalidReason
 ExperienceEmotionReasonCode = ExperienceEmotionUpdateReasonCode
 
+_EXPERIENCE_REVISION_COMPATIBILITY = {
+    (ExperienceRevisionOperation.REASSESS, ExperienceRevisionReason.REASSESSMENT),
+    (ExperienceRevisionOperation.CORRECT, ExperienceRevisionReason.CORRECTION),
+    (ExperienceRevisionOperation.SUPERSEDE, ExperienceRevisionReason.SUPERSESSION),
+    (ExperienceRevisionOperation.RETRACT, ExperienceRevisionReason.RETRACTION),
+}
+
 
 def _enum(value: object, enum_type: type[Enum], name: str) -> Enum:
     if type(value) is not enum_type:
@@ -494,10 +501,10 @@ class ExperienceRevisionRecord:
     operation: ExperienceRevisionOperation
     reason: ExperienceRevisionReason
     created_at: datetime
+    event_id: str
+    event_sequence: int
     evidence_refs: tuple[str, ...] = ()
     previous_revision_digest: str | None = None
-    event_id: str | None = None
-    event_sequence: int | None = None
     record_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -509,25 +516,24 @@ class ExperienceRevisionRecord:
         )
         _enum(self.operation, ExperienceRevisionOperation, "operation")
         _enum(self.reason, ExperienceRevisionReason, "reason")
+        if (self.operation, self.reason) not in _EXPERIENCE_REVISION_COMPATIBILITY:
+            raise ValueError("Experience revision operation and reason are incompatible")
         object.__setattr__(self, "created_at", _utc_datetime(self.created_at, "created_at"))
         object.__setattr__(
             self,
             "evidence_refs",
             _canonical_references(self.evidence_refs, "evidence_refs"),
         )
-        if (self.event_id is None) != (self.event_sequence is None):
-            raise ValueError("event_id and event_sequence must be supplied together")
-        object.__setattr__(self, "event_id", _optional_identifier(self.event_id, "event_id"))
-        if self.event_sequence is not None:
-            object.__setattr__(
-                self,
+        object.__setattr__(self, "event_id", validate_identifier(self.event_id))
+        object.__setattr__(
+            self,
+            "event_sequence",
+            _positive_int(
+                self.event_sequence,
                 "event_sequence",
-                _positive_int(
-                    self.event_sequence,
-                    "event_sequence",
-                    maximum=EXPERIENCE_MAX_EVENT_SEQUENCE,
-                ),
-            )
+                maximum=EXPERIENCE_MAX_EVENT_SEQUENCE,
+            ),
+        )
         if self.revision == 0 and self.previous_revision_digest is not None:
             raise ValueError("genesis revision cannot have a previous digest")
         if self.revision > 0 and self.previous_revision_digest is None:
@@ -676,7 +682,7 @@ class ExperienceRecord:
         )
         _enum(self.lifecycle, ExperienceLifecycle, "lifecycle")
         validate_identifier(self.source_event_id)
-        _nonnegative_int(
+        _positive_int(
             self.source_event_sequence,
             "source_event_sequence",
             maximum=EXPERIENCE_MAX_EVENT_SEQUENCE,
