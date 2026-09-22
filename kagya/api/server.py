@@ -16,7 +16,7 @@ from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep, val
 from kagya.config import Settings, get_settings
 from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem
+from kagya.memory import DualMemorySystem, ExperienceStore
 from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
@@ -96,10 +96,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
+            app.state.experience_store = getattr(
+                app.state, "experience_store", None
+            ) or ExperienceStore.from_memory_root(
+                app.state.memory_system.settings.memory.persist_directory
+            )
             app.state.startup_reconciliation = StartupReconciliationCoordinator(
                 app.state.event_journal,
                 app.state.state_recovery,
                 app.state.memory_system,
+                app.state.experience_store,
             )
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True
@@ -168,6 +174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.model_provider,
                 app.state.memory_system,
                 working_memory=app.state.working_memory,
+                experience_store=app.state.experience_store,
             )
             app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)

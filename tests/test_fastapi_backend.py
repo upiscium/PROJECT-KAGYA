@@ -27,6 +27,7 @@ from kagya.identity import (
 from kagya.learning import AdapterRegistry
 from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
+from kagya.memory.experience_participant import experience_id_for_event
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
 from kagya.persona import PromptBuilder
@@ -298,20 +299,32 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert episode.response == "Visible API answer."
         assert len(client.app.state.main_loop.session_state.turns) == 1
         records = client.app.state.event_journal.records
-        assert [record.lifecycle for record in records[-8:]] == [
+        assert [record.lifecycle for record in records[-9:]] == [
             EventLifecycle.ACCEPTED,
             EventLifecycle.STARTED,
             EventLifecycle.TRANSACTION_PREPARED,
             EventLifecycle.PREPARED,
             EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.TRANSACTION_COMPLETED,
             EventLifecycle.COMPLETED,
         ]
-        assert [record.participant_id for record in records[-4:-2]] == [
+        assert [record.participant_id for record in records[-5:-2]] == [
             "memory.episodic",
+            "memory.experience",
             "session.turn",
         ]
+        completed = records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience = client.app.state.experience_store.load_current(
+            experience_id_for_event(completed.event_id, completed.processing_sequence)
+        )
+        assert experience is not None
+        assert experience.record.source_episode_id == data["episode_id"]
+        assert experience.record.source_event_id == completed.event_id
+        assert experience.record.source_event_sequence == completed.processing_sequence
         pending = settings.memory.persist_directory / ".r07-episodic-pending"
         assert list(pending.glob("*.json")) == []
 
@@ -1064,6 +1077,18 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
             PRIVATE_SENTINEL.encode() not in path.read_bytes()
             for path in settings.state_wal.directory.iterdir()
             if path.is_file()
+        )
+        experience_root = client.app.state.experience_store.root
+        assert not experience_root.exists() or all(
+            PRIVATE_SENTINEL.encode() not in path.read_bytes()
+            for path in experience_root.rglob("*.json")
+        )
+        assert all(
+            "memory.experience"
+            not in {
+                item.participant_id for item in transaction.required_participants
+            }
+            for transaction in client.app.state.event_journal.inspect().completed_transactions
         )
         assert len(client.app.state.main_loop.session_state.turns) == 1
 
@@ -2877,6 +2902,7 @@ def test_memory_prepare_failure_aborts_before_internal_commit(
         inspection = client.app.state.event_journal.inspect()
         assert inspection.aborted_transactions[0].abort_outcomes == (
             ("memory.episodic", AbortOutcome.ABORTED),
+            ("memory.experience", AbortOutcome.ALREADY_ABSENT),
         )
         assert not any(
             record.lifecycle is EventLifecycle.PREPARED
@@ -2918,6 +2944,7 @@ def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         assert transaction.participant_outcomes == (
             ("memory.episodic", ParticipantOutcome.FINALIZED),
+            ("memory.experience", ParticipantOutcome.FINALIZED),
         )
         assert transaction.unresolved_participants == ("session.turn",)
         assert transaction.reconciliation_reason is not None

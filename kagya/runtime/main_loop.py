@@ -35,6 +35,17 @@ from kagya.identity import (
     ValueSystemSnapshot,
 )
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
+from kagya.experience import (
+    ExperienceAppraisalEvidence,
+    ExperienceEmotionContributions,
+    ExperienceEmotionProjection,
+    ExperienceEmotionUpdateReasonCode,
+    ExperienceMeasurementEvidence,
+    ExperienceRecord,
+    ExperienceLifecycle,
+    calculate_subjective_salience,
+)
+from kagya.memory.experience_store import ExperienceStore
 from kagya.models import ModelProvider
 from kagya.persona import (
     ConsciousAgent,
@@ -59,6 +70,8 @@ from kagya.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBoundValue,
     TransactionParticipant,
+    TransactionKind,
+    TransactionCoordinator,
 )
 from kagya.runtime.working_memory import (
     WorkingMemory,
@@ -68,6 +81,7 @@ from kagya.runtime.working_memory import (
 
 if TYPE_CHECKING:
     from kagya.memory.episodic_participant import MemoryEpisodicParticipant
+    from kagya.memory.experience_participant import MemoryExperienceParticipant
 
 
 @dataclass(frozen=True)
@@ -115,6 +129,7 @@ class _ComputedChat:
     trace: DebugChatTrace | None
     diagnostics: ChatDiagnostics
     memory_participant: MemoryEpisodicParticipant
+    experience_participant: MemoryExperienceParticipant | None
     session_participant: SessionTurnParticipant
 
 
@@ -137,12 +152,16 @@ class KagyaMainLoop:
         adapter_id: str | None = None,
         context_registry: ContextRegistry | None = None,
         value_system: ValueSystem | None = None,
+        experience_store: ExperienceStore | None = None,
     ) -> None:
         from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system
+        self.experience_store = experience_store or ExperienceStore.from_memory_root(
+            memory_system.settings.memory.persist_directory
+        )
         self._runtime: object | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
@@ -527,6 +546,12 @@ class KagyaMainLoop:
         from kagya.memory.episodic_participant import (
             EpisodicWrite,
             MemoryEpisodicParticipant,
+            episodic_episode_id,
+        )
+        from kagya.memory.experience_participant import (
+            ExperienceCreateIntent,
+            MemoryExperienceParticipant,
+            experience_id_for_event,
         )
 
         current_context = resolve_chat_context(context_registry, selectors)
@@ -598,6 +623,79 @@ class KagyaMainLoop:
                 schema_version=3,
             ),
         )
+        experience_participant: MemoryExperienceParticipant | None = None
+        if not capture_debug and self._runtime is not None:
+            if not isinstance(self._runtime, AgentRuntime):
+                raise RuntimeError("ordinary CHAT runtime binding is invalid")
+            event = self._runtime.current_event()
+            if (
+                event is None
+                or event.event_type is not AgentEventType.CHAT
+                or event.source is not AgentEventSource.API_CHAT
+                or event.processing_sequence is None
+                or event.processing_sequence <= 0
+            ):
+                raise RuntimeError("ordinary CHAT requires the active runtime event")
+            transaction_id = TransactionCoordinator.derive_transaction_id(
+                event, TransactionKind.EVENT_MUTATION
+            )
+            measurement_evidence = ExperienceMeasurementEvidence.from_measurement(
+                measurement
+            )
+            appraisal_evidence = ExperienceAppraisalEvidence.from_result(appraisal)
+            pre_appraisal_emotion = ExperienceEmotionProjection.from_state(
+                temporal_update.state
+            )
+            post_appraisal_emotion = ExperienceEmotionProjection.from_state(
+                emotion_update.state
+            )
+            emotion_contributions = ExperienceEmotionContributions.from_update(
+                emotion_update
+            )
+            temporal_reasons = tuple(
+                ExperienceEmotionUpdateReasonCode(reason.value)
+                for reason in temporal_update.reasons
+            )
+            emotion_reasons = tuple(
+                ExperienceEmotionUpdateReasonCode(reason.value)
+                for reason in emotion_update.reasons
+            )
+            experience_record = ExperienceRecord(
+                experience_id=experience_id_for_event(
+                    event.event_id, event.processing_sequence
+                ),
+                revision=0,
+                lifecycle=ExperienceLifecycle.ACTIVE,
+                source_event_id=event.event_id,
+                source_event_sequence=event.processing_sequence,
+                source_episode_id=episodic_episode_id(
+                    transaction_id,
+                    memory_participant.participant_id,
+                    memory_participant.operation_digest,
+                ),
+                context_id=provenance[0],
+                measurement=measurement_evidence,
+                appraisal=appraisal_evidence,
+                pre_appraisal_emotion=pre_appraisal_emotion,
+                temporal_update_reasons=temporal_reasons,
+                post_appraisal_emotion=post_appraisal_emotion,
+                emotion_contributions=emotion_contributions,
+                emotion_update_reasons=emotion_reasons,
+                subjective_salience=calculate_subjective_salience(
+                    measurement_evidence,
+                    pre_appraisal_emotion,
+                    post_appraisal_emotion,
+                ),
+                created_at=event.requested_at,
+            )
+            experience_participant = MemoryExperienceParticipant(
+                self.memory_system,
+                self.experience_store,
+                ExperienceCreateIntent(
+                    experience_record,
+                    memory_participant.operation_digest,
+                ),
+            )
         session_participant = SessionTurnParticipant(
             self.session_state,
             SessionTurnOperation(
@@ -629,6 +727,7 @@ class KagyaMainLoop:
             trace=trace,
             diagnostics=diagnostics,
             memory_participant=memory_participant,
+            experience_participant=experience_participant,
             session_participant=session_participant,
         )
 
@@ -681,4 +780,10 @@ class KagyaMainLoop:
 
     @staticmethod
     def _participants(computed: _ComputedChat) -> tuple[TransactionParticipant, ...]:
-        return (computed.memory_participant, computed.session_participant)
+        if computed.experience_participant is None:
+            return (computed.memory_participant, computed.session_participant)
+        return (
+            computed.memory_participant,
+            computed.experience_participant,
+            computed.session_participant,
+        )
