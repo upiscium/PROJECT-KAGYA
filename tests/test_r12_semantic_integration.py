@@ -378,3 +378,36 @@ def test_reconstructible_semantic_receipt_can_retire_after_baseline(
         processing_sequence=event.processing_sequence,
     )
     assert reconstructed.operation == participant.operation
+
+
+def test_semantic_checkpoint_binds_horizon_to_journal_record(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    store.write_checkpoint(
+        processing_high_water=1,
+        journal_lineage_id="lineage-1",
+        journal_tail_record_id="record-1",
+        journal_tail_record_hash="a" * 64,
+    )
+    record = SimpleNamespace(
+        record_id="record-1",
+        record_hash="a" * 64,
+        lifecycle=EventLifecycle.TRANSACTION_COMPLETED,
+        processing_sequence=1,
+        recovery_processing_high_water=None,
+    )
+    journal = SimpleNamespace(
+        inspect=lambda: SimpleNamespace(
+            journal_lineage_id="lineage-1",
+            processing_high_water=2,
+            records=(record,),
+        )
+    )
+    retention = SemanticReceiptRetentionCoordinator(journal, store)
+
+    assert retention.checkpoint_covers(
+        SimpleNamespace(processing_sequence=1)
+    )  # type: ignore[arg-type]
+    assert not retention.checkpoint_covers(
+        SimpleNamespace(processing_sequence=2)
+    )  # type: ignore[arg-type]

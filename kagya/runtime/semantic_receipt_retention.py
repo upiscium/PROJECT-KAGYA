@@ -34,15 +34,29 @@ class SemanticReceiptRetentionCoordinator:
         lineage = getattr(inspection, "journal_lineage_id", None)
         processing_high_water = getattr(inspection, "processing_high_water", None)
         records = getattr(inspection, "records", ())
+        tail_record = next(
+            (
+                record
+                for record in records
+                if record.record_id == checkpoint.journal_tail_record_id
+                and record.record_hash == checkpoint.journal_tail_record_hash
+            ),
+            None,
+        )
+        if tail_record is None:
+            return None
+        lifecycle = getattr(tail_record.lifecycle, "value", tail_record.lifecycle)
+        if lifecycle in {"completed", "transaction_completed", "transaction_reconciled"}:
+            tail_high_water = tail_record.processing_sequence
+        elif lifecycle in {"participant_baseline_established", "cleared"}:
+            tail_high_water = tail_record.recovery_processing_high_water
+        else:
+            tail_high_water = None
         if (
             checkpoint.journal_lineage_id != lineage
             or type(processing_high_water) is not int
             or checkpoint.processing_high_water > processing_high_water
-            or not any(
-                record.record_id == checkpoint.journal_tail_record_id
-                and record.record_hash == checkpoint.journal_tail_record_hash
-                for record in records
-            )
+            or tail_high_water != checkpoint.processing_high_water
         ):
             return None
         return checkpoint.processing_high_water
