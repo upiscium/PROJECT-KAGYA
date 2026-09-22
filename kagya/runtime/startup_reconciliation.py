@@ -178,7 +178,7 @@ class StartupReconciliationCoordinator:
             manifest,
             manifest.external_reconciliation_required,
         )
-        self.state_recovery.clear_recovery_gate(
+        cleared = self.state_recovery.clear_recovery_gate(
             resumed, reconciliation, baseline, clear
         )
         self.journal.append_cleared(
@@ -193,7 +193,7 @@ class StartupReconciliationCoordinator:
             clear.wal_record_hash,
             clear.journal_lineage_id,
         )
-        self.ensure_adoption_baseline(resumed)
+        self.ensure_adoption_baseline(cleared)
         return True
 
     def reconcile_recovery_gate(

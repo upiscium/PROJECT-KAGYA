@@ -843,4 +843,11 @@ def test_gate_clear_resumes_after_wal_cas_before_journal_terminal(
 
     assert restarted.resume_prepared_gate_clear()
     assert reopened.inspect().terminal_gate_clear is not None
+    terminal_bytes = reopened.path.read_bytes()
+    baseline_count = len(reopened.inspect().baselines)
     assert not restarted.resume_prepared_gate_clear()
+    assert reopened.path.read_bytes() == terminal_bytes
+    assert len(reopened.inspect().baselines) == baseline_count
+    assert sum(
+        item.lifecycle is EventLifecycle.CLEARED for item in reopened.inspect().records
+    ) == 1
