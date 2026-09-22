@@ -2310,6 +2310,62 @@ def test_u5_baseline_rejects_any_registry_other_than_the_fixed_registry(
     assert value.records == before
 
 
+def test_u2_baseline_epoch_adopts_strict_superset_without_rewriting_history(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "u2-baseline.jsonl")
+    append_u5_baseline(value)
+    historical = value.path.read_bytes()
+    inspection = value.inspect()
+    baseline = inspection.baselines[-1]
+    registry = (
+        ParticipantBaseline(
+            participant_id="memory.episodic",
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id="memory.experience",
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id="session.turn",
+            domain=ParticipantDomain.EPHEMERAL_PROCESS,
+        ),
+    )
+    value.append_participant_baseline(
+        str(uuid5(NAMESPACE_URL, "u2-baseline")),
+        inspection.snapshot_sequence,
+        inspection.snapshot_hash,
+        inspection.processing_high_water,
+        baseline.wal_generation_id,
+        baseline.wal_record_id,
+        baseline.wal_record_hash,
+        baseline.journal_lineage_id,
+        registry,
+        adoption_epoch=1,
+    )
+
+    upgraded = value.inspect()
+    assert value.path.read_bytes().startswith(historical)
+    assert [item.adoption_epoch for item in upgraded.baselines] == [0, 1]
+    assert upgraded.baselines[-1].participant_registry == registry
+    after_upgrade = value.path.read_bytes()
+    with pytest.raises(ValueError):
+        value.append_participant_baseline(
+            str(uuid5(NAMESPACE_URL, "u2-repeat")),
+            upgraded.snapshot_sequence,
+            upgraded.snapshot_hash,
+            upgraded.processing_high_water,
+            upgraded.baselines[-1].wal_generation_id,
+            upgraded.baselines[-1].wal_record_id,
+            upgraded.baselines[-1].wal_record_hash,
+            upgraded.baselines[-1].journal_lineage_id,
+            registry,
+            adoption_epoch=2,
+        )
+    assert value.path.read_bytes() == after_upgrade
+
+
 def test_u5_canonically_hashed_noncurrent_baseline_fails_replay(
     tmp_path: Path,
 ) -> None:

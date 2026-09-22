@@ -52,6 +52,7 @@ from kagya.runtime.transaction_coordinator import (
 )
 
 
+MEMORY_EXPERIENCE_PARTICIPANT_ID = "memory.experience"
 _RECONCILIATION_NAMESPACE = UUID("0b941247-478c-5e32-9142-d82b165a330f")
 
 
@@ -72,6 +73,10 @@ class StartupReconciliationCoordinator:
     participant_registry = (
         ParticipantBaseline(
             participant_id=MEMORY_EPISODIC_PARTICIPANT_ID,
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id=MEMORY_EXPERIENCE_PARTICIPANT_ID,
             domain=ParticipantDomain.DURABLE_DOMAIN,
         ),
         ParticipantBaseline(
@@ -178,6 +183,7 @@ class StartupReconciliationCoordinator:
             clear.wal_record_hash,
             clear.journal_lineage_id,
         )
+        self.ensure_adoption_baseline(resumed)
         return True
 
     def reconcile_recovery_gate(
@@ -193,11 +199,11 @@ class StartupReconciliationCoordinator:
             raise StartupReconciliationError(
                 "External gate has no true rollback completion proof"
             )
-        if len(inspection.baselines) != 1:
+        if not inspection.baselines:
             return StartupReconciliationResult(
                 recovery, False, "participant_baseline_unavailable"
             )
-        baseline = inspection.baselines[0]
+        baseline = inspection.baselines[-1]
         if (
             recovery_record.snapshot_sequence is None
             or recovery_record.recovery_processing_high_water is None
@@ -224,7 +230,9 @@ class StartupReconciliationCoordinator:
                 key=lambda item: item.transaction_id,
             )
         )
-        requirements = self._aggregate_requirements(transactions)
+        requirements = self._aggregate_requirements(
+            transactions, baseline.participant_registry
+        )
         reconciliation = self._startup_reconciliation(
             recovery_record, baseline, requirements
         )
@@ -292,6 +300,10 @@ class StartupReconciliationCoordinator:
             reconciliation.wal_record_hash,
             reconciliation.journal_lineage_id,
         )
+        # The rollback was reconciled under the historical registry.  Only now,
+        # at the newly clean current boundary, may the runtime adopt a strict
+        # superset registry for subsequent transactions.
+        self.ensure_adoption_baseline(cleared)
         return StartupReconciliationResult(cleared, True)
 
     def _abort_transaction(self, transaction: EventJournalTransaction) -> None:
@@ -303,9 +315,13 @@ class StartupReconciliationCoordinator:
                 or ParticipantCapability.ABORT not in requirement.capabilities
             ):
                 continue
-            outcome = MemoryEpisodicParticipant.abort_pending(
-                self.memory, self._binding(transaction, requirement)
-            )
+            binding = self._binding(transaction, requirement)
+            if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                outcome = MemoryEpisodicParticipant.abort_pending(self.memory, binding)
+            else:
+                raise UnsupportedParticipantReconciliationError(
+                    "Participant abort resolver is not registered"
+                )
             self.journal.append_participant_aborted(
                 event,
                 transaction.transaction_id,
@@ -483,12 +499,11 @@ class StartupReconciliationCoordinator:
     @staticmethod
     def _aggregate_requirements(
         transactions: tuple[EventJournalTransaction, ...],
+        participant_registry: tuple[ParticipantBaseline, ...],
     ) -> tuple[ParticipantRequirement, ...]:
         result: list[ParticipantRequirement] = []
-        for participant_id in (
-            MEMORY_EPISODIC_PARTICIPANT_ID,
-            SESSION_TURN_PARTICIPANT_ID,
-        ):
+        for baseline in participant_registry:
+            participant_id = baseline.participant_id
             digest = startup_participant_aggregate_digest(
                 transactions, participant_id
             )

@@ -134,20 +134,34 @@ class StateRecoveryCoordinator:
         result: StateRecoveryResult,
         participant_registry: tuple[ParticipantBaseline, ...],
     ) -> EventJournalParticipantBaseline:
-        """Establish the one adoption baseline from clean, ungated authority."""
+        """Adopt a strictly larger participant registry at a clean boundary."""
 
         with self._lock:
             journal = self.journal.inspect()
-            if journal.baselines:
+            latest = journal.baselines[-1] if journal.baselines else None
+            if latest is not None:
+                previous = {
+                    item.participant_id: item.domain
+                    for item in latest.participant_registry
+                }
+                current = {
+                    item.participant_id: item.domain
+                    for item in participant_registry
+                }
                 if (
-                    len(journal.baselines) != 1
-                    or journal.baselines[0].participant_registry
-                    != participant_registry
-                    or journal.baselines[0].journal_lineage_id
-                    != journal.journal_lineage_id
+                    latest.participant_registry == participant_registry
+                    and latest.journal_lineage_id == journal.journal_lineage_id
+                ):
+                    return latest
+                if (
+                    not set(current).issuperset(previous)
+                    or set(current) == set(previous)
+                    or any(
+                        current[item] != domain
+                        for item, domain in previous.items()
+                    )
                 ):
                     raise StateRecoveryError("participant baseline authority changed")
-                return journal.baselines[0]
             snapshot = self.state_store.load()
             snapshot_hash = self.state_store.snapshot_hash(snapshot)
             wal = self.wal.inspect()
@@ -184,7 +198,14 @@ class StateRecoveryCoordinator:
             baseline_id = str(
                 uuid5(
                     _PARTICIPANT_BASELINE_NAMESPACE,
-                    f"{journal.journal_lineage_id}:{snapshot_hash}",
+                    (
+                        f"{journal.journal_lineage_id}:{snapshot_hash}"
+                        if latest is None
+                        else (
+                            f"{journal.journal_lineage_id}:{snapshot_hash}:"
+                            f"{latest.adoption_epoch + 1}"
+                        )
+                    ),
                 )
             )
             self.journal.append_participant_baseline(
@@ -197,11 +218,12 @@ class StateRecoveryCoordinator:
                 journal.wal_record_hash,
                 journal.journal_lineage_id,
                 participant_registry,
+                adoption_epoch=None if latest is None else latest.adoption_epoch + 1,
             )
             established = self.journal.inspect().baselines
-            if len(established) != 1:
+            if not established or established[-1].baseline_id != baseline_id:
                 raise StateRecoveryError("participant baseline publication failed")
-            return established[0]
+            return established[-1]
 
     def inspect_degraded_startup(self) -> DegradedStartupInspection:
         """Verify startup state without closing an unresolved transaction."""
@@ -1586,9 +1608,7 @@ class StateRecoveryCoordinator:
     ) -> None:
         if category is not EventRecoveryCategory.TRUE_ROLLBACK or not journal.baselines:
             return
-        if len(journal.baselines) != 1:
-            raise StateRecoveryError("participant baseline authority is ambiguous")
-        baseline = journal.baselines[0]
+        baseline = journal.baselines[-1]
         target_sequence = target.last_processed_event_sequence
         target_hash = self.state_store.snapshot_hash(target)
         if (

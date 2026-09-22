@@ -215,6 +215,7 @@ class EventJournalRecord(_JournalModel):
     unresolved_participants: tuple[str, ...] | None = None
     baseline_id: str | None = None
     participant_registry: tuple[ParticipantBaseline, ...] | None = None
+    adoption_epoch: int | None = Field(default=None, ge=0)
 
     @field_validator("record_id", "event_id")
     @classmethod
@@ -320,6 +321,7 @@ class EventJournalRecord(_JournalModel):
             self.startup_participant_outcome,
             self.baseline_id,
             self.participant_registry,
+            self.adoption_epoch,
         )
         if self.schema_version in {1, 2} and any(
             value is not None for value in v3_fields
@@ -540,7 +542,7 @@ class EventJournalRecord(_JournalModel):
                 "baseline_id", "snapshot_sequence", "snapshot_hash",
                 "recovery_processing_high_water",
                 "wal_generation_id", "wal_record_id", "wal_record_hash",
-                "journal_lineage_id", "participant_registry",
+                "journal_lineage_id", "participant_registry", "adoption_epoch",
             }
             if not self.participant_registry:
                 raise ValueError("participant baseline registry is missing")
@@ -973,6 +975,7 @@ class EventJournalParticipantBaseline:
     wal_record_hash: str
     journal_lineage_id: str
     participant_registry: tuple[ParticipantBaseline, ...]
+    adoption_epoch: int = 0
 
     @property
     def registry(self) -> tuple[ParticipantBaseline, ...]:
@@ -1830,21 +1833,48 @@ class EventJournal:
         processing_high_water: int, wal_generation_id: str, wal_record_id: str,
         wal_record_hash: str, journal_lineage_id: str,
         participant_registry: tuple[ParticipantBaseline, ...],
+        *, adoption_epoch: int | None = None,
     ) -> None:
-        if participant_registry != (
-            ParticipantBaseline(
-                participant_id="memory.episodic",
-                domain=ParticipantDomain.DURABLE_DOMAIN,
-            ),
-            ParticipantBaseline(
-                participant_id="session.turn",
-                domain=ParticipantDomain.EPHEMERAL_PROCESS,
-            ),
-        ):
-            raise ValueError("participant baseline registry is incomplete")
         inspection = self.inspect()
-        if inspection.baselines:
-            raise EventJournalIntegrityError("participant baseline already exists")
+        identifiers = tuple(item.participant_id for item in participant_registry)
+        if (
+            not participant_registry
+            or identifiers != tuple(sorted(identifiers))
+            or len(set(identifiers)) != len(identifiers)
+        ):
+            raise ValueError("participant baseline registry is invalid")
+        latest = inspection.baselines[-1] if inspection.baselines else None
+        if latest is None:
+            if adoption_epoch not in {None, 0}:
+                raise ValueError("initial participant baseline epoch is invalid")
+            record_adoption_epoch = adoption_epoch
+        else:
+            previous = {
+                item.participant_id: item.domain
+                for item in latest.participant_registry
+            }
+            current = {
+                item.participant_id: item.domain
+                for item in participant_registry
+            }
+            if (
+                not set(current).issuperset(previous)
+                or set(current) == set(previous)
+                or any(
+                    current[item] != domain
+                    for item, domain in previous.items()
+                )
+            ):
+                raise ValueError("participant baseline registry is not a strict superset")
+            expected_epoch = latest.adoption_epoch + 1
+            if adoption_epoch is None:
+                record_adoption_epoch = expected_epoch
+            elif adoption_epoch != expected_epoch:
+                raise ValueError("participant baseline adoption epoch is not monotonic")
+            else:
+                record_adoption_epoch = adoption_epoch
+            if any(record.baseline_id == baseline_id for record in inspection.records):
+                raise ValueError("participant baseline identifier is duplicated")
         if (
             inspection.open_events
             or inspection.open_transactions
@@ -1871,6 +1901,7 @@ class EventJournal:
             wal_generation_id=wal_generation_id, wal_record_id=wal_record_id,
             wal_record_hash=wal_record_hash, journal_lineage_id=journal_lineage_id,
             participant_registry=participant_registry,
+            adoption_epoch=record_adoption_epoch,
         )
 
     def append_clear_prepared(
@@ -2424,6 +2455,8 @@ class EventJournal:
             if record.schema_version in {1, 2}
             else set()
         )
+        if record.adoption_epoch is None:
+            excluded.add("adoption_epoch")
         canonical = json.dumps(
             record.model_dump(mode="json", exclude={"record_hash", *excluded}),
             ensure_ascii=False,
@@ -2492,6 +2525,8 @@ class EventJournal:
             if record.schema_version in {1, 2}
             else set()
         )
+        if record.adoption_epoch is None:
+            excluded.add("adoption_epoch")
         return (
             json.dumps(
                 record.model_dump(mode="json", exclude=excluded),
@@ -2978,6 +3013,8 @@ class EventJournal:
         v3_seen = checkpoint.schema_version == 3
         v3_migration_anchor_hash = checkpoint.v3_migration_anchor_hash
         transactions: dict[str, dict[str, Any]] = {}
+        baseline_records_seen: list[EventJournalRecord] = []
+        gate_clear_open = False
 
         for record in records:
             if record.record_id in seen_record_ids:
@@ -3344,7 +3381,50 @@ class EventJournal:
                 EventLifecycle.CLEARED,
             }:
                 if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
-                    prior_records = records[:index]
+                    assert record.baseline_id is not None
+                    assert record.participant_registry is not None
+                    identifiers = tuple(
+                        item.participant_id for item in record.participant_registry
+                    )
+                    if (
+                        not identifiers
+                        or identifiers != tuple(sorted(identifiers))
+                        or len(set(identifiers)) != len(identifiers)
+                        or record.baseline_id
+                        in {item.baseline_id for item in baseline_records_seen}
+                    ):
+                        raise EventJournalIntegrityError(
+                            "participant baseline authority is invalid"
+                        )
+                    current_epoch = record.adoption_epoch
+                    if not baseline_records_seen:
+                        if current_epoch not in {None, 0}:
+                            raise EventJournalIntegrityError(
+                                "participant baseline authority is invalid"
+                            )
+                    else:
+                        previous = baseline_records_seen[-1]
+                        previous_registry = {
+                            item.participant_id: item.domain
+                            for item in previous.participant_registry or ()
+                        }
+                        current_registry = {
+                            item.participant_id: item.domain
+                            for item in record.participant_registry
+                        }
+                        if (
+                            current_epoch is None
+                            or current_epoch != (previous.adoption_epoch or 0) + 1
+                            or not set(current_registry).issuperset(previous_registry)
+                            or set(current_registry) == set(previous_registry)
+                            or any(
+                                current_registry[item] != domain
+                                for item, domain in previous_registry.items()
+                            )
+                        ):
+                            raise EventJournalIntegrityError(
+                                "participant baseline authority is invalid"
+                            )
                     if (
                         record.schema_version != 3
                         or external_reconciliation_required
@@ -3355,24 +3435,7 @@ class EventJournal:
                             for transaction in transactions.values()
                         )
                         or startup_open
-                        or startup_seen_ids
-                        or any(
-                            prior.lifecycle
-                            in {
-                                EventLifecycle.CLEAR_PREPARED,
-                                EventLifecycle.CLEARED,
-                            }
-                            or (
-                                prior.lifecycle
-                                in {
-                                    EventLifecycle.RECOVERY_PREPARED,
-                                    EventLifecycle.RECOVERY_COMPLETED,
-                                }
-                                and prior.recovery_category
-                                is EventRecoveryCategory.TRUE_ROLLBACK
-                            )
-                            for prior in prior_records
-                        )
+                        or gate_clear_open
                         or record.snapshot_sequence != snapshot_sequence
                         or record.snapshot_hash != snapshot_hash
                         or record.recovery_processing_high_water != high_water
@@ -3384,6 +3447,12 @@ class EventJournal:
                         raise EventJournalIntegrityError(
                             "participant baseline authority is invalid"
                         )
+                    baseline_records_seen.append(record)
+                elif record.lifecycle is EventLifecycle.CLEAR_PREPARED:
+                    gate_clear_open = True
+                else:
+                    gate_clear_open = False
+                    external_reconciliation_required = False
                 continue
             if record.lifecycle in {
                 EventLifecycle.TRANSACTION_PREPARED,
@@ -3889,8 +3958,6 @@ class EventJournal:
         for record in records:
             if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
                 assert record.baseline_id is not None
-                if baseline_records:
-                    raise EventJournalIntegrityError("participant baseline is duplicated")
                 baseline_records[record.baseline_id] = record
                 assert record.participant_registry is not None
                 baseline_views.append(EventJournalParticipantBaseline(
@@ -3900,6 +3967,7 @@ class EventJournal:
                     record.wal_generation_id or "", record.wal_record_id or "",
                     record.wal_record_hash or "0" * 64,
                     record.journal_lineage_id or "", record.participant_registry,
+                    record.adoption_epoch or 0,
                 ))
         open_gate: EventJournalGateClear | None = None
         terminal_gate: EventJournalGateClear | None = None

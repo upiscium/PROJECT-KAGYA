@@ -566,6 +566,7 @@ def test_true_rollback_reconciles_aggregate_and_clears_gate(tmp_path: Path) -> N
     outcomes = inspection.completed_startup_reconciliations[-1].participant_outcomes
     assert {participant_id for participant_id, _digest, _outcome in outcomes} == {
         "memory.episodic",
+        "memory.experience",
         "session.turn",
     }
     assert inspection.terminal_gate_clear is not None
@@ -783,7 +784,7 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     assert not wal.inspect().active_manifest.external_reconciliation_required
     assert {
         item.participant_id for item in inspection.baselines[0].participant_registry
-    } == {"memory.episodic", "session.turn"}
+    } == {"memory.episodic", "memory.experience", "session.turn"}
     assert "working_memory" not in journal.path.read_text()
     assert replay_calls == {
         "retrieve": 0,
