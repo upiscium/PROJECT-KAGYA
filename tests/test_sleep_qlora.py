@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,15 @@ from kagya.learning import (
 )
 from kagya.memory import DualMemorySystem
 from kagya.models import DummyProvider
+from kagya.runtime import (
+    AgentEvent,
+    AgentEventSource,
+    AgentEventType,
+    CoordinatedResult,
+    TransactionBinding,
+    TransactionCoordinator,
+    TransactionKind,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -122,14 +132,45 @@ def test_sleep_cycle_registers_candidate_and_never_active(tmp_path: Path) -> Non
         emotion_arousal=0.9,
     )
     manager = SleepCycleManager(settings, memory, DummyProvider(), registry)
+    event = AgentEvent(
+        event_id="11111111-1111-4111-8111-111111111111",
+        event_type=AgentEventType.SLEEP,
+        source=AgentEventSource.API_SLEEP_RUN,
+        requested_at=datetime.now(UTC),
+        processing_sequence=1,
+    )
+
+    class FakeRuntime:
+        def current_event(self) -> AgentEvent:
+            return event
+
+    manager.bind_runtime(FakeRuntime())  # type: ignore[arg-type]
 
     result = manager.run()
 
-    assert len(result.selected_episode_ids) == 1
-    assert len(result.semantic_memory_ids) == 1
-    assert result.training_result is not None
-    assert result.adapter_entry is not None
-    assert result.adapter_entry.status == AdapterStatus.CANDIDATE
+    assert isinstance(result, CoordinatedResult)
+    participant = result.participants[0]
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    binding = TransactionBinding(
+        transaction_id,
+        event.event_id,
+        event.processing_sequence,
+        participant.participant_id,
+        participant.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+    participant.prepare(binding)
+    participant.finalize(binding)
+
+    assert hasattr(result.value, "materialize")
+    result_value = result.value.materialize(transaction_id)
+    assert len(result_value.selected_episode_ids) == 1
+    assert len(result_value.semantic_memory_ids) == 1
+    assert result_value.training_result is not None
+    assert result_value.adapter_entry is not None
+    assert result_value.adapter_entry.status == AdapterStatus.CANDIDATE
     assert all(entry.status != AdapterStatus.ACTIVE for entry in registry.list())
     assert settings.sleep.dream_dataset_path.exists()
     assert "thought" not in settings.sleep.dream_dataset_path.read_text(

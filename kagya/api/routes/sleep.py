@@ -1,5 +1,7 @@
 """Sleep cycle routes."""
 
+from typing import cast
+
 from fastapi import APIRouter, Depends
 
 from kagya.api.dependencies import (
@@ -9,7 +11,7 @@ from kagya.api.dependencies import (
 )
 from kagya.api.runtime_execution import execute
 from kagya.api.schemas.sleep import SleepRunResponse
-from kagya.learning import SleepCycleManager
+from kagya.learning import SleepCycleManager, SleepCycleResult
 from kagya.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
@@ -23,9 +25,9 @@ def run_sleep(
     manager: SleepCycleManager = Depends(get_sleep_cycle_manager),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> SleepRunResponse:
-    result = execute(
+    result = cast(SleepCycleResult, execute(
         runtime, AgentEventType.SLEEP, AgentEventSource.API_SLEEP_RUN, manager.run
-    )
+    ))
     return SleepRunResponse(
         selected_episode_ids=result.selected_episode_ids,
         semantic_memory_ids=result.semantic_memory_ids,

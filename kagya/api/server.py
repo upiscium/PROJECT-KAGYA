@@ -298,6 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     failure_checkpoint=failure_checkpoint,
                 )
             app.state.main_loop.bind_runtime(app.state.agent_runtime)
+            app.state.sleep_cycle_manager.bind_runtime(app.state.agent_runtime)
         except BaseException:
             app.state.event_journal.close()
             raise
