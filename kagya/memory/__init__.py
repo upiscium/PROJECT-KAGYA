@@ -15,6 +15,16 @@ from kagya.memory.memory_schema import (
     MemoryRecordType,
     SemanticMemoryRecord,
 )
+from kagya.memory.experience_participant import (
+    MEMORY_EXPERIENCE_PARTICIPANT_ID,
+    MemoryExperienceParticipant,
+    ExperienceCreateIntent,
+    ExperienceRevisionIntent,
+    experience_id_for_event,
+    experience_operation_digest,
+)
+from kagya.memory.experience_store import ExperienceStore
+from kagya.memory.episodic_participant import episodic_episode_id
 
 __all__ = [
     "DualMemorySystem",
@@ -28,4 +38,12 @@ __all__ = [
     "SemanticMemoryRecord",
     "SemanticMemoryFormatError",
     "SemanticMemoryReadError",
+    "ExperienceCreateIntent",
+    "ExperienceRevisionIntent",
+    "ExperienceStore",
+    "MEMORY_EXPERIENCE_PARTICIPANT_ID",
+    "MemoryExperienceParticipant",
+    "experience_id_for_event",
+    "experience_operation_digest",
+    "episodic_episode_id",
 ]

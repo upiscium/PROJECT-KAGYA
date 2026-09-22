@@ -16,6 +16,11 @@ from kagya.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     MemoryEpisodicParticipant,
 )
+from kagya.memory.experience_participant import (
+    MEMORY_EXPERIENCE_PARTICIPANT_ID,
+    MemoryExperienceParticipant,
+)
+from kagya.memory.experience_store import ExperienceStore
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -26,6 +31,7 @@ from kagya.runtime.event_journal import (
     EventJournalTransaction,
     EventLifecycle,
     EventRecoveryCategory,
+    AbortOutcome,
     ParticipantBaseline,
     ParticipantCapability,
     ParticipantDomain,
@@ -47,12 +53,12 @@ from kagya.runtime.state_recovery import (
 from kagya.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     ParticipantUnavailableError,
+    ReconcilableTransactionParticipant,
     TransactionBinding,
     UnsupportedParticipantReconciliationError,
 )
 
 
-MEMORY_EXPERIENCE_PARTICIPANT_ID = "memory.experience"
 _RECONCILIATION_NAMESPACE = UUID("0b941247-478c-5e32-9142-d82b165a330f")
 
 
@@ -90,10 +96,14 @@ class StartupReconciliationCoordinator:
         journal: EventJournal,
         state_recovery: StateRecoveryCoordinator,
         memory: DualMemorySystem,
+        experience_store: ExperienceStore | None = None,
     ) -> None:
         self.journal = journal
         self.state_recovery = state_recovery
         self.memory = memory
+        self.experience_store = experience_store or ExperienceStore.from_memory_root(
+            memory.settings.memory.persist_directory
+        )
 
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
         """Resolve Path A without replaying an event handler or model call."""
@@ -318,6 +328,12 @@ class StartupReconciliationCoordinator:
             binding = self._binding(transaction, requirement)
             if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
                 outcome = MemoryEpisodicParticipant.abort_pending(self.memory, binding)
+            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                outcome = MemoryExperienceParticipant.abort_pending(
+                    self.memory, self.experience_store, binding
+                )
+            elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
+                outcome = AbortOutcome.ALREADY_ABSENT
             else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant abort resolver is not registered"
@@ -349,6 +365,10 @@ class StartupReconciliationCoordinator:
                 continue
             if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
                 outcome = self._memory_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
+            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                outcome = self._experience_participant(
                     transaction, requirement
                 ).finalize(self._binding(transaction, requirement))
             elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
@@ -479,11 +499,15 @@ class StartupReconciliationCoordinator:
                     requirement.operation_digest,
                 )
                 continue
-            if participant_id != MEMORY_EPISODIC_PARTICIPANT_ID:
+            participant: ReconcilableTransactionParticipant
+            if participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                participant = self._memory_participant(transaction, requirement)
+            elif participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                participant = self._experience_participant(transaction, requirement)
+            else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant resolver is not registered"
                 )
-            participant = self._memory_participant(transaction, requirement)
             binding = self._binding(transaction, requirement)
             try:
                 participant.inspect_reconciliation(binding)
@@ -547,6 +571,25 @@ class StartupReconciliationCoordinator:
             transaction.transaction_id,
             requirement.participant_id,
             requirement.operation_digest,
+        )
+
+    def _experience_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> MemoryExperienceParticipant:
+        if requirement.participant_id != MEMORY_EXPERIENCE_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "Experience participant resolver is not registered"
+            )
+        return MemoryExperienceParticipant.from_pending(
+            self.memory,
+            self.experience_store,
+            transaction.transaction_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
         )
 
     @staticmethod
