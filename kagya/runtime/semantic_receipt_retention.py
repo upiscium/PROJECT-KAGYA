@@ -5,6 +5,7 @@ from __future__ import annotations
 from kagya.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
     MemorySemanticParticipant,
+    SemanticCreateIntent,
 )
 from kagya.memory.semantic_store import (
     SemanticStore,
@@ -57,7 +58,7 @@ class SemanticReceiptRetentionCoordinator:
                 reconstructible = True
             else:
                 try:
-                    MemorySemanticParticipant.operation_from_authority(
+                    operation = MemorySemanticParticipant.operation_from_authority(
                         self.store,
                         transaction.transaction_id,
                         transaction.event_id,
@@ -71,7 +72,14 @@ class SemanticReceiptRetentionCoordinator:
                 ):
                     reconstructible = False
                 else:
-                    reconstructible = True
+                    # Revision authority can later be compacted out of the
+                    # retained Semantic window.  U3 create batches have
+                    # deterministic revision-zero artifacts; retain revision
+                    # receipts until a baseline proves them unreachable.
+                    reconstructible = all(
+                        isinstance(entry.mutation, SemanticCreateIntent)
+                        for entry in operation.entries
+                    )
                 if not reconstructible:
                     continue
             proofs[transaction.transaction_id] = requirement.operation_digest
