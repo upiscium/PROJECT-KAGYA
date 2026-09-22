@@ -567,6 +567,7 @@ def test_true_rollback_reconciles_aggregate_and_clears_gate(tmp_path: Path) -> N
     assert {participant_id for participant_id, _digest, _outcome in outcomes} == {
         "memory.episodic",
         "memory.experience",
+        "memory.semantic",
         "session.turn",
     }
     assert inspection.terminal_gate_clear is not None
@@ -626,8 +627,8 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     boot = recovery.prepare_startup()
     recovery.publish_boot_anchor(boot)
     semantic_ids = (
-        memory.save_semantic("semantic B"),
-        memory.save_semantic("semantic D"),
+        memory.save_legacy_semantic("semantic B"),
+        memory.save_legacy_semantic("semantic D"),
     )
 
     initial = store.load()
@@ -673,7 +674,7 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
         first_participant.episode_id(first_transaction_id),
         second_participant.episode_id(second_transaction_id),
     )
-    derived_semantic_id = memory.save_semantic(
+    derived_semantic_id = memory.save_legacy_semantic(
         "semantic derived from context B", source_episode_ids=[committed_ids[1]]
     )
     episodic_before = memory.db1.get(
@@ -784,7 +785,12 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     assert not wal.inspect().active_manifest.external_reconciliation_required
     assert {
         item.participant_id for item in inspection.baselines[0].participant_registry
-    } == {"memory.episodic", "memory.experience", "session.turn"}
+    } == {
+        "memory.episodic",
+        "memory.experience",
+        "memory.semantic",
+        "session.turn",
+    }
     assert "working_memory" not in journal.path.read_text()
     assert replay_calls == {
         "retrieve": 0,

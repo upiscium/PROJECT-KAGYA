@@ -21,6 +21,11 @@ from kagya.memory.experience_participant import (
     MemoryExperienceParticipant,
 )
 from kagya.memory.experience_store import ExperienceStore
+from kagya.memory.semantic_participant import (
+    MEMORY_SEMANTIC_PARTICIPANT_ID,
+    MemorySemanticParticipant,
+)
+from kagya.memory.semantic_store import SemanticStore
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.event_journal import (
     EventJournal,
@@ -86,6 +91,10 @@ class StartupReconciliationCoordinator:
             domain=ParticipantDomain.DURABLE_DOMAIN,
         ),
         ParticipantBaseline(
+            participant_id=MEMORY_SEMANTIC_PARTICIPANT_ID,
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
             participant_id=SESSION_TURN_PARTICIPANT_ID,
             domain=ParticipantDomain.EPHEMERAL_PROCESS,
         ),
@@ -97,11 +106,15 @@ class StartupReconciliationCoordinator:
         state_recovery: StateRecoveryCoordinator,
         memory: DualMemorySystem,
         experience_store: ExperienceStore | None = None,
+        semantic_store: SemanticStore | None = None,
     ) -> None:
         self.journal = journal
         self.state_recovery = state_recovery
         self.memory = memory
         self.experience_store = experience_store or ExperienceStore.from_memory_root(
+            memory.settings.memory.persist_directory
+        )
+        self.semantic_store = semantic_store or SemanticStore.from_memory_root(
             memory.settings.memory.persist_directory
         )
 
@@ -332,6 +345,10 @@ class StartupReconciliationCoordinator:
                 outcome = MemoryExperienceParticipant.abort_pending(
                     self.memory, self.experience_store, binding
                 )
+            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                outcome = MemorySemanticParticipant.abort_pending(
+                    self.memory, self.semantic_store, binding
+                )
             elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
                 outcome = AbortOutcome.ALREADY_ABSENT
             else:
@@ -369,6 +386,10 @@ class StartupReconciliationCoordinator:
                 ).finalize(self._binding(transaction, requirement))
             elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
                 outcome = self._experience_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
+            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                outcome = self._semantic_participant(
                     transaction, requirement
                 ).finalize(self._binding(transaction, requirement))
             elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
@@ -504,6 +525,8 @@ class StartupReconciliationCoordinator:
                 participant = self._memory_participant(transaction, requirement)
             elif participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
                 participant = self._experience_participant(transaction, requirement)
+            elif participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                participant = self._semantic_participant(transaction, requirement)
             else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant resolver is not registered"
@@ -585,6 +608,25 @@ class StartupReconciliationCoordinator:
         return MemoryExperienceParticipant.from_pending(
             self.memory,
             self.experience_store,
+            transaction.transaction_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+        )
+
+    def _semantic_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> MemorySemanticParticipant:
+        if requirement.participant_id != MEMORY_SEMANTIC_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "Semantic participant resolver is not registered"
+            )
+        return MemorySemanticParticipant.from_pending(
+            self.memory,
+            self.semantic_store,
             transaction.transaction_id,
             requirement.participant_id,
             requirement.operation_digest,
