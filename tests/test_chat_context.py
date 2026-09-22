@@ -393,7 +393,7 @@ def test_real_semantic_provenance_reaches_contextual_selection(
         context_id=current.context_id,
         source_channel="chat",
     )
-    semantic_id = memory.save_semantic(
+    semantic_id = memory.save_legacy_semantic(
         "semantic body", source_episode_ids=[episode_id]
     )
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)

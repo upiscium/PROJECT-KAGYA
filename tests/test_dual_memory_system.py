@@ -12,6 +12,7 @@ from kagya.memory.dual_memory_system import (
     EpisodicMemoryReadError,
     SemanticMemoryFormatError,
     SemanticMemoryReadError,
+    SemanticMemoryWriteError,
 )
 from kagya.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
@@ -72,10 +73,19 @@ def test_new_memory_metadata_rejects_private_fields(tmp_path: Path) -> None:
             metadata={"nested": {"raw-prompt": PRIVATE_SENTINEL}},
         )
     with pytest.raises(ValueError, match="cannot contain private model fields"):
-        memory.save_semantic(
+        memory.save_legacy_semantic(
             "visible fact",
             metadata={"hidden_thought": PRIVATE_SENTINEL},
         )
+
+
+def test_direct_semantic_publication_requires_r07_coordination(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
+
+    with pytest.raises(SemanticMemoryWriteError, match="Coordinated Semantic"):
+        memory.save_semantic("direct bypass")
+    with pytest.raises(SemanticMemoryWriteError, match="Coordinated Semantic"):
+        memory.consolidate_to_semantic(DummyProvider())
 
 
 def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> None:
@@ -116,7 +126,7 @@ def test_legacy_episodic_private_data_is_scrubbed_on_reopen(tmp_path: Path) -> N
 
 def test_semantic_records_can_be_retrieved_from_db2(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
-    semantic_id = memory.save_semantic("The user likes lunar gardens.")
+    semantic_id = memory.save_legacy_semantic("The user likes lunar gardens.")
 
     context = memory.retrieve_context("lunar gardens")
 
@@ -334,7 +344,7 @@ def test_archive_preserves_schema2_provenance(tmp_path: Path) -> None:
         source_session_id="session-a",
     )
 
-    memory.consolidate_to_semantic(DummyProvider())
+    memory.consolidate_to_legacy_semantic(DummyProvider())
 
     committed = memory.get_committed_episodic("episode-schema2")
     assert committed is not None
@@ -404,7 +414,7 @@ def test_committed_episodic_read_rejects_conflicting_backend_shape(
 
 def test_committed_semantic_read_returns_exact_projection(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
-    semantic_id = memory.save_semantic(
+    semantic_id = memory.save_legacy_semantic(
         "The user likes lunar gardens.",
         source_episode_ids=["episode-1"],
         metadata={"safe": "yes"},
@@ -454,7 +464,7 @@ def test_committed_semantic_read_rejects_malformed_conflicts_without_repair(
     tmp_path: Path, mutate
 ) -> None:
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
-    semantic_id = memory.save_semantic("visible text")
+    semantic_id = memory.save_legacy_semantic("visible text")
     stored = memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
     metadata = dict(stored["metadatas"][0])
     mutate(metadata)
@@ -514,7 +524,7 @@ def test_consolidation_archives_db1_records_instead_of_deleting(tmp_path: Path) 
     memory = DualMemorySystem(_settings_for_tmp_memory(tmp_path))
     episode_id = memory.save_episodic("fact", "response", emotion_arousal=1.0)
 
-    semantic_ids = memory.consolidate_to_semantic(DummyProvider())
+    semantic_ids = memory.consolidate_to_legacy_semantic(DummyProvider())
 
     assert len(semantic_ids) == 1
     stored = memory.db1.get(ids=[episode_id], include=["metadatas"])
@@ -529,7 +539,7 @@ def test_retrieval_respects_configured_db1_and_db2_top_k(tmp_path: Path) -> None
     )
     for index in range(3):
         memory.save_episodic(f"shared topic episode {index}", "response")
-        memory.save_semantic(f"shared topic semantic {index}")
+        memory.save_legacy_semantic(f"shared topic semantic {index}")
 
     context = memory.retrieve_context("shared topic")
 
@@ -574,7 +584,7 @@ def test_pending_episodic_is_invisible_to_retrieval_and_consolidation(
     assert memory.get_episodic_record(participant.episode_id(TRANSACTION_ID)) is None
     assert memory.retrieve_context("staged user").db1_results == []
     assert memory._get_unarchived_episodic_records() == []
-    assert memory.consolidate_to_semantic(DummyProvider()) == []
+    assert memory.consolidate_to_legacy_semantic(DummyProvider()) == []
 
 
 def test_finalize_is_idempotent_when_committed_record_and_pending_both_exist(

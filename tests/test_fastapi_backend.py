@@ -2124,7 +2124,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("rollback WM seed")
+        client.app.state.memory_system.save_legacy_semantic("rollback WM seed")
         assert (
             client.post(
                 "/api/chat", json={"message": "rollback WM seed", "attachments": []}
@@ -2556,7 +2556,7 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
     )
 
     with TestClient(app) as client:
-        client.app.state.memory_system.save_semantic("U5 durable WM seed")
+        client.app.state.memory_system.save_legacy_semantic("U5 durable WM seed")
         assert client.post(
             "/api/chat", json={"message": "U5 durable WM seed", "attachments": []}
         ).status_code == 200
@@ -3304,7 +3304,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
     resolved_body = "U4-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        semantic_id = client.app.state.memory_system.save_semantic(resolved_body)
+        semantic_id = client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat",
             json={"message": resolved_body, "attachments": [], "debug": False},
@@ -3355,7 +3355,7 @@ def test_debug_projection_can_use_resolved_body_without_durable_leak(
     resolved_body = "U4-DEBUG-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic(resolved_body)
+        client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat/debug",
             headers=admin_headers(),
@@ -3384,7 +3384,7 @@ def test_handler_failure_restores_prior_canonical_working_memory(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("U4 failure checkpoint marker")
+        client.app.state.memory_system.save_legacy_semantic("U4 failure checkpoint marker")
         first = client.post(
             "/api/chat",
             json={"message": "U4 failure checkpoint marker", "attachments": []},
@@ -3484,7 +3484,7 @@ def test_startup_does_not_resolve_noneligible_working_memory_refs(
     settings = _settings(tmp_path)
     marker = f"U5-{status.value}-working-memory-ref"
     with _client(tmp_path, settings=settings) as first:
-        source_id = first.app.state.memory_system.save_semantic(marker)
+        source_id = first.app.state.memory_system.save_legacy_semantic(marker)
         assert first.post(
             "/api/chat", json={"message": marker, "attachments": []}
         ).status_code == 200
