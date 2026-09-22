@@ -494,7 +494,7 @@ class ExperienceStore:
         return self._read_json(self.receipt_path(transaction_id), missing_ok=True)
 
     def write_receipt(self, transaction_id: str, payload: dict[str, object]) -> None:
-        """Durably retain a bounded operation receipt before publication."""
+        """Durably retain a bounded operation receipt after publication."""
 
         path = self.receipt_path(transaction_id)
         self._write_immutable_json(path, payload)
@@ -604,15 +604,47 @@ class ExperienceStore:
         self._fsync_directory(path.parent)
 
     def load_current(self, experience_id: str) -> ExperienceStoredEntry | None:
+        """Load a current record, rejecting an untyped empty record directory."""
+
+        return self._load_current(experience_id)
+
+    def load_pending_create_current(
+        self, experience_id: str
+    ) -> ExperienceStoredEntry | None:
+        """Load a create candidate when verified pending evidence permits an empty dir."""
+
+        return self._load_current(experience_id, allow_empty=True)
+
+    def load_committed_current(self, experience_id: str) -> ExperienceStoredEntry:
+        """Load a committed record, rejecting disappearance of its record directory."""
+
+        current = self._load_current(experience_id, require_present=True)
+        if current is None:
+            raise ExperienceStoreCorrupt("Committed Experience record is absent")
+        return current
+
+    def _load_current(
+        self,
+        experience_id: str,
+        *,
+        allow_empty: bool = False,
+        require_present: bool = False,
+    ) -> ExperienceStoredEntry | None:
         self._validate_identifier(experience_id)
+        if allow_empty and require_present:
+            raise ValueError("Experience current load modes conflict")
         directory = self.records_root / experience_id
         if not self._path_exists(directory):
+            if require_present:
+                raise ExperienceStoreCorrupt("Experience record directory is absent")
             return None
         self._secure_parent(directory, create=False)
         self._recover_publication_temps(directory)
         self._recover_compaction(directory, experience_id)
         entries = self._load_entries(directory, experience_id)
         if not entries:
+            if allow_empty:
+                return None
             raise ExperienceStoreCorrupt("Experience record directory is empty")
         self._validate_revision_window(entries)
         return entries[max(entries)]
@@ -660,20 +692,7 @@ class ExperienceStore:
                 raise ExperienceStoreCorrupt("Experience revision window is incomplete")
         if current_revision < 32 and actual != expected:
             raise ExperienceStoreCorrupt("Experience revision window is incomplete")
-        for revision, entry in entries.items():
-            evidence = entry.revision_evidence
-            if evidence is None or evidence != entry.record.revision_history[-1]:
-                raise ExperienceStoreCorrupt("Experience operation evidence is inconsistent")
-            if revision == 0:
-                if entry.previous_record_digest is not None:
-                    raise ExperienceStoreCorrupt("Genesis artifact has a prior record")
-                continue
-            previous = entries.get(revision - 1)
-            if previous is not None:
-                if entry.previous_record_digest != experience_record_digest(previous.record):
-                    raise ExperienceStoreCorrupt("Experience record chain is broken")
-            elif _DIGEST.fullmatch(entry.previous_record_digest or "") is None:
-                raise ExperienceStoreCorrupt("Compacted Experience predecessor is invalid")
+        self._validate_revision_chain(entries)
         current = entries[current_revision]
         if current_revision >= 32:
             floor = current_revision - 32
@@ -692,6 +711,24 @@ class ExperienceStore:
                 raise ExperienceStoreCorrupt("Experience evidence anchor is invalid")
         elif any(entry.anchor_revision is not None for entry in entries.values()):
             raise ExperienceStoreCorrupt("Unexpected Experience history anchor")
+
+    def _validate_revision_chain(
+        self, entries: dict[int, ExperienceStoredEntry]
+    ) -> None:
+        for revision, entry in entries.items():
+            evidence = entry.revision_evidence
+            if evidence is None or evidence != entry.record.revision_history[-1]:
+                raise ExperienceStoreCorrupt("Experience operation evidence is inconsistent")
+            if revision == 0:
+                if entry.previous_record_digest is not None:
+                    raise ExperienceStoreCorrupt("Genesis artifact has a prior record")
+                continue
+            previous = entries.get(revision - 1)
+            if previous is not None:
+                if entry.previous_record_digest != experience_record_digest(previous.record):
+                    raise ExperienceStoreCorrupt("Experience record chain is broken")
+            elif _DIGEST.fullmatch(entry.previous_record_digest or "") is None:
+                raise ExperienceStoreCorrupt("Compacted Experience predecessor is invalid")
 
     def _recover_publication_temps(self, directory: Path) -> None:
         try:
@@ -729,6 +766,46 @@ class ExperienceStore:
                 ) from error
         if any(_TEMP_NAME.fullmatch(path.name) is not None for path in paths):
             self._fsync_directory(directory)
+
+    def _validate_compaction_recovery(
+        self,
+        entries: dict[int, ExperienceStoredEntry],
+        *,
+        current_revision: int,
+        floor: int,
+        anchor_revision: int,
+        anchor_digest: str,
+        anchor_record_digest: str,
+        current_record_digest: str,
+    ) -> None:
+        if not entries or max(entries) != current_revision:
+            raise ExperienceStoreCorrupt("Experience compaction current reference is invalid")
+        actual = set(entries)
+        suffix = set(range(floor, current_revision + 1))
+        prefix = sorted(revision for revision in actual if revision < floor)
+        prefix_is_contiguous_suffix = not prefix or prefix == list(range(prefix[0], floor))
+        if (
+            not suffix.issubset(actual)
+            or not prefix_is_contiguous_suffix
+            or actual != suffix | set(prefix)
+        ):
+            raise ExperienceStoreCorrupt("Experience compaction prefix is inconsistent")
+        self._validate_revision_chain(entries)
+        anchor = entries.get(floor)
+        current = entries.get(current_revision)
+        if anchor is None or current is None:
+            raise ExperienceStoreCorrupt("Experience compaction anchor is absent")
+        if (
+            experience_record_digest(anchor.record) != anchor_record_digest
+            or anchor.revision_evidence is None
+            or anchor.revision_evidence.record_digest != anchor_digest
+            or experience_record_digest(current.record) != current_record_digest
+            or current.record.history_anchor_revision != anchor_revision
+            or current.record.history_anchor_digest != anchor_digest
+            or current.anchor_revision != anchor_revision
+            or current.anchor_record_digest != anchor_record_digest
+        ):
+            raise ExperienceStoreCorrupt("Experience compaction marker conflicts")
 
     def _recover_compaction(self, directory: Path, experience_id: str) -> None:
         marker = directory / _COMPACTION_NAME
@@ -775,16 +852,16 @@ class ExperienceStore:
             )
         except (TypeError, ValueError, ExperienceStoreCorrupt):
             raise ExperienceStoreCorrupt("Experience compaction marker is invalid") from None
-        current_path = directory / f"{current_revision}.json"
-        current_payload = self._read_json(current_path)
-        current = self._entry_from_payload(current_payload, experience_id, current_revision)
-        if (
-            experience_record_digest(current.record) != current_record_digest
-            or current.record.history_anchor_revision != anchor_revision
-            or current.record.history_anchor_digest != anchor_digest
-            or current.anchor_record_digest != anchor_record_digest
-        ):
-            raise ExperienceStoreCorrupt("Experience compaction marker conflicts")
+        entries = self._load_entries(directory, experience_id)
+        self._validate_compaction_recovery(
+            entries,
+            current_revision=current_revision,
+            floor=floor,
+            anchor_revision=anchor_revision,
+            anchor_digest=anchor_digest,
+            anchor_record_digest=anchor_record_digest,
+            current_record_digest=current_record_digest,
+        )
         for revision in delete_revisions:
             path = directory / f"{revision}.json"
             try:

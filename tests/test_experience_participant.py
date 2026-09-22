@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from dataclasses import replace
+import os
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from kagya.memory.experience_participant import (
     MemoryExperienceParticipant,
     experience_id_for_event,
 )
-from kagya.memory.experience_store import ExperienceStore
+from kagya.memory.experience_store import ExperienceStore, ExperienceStoreCorrupt
 from kagya.runtime import (
     AgentEvent,
     AgentEventSource,
@@ -166,6 +167,7 @@ def test_prepare_is_pending_only_and_finalize_requires_committed_episode(
     participant.prepare(binding)
     assert store.load_current(participant.operation.record.experience_id) is None
     assert store.load_pending(binding.transaction_id) is not None
+    assert store.load_receipt(binding.transaction_id) is None
     with pytest.raises(ParticipantUnavailableError):
         participant.finalize(binding)
 
@@ -182,16 +184,256 @@ def test_prepare_is_pending_only_and_finalize_requires_committed_episode(
     assert store.load_pending(binding.transaction_id) is None
 
 
+def test_receipt_survives_crash_before_pending_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+
+    def crash_before_pending_removal(_transaction_id: str) -> None:
+        raise ParticipantUnavailableError("injected crash before pending removal")
+
+    monkeypatch.setattr(participant, "_remove_pending", crash_before_pending_removal)
+    with pytest.raises(ParticipantUnavailableError):
+        participant.finalize(binding)
+    monkeypatch.undo()
+
+    assert store.load_current(participant.operation.record.experience_id) is not None
+    assert store.load_receipt(binding.transaction_id) is not None
+    assert store.load_pending(binding.transaction_id) is not None
+    restarted = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=EVENT_ID,
+        processing_sequence=1,
+    )
+    assert restarted.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    assert store.load_pending(binding.transaction_id) is None
+
+
+@pytest.mark.parametrize("fault_stage", ["temp_fsync", "link"])
+def test_first_create_publication_crash_restarts_from_pending_to_exact_one_revision(
+    tmp_path: Path, fault_stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+    record_directory = store.record_path(
+        participant.operation.record.experience_id, 0
+    ).parent
+    original_fsync = os.fsync
+    original_unlink = os.unlink
+    fault_injected = False
+
+    def fail_temp_fsync(descriptor: int) -> None:
+        nonlocal fault_injected
+        descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if (
+            fault_stage == "temp_fsync"
+            and ".publish-" in descriptor_path.name
+            and not fault_injected
+        ):
+            fault_injected = True
+            raise OSError("injected crash while syncing first revision temp")
+        original_fsync(descriptor)
+
+    def fail_before_link(
+        source: str,
+        destination: str,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal fault_injected
+        temporary = record_directory / source
+        assert temporary.exists()
+        fault_injected = True
+        raise OSError("injected crash before first revision link")
+
+    def preserve_temporary(
+        path: object, *args: object, **kwargs: object
+    ) -> None:
+        if isinstance(path, str) and ".publish-" in path:
+            raise OSError("injected crash before temporary cleanup")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fail_temp_fsync)
+    if fault_stage == "link":
+        monkeypatch.setattr(os, "link", fail_before_link)
+    monkeypatch.setattr(os, "unlink", preserve_temporary)
+    with pytest.raises(ParticipantUnavailableError):
+        participant.finalize(binding)
+    assert fault_injected
+    assert not store.record_path(participant.operation.record.experience_id, 0).exists()
+    assert any(".publish-" in item.name for item in record_directory.iterdir())
+    monkeypatch.undo()
+
+    restarted = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=EVENT_ID,
+        processing_sequence=1,
+    )
+    assert restarted.finalize(binding) is ParticipantOutcome.FINALIZED
+    current = store.load_current(participant.operation.record.experience_id)
+    assert current is not None
+    assert current.record == participant.operation.record
+    assert current.record.revision == 0
+    assert not store.load_pending(binding.transaction_id)
+    assert not any(".publish-" in item.name for item in record_directory.iterdir())
+
+
+def test_pending_create_allows_only_typed_empty_record_directory(
+    tmp_path: Path,
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+    record_directory = store.record_path(
+        participant.operation.record.experience_id, 0
+    ).parent
+    record_directory.mkdir(parents=True, mode=0o700)
+
+    with pytest.raises(ExperienceStoreCorrupt):
+        store.load_current(participant.operation.record.experience_id)
+
+    restarted = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=EVENT_ID,
+        processing_sequence=1,
+    )
+    assert restarted.finalize(binding) is ParticipantOutcome.FINALIZED
+    assert store.record_path(participant.operation.record.experience_id, 0).exists()
+
+
+def test_receipt_without_committed_record_fails_closed(
+    tmp_path: Path,
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+    participant.finalize(binding)
+    record_directory = store.record_path(
+        participant.operation.record.experience_id, 0
+    ).parent
+    store.record_path(participant.operation.record.experience_id, 0).unlink()
+    record_directory.rmdir()
+
+    with pytest.raises(ParticipantDivergedError):
+        MemoryExperienceParticipant.from_pending(
+            memory,
+            store,
+            binding.transaction_id,
+            binding.participant_id,
+            binding.operation_digest,
+            event_id=EVENT_ID,
+            processing_sequence=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("source_event_id", "33333333-3333-4333-8333-333333333333"),
+        ("source_event_sequence", 99),
+        ("source_episode_id", "episode:substituted"),
+        ("context_id", "context:substituted"),
+        ("created_at", datetime(2026, 1, 2, tzinfo=UTC)),
+        ("source_episode_operation_digest", "9" * 64),
+    ],
+)
+def test_revision_lineage_substitution_fails_closed(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+    participant.finalize(binding)
+    initial = participant.operation.record
+    revision_record = ExperienceRevisionRecord(
+        initial.experience_id,
+        1,
+        ExperienceRevisionOperation.CORRECT,
+        ExperienceRevisionReason.CORRECTION,
+        NOW,
+        REVISION_EVENT_ID,
+        2,
+        evidence_refs=("evidence:1",),
+        previous_revision_digest=initial.revision_history[-1].record_digest,
+    )
+    revised = replace(
+        initial,
+        revision=1,
+        revision_history=(initial.revision_history[-1], revision_record),
+        **({field: replacement} if field != "source_episode_operation_digest" else {}),
+    )
+    source_digest = (
+        replacement
+        if field == "source_episode_operation_digest"
+        else participant.operation.source_episode_operation_digest
+    )
+    assert isinstance(source_digest, str)
+    revision = MemoryExperienceParticipant(
+        memory,
+        store,
+        ExperienceRevisionIntent(
+            revised,
+            revision_record,
+            expected_revision=0,
+            expected_record_digest=experience_record_digest(initial),
+            source_episode_operation_digest=source_digest,
+        ),
+    )
+    revision_transaction_id = TransactionCoordinator.derive_transaction_id(
+        AgentEvent(
+            REVISION_EVENT_ID,
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            NOW,
+            2,
+        ),
+        TransactionKind.EVENT_MUTATION,
+    )
+    revision_binding = TransactionBinding(
+        revision_transaction_id,
+        REVISION_EVENT_ID,
+        2,
+        MEMORY_EXPERIENCE_PARTICIPANT_ID,
+        revision.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+
+    with pytest.raises(ParticipantDivergedError, match="lineage"):
+        revision.prepare(revision_binding)
+    assert store.load_pending(revision_transaction_id) is None
+
+
 def test_abort_removes_only_pending_and_restart_reuses_committed_identity(
     tmp_path: Path,
 ) -> None:
     memory, store, _episode, _episode_binding, participant, binding = _setup(tmp_path)
 
     participant.prepare(binding)
-    assert participant.abort(binding).value == "aborted"
+    assert (
+        MemoryExperienceParticipant.abort_pending(memory, store, binding).value
+        == "aborted"
+    )
     assert store.load_current(participant.operation.record.experience_id) is None
     assert store.load_receipt(binding.transaction_id) is None
-    assert participant.abort(binding).value == "already_absent"
+    assert (
+        MemoryExperienceParticipant.abort_pending(memory, store, binding).value
+        == "already_absent"
+    )
 
     participant.prepare(binding)
     # A committed source is required before the Experience can be published.
@@ -211,7 +453,7 @@ def test_abort_removes_only_pending_and_restart_reuses_committed_identity(
 
 
 def test_revision_prepare_writes_pending_and_restart_rolls_forward(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
     participant.prepare(binding)
@@ -282,8 +524,24 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
         TransactionKind.EVENT_MUTATION,
     )
 
-    revision.prepare(revision_binding)
+    original_write_pending = store.write_pending
+
+    def write_then_crash(transaction_id: str, payload: dict[str, object]) -> None:
+        original_write_pending(transaction_id, payload)
+        raise RuntimeError("injected crash after revision pending publication")
+
+    monkeypatch.setattr(store, "write_pending", write_then_crash)
+    with pytest.raises(RuntimeError):
+        revision.prepare(revision_binding)
+    monkeypatch.undo()
     assert store.load_pending(revision_transaction_id) is not None
+    assert store.load_receipt(revision_transaction_id) is None
+    assert (
+        MemoryExperienceParticipant.abort_pending(memory, store, revision_binding).value
+        == "aborted"
+    )
+    assert store.load_pending(revision_transaction_id) is None
+    revision.prepare(revision_binding)
     rebuilt = MemoryExperienceParticipant.from_pending(
         memory,
         store,
@@ -296,6 +554,15 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
     assert rebuilt.abort(revision_binding).value == "aborted"
     assert rebuilt.abort(revision_binding).value == "already_absent"
     revision.prepare(revision_binding)
+    assert isinstance(revision.operation, ExperienceRevisionIntent)
+    store.publish_revision(
+        revision.operation.record,
+        revision.operation_digest,
+        revision.operation.source_episode_operation_digest,
+        expected_revision=revision.operation.expected_revision,
+        expected_digest=revision.operation.expected_record_digest,
+    )
+    assert store.load_receipt(revision_transaction_id) is None
     rebuilt = MemoryExperienceParticipant.from_pending(
         memory,
         store,
@@ -305,13 +572,25 @@ def test_revision_prepare_writes_pending_and_restart_rolls_forward(
         event_id=REVISION_EVENT_ID,
         processing_sequence=2,
     )
-    assert rebuilt.finalize(revision_binding) is ParticipantOutcome.FINALIZED
+    assert rebuilt.finalize(revision_binding) is ParticipantOutcome.ALREADY_CONSISTENT
     current = store.load_current(initial.experience_id)
     assert current is not None
     assert current.record == revised
     receipt = store.load_receipt(revision_transaction_id)
     assert receipt is not None
     assert receipt["operation_digest"] == revision.operation_digest
+    store.write_pending(revision_transaction_id, revision._artifact(revision_binding))
+    pending_receipt_restart = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        revision_transaction_id,
+        revision_binding.participant_id,
+        revision_binding.operation_digest,
+        event_id=REVISION_EVENT_ID,
+        processing_sequence=2,
+    )
+    assert pending_receipt_restart.finalize(revision_binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    assert store.load_pending(revision_transaction_id) is None
     restarted_after_commit = MemoryExperienceParticipant.from_pending(
         memory,
         store,

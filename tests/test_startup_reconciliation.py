@@ -851,3 +851,61 @@ def test_gate_clear_resumes_after_wal_cas_before_journal_terminal(
     assert sum(
         item.lifecycle is EventLifecycle.CLEARED for item in reopened.inspect().records
     ) == 1
+
+
+def test_gate_clear_resumes_from_prepared_record_before_wal_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, store, journal, wal, recovery = _graph(tmp_path)
+    boot = recovery.prepare_startup()
+    recovery.publish_boot_anchor(boot)
+    item = _event("startup-gate-clear-before-wal")
+    participant = _participant(memory)
+    transaction_coordinator = _prepared_transaction(journal, item, participant)
+    initial = store.load()
+    candidate = _snapshot(1)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    transaction_coordinator.finalize_event(item, evidence)
+    recovery.complete_committed_event(item, evidence)
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    store.path.unlink()
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    coordinator = StartupReconciliationCoordinator(journal, recovery, memory)
+
+    def crash_before_wal_clear(*_args: object, **_kwargs: object) -> object:
+        raise EventJournalAppendError(EventJournalAppendStage.WRITE, published=False)
+
+    monkeypatch.setattr(recovery, "clear_recovery_gate", crash_before_wal_clear)
+    with pytest.raises(EventJournalAppendError):
+        coordinator.reconcile_recovery_gate(rolled_back)
+    assert journal.inspect().open_gate_clear is not None
+    assert wal.inspect().active_manifest is not None
+    assert wal.inspect().active_manifest.external_reconciliation_required
+    baseline_count_before_resume = len(journal.inspect().baselines)
+
+    journal.close()
+    reopened = EventJournal(journal.path, 100_000, 4, clock=lambda: NOW)
+    reopened_recovery = StateRecoveryCoordinator(
+        AgentStateStore(store.path, baseline_surprisal=1.0, clock=lambda: NOW),
+        reopened,
+        StateWAL(wal.root),
+    )
+    restarted = StartupReconciliationCoordinator(
+        reopened, reopened_recovery, DualMemorySystem(_settings(tmp_path))
+    )
+
+    assert restarted.resume_prepared_gate_clear()
+    assert not restarted.resume_prepared_gate_clear()
+    assert reopened.inspect().terminal_gate_clear is not None
+    assert not reopened_recovery.wal.inspect().active_manifest.external_reconciliation_required
+    assert len(reopened.inspect().baselines) == baseline_count_before_resume
+    assert sum(
+        item.lifecycle is EventLifecycle.CLEARED for item in reopened.inspect().records
+    ) == 1

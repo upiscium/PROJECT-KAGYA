@@ -304,7 +304,17 @@ class MemoryExperienceParticipant:
                 participant._validate_record_identity(
                     transaction_id, event_id, processing_sequence
                 )
-            current = participant._current_entry()
+            receipt = cls._load_receipt(store, transaction_id)
+            if receipt is not None:
+                cls._operation_from_receipt(
+                    receipt, transaction_id, participant_id, operation_digest
+                )
+            current = participant._current_entry(
+                pending_create=(
+                    isinstance(operation, ExperienceCreateIntent) and receipt is None
+                ),
+                committed=receipt is not None,
+            )
             if current is not None:
                 if isinstance(participant.operation, ExperienceRevisionIntent):
                     if not participant._operation_matches_current(current):
@@ -443,8 +453,25 @@ class MemoryExperienceParticipant:
         self._validate_source_operation(binding)
         expected = self._artifact(binding)
         try:
-            current = self._current_entry()
-            self._ensure_receipt(binding)
+            pending = self.store.load_pending(binding.transaction_id)
+            if pending is not None and pending != expected:
+                raise ParticipantDivergedError("Experience pending artifact conflicts")
+            receipt = self.store.load_receipt(binding.transaction_id)
+            if receipt is not None:
+                self._operation_from_receipt(
+                    receipt,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+            current = self._current_entry(
+                pending_create=(
+                    pending is not None
+                    and isinstance(self.operation, ExperienceCreateIntent)
+                    and receipt is None
+                ),
+                committed=receipt is not None,
+            )
             if current is not None:
                 if self._operation_matches_current(current):
                     pass
@@ -458,9 +485,6 @@ class MemoryExperienceParticipant:
                         self._ensure_current_matches(current)
                     else:
                         self._validate_committed_artifact()
-                pending = self.store.load_pending(binding.transaction_id)
-                if pending is not None and pending != expected:
-                    raise ParticipantDivergedError("Experience pending artifact conflicts")
                 if (
                     pending is None
                     and isinstance(self.operation, ExperienceRevisionIntent)
@@ -470,9 +494,6 @@ class MemoryExperienceParticipant:
                 return
             if isinstance(self.operation, ExperienceRevisionIntent):
                 raise ParticipantUnavailableError("Experience revision target is absent")
-            pending = self.store.load_pending(binding.transaction_id)
-            if pending is not None and pending != expected:
-                raise ParticipantDivergedError("Experience pending artifact conflicts")
             if pending is None:
                 self.store.write_pending(binding.transaction_id, expected)
         except (ExperienceStoreCorrupt, ExperienceStoreConflict) as error:
@@ -496,19 +517,34 @@ class MemoryExperienceParticipant:
         try:
             pending = store.load_pending(binding.transaction_id)
             receipt = cls._load_receipt(store, binding.transaction_id)
-            current = None
+            pending_operation = None
+            if pending is not None:
+                pending_operation = cls._operation_from_pending_payload(
+                    pending,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+            receipt_operation = None
             if receipt is not None:
-                operation = cls._operation_from_receipt(
+                receipt_operation = cls._operation_from_receipt(
                     receipt,
                     binding.transaction_id,
                     binding.participant_id,
                     binding.operation_digest,
                 )
-                current = store.load_current(operation.record.experience_id)
-            else:
+            operation = receipt_operation or pending_operation
+            if operation is None:
                 current = store.load_current(
                     experience_id_for_event(binding.event_id, binding.processing_sequence)
                 )
+            else:
+                if receipt is not None:
+                    current = store.load_committed_current(operation.record.experience_id)
+                elif isinstance(operation, ExperienceCreateIntent):
+                    current = store.load_pending_create_current(operation.record.experience_id)
+                else:
+                    current = store.load_current(operation.record.experience_id)
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
@@ -541,8 +577,25 @@ class MemoryExperienceParticipant:
         self._validate_source_committed(binding)
         expected = self._artifact(binding)
         try:
-            current = self._current_entry()
             pending = self.store.load_pending(binding.transaction_id)
+            if pending is not None and pending != expected:
+                raise ParticipantDivergedError("Experience pending artifact conflicts")
+            receipt = self.store.load_receipt(binding.transaction_id)
+            if receipt is not None:
+                self._operation_from_receipt(
+                    receipt,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+            current = self._current_entry(
+                pending_create=(
+                    pending == expected
+                    and isinstance(self.operation, ExperienceCreateIntent)
+                    and receipt is None
+                ),
+                committed=receipt is not None,
+            )
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
@@ -584,7 +637,6 @@ class MemoryExperienceParticipant:
             if pending is None:
                 raise ParticipantUnavailableError("Experience pending artifact is absent")
             raise ParticipantDivergedError("Experience pending artifact conflicts")
-        self._ensure_receipt(binding)
         try:
             if isinstance(self.operation, ExperienceCreateIntent):
                 self.store.publish_create(
@@ -604,6 +656,7 @@ class MemoryExperienceParticipant:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
+        self._ensure_receipt(binding)
         self._remove_pending(binding.transaction_id)
         self._prune_receipts(binding.transaction_id)
         return ParticipantOutcome.FINALIZED
@@ -612,8 +665,25 @@ class MemoryExperienceParticipant:
         self._validate_binding(binding)
         self._validate_record_identity(binding.transaction_id, binding.event_id, binding.processing_sequence)
         try:
-            current = self._current_entry()
             pending = self.store.load_pending(binding.transaction_id)
+            if pending is not None and pending != self._artifact(binding):
+                raise ParticipantDivergedError("Experience pending artifact conflicts")
+            receipt = self.store.load_receipt(binding.transaction_id)
+            if receipt is not None:
+                self._operation_from_receipt(
+                    receipt,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+            current = self._current_entry(
+                pending_create=(
+                    pending is not None
+                    and isinstance(self.operation, ExperienceCreateIntent)
+                    and receipt is None
+                ),
+                committed=receipt is not None,
+            )
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
@@ -631,8 +701,6 @@ class MemoryExperienceParticipant:
         if pending is None:
             self._remove_receipt(binding.transaction_id)
             return AbortOutcome.ALREADY_ABSENT
-        if pending != self._artifact(binding):
-            raise ParticipantDivergedError("Experience pending artifact conflicts")
         self._remove_pending(binding.transaction_id)
         self._remove_receipt(binding.transaction_id)
         return AbortOutcome.ABORTED
@@ -641,8 +709,26 @@ class MemoryExperienceParticipant:
         self._validate_binding(binding)
         self._validate_record_identity(binding.transaction_id, binding.event_id, binding.processing_sequence)
         try:
-            current = self._current_entry()
             pending = self.store.load_pending(binding.transaction_id)
+            expected = self._artifact(binding)
+            if pending is not None and pending != expected:
+                raise ParticipantDivergedError("Experience pending artifact conflicts")
+            receipt = self.store.load_receipt(binding.transaction_id)
+            if receipt is not None:
+                self._operation_from_receipt(
+                    receipt,
+                    binding.transaction_id,
+                    binding.participant_id,
+                    binding.operation_digest,
+                )
+            current = self._current_entry(
+                pending_create=(
+                    pending == expected
+                    and isinstance(self.operation, ExperienceCreateIntent)
+                    and receipt is None
+                ),
+                committed=receipt is not None,
+            )
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
@@ -659,8 +745,6 @@ class MemoryExperienceParticipant:
                     self._ensure_current_matches(current)
                 else:
                     self._validate_committed_artifact()
-            if pending is not None and pending != self._artifact(binding):
-                raise ParticipantDivergedError("Experience pending artifact conflicts")
             return StartupParticipantOutcome.VERIFIED_CONSISTENT
         if pending == self._artifact(binding):
             raise ParticipantUnavailableError("Experience roll-forward is required")
@@ -801,8 +885,18 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
 
-    def _current_entry(self) -> ExperienceStoredEntry | None:
+    def _current_entry(
+        self, *, pending_create: bool = False, committed: bool = False
+    ) -> ExperienceStoredEntry | None:
+        if pending_create and committed:
+            raise ValueError("Experience current load modes conflict")
         try:
+            if pending_create:
+                return self.store.load_pending_create_current(
+                    self.operation.record.experience_id
+                )
+            if committed:
+                return self.store.load_committed_current(self.operation.record.experience_id)
             return self.store.load_current(self.operation.record.experience_id)
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
@@ -831,9 +925,14 @@ class MemoryExperienceParticipant:
 
     def _validate_committed_artifact(self) -> ExperienceStoredEntry:
         try:
-            entry = self.store.load_revision(
-                self.operation.record.experience_id,
-                self.operation.record.revision,
+            current = self.store.load_committed_current(self.operation.record.experience_id)
+            entry = (
+                current
+                if current.record.revision == self.operation.record.revision
+                else self.store.load_revision(
+                    self.operation.record.experience_id,
+                    self.operation.record.revision,
+                )
             )
         except ExperienceStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None

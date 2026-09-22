@@ -273,12 +273,51 @@ def test_publication_temp_is_typed_and_recovers_without_replacing_final(
     assert current is not None and current.record == record
     assert path.read_bytes() == final_bytes
     assert not any(".publish-" in item.name for item in path.parent.iterdir())
+    assert {
+        int(item.stem)
+        for item in path.parent.iterdir()
+        if item.suffix == ".json" and item.stem.isdigit()
+    } == {0}
 
     unknown = path.parent / ".tmp-unknown"
     unknown.write_bytes(b"not a recognized publication artifact")
     unknown.chmod(0o600)
     with pytest.raises(ExperienceStoreCorrupt):
         store.load_current(record.experience_id)
+
+
+def test_first_create_parent_fsync_failure_recovers_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    record = _record()
+    record_directory = store.record_path(record.experience_id, 0).parent
+    original_fsync = os.fsync
+    record_directory_syncs = 0
+
+    def fail_after_link(descriptor: int) -> None:
+        nonlocal record_directory_syncs
+        descriptor_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        if descriptor_path == record_directory:
+            record_directory_syncs += 1
+            if record_directory_syncs == 2:
+                raise OSError("injected parent fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_after_link)
+    with pytest.raises(ExperienceStoreUnavailable):
+        store.publish_create(record, OPERATION_DIGEST, SOURCE_DIGEST)
+    monkeypatch.undo()
+
+    assert record_directory_syncs == 2
+    current = store.load_current(record.experience_id)
+    assert current is not None and current.record == record
+    assert {
+        int(item.stem)
+        for item in record_directory.iterdir()
+        if item.suffix == ".json" and item.stem.isdigit()
+    } == {0}
+    assert not any(".publish-" in item.name for item in record_directory.iterdir())
 
 
 def test_retention_is_exact_anchored_and_idempotent(
@@ -343,3 +382,55 @@ def test_retention_is_exact_anchored_and_idempotent(
     store.record_path(records[-1].experience_id, 10).unlink()
     with pytest.raises(ExperienceStoreCorrupt):
         store.load_current(records[-1].experience_id)
+
+
+def test_compaction_damaged_anchor_fails_before_prefix_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    records = _revision_series("experience:damaged-anchor", 33)
+    store.publish_create(records[0], OPERATION_DIGEST, SOURCE_DIGEST)
+    for revision in range(1, len(records)):
+        if revision == 33:
+            original_unlink = Path.unlink
+            failed = False
+
+            def fail_first_prune_unlink(
+                path: Path, *args: object, **kwargs: object
+            ) -> None:
+                nonlocal failed
+                if path.name == "0.json" and not failed:
+                    failed = True
+                    raise OSError("injected compaction failure")
+                original_unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", fail_first_prune_unlink)
+            with pytest.raises(ExperienceStoreUnavailable):
+                store.publish_revision(
+                    records[revision],
+                    f"{revision + 2:064x}",
+                    SOURCE_DIGEST,
+                    expected_revision=revision - 1,
+                    expected_digest=experience_record_digest(records[revision - 1]),
+                )
+            monkeypatch.undo()
+            break
+        store.publish_revision(
+            records[revision],
+            f"{revision + 2:064x}",
+            SOURCE_DIGEST,
+            expected_revision=revision - 1,
+            expected_digest=experience_record_digest(records[revision - 1]),
+        )
+
+    directory = store.records_root / records[-1].experience_id
+    prefix = store.record_path(records[-1].experience_id, 0)
+    prefix_bytes = prefix.read_bytes()
+    marker = directory / ".compaction.json"
+    assert marker.exists()
+    store.record_path(records[-1].experience_id, 1).unlink()
+
+    with pytest.raises(ExperienceStoreCorrupt):
+        store.load_current(records[-1].experience_id)
+    assert prefix.read_bytes() == prefix_bytes
+    assert marker.exists()
