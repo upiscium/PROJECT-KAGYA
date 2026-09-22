@@ -358,6 +358,66 @@ def test_schema_is_strict_and_has_no_metadata_escape_hatch() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("lifecycle", "fields"),
+    [
+        (
+            EventLifecycle.CHECKPOINT,
+            {
+                "processing_sequence": 0,
+                "snapshot_sequence": 0,
+                "snapshot_hash": HASH_0,
+                "wal_generation_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-generation")),
+                "wal_record_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-record")),
+                "wal_record_hash": HASH_1,
+                "journal_lineage_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-lineage")),
+                "external_reconciliation_required": False,
+                "v3_migration_anchor_hash": HASH_2,
+            },
+        ),
+        (
+            EventLifecycle.TRANSACTION_COMPLETED,
+            {
+                "event_id": event("forbidden-transaction", 1).event_id,
+                "event_type": AgentEventType.CHAT,
+                "source": AgentEventSource.API_CHAT,
+                "processing_sequence": 1,
+                "transaction_id": str(uuid5(NAMESPACE_URL, "forbidden-transaction-id")),
+            },
+        ),
+        (
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            {
+                "reconciliation_id": str(uuid5(NAMESPACE_URL, "forbidden-reconciliation")),
+                "recovery_id": str(uuid5(NAMESPACE_URL, "forbidden-recovery")),
+                "snapshot_sequence": 0,
+                "snapshot_hash": HASH_0,
+                "recovery_processing_high_water": 0,
+                "wal_generation_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-generation")),
+                "wal_record_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-record")),
+                "wal_record_hash": HASH_1,
+                "journal_lineage_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-lineage")),
+            },
+        ),
+    ],
+)
+def test_adoption_epoch_is_baseline_only(
+    lifecycle: EventLifecycle, fields: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(
+            {
+                "schema_version": 3,
+                "record_id": str(uuid5(NAMESPACE_URL, f"forbidden-{lifecycle.value}")),
+                "timestamp": NOW,
+                "lifecycle": lifecycle,
+                "record_hash": HASH_0,
+                "adoption_epoch": 1,
+                **fields,
+            }
+        )
+
+
 def test_journal_config_is_strict_positive_and_backward_compatible() -> None:
     settings = load_settings(CONFIG_PATH)
     assert settings.event_journal.path == Path(".kagya/event_journal.jsonl")

@@ -104,6 +104,25 @@ def test_store_publishes_immutable_current_and_rejects_conflicts(tmp_path: Path)
         store.publish_create(record, "3" * 64, SOURCE_DIGEST)
 
 
+def test_first_directory_creation_syncs_each_parent_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    record = _record()
+    synced: list[Path] = []
+    original = ExperienceStore._fsync_directory
+
+    def record_sync(path: Path) -> None:
+        synced.append(path)
+        original(path)
+
+    monkeypatch.setattr(ExperienceStore, "_fsync_directory", staticmethod(record_sync))
+    store.publish_create(record, OPERATION_DIGEST, SOURCE_DIGEST)
+
+    record_directory = store.records_root / record.experience_id
+    assert {store.root, store.records_root, record_directory}.issubset(synced)
+
+
 def test_store_rejects_malformed_and_symlink_artifacts(tmp_path: Path) -> None:
     store = ExperienceStore(tmp_path / "experience")
     record = _record()

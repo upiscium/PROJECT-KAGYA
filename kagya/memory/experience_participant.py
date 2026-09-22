@@ -295,7 +295,11 @@ class MemoryExperienceParticipant:
                 )
             current = participant._current_entry()
             if current is not None:
-                participant._ensure_current_matches(current)
+                if isinstance(participant.operation, ExperienceRevisionIntent):
+                    if not participant._operation_matches_current(current):
+                        participant._validate_revision_target(current)
+                else:
+                    participant._ensure_current_matches(current)
             return participant
         if event_id is None or processing_sequence is None:
             raise UnsupportedParticipantReconciliationError(
@@ -383,6 +387,12 @@ class MemoryExperienceParticipant:
                 pending = self.store.load_pending(binding.transaction_id)
                 if pending is not None and pending != expected:
                     raise ParticipantDivergedError("Experience pending artifact conflicts")
+                if (
+                    pending is None
+                    and isinstance(self.operation, ExperienceRevisionIntent)
+                    and not self._operation_matches_current(current)
+                ):
+                    self.store.write_pending(binding.transaction_id, expected)
                 return
             if isinstance(self.operation, ExperienceRevisionIntent):
                 raise ParticipantUnavailableError("Experience revision target is absent")
@@ -418,7 +428,7 @@ class MemoryExperienceParticipant:
             raise ParticipantDivergedError(str(error)) from None
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
-        if current is not None:
+        if current is not None and pending is None:
             raise ParticipantDivergedError("Committed Experience cannot be aborted")
         if pending is None:
             return AbortOutcome.ALREADY_ABSENT
@@ -493,7 +503,11 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
         if current is not None:
-            raise ParticipantDivergedError("Committed Experience cannot be aborted")
+            if not isinstance(self.operation, ExperienceRevisionIntent):
+                raise ParticipantDivergedError("Committed Experience cannot be aborted")
+            if self._operation_matches_current(current):
+                raise ParticipantDivergedError("Committed Experience cannot be aborted")
+            self._validate_revision_target(current)
         if pending is None:
             return AbortOutcome.ALREADY_ABSENT
         if pending != self._artifact(binding):
@@ -512,7 +526,11 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
         if current is not None:
-            self._ensure_current_matches(current)
+            if isinstance(self.operation, ExperienceRevisionIntent):
+                if not self._operation_matches_current(current):
+                    self._validate_revision_target(current)
+            else:
+                self._ensure_current_matches(current)
             if pending is not None and pending != self._artifact(binding):
                 raise ParticipantDivergedError("Experience pending artifact conflicts")
             return StartupParticipantOutcome.VERIFIED_CONSISTENT

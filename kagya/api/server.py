@@ -96,11 +96,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
-            app.state.experience_store = getattr(
-                app.state, "experience_store", None
-            ) or ExperienceStore.from_memory_root(
-                app.state.memory_system.settings.memory.persist_directory
-            )
+            injected_main_loop = getattr(app.state, "main_loop", None)
+            if injected_main_loop is not None and not isinstance(
+                injected_main_loop, KagyaMainLoop
+            ):
+                raise RuntimeError("Injected main loop has an invalid type")
+            injected_experience_store = getattr(app.state, "experience_store", None)
+            if injected_main_loop is not None:
+                loop_experience_store = injected_main_loop.experience_store
+                if injected_experience_store is None:
+                    injected_experience_store = loop_experience_store
+                elif injected_experience_store is not loop_experience_store:
+                    raise RuntimeError(
+                        "Injected main loop and Experience store do not match"
+                    )
+            if injected_experience_store is None:
+                injected_experience_store = ExperienceStore.from_memory_root(
+                    app.state.memory_system.settings.memory.persist_directory
+                )
+            elif not isinstance(injected_experience_store, ExperienceStore):
+                raise RuntimeError("Injected Experience store has an invalid type")
+            app.state.experience_store = injected_experience_store
             app.state.startup_reconciliation = StartupReconciliationCoordinator(
                 app.state.event_journal,
                 app.state.state_recovery,
@@ -176,6 +192,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 working_memory=app.state.working_memory,
                 experience_store=app.state.experience_store,
             )
+            if app.state.main_loop.experience_store is not app.state.experience_store:
+                raise RuntimeError(
+                    "Main loop and Experience store do not match after startup"
+                )
             app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
             app.state.sleep_cycle_manager = getattr(

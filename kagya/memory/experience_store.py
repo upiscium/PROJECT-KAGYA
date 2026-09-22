@@ -721,6 +721,8 @@ class ExperienceStore:
                             "Experience directory is absent"
                         ) from None
                     current.mkdir(mode=0o700)
+                    self._fsync_directory(current.parent)
+                    self._fsync_directory(current)
                     status = current.lstat()
                 if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid():
                     raise ExperienceStoreCorrupt("Experience directory is unsafe")

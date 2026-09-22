@@ -813,6 +813,7 @@ class EventJournalRecord(_JournalModel):
             "unresolved_participants",
             "baseline_id",
             "participant_registry",
+            "adoption_epoch",
         )
         if any(
             getattr(self, field) is not None for field in fields if field not in allowed

@@ -360,6 +360,28 @@ class KagyaMainLoop:
             raise RuntimeError("KagyaMainLoop is already bound to another runtime")
         self._runtime = runtime
 
+    def _validated_chat_event(self, *, capture_debug: bool) -> AgentEvent | None:
+        """Validate the chat method against the active runtime event, when bound."""
+
+        if self._runtime is None:
+            return None
+        if not isinstance(self._runtime, AgentRuntime):
+            raise RuntimeError("chat runtime binding is invalid")
+        event = self._runtime.current_event()
+        if event is None:
+            raise RuntimeError("chat requires the active runtime event")
+        expected_type = AgentEventType.DEBUG_CHAT if capture_debug else AgentEventType.CHAT
+        expected_source = (
+            AgentEventSource.API_CHAT_DEBUG
+            if capture_debug
+            else AgentEventSource.API_CHAT
+        )
+        if event.event_type is not expected_type or event.source is not expected_source:
+            raise RuntimeError("chat method does not match the active runtime event")
+        if event.processing_sequence is None or event.processing_sequence <= 0:
+            raise RuntimeError("chat event has no processing sequence")
+        return event
+
     def _governance_context(
         self,
         runtime: AgentRuntime, expected_source: AgentEventSource
@@ -554,6 +576,7 @@ class KagyaMainLoop:
             experience_id_for_event,
         )
 
+        event = self._validated_chat_event(capture_debug=capture_debug)
         current_context = resolve_chat_context(context_registry, selectors)
         provenance = (
             current_context.context_id,
@@ -624,18 +647,10 @@ class KagyaMainLoop:
             ),
         )
         experience_participant: MemoryExperienceParticipant | None = None
-        if not capture_debug and self._runtime is not None:
-            if not isinstance(self._runtime, AgentRuntime):
-                raise RuntimeError("ordinary CHAT runtime binding is invalid")
-            event = self._runtime.current_event()
-            if (
-                event is None
-                or event.event_type is not AgentEventType.CHAT
-                or event.source is not AgentEventSource.API_CHAT
-                or event.processing_sequence is None
-                or event.processing_sequence <= 0
-            ):
-                raise RuntimeError("ordinary CHAT requires the active runtime event")
+        if not capture_debug and event is not None:
+            event_sequence = event.processing_sequence
+            if event_sequence is None:  # pragma: no cover - validated above
+                raise RuntimeError("chat event has no processing sequence")
             transaction_id = TransactionCoordinator.derive_transaction_id(
                 event, TransactionKind.EVENT_MUTATION
             )
@@ -662,12 +677,12 @@ class KagyaMainLoop:
             )
             experience_record = ExperienceRecord(
                 experience_id=experience_id_for_event(
-                    event.event_id, event.processing_sequence
+                    event.event_id, event_sequence
                 ),
                 revision=0,
                 lifecycle=ExperienceLifecycle.ACTIVE,
                 source_event_id=event.event_id,
-                source_event_sequence=event.processing_sequence,
+                source_event_sequence=event_sequence,
                 source_episode_id=episodic_episode_id(
                     transaction_id,
                     memory_participant.participant_id,

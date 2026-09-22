@@ -25,7 +25,12 @@ from kagya.identity import (
     ValueMutationEvidence,
 )
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
+from kagya.memory import (
+    DualMemorySystem,
+    EpisodicMemoryFormatError,
+    ExperienceStore,
+    MemoryContext,
+)
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
 from kagya.memory.experience_participant import experience_id_for_event
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
@@ -56,6 +61,7 @@ from kagya.runtime import (
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
+    KagyaMainLoop,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
@@ -372,6 +378,65 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
             main_loop.emotion_engine.state.arousal,
             main_loop.emotion_engine.state.optimal_loss,
         )
+
+
+def test_bound_chat_methods_reject_mismatched_runtime_events(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        mismatches = (
+            (
+                AgentEventType.CHAT,
+                AgentEventSource.API_CHAT,
+                lambda: main_loop.chat_debug("wrong ordinary handler"),
+            ),
+            (
+                AgentEventType.DEBUG_CHAT,
+                AgentEventSource.API_CHAT_DEBUG,
+                lambda: main_loop.chat("wrong debug handler"),
+            ),
+        )
+        for event_type, source, handler in mismatches:
+            with pytest.raises(AgentRuntimeExecutionError) as raised:
+                runtime.submit(event_type, source, handler).result(timeout=10)
+            assert isinstance(raised.value.__cause__, RuntimeError)
+            assert "chat method does not match" in str(raised.value.__cause__)
+
+
+def test_injected_main_loop_store_is_used_as_startup_authority(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = ExperienceStore(tmp_path / "injected-experience")
+    loop = KagyaMainLoop(settings, ThinkingProvider(), memory, experience_store=store)
+
+    with _client(tmp_path, settings=settings, main_loop=loop) as client:
+        assert client.app.state.experience_store is store
+        assert client.app.state.main_loop.experience_store is store
+        response = client.post(
+            "/api/chat", json={"message": "injected", "attachments": []}
+        )
+        assert response.status_code == 200
+        assert tuple(store.records_root.rglob("*.json"))
+
+
+def test_injected_main_loop_and_store_must_match(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    loop_store = ExperienceStore(tmp_path / "loop-experience")
+    app_store = ExperienceStore(tmp_path / "app-experience")
+    loop = KagyaMainLoop(
+        settings, ThinkingProvider(), memory, experience_store=loop_store
+    )
+    client = _client(
+        tmp_path,
+        settings=settings,
+        main_loop=loop,
+        experience_store=app_store,
+    )
+
+    with pytest.raises(RuntimeError, match="do not match"):
+        with client:
+            pass
 
 
 def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
@@ -3488,6 +3553,8 @@ def _client(
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
     timer: RecordingTimer | None = None,
+    main_loop: KagyaMainLoop | None = None,
+    experience_store: ExperienceStore | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -3498,6 +3565,10 @@ def _client(
     app.state.model_provider = provider or ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
+    if experience_store is not None:
+        app.state.experience_store = experience_store
+    if main_loop is not None:
+        app.state.main_loop = main_loop
     if runtime is not None:
         app.state.agent_runtime = runtime
     if timer is not None:

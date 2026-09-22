@@ -1,6 +1,7 @@
 """R07 participant protocol tests for durable Experience evidence."""
 
 from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,10 @@ from kagya.experience import (
     ExperienceLifecycle,
     ExperienceMeasurementEvidence,
     ExperienceRecord,
+    ExperienceRevisionOperation,
+    ExperienceRevisionReason,
+    ExperienceRevisionRecord,
+    experience_record_digest,
 )
 from kagya.memory import DualMemorySystem, MemoryRecordType
 from kagya.memory.episodic_participant import (
@@ -24,6 +29,7 @@ from kagya.memory.episodic_participant import (
 )
 from kagya.memory.experience_participant import (
     ExperienceCreateIntent,
+    ExperienceRevisionIntent,
     MEMORY_EXPERIENCE_PARTICIPANT_ID,
     MemoryExperienceParticipant,
     experience_id_for_event,
@@ -34,6 +40,7 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     ParticipantOutcome,
+    ParticipantDivergedError,
     ParticipantUnavailableError,
     TransactionBinding,
     TransactionCoordinator,
@@ -44,6 +51,7 @@ from kagya.runtime import (
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 EVENT_ID = "11111111-1111-4111-8111-111111111111"
+REVISION_EVENT_ID = "22222222-2222-4222-8222-222222222222"
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -184,3 +192,98 @@ def test_abort_removes_only_pending_and_restart_reuses_committed_identity(
         processing_sequence=1,
     )
     assert rebuilt.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+
+
+def test_revision_prepare_writes_pending_and_restart_rolls_forward(
+    tmp_path: Path,
+) -> None:
+    memory, store, episode, episode_binding, participant, binding = _setup(tmp_path)
+    participant.prepare(binding)
+    episode.finalize(episode_binding)
+    participant.finalize(binding)
+    initial = participant.operation.record
+    genesis = ExperienceRevisionRecord(
+        initial.experience_id,
+        0,
+        ExperienceRevisionOperation.REASSESS,
+        ExperienceRevisionReason.REASSESSMENT,
+        NOW,
+        EVENT_ID,
+        1,
+        evidence_refs=("evidence:0",),
+    )
+    revised = replace(
+        initial,
+        revision=1,
+        revision_history=(genesis,),
+    )
+    revision_record = ExperienceRevisionRecord(
+        initial.experience_id,
+        1,
+        ExperienceRevisionOperation.CORRECT,
+        ExperienceRevisionReason.CORRECTION,
+        NOW,
+        REVISION_EVENT_ID,
+        2,
+        evidence_refs=("evidence:1",),
+        previous_revision_digest=genesis.record_digest,
+    )
+    revision = MemoryExperienceParticipant(
+        memory,
+        store,
+        ExperienceRevisionIntent(
+            revised,
+            revision_record,
+            expected_revision=0,
+            expected_record_digest=experience_record_digest(initial),
+            source_episode_operation_digest=participant.operation.source_episode_operation_digest,
+        ),
+    )
+    revision_transaction_id = TransactionCoordinator.derive_transaction_id(
+        AgentEvent(
+            REVISION_EVENT_ID,
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            NOW,
+            2,
+        ),
+        TransactionKind.EVENT_MUTATION,
+    )
+    revision_binding = TransactionBinding(
+        revision_transaction_id,
+        REVISION_EVENT_ID,
+        2,
+        MEMORY_EXPERIENCE_PARTICIPANT_ID,
+        revision.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+
+    revision.prepare(revision_binding)
+    assert store.load_pending(revision_transaction_id) is not None
+    rebuilt = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        revision_transaction_id,
+        revision_binding.participant_id,
+        revision_binding.operation_digest,
+        event_id=REVISION_EVENT_ID,
+        processing_sequence=2,
+    )
+    assert rebuilt.abort(revision_binding).value == "aborted"
+    assert rebuilt.abort(revision_binding).value == "already_absent"
+    revision.prepare(revision_binding)
+    rebuilt = MemoryExperienceParticipant.from_pending(
+        memory,
+        store,
+        revision_transaction_id,
+        revision_binding.participant_id,
+        revision_binding.operation_digest,
+        event_id=REVISION_EVENT_ID,
+        processing_sequence=2,
+    )
+    assert rebuilt.finalize(revision_binding) is ParticipantOutcome.FINALIZED
+    current = store.load_current(initial.experience_id)
+    assert current is not None
+    assert current.record == revised
+    with pytest.raises(ParticipantDivergedError):
+        rebuilt.abort(revision_binding)
