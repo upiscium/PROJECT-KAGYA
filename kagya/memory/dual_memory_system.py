@@ -3,6 +3,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 import json
 import math
 from typing import Any
@@ -20,6 +21,13 @@ from kagya.memory.memory_schema import (
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
+)
+from kagya.memory.semantic_lifecycle import SemanticLifecycle, SemanticRevision
+from kagya.memory.semantic_store import (
+    SemanticStore,
+    SemanticStoreCorrupt,
+    SemanticStoreError,
+    SemanticStoreUnavailable,
 )
 from kagya.models import ModelProvider
 from kagya.privacy import PRIVATE_FIELD_KEYS, normalize_private_key, reject_private_fields, scrub_private_fields
@@ -70,6 +78,22 @@ class SemanticMemoryFormatError(Exception):
     """Committed semantic Memory has malformed domain content."""
 
 
+class SemanticMemoryWriteError(Exception):
+    """Direct Semantic DB2 writes are unavailable outside R07 coordination."""
+
+
+class SemanticProjectionStatus(StrEnum):
+    """Classification of one DB2 row against authoritative Semantic state."""
+
+    MISSING = "MISSING"
+    EXACT = "EXACT"
+    REPAIRABLE_STALE = "REPAIRABLE_STALE"
+    DIVERGENT = "DIVERGENT"
+
+
+SEMANTIC_PROJECTION_SCHEMA = "r12.semantic.v1"
+
+
 @dataclass(frozen=True, slots=True)
 class CommittedEpisodicMemory:
     """One committed DB1 document and its parsed metadata projection."""
@@ -86,6 +110,15 @@ class CommittedSemanticMemory:
     document: str
     metadata: dict[str, Any]
     record: SemanticMemoryRecord
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticProjectionInspection:
+    """Read-only DB2 projection classification."""
+
+    status: SemanticProjectionStatus
+    document: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class DualMemorySystem:
@@ -108,6 +141,9 @@ class DualMemorySystem:
         self.db2 = self.client.get_or_create_collection(
             name=settings.memory.db2_collection,
             embedding_function=self.embedding_function,
+        )
+        self.semantic_store = SemanticStore.from_memory_root(
+            settings.memory.persist_directory
         )
         self._scrub_legacy_private_records()
 
@@ -196,9 +232,164 @@ class DualMemorySystem:
             raise SemanticMemoryFormatError(
                 "Committed semantic Memory is invalid"
             ) from None
+        if _is_r12_semantic_projection(metadata):
+            self._verify_new_semantic_projection(semantic_id, documents[0], metadata)
         return CommittedSemanticMemory(
             document=documents[0], metadata=metadata, record=record
         )
+
+    def inspect_semantic_projection(
+        self,
+        semantic_id: str,
+        revision: SemanticRevision,
+        store: SemanticStore | None = None,
+    ) -> SemanticProjectionInspection:
+        """Classify DB2 without mutating it or consulting a model."""
+
+        if revision.semantic_id != semantic_id:
+            raise ValueError("Semantic projection identity is inconsistent")
+        current_store = store or self.semantic_store
+        raw = self._get_semantic_projection_raw(semantic_id)
+        if raw is None:
+            return SemanticProjectionInspection(SemanticProjectionStatus.MISSING)
+        document, metadata = raw
+        if not _is_r12_semantic_projection(metadata):
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        row_revision = metadata.get("semantic_revision")
+        if type(row_revision) is not int or row_revision < 0:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        try:
+            retained = current_store.load_revision(semantic_id, row_revision)
+        except SemanticStoreUnavailable as error:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic revision is unavailable"
+            ) from error
+        except SemanticStoreCorrupt as error:
+            raise SemanticMemoryFormatError(
+                "Authoritative Semantic revision is invalid"
+            ) from error
+        if retained is None:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        expected_retained = semantic_projection_metadata(retained.revision)
+        if document != retained.revision.semantic_content or metadata != expected_retained:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        if row_revision == revision.revision:
+            if retained.revision.revision_digest != revision.revision_digest:
+                return SemanticProjectionInspection(
+                    SemanticProjectionStatus.DIVERGENT, document, metadata
+                )
+            if revision.lifecycle is not SemanticLifecycle.ACTIVE:
+                return SemanticProjectionInspection(
+                    SemanticProjectionStatus.REPAIRABLE_STALE, document, metadata
+                )
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.EXACT, document, metadata
+            )
+        if row_revision < revision.revision:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.REPAIRABLE_STALE, document, metadata
+            )
+        return SemanticProjectionInspection(
+            SemanticProjectionStatus.DIVERGENT, document, metadata
+        )
+
+    def project_semantic_revision(
+        self, revision: SemanticRevision, store: SemanticStore | None = None
+    ) -> SemanticProjectionStatus:
+        """Repair one projection only when its current bytes are safe to replace."""
+
+        inspection = self.inspect_semantic_projection(revision.semantic_id, revision, store)
+        if inspection.status is SemanticProjectionStatus.DIVERGENT:
+            raise SemanticMemoryFormatError("Semantic DB2 projection diverged")
+        if revision.lifecycle is not SemanticLifecycle.ACTIVE:
+            if inspection.status is SemanticProjectionStatus.REPAIRABLE_STALE:
+                self._delete_semantic_projection(revision.semantic_id)
+            return inspection.status
+        if inspection.status is SemanticProjectionStatus.EXACT:
+            return inspection.status
+        if inspection.status is SemanticProjectionStatus.REPAIRABLE_STALE:
+            self._delete_semantic_projection(revision.semantic_id)
+        try:
+            metadata = semantic_projection_metadata(revision)
+            self.db2.add(
+                ids=[revision.semantic_id],
+                documents=[revision.semantic_content],
+                metadatas=[metadata],
+            )
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Semantic DB2 projection is unavailable"
+            ) from error
+        verified = self.inspect_semantic_projection(revision.semantic_id, revision, store)
+        if verified.status is not SemanticProjectionStatus.EXACT:
+            if verified.status is SemanticProjectionStatus.DIVERGENT:
+                raise SemanticMemoryFormatError("Semantic DB2 projection diverged")
+            raise SemanticMemoryReadError("Semantic DB2 projection is unverified")
+        return verified.status
+
+    def _get_semantic_projection_raw(
+        self, semantic_id: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        try:
+            result = self.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != semantic_id:
+                raise ValueError
+            if not isinstance(documents[0], str):
+                raise ValueError
+            return documents[0], _strict_metadata(metadatas[0])
+        except SemanticMemoryReadError:
+            raise
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Committed semantic Memory is unavailable"
+            ) from error
+
+    def _delete_semantic_projection(self, semantic_id: str) -> None:
+        try:
+            self.db2.delete(ids=[semantic_id])
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Semantic DB2 projection is unavailable"
+            ) from error
+
+    def _verify_new_semantic_projection(
+        self, semantic_id: str, document: str, metadata: Mapping[str, Any]
+    ) -> None:
+        if not _is_r12_semantic_projection(metadata):
+            return
+        try:
+            current = self.semantic_store.load_current(semantic_id)
+        except SemanticStoreUnavailable as error:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic Memory is unavailable"
+            ) from error
+        except SemanticStoreError as error:
+            raise SemanticMemoryFormatError(
+                "Authoritative Semantic Memory is invalid"
+            ) from error
+        if current is None:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic Memory is unavailable"
+            )
+        if (
+            current.revision.lifecycle is not SemanticLifecycle.ACTIVE
+            or document != current.revision.semantic_content
+            or dict(metadata) != semantic_projection_metadata(current.revision)
+        ):
+            raise SemanticMemoryFormatError(
+                "Committed semantic projection is not authoritative"
+            )
 
     def publish_coordinated_episodic(
         self,
@@ -281,6 +472,18 @@ class DualMemorySystem:
         source_episode_ids: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        raise SemanticMemoryWriteError(
+            "Coordinated Semantic publication is required"
+        )
+
+    def save_legacy_semantic(
+        self,
+        text: str,
+        *,
+        source_episode_ids: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Explicit R09-compatible fixture/import writer; never use in production."""
         source_ids = _copy_source_episode_ids(source_episode_ids)
         context_id = self._derive_semantic_context_id(source_ids)
         extra_metadata = metadata or {}
@@ -342,10 +545,38 @@ class DualMemorySystem:
         )
         return MemoryContext(
             db1_results=_episodic_records_from_query(db1_results),
-            db2_results=_semantic_records_from_query(db2_results),
+            db2_results=self._semantic_records_from_query(db2_results),
         )
 
+    def _semantic_records_from_query(
+        self, result: Mapping[str, Any]
+    ) -> list[SemanticMemoryRecord]:
+        ids = _semantic_query_list(result.get("ids"))
+        documents = _semantic_query_list(result.get("documents"))
+        metadatas = _semantic_query_list(result.get("metadatas"))
+        if not (len(ids) == len(documents) == len(metadatas)):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        records: list[SemanticMemoryRecord] = []
+        for record_id, document, metadata in zip(ids, documents, metadatas, strict=True):
+            if (
+                not isinstance(record_id, str)
+                or not isinstance(document, str)
+                or not isinstance(metadata, dict)
+            ):
+                raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+            record = _semantic_record_from_metadata(record_id, document, metadata)
+            if _is_r12_semantic_projection(metadata):
+                self._verify_new_semantic_projection(record_id, document, metadata)
+            records.append(record)
+        return records
+
     def consolidate_to_semantic(self, model_provider: ModelProvider) -> list[str]:
+        raise SemanticMemoryWriteError(
+            "Coordinated Semantic publication is required"
+        )
+
+    def consolidate_to_legacy_semantic(self, model_provider: ModelProvider) -> list[str]:
+        """Explicit compatibility helper for pre-R12 consolidation fixtures."""
         records = self._get_unarchived_episodic_records()
         semantic_ids: list[str] = []
         for record in records:
@@ -353,7 +584,7 @@ class DualMemorySystem:
                 continue
             semantic_text = model_provider.generate(build_consolidation_prompt(record))
             semantic_ids.append(
-                self.save_semantic(semantic_text, source_episode_ids=[record.id])
+                self.save_legacy_semantic(semantic_text, source_episode_ids=[record.id])
             )
             self._archive_episodic(record.id)
         return semantic_ids
@@ -438,27 +669,32 @@ class DualMemorySystem:
                     "Committed semantic Memory is invalid"
                 )
             semantic_metadata: dict[str, Any] = dict(raw_metadata or {})
+            if _is_r12_semantic_projection(semantic_metadata):
+                try:
+                    _committed_semantic_record(str(record_id), document, semantic_metadata)
+                except Exception:
+                    raise SemanticMemoryFormatError(
+                        "Committed semantic Memory is invalid"
+                    ) from None
+                # New-format rows are immutable projections.  Startup
+                # reconciliation, not this compatibility scrub, owns repair.
+                continue
             try:
                 _semantic_context_id_from_metadata(semantic_metadata)
             except (TypeError, ValueError):
                 raise SemanticMemoryFormatError(
                     "Committed semantic Memory is invalid"
                 ) from None
-            semantic_sanitized: dict[str, Any] = dict(
-                _sanitize_persisted_metadata(semantic_metadata)
-            )
             try:
                 _committed_semantic_record(
-                    str(record_id), document, semantic_sanitized
+                    str(record_id), document, semantic_metadata
                 )
             except Exception:
                 raise SemanticMemoryFormatError(
                     "Committed semantic Memory is invalid"
                 ) from None
-            if semantic_sanitized != semantic_metadata:
-                self.db2.update(
-                    ids=[str(record_id)], metadatas=[semantic_sanitized]
-                )
+            # Legacy Semantic bytes are intentionally not rewritten at startup;
+            # the explicit import/fixture writer is the only compatibility path.
 
 
 def _embed_text(text: str) -> list[float]:
@@ -891,6 +1127,49 @@ def _semantic_query_list(value: Any) -> list[Any]:
             raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
         return value[0]
     return value
+
+
+def _is_r12_semantic_projection(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("semantic_projection_schema") == SEMANTIC_PROJECTION_SCHEMA
+
+
+def semantic_projection_metadata(
+    revision: SemanticRevision,
+) -> dict[str, str | int | float | bool]:
+    """Build the strict searchable projection for one authoritative revision."""
+
+    if not isinstance(revision, SemanticRevision):
+        raise TypeError("revision must be SemanticRevision")
+    source_episode_ids = sorted(
+        {
+            edge.source_id
+            for edge in revision.source_edges
+            if edge.source_kind.value == "episodic"
+        }
+    )
+    metadata: dict[str, str | int | float | bool] = {
+        "semantic_projection_schema": SEMANTIC_PROJECTION_SCHEMA,
+        "semantic_revision": revision.revision,
+        "semantic_revision_digest": revision.revision_digest,
+        "semantic_content_digest": revision.content_digest,
+        "semantic_lifecycle": revision.lifecycle.value,
+        "semantic_provenance_digest": revision.provenance.digest,
+        "text": revision.semantic_content,
+        "source_episode_ids": json.dumps(
+            source_episode_ids, ensure_ascii=True, separators=(",", ":")
+        ),
+        "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
+        "created_at": revision.created_at.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ),
+        "extra": "{}",
+    }
+    if (
+        revision.provenance.classification.value == "single_context"
+        and len(revision.provenance.known_context_ids) == 1
+    ):
+        metadata["context_id"] = revision.provenance.known_context_ids[0]
+    return metadata
 
 
 def _loads_json_dict(value: Any) -> dict[str, Any]:

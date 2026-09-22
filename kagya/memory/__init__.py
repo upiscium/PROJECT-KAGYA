@@ -8,12 +8,45 @@ from kagya.memory.dual_memory_system import (
     EpisodicMemoryReadError,
     SemanticMemoryFormatError,
     SemanticMemoryReadError,
+    SemanticMemoryWriteError,
+    SemanticProjectionInspection,
+    SemanticProjectionStatus,
+    semantic_projection_metadata,
 )
 from kagya.memory.memory_schema import (
     EpisodicMemoryRecord,
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
+)
+from kagya.memory.experience_participant import (
+    MEMORY_EXPERIENCE_PARTICIPANT_ID,
+    MemoryExperienceParticipant,
+    ExperienceCreateIntent,
+    ExperienceRevisionIntent,
+    experience_id_for_event,
+    experience_operation_digest,
+)
+from kagya.memory.experience_store import ExperienceStore
+from kagya.memory.episodic_participant import episodic_episode_id
+from kagya.memory.semantic_participant import (
+    MEMORY_SEMANTIC_PARTICIPANT_ID,
+    SEMANTIC_MAX_BATCH_ENTRIES,
+    MemorySemanticParticipant,
+    SemanticBatchEntry,
+    SemanticBatchOperation,
+    SemanticCreateIntent,
+    SemanticRevisionIntent,
+    semantic_batch_operation_digest,
+    semantic_id_for_batch_entry,
+)
+from kagya.memory.semantic_store import (
+    SemanticStoredEntry,
+    SemanticStore,
+    SemanticStoreConflict,
+    SemanticStoreCorrupt,
+    SemanticStoreError,
+    SemanticStoreUnavailable,
 )
 
 __all__ = [
@@ -28,4 +61,31 @@ __all__ = [
     "SemanticMemoryRecord",
     "SemanticMemoryFormatError",
     "SemanticMemoryReadError",
+    "SemanticMemoryWriteError",
+    "SemanticProjectionInspection",
+    "SemanticProjectionStatus",
+    "semantic_projection_metadata",
+    "ExperienceCreateIntent",
+    "ExperienceRevisionIntent",
+    "ExperienceStore",
+    "MEMORY_EXPERIENCE_PARTICIPANT_ID",
+    "MemoryExperienceParticipant",
+    "experience_id_for_event",
+    "experience_operation_digest",
+    "episodic_episode_id",
+    "MEMORY_SEMANTIC_PARTICIPANT_ID",
+    "SEMANTIC_MAX_BATCH_ENTRIES",
+    "MemorySemanticParticipant",
+    "SemanticBatchEntry",
+    "SemanticBatchOperation",
+    "SemanticCreateIntent",
+    "SemanticRevisionIntent",
+    "semantic_batch_operation_digest",
+    "semantic_id_for_batch_entry",
+    "SemanticStoredEntry",
+    "SemanticStore",
+    "SemanticStoreConflict",
+    "SemanticStoreCorrupt",
+    "SemanticStoreError",
+    "SemanticStoreUnavailable",
 ]

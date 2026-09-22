@@ -203,12 +203,11 @@ class MemoryEpisodicParticipant:
 
     def episode_id(self, transaction_id: str) -> str:
         try:
-            parsed = UUID(transaction_id)
+            return episodic_episode_id(
+                transaction_id, self.participant_id, self.operation_digest
+            )
         except (TypeError, ValueError):
             raise ParticipantDivergedError("Transaction identity is invalid") from None
-        if str(parsed) != transaction_id:
-            raise ParticipantDivergedError("Transaction identity is invalid")
-        return _episode_id(transaction_id, self.participant_id, self.operation_digest)
 
     def pending_path(self, binding: TransactionBinding) -> Path:
         self._validate_binding(binding)
@@ -698,6 +697,21 @@ def _episode_id(
         separators=(",", ":"),
     )
     return f"episode-{uuid5(_EPISODE_ID_NAMESPACE, canonical)}"
+
+
+def episodic_episode_id(
+    transaction_id: str, participant_id: str, operation_digest: str
+) -> str:
+    """Return the canonical R07 episode identity without duplicating its algorithm."""
+
+    parsed = UUID(transaction_id)
+    if str(parsed) != transaction_id:
+        raise ValueError("Transaction identity is invalid")
+    if participant_id != MEMORY_EPISODIC_PARTICIPANT_ID:
+        raise ValueError("Participant identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
+        raise ValueError("Operation digest is invalid")
+    return _episode_id(transaction_id, participant_id, operation_digest)
 
 
 def _operation_from_record(

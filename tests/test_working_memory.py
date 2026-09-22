@@ -763,7 +763,7 @@ def test_resolver_passes_episodic_and_semantic_context_ephemerally(
         context_id="context-a",
         source_channel="chat",
     )
-    semantic_id = source.save_semantic(
+    semantic_id = source.save_legacy_semantic(
         "semantic context body", source_episode_ids=["episode-context"]
     )
     working = WorkingMemory(item_capacity=2, projection_max_bytes=1000)
@@ -810,7 +810,7 @@ def test_semantic_resolver_does_not_reinfer_context_from_source_episodes(
         context_id="context-a",
         source_channel="chat",
     )
-    semantic_id = source.save_semantic(
+    semantic_id = source.save_legacy_semantic(
         "semantic context body", source_episode_ids=["episode-context"]
     )
     item = WorkingMemoryItem(
@@ -1024,7 +1024,7 @@ def test_real_conflicting_source_resolves_malformed_without_repair(
         source.db1.update(ids=[source_id], documents=["conflicting document"])
         collection = source.db1
     else:
-        source_id = source.save_semantic("visible semantic")
+        source_id = source.save_legacy_semantic("visible semantic")
         stored = source.db2.get(ids=[source_id], include=["metadatas"])
         metadata = dict(stored["metadatas"][0])
         metadata["text"] = "conflicting metadata"
@@ -1055,8 +1055,8 @@ def test_real_semantic_resolution_and_utf8_budget_use_authoritative_documents(
     tmp_path: Path,
 ) -> None:
     source = _dual_memory(tmp_path)
-    large_id = source.save_semantic("é" * 20)
-    small_id = source.save_semantic("fits")
+    large_id = source.save_legacy_semantic("é" * 20)
+    small_id = source.save_legacy_semantic("fits")
     working = WorkingMemory(item_capacity=2, projection_max_bytes=5)
     admit(
         working,
@@ -1094,7 +1094,7 @@ def test_resolved_body_never_enters_agent_state_or_wal(tmp_path: Path) -> None:
     sentinel = "U3-EPHEMERAL-BODY-SENTINEL"
     settings = _settings_for_tmp_memory(tmp_path)
     source = DualMemorySystem(settings)
-    semantic_id = source.save_semantic(sentinel)
+    semantic_id = source.save_legacy_semantic(sentinel)
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
     admit(working, semantic_id, kind=WorkingMemorySourceKind.SEMANTIC)
     loop = KagyaMainLoop(settings, DummyProvider(), source, working_memory=working)

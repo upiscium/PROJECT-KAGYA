@@ -255,7 +255,7 @@ def test_main_loop_resolves_committed_body_and_passes_view_to_prompt_builder(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    semantic_id = memory.save_semantic("committed body")
+    semantic_id = memory.save_legacy_semantic("committed body")
     captured: list[object] = []
 
     class CapturingPromptBuilder:
@@ -526,7 +526,7 @@ def test_prior_working_memory_decays_and_retrieved_reference_reactivates(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    retrieved_id = memory.save_semantic("retrieved exact body")
+    retrieved_id = memory.save_legacy_semantic("retrieved exact body")
     working = WorkingMemory(item_capacity=2, projection_max_bytes=100)
     working.admit(WorkingMemorySourceKind.SEMANTIC, retrieved_id, 0.5, 0.4)
     working.admit(WorkingMemorySourceKind.SEMANTIC, "semantic-not-retrieved", 0.5, 0.4)
@@ -561,8 +561,8 @@ def test_oversized_exact_source_is_excluded_and_smaller_source_is_prompted(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    large_id = memory.save_semantic("X" * 20)
-    small_id = memory.save_semantic("fits")
+    large_id = memory.save_legacy_semantic("X" * 20)
+    small_id = memory.save_legacy_semantic("fits")
     monkeypatch.setattr(
         memory,
         "retrieve_context",
@@ -642,7 +642,7 @@ def test_exact_source_failure_is_bounded_and_chat_continues(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    source_id = memory.save_semantic("source body must stay absent")
+    source_id = memory.save_legacy_semantic("source body must stay absent")
     monkeypatch.setattr(
         memory,
         "retrieve_context",
@@ -674,7 +674,7 @@ def test_malformed_exact_source_is_not_prompted_or_repaired(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    source_id = memory.save_semantic("authoritative document")
+    source_id = memory.save_legacy_semantic("authoritative document")
     stored = memory.db2.get(ids=[source_id], include=["metadatas"])
     metadata = dict(stored["metadatas"][0])
     metadata["text"] = "conflicting metadata body"
@@ -711,7 +711,7 @@ def test_select_and_prompt_build_are_pure_after_explicit_chat_mutations(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    semantic_id = memory.save_semantic("pure source")
+    semantic_id = memory.save_legacy_semantic("pure source")
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
     loop = KagyaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
@@ -1070,7 +1070,7 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     provider = ThinkingDummyProvider()
     memory = DualMemorySystem(settings)
     memory.save_episodic("old episode", "old answer")
-    memory.save_semantic("stable semantic memory")
+    memory.save_legacy_semantic("stable semantic memory")
     loop = KagyaMainLoop(settings, provider, memory)
 
     _result, trace = _materialize(loop.chat_debug("old semantic query"))

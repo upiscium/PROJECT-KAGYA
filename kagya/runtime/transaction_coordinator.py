@@ -151,9 +151,14 @@ class TransactionCoordinator:
         self,
         journal: EventJournal,
         internal_commit_verifier: Callable[[AgentEvent, InternalCommitEvidence], None],
+        *,
+        before_prepare: Callable[[], None] | None = None,
+        after_participant_finalized: Callable[[], None] | None = None,
     ) -> None:
         self.journal = journal
         self._internal_commit_verifier = internal_commit_verifier
+        self._before_prepare = before_prepare
+        self._after_participant_finalized = after_participant_finalized
         self._lock = RLock()
         self._live: dict[str, _LiveTransaction] = {}
 
@@ -209,6 +214,14 @@ class TransactionCoordinator:
             )
         ):
             raise TransactionPreparationError("Transaction preparation is invalid")
+
+        if self._before_prepare is not None:
+            try:
+                self._before_prepare()
+            except Exception as error:
+                raise TransactionPreparationError(
+                    "Transaction receipt retention is unavailable"
+                ) from error
 
         participants, requirements = self._validate_plan(result.participants)
         transaction_id = self.derive_transaction_id(event, result.transaction_kind)
@@ -413,6 +426,14 @@ class TransactionCoordinator:
                     outcome,
                 )
                 known.add(requirement.participant_id)
+                if self._after_participant_finalized is not None:
+                    try:
+                        self._after_participant_finalized()
+                    except Exception:
+                        # Journal evidence is authoritative once the outcome
+                        # append succeeds.  Cleanup is retried at startup or
+                        # before the next transaction admission.
+                        pass
             except Exception as error:
                 failure = error
                 break

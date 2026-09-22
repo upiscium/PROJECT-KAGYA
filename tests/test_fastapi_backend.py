@@ -25,8 +25,14 @@ from kagya.identity import (
     ValueMutationEvidence,
 )
 from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
+from kagya.memory import (
+    DualMemorySystem,
+    EpisodicMemoryFormatError,
+    ExperienceStore,
+    MemoryContext,
+)
 from kagya.memory.episodic_participant import MemoryEpisodicParticipant
+from kagya.memory.experience_participant import experience_id_for_event
 from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from kagya.models import DummyProvider
 from kagya.persona import PromptBuilder
@@ -55,6 +61,7 @@ from kagya.runtime import (
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
+    KagyaMainLoop,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
@@ -298,20 +305,32 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert episode.response == "Visible API answer."
         assert len(client.app.state.main_loop.session_state.turns) == 1
         records = client.app.state.event_journal.records
-        assert [record.lifecycle for record in records[-8:]] == [
+        assert [record.lifecycle for record in records[-9:]] == [
             EventLifecycle.ACCEPTED,
             EventLifecycle.STARTED,
             EventLifecycle.TRANSACTION_PREPARED,
             EventLifecycle.PREPARED,
             EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.TRANSACTION_COMPLETED,
             EventLifecycle.COMPLETED,
         ]
-        assert [record.participant_id for record in records[-4:-2]] == [
+        assert [record.participant_id for record in records[-5:-2]] == [
             "memory.episodic",
+            "memory.experience",
             "session.turn",
         ]
+        completed = records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience = client.app.state.experience_store.load_current(
+            experience_id_for_event(completed.event_id, completed.processing_sequence)
+        )
+        assert experience is not None
+        assert experience.record.source_episode_id == data["episode_id"]
+        assert experience.record.source_event_id == completed.event_id
+        assert experience.record.source_event_sequence == completed.processing_sequence
         pending = settings.memory.persist_directory / ".r07-episodic-pending"
         assert list(pending.glob("*.json")) == []
 
@@ -359,6 +378,65 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
             main_loop.emotion_engine.state.arousal,
             main_loop.emotion_engine.state.optimal_loss,
         )
+
+
+def test_bound_chat_methods_reject_mismatched_runtime_events(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        mismatches = (
+            (
+                AgentEventType.CHAT,
+                AgentEventSource.API_CHAT,
+                lambda: main_loop.chat_debug("wrong ordinary handler"),
+            ),
+            (
+                AgentEventType.DEBUG_CHAT,
+                AgentEventSource.API_CHAT_DEBUG,
+                lambda: main_loop.chat("wrong debug handler"),
+            ),
+        )
+        for event_type, source, handler in mismatches:
+            with pytest.raises(AgentRuntimeExecutionError) as raised:
+                runtime.submit(event_type, source, handler).result(timeout=10)
+            assert isinstance(raised.value.__cause__, RuntimeError)
+            assert "chat method does not match" in str(raised.value.__cause__)
+
+
+def test_injected_main_loop_store_is_used_as_startup_authority(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = ExperienceStore(tmp_path / "injected-experience")
+    loop = KagyaMainLoop(settings, ThinkingProvider(), memory, experience_store=store)
+
+    with _client(tmp_path, settings=settings, main_loop=loop) as client:
+        assert client.app.state.experience_store is store
+        assert client.app.state.main_loop.experience_store is store
+        response = client.post(
+            "/api/chat", json={"message": "injected", "attachments": []}
+        )
+        assert response.status_code == 200
+        assert tuple(store.records_root.rglob("*.json"))
+
+
+def test_injected_main_loop_and_store_must_match(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    loop_store = ExperienceStore(tmp_path / "loop-experience")
+    app_store = ExperienceStore(tmp_path / "app-experience")
+    loop = KagyaMainLoop(
+        settings, ThinkingProvider(), memory, experience_store=loop_store
+    )
+    client = _client(
+        tmp_path,
+        settings=settings,
+        main_loop=loop,
+        experience_store=app_store,
+    )
+
+    with pytest.raises(RuntimeError, match="do not match"):
+        with client:
+            pass
 
 
 def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
@@ -1064,6 +1142,18 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
             PRIVATE_SENTINEL.encode() not in path.read_bytes()
             for path in settings.state_wal.directory.iterdir()
             if path.is_file()
+        )
+        experience_root = client.app.state.experience_store.root
+        assert not experience_root.exists() or all(
+            PRIVATE_SENTINEL.encode() not in path.read_bytes()
+            for path in experience_root.rglob("*.json")
+        )
+        assert all(
+            "memory.experience"
+            not in {
+                item.participant_id for item in transaction.required_participants
+            }
+            for transaction in client.app.state.event_journal.inspect().completed_transactions
         )
         assert len(client.app.state.main_loop.session_state.turns) == 1
 
@@ -2034,7 +2124,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("rollback WM seed")
+        client.app.state.memory_system.save_legacy_semantic("rollback WM seed")
         assert (
             client.post(
                 "/api/chat", json={"message": "rollback WM seed", "attachments": []}
@@ -2466,7 +2556,7 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
     )
 
     with TestClient(app) as client:
-        client.app.state.memory_system.save_semantic("U5 durable WM seed")
+        client.app.state.memory_system.save_legacy_semantic("U5 durable WM seed")
         assert client.post(
             "/api/chat", json={"message": "U5 durable WM seed", "attachments": []}
         ).status_code == 200
@@ -2877,6 +2967,7 @@ def test_memory_prepare_failure_aborts_before_internal_commit(
         inspection = client.app.state.event_journal.inspect()
         assert inspection.aborted_transactions[0].abort_outcomes == (
             ("memory.episodic", AbortOutcome.ABORTED),
+            ("memory.experience", AbortOutcome.ALREADY_ABSENT),
         )
         assert not any(
             record.lifecycle is EventLifecycle.PREPARED
@@ -2918,6 +3009,7 @@ def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         assert transaction.participant_outcomes == (
             ("memory.episodic", ParticipantOutcome.FINALIZED),
+            ("memory.experience", ParticipantOutcome.FINALIZED),
         )
         assert transaction.unresolved_participants == ("session.turn",)
         assert transaction.reconciliation_reason is not None
@@ -3212,7 +3304,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
     resolved_body = "U4-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        semantic_id = client.app.state.memory_system.save_semantic(resolved_body)
+        semantic_id = client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat",
             json={"message": resolved_body, "attachments": [], "debug": False},
@@ -3263,7 +3355,7 @@ def test_debug_projection_can_use_resolved_body_without_durable_leak(
     resolved_body = "U4-DEBUG-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic(resolved_body)
+        client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat/debug",
             headers=admin_headers(),
@@ -3292,7 +3384,7 @@ def test_handler_failure_restores_prior_canonical_working_memory(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("U4 failure checkpoint marker")
+        client.app.state.memory_system.save_legacy_semantic("U4 failure checkpoint marker")
         first = client.post(
             "/api/chat",
             json={"message": "U4 failure checkpoint marker", "attachments": []},
@@ -3392,7 +3484,7 @@ def test_startup_does_not_resolve_noneligible_working_memory_refs(
     settings = _settings(tmp_path)
     marker = f"U5-{status.value}-working-memory-ref"
     with _client(tmp_path, settings=settings) as first:
-        source_id = first.app.state.memory_system.save_semantic(marker)
+        source_id = first.app.state.memory_system.save_legacy_semantic(marker)
         assert first.post(
             "/api/chat", json={"message": marker, "attachments": []}
         ).status_code == 200
@@ -3461,6 +3553,8 @@ def _client(
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
     timer: RecordingTimer | None = None,
+    main_loop: KagyaMainLoop | None = None,
+    experience_store: ExperienceStore | None = None,
 ) -> TestClient:
     if configure_admin_token:
         os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
@@ -3471,6 +3565,10 @@ def _client(
     app.state.model_provider = provider or ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
+    if experience_store is not None:
+        app.state.experience_store = experience_store
+    if main_loop is not None:
+        app.state.main_loop = main_loop
     if runtime is not None:
         app.state.agent_runtime = runtime
     if timer is not None:

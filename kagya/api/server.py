@@ -16,7 +16,7 @@ from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep, val
 from kagya.config import Settings, get_settings
 from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem
+from kagya.memory import DualMemorySystem, ExperienceStore
 from kagya.models import load_model_provider
 from kagya.runtime import (
     AgentEvent,
@@ -38,6 +38,9 @@ from kagya.runtime import (
     WorkingMemory,
 )
 from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from kagya.runtime.semantic_receipt_retention import (
+    SemanticReceiptRetentionCoordinator,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -96,10 +99,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
+            app.state.semantic_store = app.state.memory_system.semantic_store
+            app.state.semantic_receipt_retention = (
+                SemanticReceiptRetentionCoordinator(
+                    app.state.event_journal, app.state.semantic_store
+                )
+            )
+            injected_main_loop = getattr(app.state, "main_loop", None)
+            if injected_main_loop is not None and not isinstance(
+                injected_main_loop, KagyaMainLoop
+            ):
+                raise RuntimeError("Injected main loop has an invalid type")
+            injected_experience_store = getattr(app.state, "experience_store", None)
+            if injected_main_loop is not None:
+                loop_experience_store = injected_main_loop.experience_store
+                if injected_experience_store is None:
+                    injected_experience_store = loop_experience_store
+                elif injected_experience_store is not loop_experience_store:
+                    raise RuntimeError(
+                        "Injected main loop and Experience store do not match"
+                    )
+            if injected_experience_store is None:
+                injected_experience_store = ExperienceStore.from_memory_root(
+                    app.state.memory_system.settings.memory.persist_directory
+                )
+            elif not isinstance(injected_experience_store, ExperienceStore):
+                raise RuntimeError("Injected Experience store has an invalid type")
+            app.state.experience_store = injected_experience_store
             app.state.startup_reconciliation = StartupReconciliationCoordinator(
                 app.state.event_journal,
                 app.state.state_recovery,
                 app.state.memory_system,
+                app.state.experience_store,
+                app.state.semantic_store,
+                semantic_checkpoint_covers=(
+                    app.state.semantic_receipt_retention.checkpoint_covers
+                ),
             )
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True
@@ -130,6 +165,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.startup_reconciliation.ensure_adoption_baseline(
                         recovery
                     )
+                if participants_consistent:
+                    participants_consistent, degraded_reason = (
+                        app.state.startup_reconciliation.reconcile_terminal_semantic_projections()
+                    )
+                if participants_consistent:
+                    try:
+                        app.state.semantic_receipt_retention.after_terminal_completion()
+                    except Exception:
+                        participants_consistent = False
+                        degraded_reason = "semantic_receipt_retention_unavailable"
                 startup_state = recovery
             else:
                 if journal_schema != 3:
@@ -168,7 +213,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.model_provider,
                 app.state.memory_system,
                 working_memory=app.state.working_memory,
+                experience_store=app.state.experience_store,
             )
+            if app.state.main_loop.experience_store is not app.state.experience_store:
+                raise RuntimeError(
+                    "Main loop and Experience store do not match after startup"
+                )
             app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
             app.state.sleep_cycle_manager = getattr(
@@ -191,6 +241,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.transaction_coordinator = TransactionCoordinator(
             app.state.event_journal,
             app.state.state_recovery.verify_internal_commit,
+            before_prepare=app.state.semantic_receipt_retention.before_prepare,
+            after_participant_finalized=(
+                app.state.semantic_receipt_retention.after_participant_finalized
+            ),
         )
 
         def admission_checkpoint(event: AgentEvent) -> None:
@@ -233,6 +287,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(evidence, InternalCommitEvidence):
                 raise StateRecoveryError("Internal commit evidence is unavailable")
             app.state.state_recovery.complete_committed_event(event, evidence)
+            app.state.semantic_receipt_retention.after_terminal_completion()
 
         def failure_checkpoint(event: AgentEvent) -> None:
             app.state.agent_state_store.restore_into(
@@ -271,6 +326,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     failure_checkpoint=failure_checkpoint,
                 )
             app.state.main_loop.bind_runtime(app.state.agent_runtime)
+            app.state.sleep_cycle_manager.bind_runtime(app.state.agent_runtime)
         except BaseException:
             app.state.event_journal.close()
             raise
