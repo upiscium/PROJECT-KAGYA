@@ -12,8 +12,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep
+from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep, values
 from kagya.config import Settings, get_settings
+from kagya.identity import ValueConflictDefinition
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem
 from kagya.models import load_model_provider
@@ -64,11 +65,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 app.state.event_journal = existing_journal
 
+            configured_value_seeds = tuple(
+                seed.to_declaration() for seed in app_settings.values.seeds
+            )
+            configured_value_conflicts = tuple(
+                ValueConflictDefinition(
+                    left_value_id=conflict.left_value_id,
+                    right_value_id=conflict.right_value_id,
+                )
+                for conflict in app_settings.values.conflicts
+            )
             app.state.agent_state_store = getattr(
                 app.state, "agent_state_store", None
             ) or AgentStateStore(
                 app_settings.agent_state.path,
                 app_settings.emotion.baseline_surprisal,
+            )
+            app.state.agent_state_store.configure_value_contract(
+                configured_value_seeds, configured_value_conflicts
             )
             app.state.state_wal = getattr(app.state, "state_wal", None) or StateWAL(
                 app_settings.state_wal.directory
@@ -197,6 +211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             nonlocal committed_snapshot, committed_snapshot_hash
             sequence = event.processing_sequence
             assert sequence is not None
+            app.state.main_loop._validate_value_event_commit(event)
             candidate = app.state.agent_state_store.capture(
                 app.state.main_loop, sequence
             )
@@ -204,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
+            app.state.main_loop._publish_committed_value_view()
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
             return evidence
@@ -254,6 +270,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     terminal_completion_checkpoint=terminal_completion_checkpoint,
                     failure_checkpoint=failure_checkpoint,
                 )
+            app.state.main_loop.bind_runtime(app.state.agent_runtime)
         except BaseException:
             app.state.event_journal.close()
             raise
@@ -303,9 +320,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         is_context_path = request.url.path == "/api/contexts" or (
             request.url.path.startswith("/api/contexts/")
         )
+        is_values_path = request.url.path == "/api/values" or (
+            request.url.path.startswith("/api/values/")
+        )
         if (
             request.url.path not in {"/api/chat", "/api/chat/debug"}
             and not is_context_path
+            and not is_values_path
         ):
             return await default_validation_exception_handler(request, error)
         return JSONResponse(
@@ -366,6 +387,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(memory.router)
     app.include_router(sleep.router)
     app.include_router(adapters.router)
+    app.include_router(values.router)
 
     return app
 

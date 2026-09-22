@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import inspect
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, cast
 
 from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from kagya.cognition import (
@@ -18,6 +18,22 @@ from kagya.cognition import (
     model_key,
 )
 from kagya.config import Settings
+from kagya.identity import (
+    IdentityOrigin,
+    OriginActor,
+    OriginInputKind,
+    ValueAdmissionStatus,
+    ValueConflictDefinition,
+    ValueDomainError,
+    ValueMutationEvidence,
+    ValueMutationResult,
+    ValueNotFound,
+    ValueOriginReviewDecision,
+    ValuePromptView,
+    ValueRevisionOperation,
+    ValueSystem,
+    ValueSystemSnapshot,
+)
 from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
 from kagya.models import ModelProvider
 from kagya.persona import (
@@ -27,6 +43,12 @@ from kagya.persona import (
     ResponsePostprocessor,
 )
 from kagya.runtime.chat_context import ChatContextSelectors, resolve_chat_context
+from kagya.runtime.agent_runtime import (
+    AgentEvent,
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+)
 from kagya.runtime.session_participant import (
     SessionTurnOperation,
     SessionTurnParticipant,
@@ -114,12 +136,14 @@ class KagyaMainLoop:
         postprocessor: ResponsePostprocessor | None = None,
         adapter_id: str | None = None,
         context_registry: ContextRegistry | None = None,
+        value_system: ValueSystem | None = None,
     ) -> None:
         from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
         self.settings = settings
         self.provider = provider
         self.memory_system = memory_system
+        self._runtime: object | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
@@ -173,6 +197,241 @@ class KagyaMainLoop:
         self.adapter_id = adapter_id
         self.context_registry = (
             context_registry if context_registry is not None else ContextRegistry()
+        )
+        configured_seeds = tuple(seed.to_declaration() for seed in settings.values.seeds)
+        configured_conflicts = tuple(
+            ValueConflictDefinition(
+                left_value_id=conflict.left_value_id,
+                right_value_id=conflict.right_value_id,
+            )
+            for conflict in settings.values.conflicts
+        )
+        if value_system is None:
+            authority = ValueSystem.from_seed_declarations(
+                configured_seeds, configured_conflicts
+            )
+        else:
+            if not isinstance(value_system, ValueSystem):
+                raise TypeError("value_system must be ValueSystem")
+            authority = ValueSystem.restore_snapshot(value_system.snapshot())
+        self._value_system = authority
+        self._committed_value_snapshot: ValueSystemSnapshot = authority.snapshot()
+
+    @property
+    def value_system(self) -> ValueSystem:
+        """Return a detached read-only-by-convention Value projection."""
+
+        return ValueSystem.restore_snapshot(self._committed_value_snapshot)
+
+    def _value_system_for_state(self) -> ValueSystem:
+        """Return the internal Value authority to AgentState only."""
+
+        return self._value_system
+
+    def _replace_value_system_for_state(self, value_system: ValueSystem) -> None:
+        if not isinstance(value_system, ValueSystem):
+            raise TypeError("value_system must be ValueSystem")
+        self._value_system = value_system
+        self._committed_value_snapshot = value_system.snapshot()
+
+    def _publish_committed_value_view(self) -> None:
+        """Publish the Value state after the runtime commit protocol succeeds."""
+
+        self._committed_value_snapshot = self._value_system.snapshot()
+
+    def _validate_value_event_commit(self, event: AgentEvent) -> None:
+        """Require newly introduced Value history to name the committing event."""
+
+        self._value_system.validate()
+        current = self._value_system.snapshot()
+        previous = self._committed_value_snapshot
+        if current == previous:
+            return
+        if current.conflicts != previous.conflicts:
+            raise ValueDomainError("Value conflicts changed outside their authority")
+        previous_values = {value.value_id: value for value in previous.values}
+        current_values = {value.value_id: value for value in current.values}
+        previous_histories = {
+            history.value_id: history for history in previous.histories
+        }
+        current_histories = {
+            history.value_id: history for history in current.histories
+        }
+        previous_ledgers = dict(previous.evidence_ledgers)
+        current_ledgers = dict(current.evidence_ledgers)
+        previous_ledger_digests = dict(previous.evidence_ledger_digests)
+        current_ledger_digests = dict(current.evidence_ledger_digests)
+        if not (
+            set(current_values)
+            == set(current_histories)
+            == set(current_ledgers)
+            == set(current_ledger_digests)
+        ):
+            raise ValueDomainError("Value authority keys are inconsistent at commit")
+        if set(previous_values) - set(current_values):
+            raise ValueDomainError("Value state was removed outside its authority")
+
+        for value_id, value in current_values.items():
+            previous_value = previous_values.get(value_id)
+            previous_history = previous_histories.get(value_id)
+            current_history = current_histories.get(value_id)
+            if current_history is None:
+                raise ValueDomainError("Value history is missing at commit")
+            prior_record_digests = (
+                {record.record_digest for record in previous_history.records}
+                if previous_history is not None
+                else set()
+            )
+            new_records = tuple(
+                record
+                for record in current_history.records
+                if record.record_digest not in prior_record_digests
+            )
+            changed = (
+                previous_value != value
+                or previous_history != current_history
+                or previous_ledgers.get(value_id) != current_ledgers.get(value_id)
+                or previous_ledger_digests.get(value_id)
+                != current_ledger_digests.get(value_id)
+            )
+            if not changed:
+                continue
+            if not new_records:
+                raise ValueDomainError("Value change has no committing revision")
+            for record in new_records:
+                expected_source = {
+                    ValueRevisionOperation.ADMISSION: AgentEventSource.API_VALUES_SEED_ADOPT,
+                    ValueRevisionOperation.FREEZE: AgentEventSource.API_VALUES_FREEZE,
+                    ValueRevisionOperation.UNFREEZE: AgentEventSource.API_VALUES_UNFREEZE,
+                    ValueRevisionOperation.ORIGIN_REVIEW: AgentEventSource.API_VALUES_ORIGIN_REVIEW,
+                    ValueRevisionOperation.ROLLBACK: AgentEventSource.API_VALUES_ROLLBACK,
+                }.get(record.operation)
+                if (
+                    event.event_type is not AgentEventType.VALUE_GOVERNANCE
+                    or expected_source is None
+                    or event.source is not expected_source
+                ):
+                    raise ValueDomainError(
+                        "Value revision is not authorized by a governance event"
+                    )
+                governance_origin_id = IdentityOrigin(
+                    OriginActor.OPERATOR,
+                    OriginInputKind.CONSTRAINT,
+                    ValueAdmissionStatus.PENDING,
+                    source_ref=event.source.value,
+                    event_id=event.event_id,
+                    event_sequence=event.processing_sequence,
+                ).origin_id
+                if record.origin_id != governance_origin_id:
+                    raise ValueDomainError(
+                        "Value revision origin is not bound to governance provenance"
+                    )
+                if (
+                    record.event_id != event.event_id
+                    or record.event_sequence != event.processing_sequence
+                ):
+                    raise ValueDomainError(
+                        "Value revision is not bound to the committing event"
+                    )
+
+    def bind_runtime(self, runtime: object) -> None:
+        """Bind the one application runtime allowed to govern this authority."""
+
+        if self._runtime is not None and self._runtime is not runtime:
+            raise RuntimeError("KagyaMainLoop is already bound to another runtime")
+        self._runtime = runtime
+
+    def _governance_context(
+        self,
+        runtime: AgentRuntime, expected_source: AgentEventSource
+    ) -> tuple[ValueMutationEvidence, IdentityOrigin]:
+        if not isinstance(runtime, AgentRuntime):
+            raise TypeError("governance runtime must be an AgentRuntime")
+        if self._runtime is not runtime:
+            raise ValueDomainError("governance runtime is not the bound application runtime")
+        event = runtime.current_event()
+        if event is None:
+            raise ValueDomainError("Value governance requires the active runtime event")
+        if event.event_type is not AgentEventType.VALUE_GOVERNANCE:
+            raise ValueDomainError("Value governance requires a governance event")
+        if event.source is not expected_source:
+            raise ValueDomainError("Value governance source is not authorized")
+        if event.processing_sequence is None:
+            raise ValueDomainError("Value governance event has no processing sequence")
+        evidence = ValueMutationEvidence(
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            recorded_at=event.requested_at,
+        )
+        origin = IdentityOrigin(
+            OriginActor.OPERATOR,
+            OriginInputKind.CONSTRAINT,
+            ValueAdmissionStatus.PENDING,
+            source_ref=event.source.value,
+            event_id=event.event_id,
+            event_sequence=event.processing_sequence,
+            confidence=1.0,
+        )
+        return evidence, origin
+
+    def freeze_value(self, runtime: AgentRuntime, value_id: str) -> ValueMutationResult:
+        evidence, origin = self._governance_context(
+            runtime, AgentEventSource.API_VALUES_FREEZE
+        )
+        return self._value_system.freeze(
+            value_id, evidence, governance_origin=origin
+        )
+
+    def unfreeze_value(self, runtime: AgentRuntime, value_id: str) -> ValueMutationResult:
+        evidence, origin = self._governance_context(
+            runtime, AgentEventSource.API_VALUES_UNFREEZE
+        )
+        return self._value_system.unfreeze(
+            value_id, evidence, governance_origin=origin
+        )
+
+    def rollback_value(
+        self, runtime: AgentRuntime, value_id: str, target_revision: int
+    ) -> ValueMutationResult:
+        evidence, origin = self._governance_context(
+            runtime, AgentEventSource.API_VALUES_ROLLBACK
+        )
+        return self._value_system.rollback(
+            value_id,
+            target_revision,
+            evidence,
+            governance_origin=origin,
+        )
+
+    def adopt_configured_value_seed(
+        self, runtime: AgentRuntime, value_id: str
+    ) -> ValueMutationResult:
+        evidence, origin = self._governance_context(
+            runtime, AgentEventSource.API_VALUES_SEED_ADOPT
+        )
+        for configured_seed in self.settings.values.seeds:
+            if configured_seed.value_id == value_id:
+                return self._value_system.adopt_seed(
+                    configured_seed.to_declaration(),
+                    evidence,
+                    governance_origin=origin,
+                )
+        raise ValueNotFound("configured Value seed not found")
+
+    def review_value_origin(
+        self,
+        runtime: AgentRuntime,
+        value_id: str,
+        decision: ValueOriginReviewDecision,
+    ) -> ValueMutationResult:
+        evidence, origin = self._governance_context(
+            runtime, AgentEventSource.API_VALUES_ORIGIN_REVIEW
+        )
+        return self._value_system.review_origin(
+            value_id,
+            decision,
+            evidence,
+            governance_origin=origin,
         )
 
     def chat(
@@ -277,6 +536,7 @@ class KagyaMainLoop:
             current_context.source_session_id,
         )
         context_view = ContextPromptView.from_frame(current_context)
+        value_view = self.value_system.prompt_view(current_context.context_id)
         context_text = self.session_state.context_text()
         temporal_update = emotion_engine.advance_to()
         measurement = self.surprisal_calculator.measure(
@@ -318,7 +578,7 @@ class KagyaMainLoop:
             current_context.context_id,
         )
         prompt = self._build_prompt(
-            user_input, emotion_state, working_memory_view, context_view
+            user_input, emotion_state, working_memory_view, context_view, value_view
         )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
@@ -378,24 +638,32 @@ class KagyaMainLoop:
         emotion_state: EmotionState,
         working_memory_view: WorkingMemoryView,
         context_view: ContextPromptView,
+        value_view: ValuePromptView,
     ) -> str:
-        """Pass Context projection while retaining older injected builders."""
+        """Pass prompt projections while retaining older injected builders."""
 
-        build = self.prompt_builder.build
-        parameters = inspect.signature(build).parameters.values()
-        accepts_context = any(
-            parameter.name == "context_view"
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        build = cast(Callable[..., str], self.prompt_builder.build)
+        parameters = tuple(inspect.signature(build).parameters.values())
+        keyword_names = {
+            parameter.name
             for parameter in parameters
+            if parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        }
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
         )
-        if accepts_context:
-            return build(
-                user_input,
-                emotion_state,
-                working_memory_view,
-                context_view=context_view,
-            )
-        return build(user_input, emotion_state, working_memory_view)
+        keyword_arguments: dict[str, object] = {}
+        if accepts_kwargs or "context_view" in keyword_names:
+            keyword_arguments["context_view"] = context_view
+        if accepts_kwargs or "value_view" in keyword_names:
+            keyword_arguments["value_view"] = value_view
+        return build(
+            user_input,
+            emotion_state,
+            working_memory_view,
+            **keyword_arguments,
+        )
 
     def _chat_result(
         self, computed: _ComputedChat, transaction_id: str

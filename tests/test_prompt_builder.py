@@ -1,6 +1,12 @@
 """U4 PromptBuilder contract tests."""
 
 from kagya.body import EmotionState
+from kagya.identity import (
+    ValueSeedDeclaration,
+    ValuePromptView,
+    ValueScope,
+    ValueSystem,
+)
 from kagya.persona import PromptBuilder
 from kagya.runtime import (
     WorkingMemoryDecision,
@@ -94,3 +100,58 @@ def test_build_is_purely_repeatable() -> None:
     second = PromptBuilder().build("hello", EmotionState(), memory_view)
 
     assert first == second
+
+
+def test_build_renders_bounded_active_value_projection_deterministically() -> None:
+    value_view = ValueSystem.from_seed_declarations(
+        (
+            ValueSeedDeclaration(
+                value_id="care",
+                name="care",
+                concept="Protect wellbeing.",
+                scope=ValueScope.SUBJECT,
+                context_ids=(),
+                polarity=1,
+                initial_strength=0.8,
+                confidence=0.9,
+                stability=0.0,
+                protectedness=0.0,
+                negotiability=1.0,
+                allowed_update_rate=0.1,
+            ),
+        )
+    ).prompt_view("conversation-default")
+
+    prompt = PromptBuilder().build(
+        "hello",
+        EmotionState(),
+        view(),
+        value_view=value_view,
+    )
+
+    assert "Active Values:" in prompt
+    assert (
+        "- value_id=care; authority=system_authorized; scope=subject; "
+        "polarity=+1; strength=0.800000; confidence=0.900000; "
+        "name=care; concept=Protect wellbeing."
+    ) in prompt
+    for forbidden in (
+        "source_ref",
+        "event_id",
+        "event_sequence",
+        "origin_id",
+        "seed_contract_digest",
+        "evidence_refs",
+        "revision",
+    ):
+        assert forbidden not in prompt
+
+
+def test_build_renders_explicit_empty_value_projection_and_omits_none() -> None:
+    empty_prompt = PromptBuilder().build(
+        "hello", EmotionState(), view(), value_view=ValuePromptView(())
+    )
+    omitted_prompt = PromptBuilder().build("hello", EmotionState(), view())
+
+    assert "Active Values:\n- none" in empty_prompt
+    assert "Active Values:" not in omitted_prompt

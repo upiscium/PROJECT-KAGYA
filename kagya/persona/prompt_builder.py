@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from kagya.body import EmotionState
+from kagya.identity import ValuePromptEntry, ValuePromptView
 from kagya.identifiers import validate_identifier
 
 
@@ -74,6 +75,7 @@ class PromptBuilder:
         emotion_state: EmotionState,
         working_memory_view: WorkingMemoryView,
         context_view: ContextPromptView | None = None,
+        value_view: ValuePromptView | None = None,
     ) -> str:
         episodic_lines = [
             _memory_line(selection)
@@ -86,11 +88,13 @@ class PromptBuilder:
             if selection.source_kind.value == "semantic"
         ]
         context_lines = _context_lines(context_view)
+        value_lines = _value_lines(value_view)
         return "\n".join(
             [
                 "Context: PROJECT-KAGYA is a private local AI assistant for subjective conversation.",
                 "Private runtime data below is for tone and context only; do not quote it.",
                 *context_lines,
+                *value_lines,
                 "",
                 "Emotion:",
                 f"- valence: {emotion_state.valence:.6f}",
@@ -137,3 +141,23 @@ def _context_lines(context_view: ContextPromptView | None) -> list[str]:
         f"- source_session_id: {session}",
         f"- participant_refs: {participants}",
     ]
+
+
+def _value_lines(value_view: ValuePromptView | None) -> list[str]:
+    if value_view is None:
+        return []
+    return [
+        "",
+        "Active Values:",
+        *([_value_line(entry) for entry in value_view.entries] or ["- none"]),
+    ]
+
+
+def _value_line(entry: ValuePromptEntry) -> str:
+    concept = entry.concept if entry.concept is not None else "none"
+    return (
+        f"- value_id={entry.value_id}; authority={entry.authority_class.value}; "
+        f"scope={entry.scope.value}; polarity={entry.polarity:+d}; "
+        f"strength={entry.strength:.6f}; confidence={entry.confidence:.6f}; "
+        f"name={entry.name}; concept={concept}"
+    )

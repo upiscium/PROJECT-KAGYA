@@ -3,7 +3,21 @@
 from pathlib import Path
 import math
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
+
+from kagya.identifiers import validate_identifier
+from kagya.identity.value_system import ValueSeedDeclaration, ValueScope
 
 
 class StrictBaseModel(BaseModel):
@@ -150,6 +164,161 @@ class StateWALSettings(StrictBaseModel):
     directory: Path = Path(".kagya/private/state_wal")
 
 
+class ValueSeedSettings(StrictBaseModel):
+    """A non-authoritative value declaration supplied by configuration."""
+
+    value_id: StrictStr
+    name: StrictStr
+    concept: StrictStr | None = None
+    scope: Literal["subject", "context"] = "subject"
+    context_ids: list[StrictStr] = Field(default_factory=list, max_length=16)
+    polarity: StrictInt = 1
+    strength: StrictFloat = Field(ge=0.0, le=1.0)
+    confidence: StrictFloat = Field(ge=0.0, le=1.0)
+    stability: StrictFloat = Field(ge=0.0, le=1.0)
+    protectedness: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
+    negotiability: StrictFloat = Field(default=1.0, ge=0.0, le=1.0)
+    allowed_update_rate: StrictFloat = Field(gt=0.0, le=1.0)
+
+    @field_validator("value_id")
+    @classmethod
+    def validate_value_id(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not value or any(ord(char) < 32 or ord(char) == 127 for char in value) or len(value) > 128:
+            raise ValueError("value text must be bounded and single-line")
+        return value
+
+    @field_validator("concept")
+    @classmethod
+    def validate_concept(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            or len(value) > 2048
+        ):
+            raise ValueError("value text must be bounded and single-line")
+        return value
+
+    @field_validator("context_ids")
+    @classmethod
+    def validate_context_ids(cls, value: list[str]) -> list[str]:
+        for context_id in value:
+            validate_identifier(context_id)
+        if value != sorted(set(value)) or len(value) != len(set(value)):
+            raise ValueError("context_ids must be sorted and unique")
+        return value
+
+    @field_validator(
+        "strength",
+        "confidence",
+        "stability",
+        "protectedness",
+        "negotiability",
+        "allowed_update_rate",
+    )
+    @classmethod
+    def require_finite_value(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value settings must be finite")
+        return value
+
+    @field_validator("polarity")
+    @classmethod
+    def validate_polarity(cls, value: int) -> int:
+        if value not in (-1, 1):
+            raise ValueError("polarity must be exactly -1 or 1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "ValueSeedSettings":
+        if self.scope == "subject" and self.context_ids:
+            raise ValueError("subject values cannot have contexts")
+        if self.scope == "context" and not self.context_ids:
+            raise ValueError("context values require contexts")
+        return self
+
+    def to_declaration(self) -> ValueSeedDeclaration:
+        """Convert inert config into an immutable, digestable seed declaration."""
+
+        return ValueSeedDeclaration(
+            value_id=self.value_id,
+            name=self.name,
+            concept=self.concept,
+            scope=ValueScope(self.scope),
+            context_ids=tuple(self.context_ids),
+            polarity=self.polarity,
+            initial_strength=self.strength,
+            confidence=self.confidence,
+            stability=self.stability,
+            protectedness=self.protectedness,
+            negotiability=self.negotiability,
+            allowed_update_rate=self.allowed_update_rate,
+        )
+
+
+class ValueConflictSettings(StrictBaseModel):
+    conflict_id: StrictStr
+    name: StrictStr
+    left_value_id: StrictStr
+    right_value_id: StrictStr
+
+    @field_validator("conflict_id", "name")
+    @classmethod
+    def validate_conflict_text(cls, value: str) -> str:
+        if not value or len(value) > 128 or any(
+            ord(char) < 32 or ord(char) == 127 for char in value
+        ):
+            raise ValueError("conflict text must be bounded and single-line")
+        return value
+
+    @field_validator("conflict_id")
+    @classmethod
+    def validate_conflict_id(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @field_validator("left_value_id", "right_value_id")
+    @classmethod
+    def validate_conflict_value_id(cls, value: str) -> str:
+        return validate_identifier(value)
+
+    @model_validator(mode="after")
+    def validate_pair_order(self) -> "ValueConflictSettings":
+        if self.left_value_id == self.right_value_id:
+            raise ValueError("conflicts cannot be self-conflicts")
+        if self.left_value_id > self.right_value_id:
+            raise ValueError("conflict value IDs must be in canonical order")
+        return self
+
+
+class ValueSystemSettings(StrictBaseModel):
+    seeds: list[ValueSeedSettings] = Field(default_factory=list, max_length=128)
+    conflicts: list[ValueConflictSettings] = Field(default_factory=list, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "ValueSystemSettings":
+        seed_ids = [seed.value_id for seed in self.seeds]
+        present_ids = set(seed_ids)
+        if len(present_ids) != len(seed_ids):
+            raise ValueError("seed value IDs must be unique")
+        pairs: set[tuple[str, str]] = set()
+        conflict_ids: set[str] = set()
+        for conflict in self.conflicts:
+            pair = (conflict.left_value_id, conflict.right_value_id)
+            if not {conflict.left_value_id, conflict.right_value_id} <= present_ids:
+                raise ValueError("conflicts must reference known seed value IDs")
+            if pair in pairs or (pair[1], pair[0]) in pairs:
+                raise ValueError("conflict pairs must be unique")
+            if conflict.conflict_id in conflict_ids:
+                raise ValueError("conflict IDs must be unique")
+            pairs.add(pair)
+            conflict_ids.add(conflict.conflict_id)
+        return self
+
+
 class Settings(StrictBaseModel):
     project: ProjectSettings
     model: ModelSettings
@@ -167,3 +336,4 @@ class Settings(StrictBaseModel):
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
+    values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)

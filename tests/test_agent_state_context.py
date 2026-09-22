@@ -15,8 +15,9 @@ from kagya.runtime import (
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
-    AgentStateSnapshot,
     AgentStateSnapshotV3,
+    AgentStateSnapshotV5,
+    AgentStateSnapshotV4,
     AgentStateSnapshotV2,
     AppraisalStateSnapshot,
     CalibrationEntrySnapshot,
@@ -33,6 +34,7 @@ from kagya.runtime import (
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
+from kagya.identity import ValueSystem
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -52,6 +54,7 @@ class LoopStub:
             initial_scale=1.0,
             minimum_scale=0.1,
         )
+        self.value_system = ValueSystem()
 
 
 def make_store(path: Path) -> AgentStateStore:
@@ -96,13 +99,24 @@ def make_context_loop() -> LoopStub:
     return loop
 
 
-def as_v3(snapshot: AgentStateSnapshot) -> AgentStateSnapshotV3:
+def as_v3(snapshot: AgentStateSnapshotV5) -> AgentStateSnapshotV3:
     return AgentStateSnapshotV3(
         saved_at=snapshot.saved_at,
         last_processed_event_sequence=snapshot.last_processed_event_sequence,
         emotion_state=snapshot.emotion_state,
         working_memory=snapshot.working_memory,
         context_state=snapshot.context_state,
+    )
+
+
+def as_v4(snapshot: AgentStateSnapshotV5) -> AgentStateSnapshotV4:
+    return AgentStateSnapshotV4(
+        saved_at=snapshot.saved_at,
+        last_processed_event_sequence=snapshot.last_processed_event_sequence,
+        emotion_state=snapshot.emotion_state,
+        working_memory=snapshot.working_memory,
+        context_state=snapshot.context_state,
+        appraisal_state=snapshot.appraisal_state,
     )
 
 
@@ -189,6 +203,40 @@ def test_v3_canonical_bytes_and_hash_remain_exact() -> None:
     )
 
 
+def test_v4_canonical_bytes_and_hash_remain_exact() -> None:
+    snapshot = AgentStateSnapshotV4(
+        saved_at=NOW,
+        last_processed_event_sequence=4,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.2, arousal=0.3, optimal_loss=1.2
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
+    )
+
+    fixture = (
+        b'{"appraisal_state":{"calibration_entries":[],"last_emotion_update_at":null},'
+        b'"context_state":{"current_context_id":null,"frames":[],'
+        b'"interlocutor_bindings":[],"revision":0},'
+        b'"emotion_state":{"arousal":0.3,"optimal_loss":1.2,"valence":0.2},'
+        b'"last_processed_event_sequence":4,"saved_at":"2026-01-02T03:04:05Z",'
+        b'"schema_version":4,"working_memory":{"items":[],"revision":0}}'
+    )
+
+    assert AgentStateStore._canonical_bytes(snapshot) == fixture
+    assert hashlib.sha256(fixture).hexdigest() == (
+        "486644c1456625fde9bb9b3554a235ff0ff4d031680111b54ef4a5cd906f6ad7"
+    )
+
+
 def test_capture_without_context_authority_is_a_bounded_capture_failure(
     tmp_path: Path,
 ) -> None:
@@ -211,7 +259,9 @@ def test_capture_without_context_authority_is_a_bounded_capture_failure(
     assert not (tmp_path / "agent_state.json").exists()
 
 
-@pytest.mark.parametrize("missing", ["emotion_engine", "working_memory", "loss_calibration"])
+@pytest.mark.parametrize(
+    "missing", ["emotion_engine", "working_memory", "loss_calibration", "value_system"]
+)
 def test_capture_requires_all_runtime_authorities(
     tmp_path: Path, missing: str
 ) -> None:
@@ -346,8 +396,8 @@ def test_v4_capture_restore_round_trips_exact_context_without_clock_reads(
     loaded = store.load()
     store.restore_into(target, loaded)
 
-    assert isinstance(loaded, AgentStateSnapshot)
-    assert loaded.schema_version == 4
+    assert isinstance(loaded, AgentStateSnapshotV5)
+    assert loaded.schema_version == 5
     assert loaded.context_state == snapshot.context_state
     assert target.context_registry.state == source.context_registry.state
     assert clock_calls == 0
@@ -434,10 +484,10 @@ def test_state_wal_reconstructs_v4_context_without_new_record_schema(
 
     assert inspection.records[0].schema_version == 1
     assert reconstructed == snapshot
-    assert isinstance(reconstructed, AgentStateSnapshot)
+    assert isinstance(reconstructed, AgentStateSnapshotV5)
 
 
-def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> None:
+def test_state_wal_reconstructs_mixed_pre_v5_and_v5_history(tmp_path: Path) -> None:
     store = make_store(tmp_path / "agent_state.json")
     v1 = AgentStateSnapshotV1(
         saved_at=NOW,
@@ -449,8 +499,10 @@ def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> Non
     v2 = make_v2_snapshot().model_copy(
         update={"last_processed_event_sequence": 1}
     )
-    captured = store.capture(make_context_loop(), sequence=2)
-    v3 = as_v3(captured)
+    captured = store.capture(make_context_loop(), sequence=4)
+    v3 = as_v3(captured.model_copy(update={"last_processed_event_sequence": 2}))
+    v4 = as_v4(captured.model_copy(update={"last_processed_event_sequence": 3}))
+    v5 = captured
     wal = StateWAL(tmp_path / "wal")
     wal.bootstrap(v1, 0)
     wal.append_transition(
@@ -475,17 +527,22 @@ def test_state_wal_reconstructs_mixed_v1_v2_v3_v4_history(tmp_path: Path) -> Non
         event_source="test",
         processing_sequence=3,
         prior_snapshot=v3,
-        candidate_snapshot=captured.model_copy(
-            update={"last_processed_event_sequence": 3}
-        ),
+        candidate_snapshot=v4,
+    )
+    wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=4,
+        prior_snapshot=v4,
+        candidate_snapshot=v5,
     )
 
     reconstructed = wal.reconstruct(
-        sequence=3,
-        snapshot_hash=store.snapshot_hash(
-            captured.model_copy(update={"last_processed_event_sequence": 3})
-        ),
+        sequence=4,
+        snapshot_hash=store.snapshot_hash(v5),
     )
 
-    assert reconstructed.schema_version == 4
-    assert isinstance(reconstructed, AgentStateSnapshot)
+    assert reconstructed.schema_version == 5
+    assert isinstance(reconstructed, AgentStateSnapshotV5)
+    assert all(record.schema_version == 1 for record in wal.inspect().records)

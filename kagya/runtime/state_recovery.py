@@ -11,10 +11,12 @@ from uuid import UUID, uuid4, uuid5
 
 from kagya.runtime.agent_runtime import AgentEvent
 from kagya.runtime.agent_state import (
+    AgentStateConfigurationDrift,
     AgentStateLoadError,
     AgentStateSnapshotV1,
     AgentStateSnapshotV2,
     AgentStateSnapshotV3,
+    AgentStateSnapshotV4,
     AgentStateStore,
     CompatibleAgentStateSnapshot,
 )
@@ -1333,8 +1335,11 @@ class StateRecoveryCoordinator:
         wal_record, wal_record_hash = self._record_for_snapshot(
             post_wal, target, target_hash
         )
-        if isinstance(
-            target, (AgentStateSnapshotV1, AgentStateSnapshotV2, AgentStateSnapshotV3)
+        if type(target) in (
+            AgentStateSnapshotV1,
+            AgentStateSnapshotV2,
+            AgentStateSnapshotV3,
+            AgentStateSnapshotV4,
         ):
             try:
                 published = self.state_store.load()
@@ -1644,6 +1649,8 @@ class StateRecoveryCoordinator:
                 raise AgentStateLoadError("AgentState snapshot target is unsafe")
             return self.state_store.load(), None
         except AgentStateLoadError as error:
+            if isinstance(error, AgentStateConfigurationDrift):
+                raise
             return None, error
 
     def _validate_cross_authority(

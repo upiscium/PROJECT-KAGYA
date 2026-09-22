@@ -517,6 +517,160 @@ def test_event_is_immutable_and_has_no_handler_payload() -> None:
         event.source = "changed"  # type: ignore[misc]
 
 
+def test_current_event_is_only_visible_during_the_active_handler() -> None:
+    entered = Event()
+    release = Event()
+    observed: dict[str, object] = {}
+    runtime = AgentRuntime(1)
+
+    assert runtime.current_event() is None
+    runtime.start()
+
+    def handler() -> str:
+        current = runtime.current_event()
+        assert current is not None
+        observed["event"] = current
+        observed["worker"] = current_thread().name
+        entered.set()
+        assert release.wait(timeout=2)
+        assert runtime.current_event() is current
+        return "done"
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        handler,
+    )
+    assert entered.wait(timeout=2)
+    assert runtime.current_event() is None
+    other_thread_value: list[object] = []
+    other_thread = Thread(
+        target=lambda: other_thread_value.append(runtime.current_event()),
+        name="current-event-observer",
+    )
+    other_thread.start()
+    other_thread.join(timeout=2)
+    assert other_thread_value == [None]
+
+    release.set()
+    outcome = future.result(timeout=2)
+    runtime.shutdown()
+
+    assert outcome.value == "done"
+    assert outcome.event is observed["event"]
+    assert observed["worker"] == "kagya-agent-runtime"
+    assert runtime.current_event() is None
+
+
+def test_current_event_is_cleared_when_a_handler_raises() -> None:
+    runtime = AgentRuntime(1)
+    runtime.start()
+
+    def fail() -> None:
+        assert runtime.current_event() is not None
+        raise ValueError("handler failed")
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        fail,
+    )
+    with pytest.raises(AgentRuntimeExecutionError):
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert runtime.current_event() is None
+
+
+def test_current_event_is_cleared_before_failure_checkpoint() -> None:
+    checkpoint_observations: list[bool] = []
+
+    def failure_checkpoint(_event: object) -> None:
+        checkpoint_observations.append(runtime.current_event() is None)
+
+    runtime = AgentRuntime(1, failure_checkpoint=failure_checkpoint)
+    runtime.start()
+
+    def fail() -> None:
+        assert runtime.current_event() is not None
+        raise ValueError("handler failed")
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        fail,
+    )
+    with pytest.raises(AgentRuntimeExecutionError):
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert checkpoint_observations == [True]
+
+
+def test_current_event_is_cleared_before_preparation_failure_checkpoint() -> None:
+    checkpoint_observations: list[bool] = []
+
+    def failure_checkpoint(_event: object) -> None:
+        checkpoint_observations.append(runtime.current_event() is None)
+
+    def preparation_checkpoint(_event: object, _value: object) -> object:
+        raise ValueError("preparation failed")
+
+    runtime = AgentRuntime(
+        1,
+        preparation_checkpoint=preparation_checkpoint,
+        failure_checkpoint=failure_checkpoint,
+    )
+    runtime.start()
+
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        lambda: None,
+    )
+    with pytest.raises(AgentRuntimeDurabilityError) as error:
+        future.result(timeout=2)
+    runtime.shutdown()
+
+    assert error.value.phase is AgentRuntimeDurabilityPhase.TRANSACTION_PREPARATION
+    assert checkpoint_observations == [True]
+
+
+def test_current_event_is_cleared_before_every_durability_checkpoint() -> None:
+    checkpoint_observations: list[bool] = []
+
+    def observe(_event: object, _value: object = None) -> object:
+        checkpoint_observations.append(runtime.current_event() is None)
+        return _value
+
+    runtime = AgentRuntime(
+        1,
+        started_checkpoint=lambda _event: checkpoint_observations.append(
+            runtime.current_event() is None
+        ),
+        preparation_checkpoint=observe,
+        internal_commit_checkpoint=lambda _event: checkpoint_observations.append(
+            runtime.current_event() is None
+        ),
+        finalization_checkpoint=lambda _event, _evidence: checkpoint_observations.append(
+            runtime.current_event() is None
+        ),
+        terminal_completion_checkpoint=lambda _event, _evidence: checkpoint_observations.append(
+            runtime.current_event() is None
+        ),
+    )
+    runtime.start()
+    future = runtime.submit(
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventSource.API_VALUES_FREEZE,
+        lambda: (runtime.current_event() is not None),
+    )
+    assert future.result(timeout=2).value is True
+    runtime.shutdown()
+
+    assert checkpoint_observations == [True, True, True, True, True]
+
+
 def test_arbitrary_source_cannot_be_used_as_private_metadata() -> None:
     runtime = AgentRuntime(1)
     runtime.start()
@@ -566,6 +720,23 @@ def test_context_event_types_and_sources_are_bounded_allowlist() -> None:
 
     assert outcome.event.event_type is AgentEventType.CONTEXT_UPDATE
     assert outcome.event.source is AgentEventSource.API_CONTEXT_RELATE
+
+
+def test_value_governance_event_sources_are_bounded_allowlist() -> None:
+    assert AgentEventType.VALUE_GOVERNANCE.value == "value_governance"
+    assert {
+        AgentEventSource.API_VALUES_FREEZE.value,
+        AgentEventSource.API_VALUES_UNFREEZE.value,
+        AgentEventSource.API_VALUES_SEED_ADOPT.value,
+        AgentEventSource.API_VALUES_ORIGIN_REVIEW.value,
+        AgentEventSource.API_VALUES_ROLLBACK.value,
+    } == {
+        "api.values.freeze",
+        "api.values.unfreeze",
+        "api.values.seed_adopt",
+        "api.values.origin_review",
+        "api.values.rollback",
+    }
 
 
 def test_emotion_tick_identity_is_bounded_and_has_no_payload() -> None:
